@@ -1,0 +1,44 @@
+{
+	"name": "@gmitch215/gmux",
+	"version": "1.0.0",
+	"description": "Linux on Cloudflare Workers",
+	"author": "Gregory Mitchell <me@gmitch215.xyz>",
+	"license": "GPL-3.0-only",
+	"scripts": {
+		"prettier": "prettier --write .",
+		"prettier:check": "prettier --check .",
+		"format": "bash format.sh && prettier --write .",
+		"format:check": "bash check-format.sh && prettier --check .",
+		"prepare": "bash scripts/setup-hooks.sh"
+	},
+	"dependencies": {
+		"@drupflare/burrow": "1.1.1"
+	},
+	"devDependencies": {
+		"@cloudflare/vitest-pool-workers": "^0.22.0",
+		"@cloudflare/workers-types": "^5.20260925.1",
+		"@playwright/test": "^1.63.0",
+		"@types/bun": "latest",
+		"@vitest/coverage-istanbul": "^5.0.1",
+		"@xterm/xterm": "^6.0.0",
+		"binaryen": "^132.0.0",
+		"fflate": "^0.8.3",
+		"prettier": "^3.9.9",
+		"prettier-plugin-organize-imports": "^4.3.0",
+		"prettier-plugin-sh": "^0.20.2",
+		"typedoc": "^0.28.20",
+		"typescript": "^5.9.3",
+		"vitest": "^5.0.1",
+		"wrangler": "^4.139.0"
+	},
+	"publishConfig": {
+		"access": "public"
+	},
+	"repository": {
+		"type": "git",
+		"url": "git+https://github.com/gmitch215/gmux.git"
+	},
+	"bugs": {
+		"url": "https://github.com/gmitch215/gmux/issues"
+	}
+}
