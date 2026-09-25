@@ -1,0 +1,13 @@
+vendor/
+node_modules/
+coverage/
+bun.lock
+typedoc/
+.husky/
+TECHNICAL_REPORT.md
+experiments/
+build/
+dist/
+LICENSES/
+src/kernel/
+src/llvm/
