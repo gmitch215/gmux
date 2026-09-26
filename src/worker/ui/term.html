@@ -1,0 +1,71 @@
+<!doctype html>
+<html lang="en">
+	<head>
+		<meta charset="utf-8" />
+		<meta
+			name="viewport"
+			content="width=device-width, initial-scale=1"
+		/>
+		<title>gmux Terminal</title>
+		<link
+			rel="stylesheet"
+			href="xterm.css"
+		/>
+		<style>
+			html,
+			body {
+				margin: 0;
+				height: 100%;
+				background: #101014;
+				color: #e6e6e6;
+				font-family: ui-monospace, monospace;
+			}
+			#bar {
+				display: flex;
+				gap: 8px;
+				align-items: center;
+				padding: 8px 12px;
+				border-bottom: 1px solid #2a2a33;
+			}
+			#term {
+				height: calc(100% - 50px);
+				padding: 4px;
+			}
+			input,
+			button {
+				font: inherit;
+				background: #1b1b22;
+				color: inherit;
+				border: 1px solid #3a3a46;
+				padding: 4px 8px;
+			}
+		</style>
+	</head>
+	<body>
+		<div id="bar">
+			<strong>gmux</strong>
+			<span id="status">Connecting</span>
+			<input
+				id="token"
+				type="password"
+				placeholder="owner token"
+				hidden
+			/>
+			<button
+				id="connect"
+				hidden
+			>
+				Connect
+			</button>
+			<button
+				id="claim"
+				hidden
+			>
+				Claim This Machine
+			</button>
+		</div>
+		<div id="term"></div>
+		<script src="xterm.js"></script>
+		<script src="term.js"></script>
+	</body>
+</html>
