@@ -87,10 +87,16 @@ jobs:
         if: failure()
         run: tail -100 "$RUNNER_TEMP/rebuild/out/build.log"
       - name: Keep the Toolchain
-        if: steps.llvm-cache.outputs.cache-hit != 'true'
-        run: sudo mv "$RUNNER_TEMP/rebuild/linux-wasm/workspace/install/llvm" "$RUNNER_TEMP/llvm"
+        id: keep
+        if: ${{ !cancelled() && steps.llvm-cache.outputs.cache-hit != 'true' }}
+        run: |
+          llvm="$RUNNER_TEMP/rebuild/linux-wasm/workspace/install/llvm"
+          if ls "$llvm"/lib/clang/*/lib/libclang_rt.builtins-wasm64.a > /dev/null 2>&1; then
+            sudo mv "$llvm" "$RUNNER_TEMP/llvm"
+            echo "kept=true" >> "$GITHUB_OUTPUT"
+          fi
       - name: Save the Toolchain
-        if: steps.llvm-cache.outputs.cache-hit != 'true'
+        if: ${{ !cancelled() && steps.keep.outputs.kept == 'true' }}
         uses: actions/cache/save@v6
         with:
           path: ${{ runner.temp }}/llvm
