@@ -1,0 +1,35 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Gregory Mitchell <me@gmitch215.xyz>
+Date: Fri, 25 Sep 2026 17:58:00 -0400
+Subject: [PATCH] wasm: raise the page allocator's max order to 14
+
+Without an MMU every anonymous mmap is one physically contiguous block
+from the page allocator. The generic MAX_PAGE_ORDER of 10 capped a
+program's largest allocation at 4 MiB, and Lua's gc test failed to
+allocate 4 MiB plus a page with 47 MB free. Order 14 is 64 MiB, the
+kernel's RAM at boot. arc, arm and nios2 set ARCH_FORCE_MAX_ORDER the
+same way.
+---
+ arch/wasm/Kconfig | 9 +++++++++
+ 1 file changed, 9 insertions(+)
+
+diff --git a/arch/wasm/Kconfig b/arch/wasm/Kconfig
+--- a/arch/wasm/Kconfig
++++ b/arch/wasm/Kconfig
+@@ -123,4 +123,13 @@ config PGTABLE_LEVELS
+ 	int
+ 	default 2
+ 
++config ARCH_FORCE_MAX_ORDER
++	int "Order of maximal physically contiguous allocations"
++	default "14"
++	help
++	  Without an MMU every anonymous mmap is one physically contiguous
++	  block from the page allocator, so the largest order is the largest
++	  allocation a program can make. The generic default of 10 caps it at
++	  4 MiB; 14 allows 64 MiB, the kernel's RAM at boot.
++
+ endmenu
+-- 
+2.43.0
+

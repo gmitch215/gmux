@@ -1,0 +1,42 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Gregory Mitchell <me@gmitch215.xyz>
+Date: Fri, 25 Sep 2026 18:05:00 -0400
+Subject: [PATCH] binfmt_wasm: give programs a 128 KiB stack and no brk
+
+binfmt_wasm mapped two pages for a program's stack, started brk at the
+bottom of the same mapping and let it grow to the top, and mallocng takes
+its metadata from brk. The stack and the allocator's metadata met in the
+middle: Lua aborted in free() after an error raised inside a coroutine
+under pcall, and in malloc() building a long list. The stack is now 128
+KiB, what binfmt_elf_fdpic gives a nommu program that does not ask for a
+size, and brk has no room, so musl's malloc takes its metadata from mmap.
+---
+ fs/binfmt_wasm.c | 6 ++++--
+ 1 file changed, 4 insertions(+), 2 deletions(-)
+
+diff --git a/fs/binfmt_wasm.c b/fs/binfmt_wasm.c
+--- a/fs/binfmt_wasm.c
++++ b/fs/binfmt_wasm.c
+@@ -20,7 +20,8 @@
+ #include <linux/uaccess.h>
+ #include <linux/vmalloc.h>
+ 
+-#define WASM_STACK_SIZE		(2UL * PAGE_SIZE)
++/* 128 KiB, the default binfmt_elf_fdpic gives nommu programs */
++#define WASM_STACK_SIZE		(128UL * 1024)
+ 
+ /*
+  * Userland expects the stack to be page aligned as of now, which allows it to
+@@ -368,7 +369,8 @@
+ 	}
+ 	current->mm->brk = current->mm->start_brk; /* Already page aligned... */
+ #ifndef CONFIG_MMU
+-	current->mm->context.end_brk = current->mm->start_brk + stack_size;
++	/* no room for brk: it would grow into the stack; musl's malloc falls back to mmap */
++	current->mm->context.end_brk = current->mm->start_brk;
+ #endif
+ 	current->mm->start_stack = current->mm->start_brk + stack_size;
+ 
+-- 
+2.43.0
+

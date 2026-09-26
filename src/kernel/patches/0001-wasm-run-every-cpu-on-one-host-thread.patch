@@ -1,0 +1,147 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Gregory Mitchell <me@gmitch215.xyz>
+Date: Fri, 25 Sep 2026 03:00:00 -0400
+Subject: [PATCH] wasm: run every cpu on one host thread
+
+linux-wasm backs each cpu with a web worker and blocks it with atomic waits.
+gmux runs every cpu on one host thread, so the paths that spin or wait call
+host imports instead: cpu_relax, the idle wait (with a deadline), delay and
+halt. head.S retried a failed memory.grow at the same size forever; it now
+shrinks by a page each try. Boot memory drops from 512 MiB to 64 MiB, which a
+Durable Object can hold.
+
+Signed-off-by: Gregory Mitchell <me@gmitch215.xyz>
+---
+diff --git a/arch/wasm/configs/wasm32_nommu_defconfig b/arch/wasm/configs/wasm32_nommu_defconfig
+index 52b34d131..d42572a2e 100644
+--- a/arch/wasm/configs/wasm32_nommu_defconfig
++++ b/arch/wasm/configs/wasm32_nommu_defconfig
+@@ -34,3 +34,4 @@ CONFIG_BINFMT_WASM=y
+ # CONFIG_SECTION_MISMATCH_WARN_ONLY is not set
+ # CONFIG_RCU_TRACE is not set
+ # CONFIG_RUNTIME_TESTING_MENU is not set
++CONFIG_BOOT_MEM_PAGES=0x400
+diff --git a/arch/wasm/include/asm/processor.h b/arch/wasm/include/asm/processor.h
+index 6c6a907ac..fd756fb9a 100644
+--- a/arch/wasm/include/asm/processor.h
++++ b/arch/wasm/include/asm/processor.h
+@@ -20,7 +20,9 @@ struct pt_regs;
+  */
+ #define IRQ_CPU 1
+ 
+-#define cpu_relax()	barrier()
++/* gmux: spin-waits yield to the other cpus sharing one host thread */
++extern void wasm_cpu_relax(void);
++#define cpu_relax()	wasm_cpu_relax()
+ 
+ struct thread_struct {
+ };
+diff --git a/arch/wasm/include/asm/wasm.h b/arch/wasm/include/asm/wasm.h
+index 36fd7b70c..a70785bba 100644
+--- a/arch/wasm/include/asm/wasm.h
++++ b/arch/wasm/include/asm/wasm.h
+@@ -25,4 +25,9 @@ extern void wasm_reload_program(void);
+ 
+ extern void wasm_clone_callback(void);
+ 
++/* gmux: waits the host performs instead of memory.atomic.wait */
++extern void wasm_idle_wait(void *raised_irqs, long long timeout_ns);
++extern void wasm_delay(unsigned long ns);
++extern void wasm_halt(void);
++
+ #endif /* _ASM_WASM_WASM_H */
+diff --git a/arch/wasm/kernel/head.S b/arch/wasm/kernel/head.S
+index f4eda46fa..56d18f3a6 100644
+--- a/arch/wasm/kernel/head.S
++++ b/arch/wasm/kernel/head.S
+@@ -36,22 +36,24 @@ _start:
+ 	/* Try grow by the difference, (max - curr). */
+ 	iLONG.sub
+ 	local.set 0
++	/* gmux: on failure, shrink the request and retry; stop at success or zero */
++	block
+ 	loop
+ 		local.get 0
+ 		WASM_MEMORY_GROW /* iLONG new -> iLONG old_or_error. */
+ 		iLONG.const -1 /* -1 means allocation failed. */
+-		iLONG.eq
+-		br_if 0
++		iLONG.ne
++		br_if 1
+ 
+-		/*
+-		 * If we fail, keep decreasing. This often succeeds quite soon
+-		 * in browsers. The act of retrying allocations seem to work.
+-		 */
+ 		local.get 0
+ 		iLONG.const 1
+ 		iLONG.sub
+-		local.set 0
++		local.tee 0
++		iLONG.eqz
++		br_if 1
++		br 0
+ 	end_loop
++	end_block
+ 
+ 	block
+ 		local.get 0
+diff --git a/arch/wasm/kernel/reboot.c b/arch/wasm/kernel/reboot.c
+index c91f8fb1b..621ac21be 100644
+--- a/arch/wasm/kernel/reboot.c
++++ b/arch/wasm/kernel/reboot.c
+@@ -4,12 +4,11 @@
+ #include <linux/irqflags.h>
+ #include <linux/smp.h>
+ #include <linux/printk.h>
++#include <asm/wasm.h>
+ 
+ static void machine_hang(void)
+ {
+-	unsigned int dummy = 0U;
+-
+-	__builtin_wasm_memory_atomic_wait32(&dummy, 0U, -1LL);
++	wasm_halt();
+ }
+ 
+ void machine_restart(char *cmd)
+diff --git a/arch/wasm/kernel/smp.c b/arch/wasm/kernel/smp.c
+index 55d24e6f7..19341529c 100644
+--- a/arch/wasm/kernel/smp.c
++++ b/arch/wasm/kernel/smp.c
+@@ -322,8 +322,7 @@ void arch_cpu_idle(void)
+ 		}
+ 
+ 		if (timeout != 0LL)
+-			__builtin_wasm_memory_atomic_wait64(
+-				&raised_irqs_ptr->counter, 0ULL, timeout);
++			wasm_idle_wait(&raised_irqs_ptr->counter, timeout);
+ 
+ 		pending_irqs = (u64)atomic64_xchg(raised_irqs_ptr, 0LL);
+ 
+diff --git a/arch/wasm/lib/delay.c b/arch/wasm/lib/delay.c
+index 60cffc8d4..e9da83c2c 100644
+--- a/arch/wasm/lib/delay.c
++++ b/arch/wasm/lib/delay.c
+@@ -1,6 +1,7 @@
+ /* SPDX-License-Identifier: GPL-2.0-only */
+ 
+ #include <linux/delay.h>
++#include <asm/wasm.h>
+ 
+ void calibrate_delay(void)
+ {
+@@ -10,10 +11,8 @@ void calibrate_delay(void)
+ 
+ void __delay(unsigned long cycles)
+ {
+-	unsigned int dummy = 0U;
+-
+ 	barrier();
+-	__builtin_wasm_memory_atomic_wait32(&dummy, 0U, (long long)cycles);
++	wasm_delay(cycles);
+ 	barrier();
+ }
+ EXPORT_SYMBOL(__delay);
+-- 
+2.47.0

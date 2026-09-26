@@ -1,0 +1,39 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Gregory Mitchell <me@gmitch215.xyz>
+Date: Sat, 26 Sep 2026 09:40:00 -0400
+Subject: [PATCH] wasm: fork through the host
+
+A fork child needs its parent's call stack, which lives in the host's
+WebAssembly engine, not in memory the kernel can copy: clone(SIGCHLD)
+gave the child an empty address space and no stack, and it died on its
+first instruction. _Fork now asks the host (__gmux_fork), which captures
+the parent's frames, forks the task through the kernel, gives the child a
+copy of the parent's memory and resumes the frames in both. It returns
+the child's pid to the parent and 0 to the child, or -ENOSYS for a
+program built without resumable frames.
+---
+--- a/src/process/_Fork.c
++++ b/src/process/_Fork.c
+@@ -26,15 +26,21 @@
+ 	if (!ret) __aio_atfork(1);
+ }
+ 
++#ifdef __wasm__
++long __gmux_fork(void);
++#endif
++
+ pid_t _Fork(void)
+ {
+ 	pid_t ret;
+ 	sigset_t set;
+ 	__block_all_sigs(&set);
+ 	LOCK(__abort_lock);
+-#ifdef SYS_fork
++#if defined(__wasm__)
++	ret = __gmux_fork();
++#elif defined(SYS_fork)
+ 	ret = __syscall(SYS_fork);
+ #else
+ 	ret = __syscall(SYS_clone, SIGCHLD, 0);
+ #endif
+ 	__post_Fork(ret);

@@ -1,0 +1,74 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Gregory Mitchell <me@gmitch215.xyz>
+Date: Fri, 25 Sep 2026 20:45:00 -0400
+Subject: [PATCH] wasm: make cancellation points cancel
+
+linux-wasm made every cancellation point a plain syscall and the cancel
+handler abort, because musl finds a thread inside a cancellation point
+by the interrupted program counter and wasm has none. A deferred
+pthread_cancel of a thread blocked in sem_wait, read or
+pthread_cond_wait aborted the process (libc-test pthread_cancel-points,
+pthread_cancel-sem_wait: status 134).
+
+The cancellation point now checks for a pending cancel before its
+syscall and after an EINTR, which is upstream's C path without the
+assembly window. The window is not needed: a signal reaches a wasm
+thread only when it leaves the kernel, so none can arrive between the
+check and the syscall. SIGCANCEL drops SA_RESTART so a blocked syscall
+it interrupts returns EINTR instead of blocking again.
+---
+diff --git a/src/thread/pthread_cancel.c b/src/thread/pthread_cancel.c
+index 4ba7b8e..83015ac 100644
+--- a/src/thread/pthread_cancel.c
++++ b/src/thread/pthread_cancel.c
+@@ -54,8 +54,27 @@ hidden long __syscall_cp_c6(syscall_arg_t, syscall_arg_t, syscall_arg_t, syscall
+ 		return r; \
+ 	} while(0)
+ */
++/*
++ * gmux: without a program counter to test, a cancellation point checks for a pending cancel before
++ * its syscall and after an EINTR. A signal reaches a wasm thread only when it leaves the kernel, so
++ * nothing can arrive between the check and the syscall. SIGCANCEL has no SA_RESTART, so a blocked
++ * syscall it interrupts returns EINTR instead of blocking again.
++ */
+ #define SYSCALL_CP_C(num, ...) do {\
+-		return __syscall(__VA_ARGS__); \
++		pthread_t self; \
++		long r; \
++		int st; \
++		\
++		if ((st=(self=__pthread_self())->canceldisable) \
++			&& (st==PTHREAD_CANCEL_DISABLE || nr==SYS_close)) \
++			return __syscall(__VA_ARGS__); \
++		\
++		if (self->cancel) return __cancel(); \
++		r = __syscall(__VA_ARGS__); \
++		if (r==-EINTR && nr!=SYS_close && self->cancel && \
++			self->canceldisable != PTHREAD_CANCEL_DISABLE) \
++			r = __cancel(); \
++		return r; \
+ 	} while(0)
+ 
+ long __syscall_cp_c0(syscall_arg_t nr)
+@@ -126,9 +145,6 @@ static void cancel_handler(int sig, siginfo_t *si, void *ctx)
+ #endif
+ 		return;
+ 	}
+-#else
+-	/* TODO: handle this. */
+-	abort();
+ #endif
+ 
+ 	__syscall(SYS_tkill, self->tid, SIGCANCEL);
+@@ -144,7 +160,11 @@ void __testcancel()
+ static void init_cancellation()
+ {
+ 	struct sigaction sa = {
++#ifdef MC_PC
+ 		.sa_flags = SA_SIGINFO | SA_RESTART | SA_ONSTACK,
++#else
++		.sa_flags = SA_SIGINFO | SA_ONSTACK,
++#endif
+ 		.sa_sigaction = cancel_handler
+ 	};
+ 	memset(&sa.sa_mask, -1, _NSIG/8);

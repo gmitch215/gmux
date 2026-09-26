@@ -1,0 +1,74 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Gregory Mitchell <me@gmitch215.xyz>
+Date: Fri, 25 Sep 2026 23:50:00 -0400
+Subject: [PATCH] wasm: take a busy cpu's interrupts when its task yields
+
+linux-wasm takes interrupts only in arch_cpu_idle, so a cpu running a
+task never took its own: a timer armed there waited until the cpu went
+idle, and an alarm() of a task spinning in user code fired only when
+the timer happened to sit on another cpu (libc-test-style probes hung
+intermittently). wasm_user_interrupt, which the host calls when a task
+yields in user mode, runs this cpu's timer if it is due and every
+interrupt raised to it, as if they had interrupted the kernel, and
+reports signal or reschedule work for the host to pass through the
+kernel's exit to user mode, where a timer tick can now preempt.
+---
+--- a/arch/wasm/kernel/smp.c
++++ b/arch/wasm/kernel/smp.c
+@@ -10,6 +10,8 @@
+ #include <asm/entry.h>
+ #include <asm/time.h>
+ #include <asm/wasm.h>
++#include <asm/cpuflags.h>
++#include <asm/processor.h>
+ 
+ 
+ static DECLARE_COMPLETION(cpu_running);
+@@ -346,6 +348,37 @@
+ }
+ 
+ /*
++ * For the host when a task yields in user mode, standing in for the interrupts that stop user code on
++ * other architectures: this cpu's timer, if due, and every interrupt raised to it run here, as if
++ * they had interrupted the kernel. A cpu running user code otherwise never took them, so an alarm()
++ * of a busy task did not fire. The return says whether the task has signal or reschedule work, which
++ * the host passes through the kernel's exit to user mode.
++ */
++__visible unsigned long wasm_user_interrupt(void)
++{
++	atomic64_t *raised_irqs_ptr = this_cpu_ptr(&raised_irqs);
++	atomic64_t *expiry_ptr = this_cpu_ptr(&local_timer_expiries);
++	long long expiry = atomic64_read(expiry_ptr);
++	u64 pending;
++	int irq_nr;
++
++	/* an expiry of 0 is due now; TIMER_NEVER_EXPIRE is negative */
++	if (expiry >= 0LL && (expiry == 0LL || safe_now() >= expiry) &&
++	    atomic64_cmpxchg(expiry_ptr, expiry, TIMER_NEVER_EXPIRE) == expiry)
++		raise_interrupt(smp_processor_id(), WASM_IRQ_TIMER);
++
++	pending = (u64)atomic64_xchg(raised_irqs_ptr, 0LL);
++	if (pending) {
++		cpuflags_clear_mask(CPUFLAGS_USER_MODE);
++		for (irq_nr = 0; pending; pending >>= 1, irq_nr++)
++			if (pending & 1ULL)
++				do_irq_stacked(irq_nr);
++		cpuflags_set_mask(CPUFLAGS_USER_MODE);
++	}
++	return read_thread_flags() & (_TIF_SIGPENDING | _TIF_NOTIFY_SIGNAL | _TIF_NEED_RESCHED);
++}
++
++/*
+  * IRQ_CPU should be clear of tasks, but sometimes someone may schedule
+  * something. In severe cases (e.g. some KUnit tests that create thread pools on
+  * all online CPUs), it may become contended enough that the idle task does not
+--- a/arch/wasm/include/asm/wasm.h
++++ b/arch/wasm/include/asm/wasm.h
+@@ -37,6 +37,7 @@
+ 
+ /* gmux: kernel functions the host calls */
+ unsigned long wasm_user_work_pending(void);
++unsigned long wasm_user_interrupt(void);
+ unsigned long wasm_user_stack_low(unsigned long sp);
+ unsigned long wasm_user_stack_high(unsigned long sp);
+ int wasm_trap_unwound_kernel(void);

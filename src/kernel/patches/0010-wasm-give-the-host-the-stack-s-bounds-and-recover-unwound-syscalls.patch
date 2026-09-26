@@ -1,0 +1,126 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Gregory Mitchell <me@gmitch215.xyz>
+Date: Fri, 25 Sep 2026 23:30:00 -0400
+Subject: [PATCH] wasm: give the host the stack's bounds and recover unwound syscalls
+
+A program's 128 KiB stack sat directly above other mappings with no
+guard page, so a deep recursion wrote into whatever lay below: Lua's
+cstack.lua, recursing through gsub, overwrote mallocng metadata and
+aborted. wasm_user_stack_low and wasm_user_stack_high return the bounds
+of the mapping holding a stack pointer. The host checks each frame
+allocation against them and grows the stack in segments up to
+RLIMIT_STACK (split stacks), so the stack keeps binfmt_elf_fdpic's
+128 KiB and costs no more memory than a program uses.
+
+wasm_trap_unwound_kernel puts back the cpu flags a syscall entered with
+when a trap in the task unwound the syscall and skipped _exception_exit;
+otherwise the next syscall panicked with "Syscall called when in kernel
+mode". The functions the host calls are declared in asm/wasm.h.
+---
+--- a/fs/binfmt_wasm.c
++++ b/fs/binfmt_wasm.c
+@@ -20,7 +20,10 @@
+ #include <linux/uaccess.h>
+ #include <linux/vmalloc.h>
+ 
+-/* 128 KiB, the default binfmt_elf_fdpic gives nommu programs */
++/*
++ * 128 KiB, binfmt_elf_fdpic's default for nommu programs. Without an MMU a stack is committed memory,
++ * so the host grows it in segments up to RLIMIT_STACK as the program needs them (split stacks).
++ */
+ #define WASM_STACK_SIZE		(128UL * 1024)
+ 
+ /*
+--- a/arch/wasm/kernel/traps.c
++++ b/arch/wasm/kernel/traps.c
+@@ -7,6 +7,7 @@
+ #include <asm/processor.h>
+ #include <asm/ptrace.h>
+ #include <asm/syscall.h>
++#include <asm/wasm.h>
+ 
+ static inline void _exception_enter(struct pt_regs *regs)
+ {
+@@ -19,6 +20,20 @@
+ 	cpuflags_overwrite(regs->cpuflags);
+ }
+ 
++/*
++ * For the host after a trap in a task: a trap that unwound a syscall skipped its _exception_exit,
++ * so the cpu still says kernel mode and the next syscall would panic. Put back the flags the syscall
++ * entered with, as an oops continues after killing the task, and say whether that was needed.
++ */
++__visible int wasm_trap_unwound_kernel(void)
++{
++	if (cpuflags_load() & CPUFLAGS_USER_MODE)
++		return 0;
++	pr_warn("wasm: a trap unwound a syscall in %s[%d]\n", current->comm, task_pid_nr(current));
++	_exception_exit(current_pt_regs());
++	return 1;
++}
++
+ #define WASM_SYSCALL_N(x, args, cast_args, ...)					\
+ 	__visible long __wasm_syscall_##x args;					\
+ 	__visible long __wasm_syscall_##x args					\
+--- a/arch/wasm/kernel/process.c
++++ b/arch/wasm/kernel/process.c
+@@ -9,6 +9,36 @@
+ #include <asm/cpuflags.h>
+ #include <asm/entry.h>
+ #include <asm/wasm.h>
++#include <linux/mm.h>
++
++/*
++ * For the host, which bounds a program's stack pointer by the mapping it lives in, as a guard page
++ * does with an MMU: an end of the mapping holding sp, or 0 when none holds it or the lock is busy.
++ */
++static unsigned long user_stack_bound(unsigned long sp, bool high)
++{
++	struct mm_struct *mm = current->mm;
++	struct vm_area_struct *vma;
++	unsigned long bound = 0;
++
++	if (!mm || !mmap_read_trylock(mm))
++		return 0;
++	vma = find_vma(mm, sp);
++	if (vma && vma->vm_start <= sp && sp <= vma->vm_end)
++		bound = high ? vma->vm_end : vma->vm_start;
++	mmap_read_unlock(mm);
++	return bound;
++}
++
++__visible unsigned long wasm_user_stack_low(unsigned long sp)
++{
++	return user_stack_bound(sp, false);
++}
++
++__visible unsigned long wasm_user_stack_high(unsigned long sp)
++{
++	return user_stack_bound(sp, true);
++}
+ 
+ static cpumask_t user_cpus = CPU_MASK_NONE;
+ 
+--- a/arch/wasm/kernel/signal.c
++++ b/arch/wasm/kernel/signal.c
+@@ -2,6 +2,7 @@
+ 
+ #include <linux/entry-common.h>
+ #include <asm/ucontext.h>
++#include <asm/wasm.h>
+ 
+ struct rt_sigframe {
+ 	int sig_param;
+--- a/arch/wasm/include/asm/wasm.h
++++ b/arch/wasm/include/asm/wasm.h
+@@ -30,4 +30,10 @@
+ extern void wasm_delay(unsigned long ns);
+ extern void wasm_halt(void);
+ 
++/* gmux: kernel functions the host calls */
++unsigned long wasm_user_work_pending(void);
++unsigned long wasm_user_stack_low(unsigned long sp);
++unsigned long wasm_user_stack_high(unsigned long sp);
++int wasm_trap_unwound_kernel(void);
++
+ #endif /* _ASM_WASM_WASM_H */

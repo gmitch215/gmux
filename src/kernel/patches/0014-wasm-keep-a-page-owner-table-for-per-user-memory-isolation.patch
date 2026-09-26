@@ -1,0 +1,292 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Gregory Mitchell <me@gmitch215.xyz>
+Date: Sat, 26 Sep 2026 08:30:00 -0400
+Subject: [PATCH] wasm: keep a page owner table for per-user memory isolation
+
+Without an MMU every process and the kernel share one memory, so any
+process could write the kernel's memory and every other process's, and
+nommu's access_ok let a syscall do the same on its behalf. The kernel now
+keeps a u16 per page of RAM: the tag of the mm whose private mapping
+covers it (allocated per mm, freed in destroy_context), 0xffff for a
+writable shared mapping, 0xfffe for a read-only shared or overlaid one,
+0 for its own and free pages. nommu's mapping paths keep it current: a
+VMA set up, cleaned up, shrunk or resized.
+
+access_ok checks a non-root task's buffers against the table, so a
+syscall refuses kernel memory and other processes' memory with EFAULT.
+The host runs a non-root task's programs in a build that checks every
+store against the same table; wasm_owner_table, wasm_current_owner and
+wasm_current_euid give it the table, the task's tag and its euid. Root
+tasks are not checked.
+---
+--- a/mm/nommu.c
++++ b/mm/nommu.c
+@@ -17,6 +17,9 @@
+ #define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
+ 
+ #include <linux/export.h>
++#ifdef CONFIG_WASM
++#include <asm/wasm.h>
++#endif
+ #include <linux/mm.h>
+ #include <linux/sched/mm.h>
+ #include <linux/mman.h>
+@@ -562,6 +565,9 @@
+ static void setup_vma_to_mm(struct vm_area_struct *vma, struct mm_struct *mm)
+ {
+ 	vma->vm_mm = mm;
++#ifdef CONFIG_WASM
++	wasm_owner_map(vma);
++#endif
+ 
+ 	/* add the VMA to the mapping */
+ 	if (vma->vm_file) {
+@@ -577,6 +583,9 @@
+ 
+ static void cleanup_vma_from_mm(struct vm_area_struct *vma)
+ {
++#ifdef CONFIG_WASM
++	wasm_owner_unmap(vma, vma->vm_start, vma->vm_end);
++#endif
+ 	vma->vm_mm->map_count--;
+ 	/* remove the VMA from the mapping */
+ 	if (vma->vm_file) {
+@@ -1392,10 +1401,16 @@
+ 	if (from > vma->vm_start) {
+ 		if (vma_iter_clear_gfp(vmi, from, vma->vm_end, GFP_KERNEL))
+ 			return -ENOMEM;
++#ifdef CONFIG_WASM
++		wasm_owner_unmap(vma, from, vma->vm_end);
++#endif
+ 		vma->vm_end = from;
+ 	} else {
+ 		if (vma_iter_clear_gfp(vmi, vma->vm_start, to, GFP_KERNEL))
+ 			return -ENOMEM;
++#ifdef CONFIG_WASM
++		wasm_owner_unmap(vma, vma->vm_start, to);
++#endif
+ 		vma->vm_start = to;
+ 	}
+ 
+@@ -1571,7 +1586,13 @@
+ 		return (unsigned long) -ENOMEM;
+ 
+ 	/* all checks complete - do it */
++#ifdef CONFIG_WASM
++	wasm_owner_unmap(vma, vma->vm_start, vma->vm_end);
++#endif
+ 	vma->vm_end = vma->vm_start + new_len;
++#ifdef CONFIG_WASM
++	wasm_owner_map(vma);
++#endif
+ 	return vma->vm_start;
+ }
+ 
+--- a/arch/wasm/mm/Makefile
++++ b/arch/wasm/mm/Makefile
+@@ -1,3 +1,3 @@
+ # SPDX-License-Identifier: GPL-2.0-only
+ 
+-obj-y += init.o
++obj-y += init.o owner.o
+--- a/arch/wasm/include/asm/mmu_context.h
++++ b/arch/wasm/include/asm/mmu_context.h
+@@ -3,6 +3,16 @@
+ #ifndef _ASM_WASM_MMU_CONTEXT_H
+ #define _ASM_WASM_MMU_CONTEXT_H
+ 
++struct mm_struct;
++void wasm_owner_release(struct mm_struct *mm);
++
++/* the mm's tag in the page owner table (arch/wasm/mm/owner.c) is free again */
++#define destroy_context destroy_context
++static inline void destroy_context(struct mm_struct *mm)
++{
++	wasm_owner_release(mm);
++}
++
+ #include <asm-generic/nommu_context.h>
+ 
+ #endif /* _ASM_WASM_MMU_CONTEXT_H */
+--- a/arch/wasm/include/asm/wasm.h
++++ b/arch/wasm/include/asm/wasm.h
+@@ -41,5 +41,13 @@
+ unsigned long wasm_user_stack_low(unsigned long sp);
+ unsigned long wasm_user_stack_high(unsigned long sp);
+ int wasm_trap_unwound_kernel(void);
++unsigned long wasm_owner_table(void);
++unsigned int wasm_current_owner(void);
++unsigned int wasm_current_euid(void);
++
++/* gmux: the page owner table (arch/wasm/mm/owner.c) */
++struct vm_area_struct;
++void wasm_owner_map(struct vm_area_struct *vma);
++void wasm_owner_unmap(struct vm_area_struct *vma, unsigned long start, unsigned long end);
+ 
+ #endif /* _ASM_WASM_WASM_H */
+--- /dev/null
++++ b/arch/wasm/include/asm/mmu.h
+@@ -0,0 +1,12 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++
++#ifndef _ASM_WASM_MMU_H
++#define _ASM_WASM_MMU_H
++
++/* nommu's context, and the tag the page owner table (arch/wasm/mm/owner.c) gives the mm's pages */
++typedef struct {
++	unsigned long end_brk;
++	unsigned int owner;
++} mm_context_t;
++
++#endif /* _ASM_WASM_MMU_H */
+--- /dev/null
++++ b/arch/wasm/include/asm/uaccess.h
+@@ -0,0 +1,19 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++
++#ifndef _ASM_WASM_UACCESS_H
++#define _ASM_WASM_UACCESS_H
++
++/* nommu accepts any user pointer; a non-root task may name only its own and shared pages */
++int wasm_user_range_ok(unsigned long addr, unsigned long size);
++#define __access_ok(ptr, size) wasm_user_range_ok((unsigned long)(ptr), (size))
++
++/*
++ * strnlen_user and strncpy_from_user ask for their whole limit (execve's is 128 KiB) before scanning
++ * a string that is usually far shorter. They only read, so the string's first byte stands for it.
++ */
++#define user_read_access_begin(ptr, len) access_ok(ptr, 1)
++#define user_read_access_end() do { } while (0)
++
++#include <asm-generic/uaccess.h>
++
++#endif /* _ASM_WASM_UACCESS_H */
+--- /dev/null
++++ b/arch/wasm/mm/owner.c
+@@ -0,0 +1,124 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * The page owner table, for per-user memory isolation without an MMU: one u16 per page of RAM, the
++ * tag of the mm whose private mapping covers it, WASM_OWNER_SHARED for a writable shared mapping,
++ * WASM_OWNER_SHARED_RO for a read-only shared or overlaid one, 0 for the kernel's and free pages. The
++ * host runs a non-root task's programs in a build that checks every store against it
++ * (scripts/wasm/guard-pass.py), and access_ok checks a non-root task's syscall buffers against it.
++ */
++
++#include <linux/cred.h>
++#include <linux/idr.h>
++#include <linux/init.h>
++#include <linux/memblock.h>
++#include <linux/mm.h>
++#include <linux/sched.h>
++#include <linux/slab.h>
++#include <linux/uidgid.h>
++#include <asm/wasm.h>
++
++#define WASM_OWNER_SHARED	0xffff
++#define WASM_OWNER_SHARED_RO	0xfffe
++
++static u16 *owners;
++static unsigned long owners_pages;
++static DEFINE_IDA(owner_ida);
++
++static int __init wasm_owner_init(void)
++{
++	owners_pages = max_pfn;
++	owners = kvcalloc(owners_pages, sizeof(*owners), GFP_KERNEL);
++	return owners ? 0 : -ENOMEM;
++}
++core_initcall(wasm_owner_init);
++
++static unsigned int mm_owner(struct mm_struct *mm)
++{
++	unsigned int tag = READ_ONCE(mm->context.owner);
++	int fresh;
++
++	if (tag)
++		return tag;
++	fresh = ida_alloc_range(&owner_ida, 1, WASM_OWNER_SHARED_RO - 1, GFP_KERNEL);
++	if (fresh < 0)
++		return 0;
++	tag = cmpxchg(&mm->context.owner, 0, fresh);
++	if (tag) {
++		ida_free(&owner_ida, fresh);
++		return tag;
++	}
++	return fresh;
++}
++
++static void set_range(unsigned long start, unsigned long end, u16 tag)
++{
++	unsigned long page, last = DIV_ROUND_UP(end, PAGE_SIZE);
++
++	if (!owners)
++		return;
++	for (page = start >> PAGE_SHIFT; page < last && page < owners_pages; page++)
++		WRITE_ONCE(owners[page], tag);
++}
++
++void wasm_owner_map(struct vm_area_struct *vma)
++{
++	u16 tag;
++
++	if (is_nommu_shared_mapping(vma->vm_flags))
++		tag = vma->vm_flags & VM_WRITE ? WASM_OWNER_SHARED : WASM_OWNER_SHARED_RO;
++	else
++		tag = mm_owner(vma->vm_mm);
++	set_range(vma->vm_start, vma->vm_end, tag);
++}
++
++void wasm_owner_unmap(struct vm_area_struct *vma, unsigned long start, unsigned long end)
++{
++	/* pages other mappings still share keep their tag */
++	if (is_nommu_shared_mapping(vma->vm_flags) && vma->vm_region && vma->vm_region->vm_usage > 1)
++		return;
++	set_range(start, end, 0);
++}
++
++void wasm_owner_release(struct mm_struct *mm)
++{
++	if (mm->context.owner)
++		ida_free(&owner_ida, mm->context.owner);
++	mm->context.owner = 0;
++}
++
++int wasm_user_range_ok(unsigned long addr, unsigned long size)
++{
++	unsigned long page, last;
++	unsigned int mine;
++
++	if (!size || !owners || !current->mm || uid_eq(current_euid(), GLOBAL_ROOT_UID))
++		return 1;
++	if (addr + size < addr)
++		return 0;
++	mine = READ_ONCE(current->mm->context.owner);
++	last = (addr + size - 1) >> PAGE_SHIFT;
++	for (page = addr >> PAGE_SHIFT; page <= last; page++) {
++		u16 tag = page < owners_pages ? READ_ONCE(owners[page]) : 0;
++
++		if (tag != WASM_OWNER_SHARED && tag != WASM_OWNER_SHARED_RO && (!mine || tag != mine))
++			return 0;
++	}
++	return 1;
++}
++EXPORT_SYMBOL(wasm_user_range_ok);
++
++/* for the host: the table's address, and the current task's tag and effective uid */
++__visible unsigned long wasm_owner_table(void)
++{
++	return (unsigned long)owners;
++}
++
++__visible unsigned int wasm_current_owner(void)
++{
++	return current->mm ? mm_owner(current->mm) : 0;
++}
++
++__visible unsigned int wasm_current_euid(void)
++{
++	return from_kuid(&init_user_ns, current_euid());
++}
+-- 
+2.43.0

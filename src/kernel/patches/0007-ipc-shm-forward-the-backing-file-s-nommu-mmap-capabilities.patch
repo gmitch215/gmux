@@ -1,0 +1,59 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Gregory Mitchell <me@gmitch215.xyz>
+Date: Fri, 25 Sep 2026 20:00:00 -0400
+Subject: [PATCH] ipc/shm: forward the backing file's nommu mmap capabilities
+
+Without an MMU, do_mmap asks the file's mmap_capabilities whether it
+can map shared. shm_file_operations forwards get_unmapped_area and
+mmap to the shmem file underneath but not mmap_capabilities, so
+validate_mmap_request falls back to NOMMU_MAP_COPY for a regular file
+and every shmat returns ENODEV. The backing ramfs file is allocated
+contiguous at shmget and supports NOMMU_MAP_DIRECT; forward its answer.
+---
+ ipc/shm.c | 18 ++++++++++++++++++
+ 1 file changed, 18 insertions(+)
+
+diff --git a/ipc/shm.c b/ipc/shm.c
+--- a/ipc/shm.c
++++ b/ipc/shm.c
+@@ -657,6 +657,18 @@ static unsigned long shm_get_unmapped_area(struct file *file,
+ 						pgoff, flags);
+ }
+
++#ifndef CONFIG_MMU
++static unsigned shm_mmap_capabilities(struct file *file)
++{
++	struct shm_file_data *sfd = shm_file_data(file);
++
++	/* the default validate_mmap_request picks for a regular file */
++	if (!sfd->file->f_op->mmap_capabilities)
++		return NOMMU_MAP_COPY;
++	return sfd->file->f_op->mmap_capabilities(sfd->file);
++}
++#endif
++
+ static const struct file_operations shm_file_operations = {
+ 	.mmap		= shm_mmap,
+ 	.fsync		= shm_fsync,
+@@ -664,6 +676,9 @@ static const struct file_operations shm_file_operations = {
+ 	.get_unmapped_area	= shm_get_unmapped_area,
+ 	.llseek		= noop_llseek,
+ 	.fallocate	= shm_fallocate,
++#ifndef CONFIG_MMU
++	.mmap_capabilities	= shm_mmap_capabilities,
++#endif
+ };
+
+ /*
+@@ -677,6 +692,9 @@ static const struct file_operations shm_file_operations_huge = {
+ 	.get_unmapped_area	= shm_get_unmapped_area,
+ 	.llseek		= noop_llseek,
+ 	.fallocate	= shm_fallocate,
++#ifndef CONFIG_MMU
++	.mmap_capabilities	= shm_mmap_capabilities,
++#endif
+ 	.fop_flags	= FOP_HUGE_PAGES,
+ };
+
+--
+2.43.0

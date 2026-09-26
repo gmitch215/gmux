@@ -1,0 +1,24 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Gregory Mitchell <me@gmitch215.xyz>
+Date: Sat, 26 Sep 2026 03:30:00 -0400
+Subject: [PATCH] wasm: enable binfmt_misc for foreign executables
+
+gmux runs x86-64 and AArch64 ELF binaries through katybug, a wasm user
+program that translates them. binfmt_misc lets execve() of such a file
+start the registered interpreter with the file's path, so the process
+keeps its own argv, credentials and file descriptors and needs nothing
+from the host. The rootfs registers the two ELF machine types at boot.
+---
+--- a/arch/wasm/configs/wasm32_nommu_defconfig
++++ b/arch/wasm/configs/wasm32_nommu_defconfig
+@@ -8,6 +8,7 @@ CONFIG_EXPERT=y
+ CONFIG_HVC_WASM=y
+ # CONFIG_COMPAT_32BIT_TIME is not set
+ CONFIG_BINFMT_WASM=y
++CONFIG_BINFMT_MISC=y
+ # CONFIG_COREDUMP is not set
+ # CONFIG_COMPAT_BRK is not set
+ # CONFIG_VM_EVENT_COUNTERS is not set
+-- 
+2.43.0
+

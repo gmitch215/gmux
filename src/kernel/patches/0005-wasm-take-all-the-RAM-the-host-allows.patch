@@ -1,0 +1,56 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Gregory Mitchell <me@gmitch215.xyz>
+Date: Fri, 25 Sep 2026 18:22:00 -0400
+Subject: [PATCH] wasm: take all the RAM the host's memory maximum allows
+
+The kernel asked for a fixed 64 MiB at boot, so a machine the host gave
+256 MiB still had 64, and Lua's constructs test ran it out of memory.
+It now asks for the wasm32 maximum and, on failure, shrinks the request
+by a 64th of itself (about 200 tries, at most 1.6% left unused) where it
+shrank by one page, so RAM is whatever the host's memory limit admits.
+---
+ arch/wasm/configs/wasm32_nommu_defconfig | 2 +-
+ arch/wasm/kernel/head.S                  | 7 ++++++-
+ 2 files changed, 7 insertions(+), 2 deletions(-)
+
+diff --git a/arch/wasm/configs/wasm32_nommu_defconfig b/arch/wasm/configs/wasm32_nommu_defconfig
+--- a/arch/wasm/configs/wasm32_nommu_defconfig
++++ b/arch/wasm/configs/wasm32_nommu_defconfig
+@@ -34,4 +34,4 @@
+ # CONFIG_SECTION_MISMATCH_WARN_ONLY is not set
+ # CONFIG_RCU_TRACE is not set
+ # CONFIG_RUNTIME_TESTING_MENU is not set
+-CONFIG_BOOT_MEM_PAGES=0x400
++CONFIG_BOOT_MEM_PAGES=0xFFFF
+diff --git a/arch/wasm/kernel/head.S b/arch/wasm/kernel/head.S
+--- a/arch/wasm/kernel/head.S
++++ b/arch/wasm/kernel/head.S
+@@ -37,20 +37,24 @@
+ 	iLONG.sub
+ 	local.set 0
+-	/* gmux: on failure, shrink the request and retry; stop at success or zero */
++	/* gmux: on failure, shrink the request by a 64th and retry; stop at success or zero */
+ 	block
+ 	loop
+ 		local.get 0
+ 		WASM_MEMORY_GROW /* iLONG new -> iLONG old_or_error. */
+ 		iLONG.const -1 /* -1 means allocation failed. */
+ 		iLONG.ne
+ 		br_if 1
+ 
+ 		local.get 0
++		local.get 0
++		iLONG.const 6
++		iLONG.shr_u
+ 		iLONG.const 1
++		iLONG.add
+ 		iLONG.sub
+ 		local.tee 0
+ 		iLONG.eqz
+ 		br_if 1
+ 		br 0
+ 	end_loop
+ 	end_block
+-- 
+2.43.0
+

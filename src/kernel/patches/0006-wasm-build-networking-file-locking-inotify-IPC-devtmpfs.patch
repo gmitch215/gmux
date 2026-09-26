@@ -1,0 +1,64 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Gregory Mitchell <me@gmitch215.xyz>
+Date: Fri, 25 Sep 2026 18:55:00 -0400
+Subject: [PATCH] wasm: build networking, file locking, inotify, IPC and devtmpfs
+
+The defconfig came from tinyconfig and left 106 syscalls unbuilt, among
+them every socket call, flock, inotify, open_by_handle, System V IPC,
+POSIX message queues and AIO. Unix and IPv4 sockets (loopback),
+FILE_LOCKING, INOTIFY_USER, FHANDLE, SYSVIPC, POSIX_MQUEUE, DEVTMPFS, AIO,
+MEMBARRIER and KCMP are now built; 58 remain. The syscall adapters are
+regenerated for this configuration (0004).
+---
+diff --git a/arch/wasm/configs/wasm32_nommu_defconfig b/arch/wasm/configs/wasm32_nommu_defconfig
+--- a/arch/wasm/configs/wasm32_nommu_defconfig
++++ b/arch/wasm/configs/wasm32_nommu_defconfig
+@@ -2,10 +2,7 @@
+ CONFIG_NO_HZ_FULL=y
+ CONFIG_BLK_DEV_INITRD=y
+ CONFIG_EXPERT=y
+-# CONFIG_FHANDLE is not set
+-# CONFIG_AIO is not set
+ # CONFIG_IO_URING is not set
+-# CONFIG_MEMBARRIER is not set
+ # CONFIG_CACHESTAT_SYSCALL is not set
+ # CONFIG_KALLSYMS is not set
+ CONFIG_HVC_WASM=y
+@@ -24,9 +21,7 @@
+ # CONFIG_USB_SUPPORT is not set
+ # CONFIG_VIRTIO_MENU is not set
+ # CONFIG_VHOST_MENU is not set
+-# CONFIG_FILE_LOCKING is not set
+ # CONFIG_DNOTIFY is not set
+-# CONFIG_INOTIFY_USER is not set
+ # CONFIG_MISC_FILESYSTEMS is not set
+ # CONFIG_CRC_OPTIMIZATIONS is not set
+ # CONFIG_SYMBOLIC_ERRNAME is not set
+@@ -35,3 +30,24 @@
+ # CONFIG_RCU_TRACE is not set
+ # CONFIG_RUNTIME_TESTING_MENU is not set
+ CONFIG_BOOT_MEM_PAGES=0xFFFF
++CONFIG_NET=y
++CONFIG_UNIX=y
++CONFIG_INET=y
++CONFIG_FILE_LOCKING=y
++CONFIG_INOTIFY_USER=y
++CONFIG_FHANDLE=y
++CONFIG_SYSVIPC=y
++CONFIG_POSIX_MQUEUE=y
++CONFIG_TMPFS=y
++CONFIG_DEVTMPFS=y
++CONFIG_DEVTMPFS_MOUNT=y
++CONFIG_AIO=y
++CONFIG_MEMBARRIER=y
++CONFIG_KCMP=y
++CONFIG_EVENTFD=y
++CONFIG_SIGNALFD=y
++CONFIG_TIMERFD=y
++CONFIG_EPOLL=y
++CONFIG_FUTEX=y
++CONFIG_MULTIUSER=y
++CONFIG_POSIX_TIMERS=y
+-- 
+2.43.0
+

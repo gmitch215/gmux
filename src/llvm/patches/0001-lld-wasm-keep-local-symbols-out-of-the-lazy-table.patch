@@ -1,0 +1,26 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Gregory Mitchell <me@gmitch215.xyz>
+Date: Sat, 26 Sep 2026 13:40:00 -0400
+Subject: [PATCH] lld/wasm: keep local symbols out of the lazy table
+
+ObjFile::parseLazy() entered every defined symbol of an archive member as a
+lazy definition, including symbols with local binding. A static in one
+archive then shadowed a global of the same name in a later archive: the
+first reference extracted the member holding the static, which defines the
+name only locally, so the global stayed lazy and a relocation to it failed
+the FunctionSymbol cast in calcNewValue(). gmux's dlopen archive, first on
+every link line, has statics named error and fail; bison's and GNU patch's
+links against gnulib's error() crashed wasm-ld.
+---
+diff --git a/lld/wasm/InputFiles.cpp b/lld/wasm/InputFiles.cpp
+--- a/lld/wasm/InputFiles.cpp
++++ b/lld/wasm/InputFiles.cpp
+@@ -392,7 +392,7 @@ void ObjFile::parseLazy() {
+   LLVM_DEBUG(dbgs() << "ObjFile::parseLazy: " << toString(this) << "\n");
+   for (const SymbolRef &sym : wasmObj->symbols()) {
+     const WasmSymbol &wasmSym = wasmObj->getWasmSymbol(sym.getRawDataRefImpl());
+-    if (!wasmSym.isDefined())
++    if (!wasmSym.isDefined() || wasmSym.isBindingLocal())
+       continue;
+     symtab->addLazy(wasmSym.Info.Name, this);
+     // addLazy() may trigger this->extract() if an existing symbol is an

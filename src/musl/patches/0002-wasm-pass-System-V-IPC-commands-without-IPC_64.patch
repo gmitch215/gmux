@@ -1,0 +1,22 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Gregory Mitchell <me@gmitch215.xyz>
+Date: Fri, 25 Sep 2026 20:05:00 -0400
+Subject: [PATCH] wasm: pass System V IPC commands without IPC_64
+
+The wasm kernel uses the asm-generic syscall table, whose shmctl,
+semctl and msgctl take the command as is and always use the 64-bit
+structures. musl ORs IPC_64 (0x100) into every command unless the arch
+defines it as 0, which aarch64, riscv32, or1k and the other generic
+arches do. Without it IPC_STAT, IPC_SET and IPC_RMID all reached the
+kernel as unknown commands and failed with EINVAL, so a segment could
+be neither inspected nor removed.
+---
+diff --git a/arch/wasm/syscall_arch.h b/arch/wasm/syscall_arch.h
+--- a/arch/wasm/syscall_arch.h
++++ b/arch/wasm/syscall_arch.h
+@@ -10,3 +10,5 @@ extern long __syscall3(long n, long a, long b, long c);
+ extern long __syscall4(long n, long a, long b, long c, long d);
+ extern long __syscall5(long n, long a, long b, long c, long d, long e);
+ extern long __syscall6(long n, long a, long b, long c, long d, long e, long f);
++
++#define IPC_64 0

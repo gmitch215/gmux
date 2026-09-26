@@ -1,0 +1,35 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Gregory Mitchell <me@gmitch215.xyz>
+Date: Fri, 25 Sep 2026 18:52:00 -0400
+Subject: [PATCH] wasm: read every clone argument its flags use
+
+linux-wasm's variadic __clone read tls and ctid only under
+CLONE_CHILD_SETTID. pthread_create passes CLONE_SETTLS |
+CLONE_CHILD_CLEARTID without it, so every thread started with a TLS
+pointer of 0 (pthread_self() returned 0) and no clear-tid address, so
+pthread_join was never woken and the last worker to exit ended the
+process with status 0. The arguments come in order, so each one a flag
+uses is read; posix_spawn, which passes none, sets none of those flags.
+---
+diff --git a/src/linux/clone.c b/src/linux/clone.c
+index e3e8aa0..4ee14b2 100644
+--- a/src/linux/clone.c
++++ b/src/linux/clone.c
+@@ -71,10 +71,12 @@ int __clone(int (*fn)(void *), void *stack, int flags, void *arg, ...)
+ 	pid_t *ptid = 0, *ctid = 0;
+ 	void  *tls = 0;
+ 
++	/* gmux: the variadic arguments come in order, so each one a flag uses must be read, and
++	 * pthread_create passes CLONE_SETTLS | CLONE_CHILD_CLEARTID without CLONE_CHILD_SETTID */
+ 	va_start(ap, arg);
+-	if (flags & (CLONE_PIDFD | CLONE_PARENT_SETTID | CLONE_CHILD_SETTID))
++	if (flags & (CLONE_PIDFD | CLONE_PARENT_SETTID | CLONE_SETTLS | CLONE_CHILD_SETTID | CLONE_CHILD_CLEARTID))
+ 		ptid = va_arg(ap, pid_t *);
+-	if (flags & CLONE_CHILD_SETTID) {
++	if (flags & (CLONE_SETTLS | CLONE_CHILD_SETTID | CLONE_CHILD_CLEARTID)) {
+ 		tls = va_arg(ap, void *);
+ 		ctid = va_arg(ap, pid_t *);
+ 	}
+-- 
+2.43.0
+

@@ -1,0 +1,117 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Gregory Mitchell <me@gmitch215.xyz>
+Date: Fri, 25 Sep 2026 23:45:00 -0400
+Subject: [PATCH] wasm: charge each syscall to the clock
+
+A deployed Worker's clock stands still while code runs, so the kernel
+saw time move only when the host scheduled and at I/O. The host made
+each clock read one nanosecond later than the last, which kept
+mkstemp's names apart but made time a count of clock reads: a program
+busy-waiting for 5 ms read the clock five million times.
+
+Each syscall now charges a fixed 250 ns, the order of a syscall's own
+cost, accumulated and handed to the host with the next clock read. The
+host keeps its clock at the later of real time and the time charged,
+so time follows work done, never goes back, and catches up to real time
+whenever real time moves. Every host clock read goes through
+wasm_clock_now.
+---
+--- a/arch/wasm/kernel/time.c
++++ b/arch/wasm/kernel/time.c
+@@ -7,14 +7,33 @@
+ #include <asm/irq.h>
+ #include <asm/smp.h>
+ #include <asm/time.h>
++#include <asm/wasm.h>
++#include <linux/atomic.h>
+ 
+-extern unsigned long long wasm_cpu_clock_get_monotonic(void);
++/*
++ * gmux: time the host cannot see pass. A deployed Worker's clock stands still while code runs, so
++ * each syscall is charged a fixed cost, handed to the host with the next clock read; the host keeps
++ * its clock at the later of real time and the time charged, so it tracks work done, never goes back
++ * and catches up to real time whenever real time moves.
++ */
++#define WASM_SYSCALL_NS 250
++static atomic64_t wasm_time_charged = ATOMIC64_INIT(0);
++
++void wasm_charge_syscall(void)
++{
++	atomic64_add(WASM_SYSCALL_NS, &wasm_time_charged);
++}
++
++unsigned long long wasm_clock_now(void)
++{
++	return wasm_cpu_clock_get_monotonic(atomic64_xchg(&wasm_time_charged, 0));
++}
+ 
+ /* Wasm clock source: derived from Wasm host cpu clock (monotonic). */
+ 
+ static unsigned long long wasm_clocksource_read(struct clocksource *cs)
+ {
+-	return wasm_cpu_clock_get_monotonic();
++	return wasm_clock_now();
+ }
+ 
+ static struct clocksource wasm_clocksource = {
+@@ -36,7 +55,7 @@
+  */
+ void read_persistent_clock64(struct timespec64 *ts)
+ {
+-	*ts = ns_to_timespec64(wasm_cpu_clock_get_monotonic());
++	*ts = ns_to_timespec64(wasm_clock_now());
+ }
+ 
+ /* Wasm clock event: derived from Wasm atomic wait timeouts (in smp.c). */
+--- a/arch/wasm/kernel/smp.c
++++ b/arch/wasm/kernel/smp.c
+@@ -11,7 +11,6 @@
+ #include <asm/time.h>
+ #include <asm/wasm.h>
+ 
+-extern unsigned long long wasm_cpu_clock_get_monotonic(void);
+ 
+ static DECLARE_COMPLETION(cpu_running);
+ 
+@@ -179,7 +178,7 @@
+ 	if (delta == 0UL) {
+ 		/* Optimization: set expiry to 0 to immediately expire. */
+ 	} else {
+-		now = wasm_cpu_clock_get_monotonic();
++		now = wasm_clock_now();
+ 		expiry = now + (unsigned long long)delta;
+ 
+ 		/*
+@@ -235,7 +234,7 @@
+ 
+ static inline long long safe_now(void)
+ {
+-	unsigned long long now = wasm_cpu_clock_get_monotonic();
++	unsigned long long now = wasm_clock_now();
+ 
+ 	if (now > (unsigned long long)LLONG_MAX)
+ 		panic("time is too far into the future");
+--- a/arch/wasm/kernel/traps.c
++++ b/arch/wasm/kernel/traps.c
+@@ -52,6 +52,7 @@
+ 		regs->syscall_ret = -ENOSYS;					\
+ 										\
+ 		if (user_mode(regs)) {						\
++			wasm_charge_syscall();					\
+ 			do {							\
+ 				syscall = syscall_enter_from_user_mode(		\
+ 					regs, syscall);				\
+--- a/arch/wasm/include/asm/wasm.h
++++ b/arch/wasm/include/asm/wasm.h
+@@ -30,6 +30,11 @@
+ extern void wasm_delay(unsigned long ns);
+ extern void wasm_halt(void);
+ 
++/* gmux: the host clock, given the time charged since the last read (time.c) */
++extern unsigned long long wasm_cpu_clock_get_monotonic(unsigned long long charged);
++unsigned long long wasm_clock_now(void);
++void wasm_charge_syscall(void);
++
+ /* gmux: kernel functions the host calls */
+ unsigned long wasm_user_work_pending(void);
+ unsigned long wasm_user_stack_low(unsigned long sp);

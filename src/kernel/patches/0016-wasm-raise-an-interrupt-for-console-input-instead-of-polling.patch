@@ -1,0 +1,66 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Gregory Mitchell <me@gmitch215.xyz>
+Date: Sat, 26 Sep 2026 08:45:00 -0400
+Subject: [PATCH] wasm: raise an interrupt for console input instead of polling
+
+The hvc console had no interrupt, so khvcd polled the host for input
+every 10 ms, backing off towards 2 s while idle: an idle machine kept
+calling the host, and a keystroke waited for the next poll. The host
+now raises WASM_IRQ_HVC on IRQ_CPU when input arrives; the console
+requests it through the generic hvc irq notifiers, so khvcd sleeps
+until kicked and reads the whole batch in one wake.
+---
+--- a/arch/wasm/include/asm/irq.h
++++ b/arch/wasm/include/asm/irq.h
+@@ -7,6 +7,7 @@
+ 
+ #define WASM_IRQ_IPI			0
+ #define WASM_IRQ_TIMER			1
++#define WASM_IRQ_HVC			2
+ 
+ #include <asm-generic/irq.h>
+ 
+--- a/drivers/tty/hvc/Kconfig
++++ b/drivers/tty/hvc/Kconfig
+@@ -122,6 +122,7 @@
+ 	bool "Wasm console support"
+ 	depends on WASM
+ 	select HVC_DRIVER
++	select HVC_IRQ
+ 	help
+ 	  This config option enables support for a console managed by the Wasm
+ 	  host, for example to read printk output during boot as well as
+--- a/drivers/tty/hvc/hvc_wasm.c
++++ b/drivers/tty/hvc/hvc_wasm.c
+@@ -1,5 +1,7 @@
+ /* SPDX-License-Identifier: GPL-2.0-only */
+ 
++#include <asm/irq.h>
++
+ #include "hvc_console.h"
+ 
+ extern ssize_t wasm_driver_hvc_put(const u8 *buf, size_t count);
+@@ -18,11 +20,20 @@
+ static const struct hv_ops hvc_wasm_ops = {
+ 	.get_chars = hvc_wasm_get_chars,
+ 	.put_chars = hvc_wasm_put_chars,
++	.notifier_add = notifier_add_irq,
++	.notifier_del = notifier_del_irq,
++	.notifier_hangup = notifier_hangup_irq,
+ };
+ 
++/* for the host: raise this on IRQ_CPU when input arrives, so khvcd never polls for it */
++__visible int wasm_console_irq(void)
++{
++	return WASM_IRQ_HVC;
++}
++
+ static int __init hvc_wasm_init(void)
+ {
+-	return PTR_ERR_OR_ZERO(hvc_alloc(0, 0, &hvc_wasm_ops, PAGE_SIZE));
++	return PTR_ERR_OR_ZERO(hvc_alloc(0, WASM_IRQ_HVC, &hvc_wasm_ops, PAGE_SIZE));
+ }
+ device_initcall(hvc_wasm_init);
+ 
+-- 
+2.43.0

@@ -1,0 +1,72 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Gregory Mitchell <me@gmitch215.xyz>
+Date: Fri, 25 Sep 2026 20:20:00 -0400
+Subject: [PATCH] wasm: give every thread its own copy of the TLS image
+
+wasm reads __thread variables at __tls_base plus an offset, and the
+host sets a new thread's __tls_base to the pointer clone passes it.
+pthread_create passed its struct pthread, so a thread read every
+__thread variable, musl's own __musl_tp among them, out of the fields
+of its struct pthread (libc-test tls_init: want 23, got an address).
+__init_tls now reserves room for the module's TLS image in each
+thread's TLS area, and pthread_create fills it with __wasm_init_tls,
+points __musl_tp in it at the new thread and passes it to clone.
+---
+diff --git a/src/env/__init_tls.c b/src/env/__init_tls.c
+index a93141e..90a36ce 100644
+--- a/src/env/__init_tls.c
++++ b/src/env/__init_tls.c
+@@ -129,6 +129,11 @@ static void static_init_tls(size_t *aux)
+ #endif
+ 		+ main_tls.size + main_tls.align
+ 		+ MIN_TLS_ALIGN-1 & -MIN_TLS_ALIGN;
++#ifdef __wasm__
++	/* room for a thread's copy of the module's TLS image (pthread_create.c) */
++	libc.tls_size += __builtin_wasm_tls_size() + __builtin_wasm_tls_align()
++		+ MIN_TLS_ALIGN-1 & -MIN_TLS_ALIGN;
++#endif
+ 
+ 	if (libc.tls_size > sizeof builtin_tls) {
+ #ifndef SYS_mmap2
+diff --git a/src/thread/pthread_create.c b/src/thread/pthread_create.c
+index 087f620..f2cefda 100644
+--- a/src/thread/pthread_create.c
++++ b/src/thread/pthread_create.c
+@@ -17,6 +17,28 @@ weak_alias(dummy_0, __do_orphaned_stdio_locks);
+ weak_alias(dummy_0, __dl_thread_cleanup);
+ weak_alias(dummy_0, __membarrier_init);
+ 
++#ifdef __wasm__
++void __wasm_init_tls(void *);
++void __set_tls_base(void *);
++
++/* wasm reads __thread variables relative to __tls_base, so each thread gets its own copy of the
++ * module's TLS image, in the room __init_tls reserved, with __musl_tp in it naming the thread */
++static void *thread_tls(unsigned char *mem, pthread_t td)
++{
++	size_t align = __builtin_wasm_tls_align();
++	unsigned char *block = (void *)((uintptr_t)(mem + 2*sizeof(void *)) + align-1 & -align);
++	void *own = __builtin_wasm_tls_base();
++	/* taken before __tls_base moves; the compiler may not recompute it after the call */
++	volatile size_t tp = (uintptr_t)&__musl_tp - (uintptr_t)own;
++	__wasm_init_tls(block);
++	__set_tls_base(own);
++	*(uintptr_t *)(block + tp) = (uintptr_t)td;
++	return block;
++}
++#else
++#define thread_tls(mem, td) TP_ADJ(td)
++#endif
++
+ static int tl_lock_count;
+ static int tl_lock_waiters;
+ 
+@@ -352,7 +374,7 @@ int __pthread_create(pthread_t *restrict res, const pthread_attr_t *restrict att
+ 
+ 	__tl_lock();
+ 	if (!libc.threads_minus_1++) libc.need_locks = 1;
+-	ret = __clone((c11 ? start_c11 : start), stack, flags, args, &new->tid, TP_ADJ(new), &__thread_list_lock);
++	ret = __clone((c11 ? start_c11 : start), stack, flags, args, &new->tid, thread_tls(tsd - libc.tls_size, new), &__thread_list_lock);
+ 
+ 	/* All clone failures translate to EAGAIN. If explicit scheduling
+ 	 * was requested, attempt it before unlocking the thread list so

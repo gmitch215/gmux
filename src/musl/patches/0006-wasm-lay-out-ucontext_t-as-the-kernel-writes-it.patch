@@ -1,0 +1,32 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Gregory Mitchell <me@gmitch215.xyz>
+Date: Fri, 25 Sep 2026 20:52:00 -0400
+Subject: [PATCH] wasm: lay out ucontext_t as the kernel writes it
+
+The wasm kernel uses asm-generic's struct ucontext: uc_flags, uc_link,
+uc_stack, uc_mcontext, then uc_sigmask. musl's wasm ucontext_t had no
+uc_flags and put uc_sigmask second, so a handler that read or changed
+its context touched the wrong fields. The cancellation handler's
+addition of SIGCANCEL to the mask sigreturn restores never reached the
+mask, and its re-raised SIGCANCEL was delivered again at every
+sigreturn, without end.
+---
+diff --git a/arch/wasm/bits/signal.h b/arch/wasm/bits/signal.h
+index ab24d3d..5b96b5f 100644
+--- a/arch/wasm/bits/signal.h
++++ b/arch/wasm/bits/signal.h
+@@ -29,11 +29,13 @@ struct sigaltstack {
+ 	size_t ss_size;
+ };
+ 
++/* the kernel's asm-generic struct ucontext, which its signal frame and rt_sigreturn use */
+ typedef struct __ucontext {
++	unsigned long uc_flags;
+ 	struct __ucontext *uc_link;
+-	sigset_t uc_sigmask;
+ 	stack_t uc_stack;
+ 	mcontext_t uc_mcontext;
++	sigset_t uc_sigmask;
+ } ucontext_t;
+ 
+ #define SA_NOCLDSTOP  1

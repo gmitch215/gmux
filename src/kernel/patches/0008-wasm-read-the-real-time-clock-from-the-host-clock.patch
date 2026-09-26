@@ -1,0 +1,37 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Gregory Mitchell <me@gmitch215.xyz>
+Date: Fri, 25 Sep 2026 20:40:00 -0400
+Subject: [PATCH] wasm: read the real-time clock from the host clock
+
+The host clock counts nanoseconds since the Unix epoch, but the kernel
+used it only as its clocksource, so CLOCK_REALTIME started at zero and
+every machine believed it was 1970 (Lua's files.lua printed its test
+date as 01/01/1970). read_persistent_clock64 now returns the host clock,
+as an RTC's driver would at boot.
+---
+3:#include <linux/clocksource.h>
+4:#include <linux/clockchips.h>
+5:#include <linux/interrupt.h>
+7:#include <asm/irq.h>
+8:#include <asm/smp.h>
+9:#include <asm/time.h>
+diff --git a/arch/wasm/kernel/time.c b/arch/wasm/kernel/time.c
+index af65bc3f0..d51717de8 100644
+--- a/arch/wasm/kernel/time.c
++++ b/arch/wasm/kernel/time.c
+@@ -30,6 +30,15 @@ static int __init wasm_clocksource_init(void)
+ 	return clocksource_register_khz(&wasm_clocksource, 1000000U /* 1 ns */);
+ }
+ 
++/*
++ * The host clock counts nanoseconds since the Unix epoch, so it is also the machine's real-time
++ * clock: without this CLOCK_REALTIME starts at 1970.
++ */
++void read_persistent_clock64(struct timespec64 *ts)
++{
++	*ts = ns_to_timespec64(wasm_cpu_clock_get_monotonic());
++}
++
+ /* Wasm clock event: derived from Wasm atomic wait timeouts (in smp.c). */
+ 
+ static int wasm_clockevent_set_next_event(unsigned long delta,

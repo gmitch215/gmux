@@ -1,0 +1,83 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Gregory Mitchell <me@gmitch215.xyz>
+Date: Sat, 26 Sep 2026 06:20:00 -0400
+Subject: [PATCH] hush: restore stdin only from the redirect that moved it
+
+An interactive hush reads its input through G.HFILE_stdin on fd#0. A
+redirect of fd#0 moves that HFILE to a high fd, and restore_redirects()
+moved it back, but it did so on every call, including the restores of
+commands that redirected nothing. In "{ read a; read b; } <FILE" the
+first read's restore put the terminal back on fd#0, so the second read
+took the next line typed at the prompt; "while read l; do ...; done
+<FILE" read one line from FILE and then waited on the terminal. Native
+x86-64 hush in 1.36.1, 1.37.0 and master does the same; ash does not.
+
+The redirect that moves the HFILE now leaves a marker in its own
+squirrel (moved_to = -2), and only the restore of that squirrel moves
+stdin back, after its other fds. "read r <FILE; read r" still reads the
+second line from the terminal.
+---
+diff --git a/shell/hush.c b/shell/hush.c
+--- a/shell/hush.c
++++ b/shell/hush.c
+@@ -7833,6 +7833,8 @@
+ 	int moved_to;
+ 	/* moved_to = n: fd was moved to n; restore back to orig_fd after redir */
+ 	/* moved_to = -1: fd was opened by redirect; close orig_fd after redir */
++	/* moved_to = -2: this redirect moved the interactive input (G.HFILE_stdin)
++	 * off fd#0; move it back after redir */
+ };
+ 
+ static struct squirrel *append_squirrel(struct squirrel *sq, int i, int orig, int moved)
+@@ -7935,8 +7937,22 @@
+ 	}
+ 
+ 	/* If this one of script's fds? */
+-	if (move_HFILEs_on_redirect(fd, avoid_fd))
++	if (move_HFILEs_on_redirect(fd, avoid_fd)) {
++		/* The interactive input left fd#0: only this redirect's restore
++		 * may put it back. Restoring it from every restore_redirects()
++		 * undid "{ read a; read b; } <FILE" after its first command.
++		 */
++		if (fd == STDIN_FILENO && sqp != ERR_PTR
++		 && G.HFILE_stdin && G.HFILE_stdin->fd > STDIN_FILENO
++		) {
++			int i = 0;
++			if (*sqp)
++				while ((*sqp)[i].orig_fd >= 0)
++					i++;
++			*sqp = append_squirrel(*sqp, i, STDIN_FILENO, -2);
++		}
+ 		return 1; /* yes. "we closed fd" (actually moved it) */
++	}
+ 
+ 	/* Are we called for "exec 3>FILE"? Came through
+ 	 * redirect_and_varexp_helper(squirrel=ERR_PTR) -> setup_redirects(ERR_PTR)
+@@ -7972,10 +7988,14 @@
+ 
+ static void restore_redirects(struct squirrel *sq)
+ {
++	int stdin_moved = 0;
++
+ 	if (sq) {
+ 		int i;
+ 		for (i = 0; sq[i].orig_fd >= 0; i++) {
+-			if (sq[i].moved_to >= 0) {
++			if (sq[i].moved_to == -2) {
++				stdin_moved = 1;
++			} else if (sq[i].moved_to >= 0) {
+ 				/* We simply die on error */
+ 				debug_printf_redir("restoring redirected fd from %d to %d\n", sq[i].moved_to, sq[i].orig_fd);
+ 				xmove_fd(sq[i].moved_to, sq[i].orig_fd);
+@@ -7987,7 +8007,8 @@
+ 		}
+ 		free(sq);
+ 	}
+-	if (G.HFILE_stdin
++	if (stdin_moved
++	 && G.HFILE_stdin
+ 	 && G.HFILE_stdin->fd > STDIN_FILENO
+ 	/* we compare > STDIN, not == STDIN, since hfgetc()
+ 	 * closes fd and sets ->fd to -1 if EOF is reached.
+-- 
+2.43.0

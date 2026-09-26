@@ -1,0 +1,25 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Gregory Mitchell <me@gmitch215.xyz>
+Date: Fri, 25 Sep 2026 20:24:00 -0400
+Subject: [PATCH] wasm: read the siginfo pointer from the signal frame
+
+__libc_handle_signal pushed one constant too many before the load of
+info_param, so on wasm32 it loaded from address 8 instead of the frame
+and left the stack pointer on the operand stack (valid only because the
+function ends in unreachable). info_param was whatever sat at address 8,
+zero in practice, so every SA_SIGINFO handler, thread cancellation's
+among them, was called as handler(sig) and trapped on its signature.
+---
+48:	iLONG.const 4
+diff --git a/src/signal/wasm/restore.S b/src/signal/wasm/restore.S
+index a3b2abf..a15a8a5 100644
+--- a/src/signal/wasm/restore.S
++++ b/src/signal/wasm/restore.S
+@@ -45,7 +45,6 @@ __libc_handle_signal:
+ 
+ 	/* info_param */
+ 	global.get __stack_pointer
+-	iLONG.const 4
+ 	INSN_32_64(i32.const 4, i64.const 8)
+ 	iLONG.add
+ 	iLONG.load 0

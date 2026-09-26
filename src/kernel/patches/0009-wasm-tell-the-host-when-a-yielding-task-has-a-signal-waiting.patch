@@ -1,0 +1,37 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Gregory Mitchell <me@gmitch215.xyz>
+Date: Fri, 25 Sep 2026 20:58:00 -0400
+Subject: [PATCH] wasm: tell the host when a yielding task has a signal waiting
+
+A task in a user-mode loop never enters the kernel: the host runs it
+until its fuel runs out and gives the cpu to another task, and on the
+way back no return from an interrupt delivers its pending signals. A
+thread spinning in for (;;) could not be cancelled asynchronously and
+never saw a signal another thread sent it (libc-test pthread_cancel
+hung). wasm_user_work_pending reports whether the current task has
+signal work, so the host can pass it through the kernel's exit to
+user mode at the yield.
+---
+include/asm-generic/thread_info_tif.h:13:#define _TIF_SIGPENDING		BIT(TIF_SIGPENDING)
+include/asm-generic/thread_info_tif.h:16:#define _TIF_NOTIFY_SIGNAL	BIT(TIF_NOTIFY_SIGNAL)
+157:#define read_thread_flags() \
+diff --git a/arch/wasm/kernel/signal.c b/arch/wasm/kernel/signal.c
+index 85c3d2917..dc928068f 100644
+--- a/arch/wasm/kernel/signal.c
++++ b/arch/wasm/kernel/signal.c
+@@ -166,6 +166,15 @@ static void handle_signal(struct ksignal *ksig, struct pt_regs *regs)
+ 	signal_setup_done(ret, ksig, 0);
+ }
+ 
++/*
++ * For the host when a task yields in user mode: whether passing through the kernel would deliver
++ * a signal, as the return from a timer interrupt would on another architecture.
++ */
++__visible unsigned long wasm_user_work_pending(void)
++{
++	return read_thread_flags() & (_TIF_SIGPENDING | _TIF_NOTIFY_SIGNAL);
++}
++
+ void arch_do_signal_or_restart(struct pt_regs *regs)
+ {
+ 	struct ksignal ksig;

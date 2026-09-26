@@ -1,0 +1,47 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Gregory Mitchell <me@gmitch215.xyz>
+Date: Fri, 25 Sep 2026 21:20:00 -0400
+Subject: [PATCH] wasm: let a detached thread free its own stack
+
+linux-wasm defined CRTJMP as abort(), and a detached thread's exit
+calls __unmapself, which uses CRTJMP to move off the stack it is about
+to unmap. Every detached thread therefore aborted its whole process
+when it finished (libc-test pthread-robust-detach). __wasm_crtjmp
+moves __stack_pointer to the given stack and calls the function; the
+wasm call stack is not in linear memory, so nothing else refers to the
+mapping being freed.
+---
+diff --git a/arch/wasm/reloc.h b/arch/wasm/reloc.h
+index 833a2f5..060694f 100644
+--- a/arch/wasm/reloc.h
++++ b/arch/wasm/reloc.h
+@@ -10,4 +10,5 @@
+ #define REL_DTPOFF      R_WASM_TLS_DTPREL64
+ #define REL_TPOFF       R_WASM_TLS_TPREL64
+ 
+-#define CRTJMP(pc,sp) abort()
++hidden void __wasm_crtjmp(void (*)(void), void *);
++#define CRTJMP(pc,sp) __wasm_crtjmp((void (*)(void))(pc), (void *)(sp))
+diff --git a/src/thread/wasm/__wasm_crtjmp.S b/src/thread/wasm/__wasm_crtjmp.S
+new file mode 100644
+index 0000000..186267b
+--- /dev/null
++++ b/src/thread/wasm/__wasm_crtjmp.S
+@@ -0,0 +1,17 @@
++#include <bits/asm.h>
++
++/*
++ * CRTJMP for wasm: run fn on the stack sp and never return. Only __stack_pointer moves; the call
++ * stack itself is outside linear memory, so fn may free the mapping that held the old stack.
++ */
++.globl __wasm_crtjmp
++.hidden __wasm_crtjmp
++__wasm_crtjmp:
++	.functype __wasm_crtjmp(iLONG, iLONG) -> ()
++	local.get 1
++	global.set __stack_pointer
++	local.get 0
++	CALL_INDIRECT_FIXUP
++	call_indirect () -> ()
++	unreachable
++	end_function

@@ -1,0 +1,37 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Gregory Mitchell <me@gmitch215.xyz>
+Date: Sat, 26 Sep 2026 10:05:00 -0400
+Subject: [PATCH] wasm: give the scheduler a nanosecond clock
+
+The arch had no sched_clock(), so the scheduler used the weak default,
+which counts jiffies: every task's runtime, CLOCK_PROCESS_CPUTIME_ID
+and the fairness it schedules by moved in 10 ms steps, charged to
+whichever task was current when a jiffy passed. A 15 ms sleep read as
+10 ms of cpu once the idle cpus stopped ticking at different moments.
+sched_clock() now reads the host clock, counted from its first read so
+it starts near zero like the jiffy clock did.
+---
+diff --git a/arch/wasm/kernel/time.c b/arch/wasm/kernel/time.c
+--- a/arch/wasm/kernel/time.c
++++ b/arch/wasm/kernel/time.c
+@@ -29,6 +29,20 @@ unsigned long long wasm_clock_now(void)
+ 	return wasm_cpu_clock_get_monotonic(atomic64_xchg(&wasm_time_charged, 0));
+ }
+
++static atomic64_t wasm_sched_clock_base = ATOMIC64_INIT(0);
++
++notrace unsigned long long sched_clock(void)
++{
++	unsigned long long now = wasm_clock_now();
++	s64 base = atomic64_read(&wasm_sched_clock_base);
++
++	if (unlikely(!base)) {
++		atomic64_cmpxchg(&wasm_sched_clock_base, 0, (s64)now);
++		base = atomic64_read(&wasm_sched_clock_base);
++	}
++	return now - (unsigned long long)base;
++}
++
+ /* Wasm clock source: derived from Wasm host cpu clock (monotonic). */
+
+ static unsigned long long wasm_clocksource_read(struct clocksource *cs)

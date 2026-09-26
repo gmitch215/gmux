@@ -1,0 +1,66 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Gregory Mitchell <me@gmitch215.xyz>
+Date: Sat, 26 Sep 2026 12:15:00 -0400
+Subject: [PATCH] wasm: let the host refuse an executable
+
+A Worker cannot compile code at run time, so the host runs only the
+executables it holds a build of. start_thread() handed the new image
+to the host with no way to say no, and the host's only answer to an
+unknown hash was to throw, which took the whole machine down with the
+one process. wasm_load_executable() now returns nonzero to refuse, and
+load_wasm_binary() calls it before finalize_exec(). The exec is past
+its point of no return by then, so a refused exec kills the process
+with SIGSEGV, as any late exec failure does.
+---
+diff --git a/arch/wasm/include/asm/wasm.h b/arch/wasm/include/asm/wasm.h
+--- a/arch/wasm/include/asm/wasm.h
++++ b/arch/wasm/include/asm/wasm.h
+@@ -19,7 +19,7 @@ extern void wasm_release_task(struct task_struct *dead_task);
+ extern struct task_struct *wasm_serialize_tasks(struct task_struct *prev_task,
+ 	struct task_struct *next_task);
+
+-extern void wasm_load_executable(unsigned long bin_start, unsigned long bin_end,
++extern int wasm_load_executable(unsigned long bin_start, unsigned long bin_end,
+ 	unsigned long data_start, unsigned long table_start);
+ extern void wasm_reload_program(void);
+
+diff --git a/arch/wasm/kernel/process.c b/arch/wasm/kernel/process.c
+--- a/arch/wasm/kernel/process.c
++++ b/arch/wasm/kernel/process.c
+@@ -269,9 +269,6 @@ void start_thread(struct pt_regs *regs, unsigned long stack_pointer)
+ 	regs->stack_pointer = stack_pointer;
+ 	regs->cpuflags = CPUFLAGS_USER_TASK_DEFAULT;
+
+-	wasm_load_executable(current->mm->start_code, current->mm->end_code,
+-		current->mm->start_data, 0U);
+-
+ 	/* Reload the program when the current syscall exits. */
+ 	current_thread_info()->flags |= _TIF_RELOAD_PROGRAM;
+ }
+diff --git a/fs/binfmt_wasm.c b/fs/binfmt_wasm.c
+--- a/fs/binfmt_wasm.c
++++ b/fs/binfmt_wasm.c
+@@ -20,6 +20,8 @@
+ #include <linux/uaccess.h>
+ #include <linux/vmalloc.h>
+
++#include <asm/wasm.h>
++
+ /*
+  * 128 KiB, binfmt_elf_fdpic's default for nommu programs. Without an MMU a stack is committed memory,
+  * so the host grows it in segments up to RLIMIT_STACK as the program needs them (split stacks).
+@@ -437,6 +439,14 @@ static int load_wasm_binary(struct linux_binprm *bprm)
+ 	if (res)
+ 		return res;
+
++	/*
++	 * The host refuses code it holds no build of. That is past the point
++	 * of no return, so exec kills the process with SIGSEGV.
++	 */
++	if (wasm_load_executable(current->mm->start_code, current->mm->end_code,
++			current->mm->start_data, 0U))
++		return -ENOEXEC;
++
+ 	finalize_exec(bprm);
+ 	start_thread(regs, current->mm->start_stack);
+
