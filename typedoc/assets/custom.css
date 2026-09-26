@@ -1,0 +1,44 @@
+@import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;600&family=Noto+Sans:wght@400;600&family=Space+Grotesk:wght@500;700&display=swap');
+
+/* gmitch215.dev's brand greens over typedoc's default theme */
+:root {
+	--light-color-background: #fbfdf6;
+	--light-color-background-secondary: #f3f7ea;
+	--light-color-accent: #e2e8d6;
+	--light-color-text: #111708;
+	--light-color-text-aside: #57614a;
+	--light-color-link: #497800;
+	--light-color-focus-outline: #62a000;
+	--light-code-background: #f3f7ea;
+
+	--dark-color-background: #0b0f06;
+	--dark-color-background-secondary: #121a09;
+	--dark-color-accent: #22300f;
+	--dark-color-text: #eef5e1;
+	--dark-color-text-aside: #a3ae92;
+	--dark-color-link: #bcff43;
+	--dark-color-focus-outline: #a2f213;
+	--dark-code-background: #16200b;
+
+	--font-family-text: 'Noto Sans', ui-sans-serif, system-ui, sans-serif;
+	--font-family-code: 'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, monospace;
+}
+
+h1,
+h2,
+h3,
+h4,
+.tsd-page-title h1,
+.title {
+	font-family: 'Space Grotesk', 'Noto Sans', ui-sans-serif, sans-serif;
+}
+
+.tsd-page-toolbar {
+	border-bottom: 1px solid var(--color-accent);
+}
+
+.tsd-panel,
+.tsd-signature,
+pre {
+	border-radius: 0.75rem;
+}

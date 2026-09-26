@@ -1,42 +1,293 @@
 <!doctype html>
 <html lang="en">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>gmux</title>
-<link rel="icon" href="https://cdn.gmitch215.xyz/gmux.png">
-<style>
-:root { color-scheme: light dark; --fg: #1d1d1f; --bg: #fff; --muted: #6e6e73; --code: #f2f2f5; }
-@media (prefers-color-scheme: dark) { :root { --fg: #f2f2f5; --bg: #111114; --muted: #a1a1a6; --code: #1f1f24; } }
-body { margin: 0 auto; max-width: 52rem; padding: 2rem 1rem; font: 16px/1.6 system-ui, sans-serif; color: var(--fg); background: var(--bg); }
-nav { display: flex; gap: 1.5rem; margin-bottom: 2rem; }
-a { color: inherit; }
-code, pre { background: var(--code); border-radius: 6px; }
-pre { padding: 1rem; overflow-x: auto; }
-code { padding: 0.1rem 0.3rem; }
-table { border-collapse: collapse; }
-td, th { border: 1px solid var(--muted); padding: 0.3rem 0.6rem; }
-img { max-width: 100%; }
-</style>
-</head>
-<body>
-<nav><a href="./typedoc/">TypeScript API</a><a href="./doxygen/">C Reference</a><a href="https://github.com/gmitch215/gmux">Source</a></nav>
-<div style="display: flex; align-items: center; flex-direction: column;" align="center">
-    <img align="center" style="align-self: center; max-width: 256px" src="https://cdn.gmitch215.xyz/gmux.png" width="30%" alt="" />
-    <h1 style="text-align: center;">gmux</h1>
-    <p style="text-align: center;">Linux on Serverless</p>
-    <div align="center">
-        <img src="https://img.shields.io/github/v/release/gmitch215/gmux">
-        <img src="https://img.shields.io/github/downloads/gmitch215/gmux/total">
-        <img src="https://img.shields.io/github/license/gmitch215/gmux">
-        <img src="https://img.shields.io/github/stars/gmitch215/gmux?style=flat">
-        <img src="https://img.shields.io/github/commit-activity/t/gmitch215/gmux?color=violet">
-    </div>
-</div>
-<hr>
+	<head>
+		<meta charset="utf-8" />
+		<meta
+			name="viewport"
+			content="width=device-width, initial-scale=1"
+		/>
+		<title>gmux</title>
+		<meta
+			name="description"
+			content="Linux on Serverless: a real Linux kernel, compiled to WebAssembly, in a Cloudflare Durable Object."
+		/>
+		<link
+			rel="icon"
+			href="https://cdn.gmitch215.xyz/gmux.png"
+		/>
+		<link
+			rel="preconnect"
+			href="https://fonts.googleapis.com"
+		/>
+		<link
+			rel="preconnect"
+			href="https://fonts.gstatic.com"
+			crossorigin
+		/>
+		<link
+			rel="stylesheet"
+			href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;600&family=Noto+Sans:wght@400;600&family=Space+Grotesk:wght@500;700&display=swap"
+		/>
+		<style>
+			:root {
+				color-scheme: light dark;
+				--fg: #111708;
+				--muted: #57614a;
+				--bg: #fbfdf6;
+				--card: #ffffff;
+				--line: #e2e8d6;
+				--accent: #497800;
+				--accent-strong: #62a000;
+				--glow: color-mix(in oklab, #83d000 22%, transparent);
+				--code-bg: #f3f7ea;
+			}
+			@media (prefers-color-scheme: dark) {
+				:root {
+					--fg: #eef5e1;
+					--muted: #a3ae92;
+					--bg: #0b0f06;
+					--card: #121a09;
+					--line: #22300f;
+					--accent: #bcff43;
+					--accent-strong: #a2f213;
+					--glow: color-mix(in oklab, #a2f213 25%, transparent);
+					--code-bg: #16200b;
+				}
+			}
+			* {
+				box-sizing: border-box;
+			}
+			body {
+				margin: 0;
+				padding: 4rem 1.5rem 6rem;
+				background:
+					radial-gradient(60rem 30rem at 50% -10rem, var(--glow), transparent 70%),
+					var(--bg);
+				color: var(--fg);
+				font:
+					16px/1.7 'Noto Sans',
+					ui-sans-serif,
+					system-ui,
+					sans-serif;
+			}
+			main {
+				max-width: 50rem;
+				margin: 0 auto;
+			}
+			h1,
+			h2,
+			h3 {
+				font-family: 'Space Grotesk', 'Noto Sans', ui-sans-serif, sans-serif;
+			}
+			header {
+				display: flex;
+				align-items: center;
+				gap: 1.25rem;
+				margin-bottom: 0.5rem;
+			}
+			header img {
+				width: 4.5rem;
+				height: 4.5rem;
+			}
+			h1 {
+				margin: 0;
+				font-size: 3rem;
+				letter-spacing: -0.03em;
+			}
+			p.lead {
+				margin: 0 0 2.5rem;
+				color: var(--muted);
+				font-size: 1.15rem;
+			}
+			.links {
+				display: grid;
+				gap: 1rem;
+				grid-template-columns: repeat(auto-fit, minmax(14rem, 1fr));
+				margin-bottom: 3.5rem;
+			}
+			a.card {
+				display: block;
+				padding: 1.25rem 1.5rem;
+				border: 1px solid var(--line);
+				border-radius: 0.9rem;
+				background: var(--card);
+				color: inherit;
+				text-decoration: none;
+				transition:
+					border-color 0.15s,
+					box-shadow 0.15s,
+					transform 0.15s;
+			}
+			a.card:hover {
+				border-color: var(--accent-strong);
+				box-shadow: 0 0 40px -8px var(--glow);
+				transform: translateY(-2px);
+			}
+			a.card strong {
+				display: block;
+				font-family: 'Space Grotesk', 'Noto Sans', sans-serif;
+				font-size: 1.1rem;
+			}
+			a.card span {
+				color: var(--muted);
+				font-size: 0.9rem;
+			}
+
+			.readme h2 {
+				margin: 3rem 0 1rem;
+				padding-bottom: 0.4rem;
+				border-bottom: 1px solid var(--line);
+				font-size: 1.6rem;
+				letter-spacing: -0.01em;
+			}
+			.readme h3 {
+				margin: 2rem 0 0.75rem;
+				font-size: 1.2rem;
+			}
+			.readme a {
+				color: var(--accent);
+				text-underline-offset: 0.2em;
+			}
+			.readme hr {
+				margin: 3rem 0;
+				border: 0;
+				border-top: 1px solid var(--line);
+			}
+			.readme blockquote {
+				margin: 1.5rem 0;
+				padding: 0.25rem 0 0.25rem 1.25rem;
+				border-left: 3px solid var(--accent-strong);
+				color: var(--muted);
+			}
+			.readme ul {
+				padding-left: 1.25rem;
+			}
+			.readme li {
+				margin: 0.35rem 0;
+			}
+			.readme li::marker {
+				color: var(--accent-strong);
+			}
+			.readme code {
+				font-family: 'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, monospace;
+			}
+			.readme :not(pre) > code {
+				padding: 0.15em 0.4em;
+				border-radius: 0.35rem;
+				background: var(--code-bg);
+				font-size: 0.85em;
+			}
+			.readme pre {
+				margin: 1.25rem 0;
+				padding: 1rem 1.25rem;
+				border: 1px solid var(--line);
+				border-radius: 0.9rem;
+				overflow-x: auto;
+				font-size: 0.85rem;
+				line-height: 1.6;
+			}
+			.readme pre code {
+				display: block;
+			}
+
+			/* shiki writes both palettes onto every token, and this picks the one in use */
+			.readme .shiki,
+			.readme .shiki span {
+				color: var(--shiki-light);
+				background-color: var(--shiki-light-bg);
+			}
+			@media (prefers-color-scheme: dark) {
+				.readme .shiki,
+				.readme .shiki span {
+					color: var(--shiki-dark);
+					background-color: var(--shiki-dark-bg);
+				}
+			}
+
+			.readme .table {
+				overflow-x: auto;
+				margin: 1.25rem 0;
+				border: 1px solid var(--line);
+				border-radius: 0.9rem;
+			}
+			.readme table {
+				width: 100%;
+				border-collapse: collapse;
+				font-size: 0.925rem;
+			}
+			.readme th,
+			.readme td {
+				padding: 0.55rem 0.9rem;
+				border-bottom: 1px solid var(--line);
+				text-align: left;
+				vertical-align: top;
+			}
+			.readme th {
+				background: var(--code-bg);
+				font-weight: 600;
+				white-space: nowrap;
+			}
+			.readme tbody tr:last-child td {
+				border-bottom: 0;
+			}
+			.readme p img {
+				vertical-align: middle;
+			}
+
+			footer {
+				max-width: 50rem;
+				margin: 4rem auto 0;
+				padding-top: 1.5rem;
+				border-top: 1px solid var(--line);
+				color: var(--muted);
+				font-size: 0.9rem;
+			}
+			footer a {
+				color: inherit;
+			}
+		</style>
+	</head>
+	<body>
+		<main>
+			<header>
+				<img
+					src="https://cdn.gmitch215.xyz/gmux.png"
+					alt=""
+				/>
+				<h1>gmux</h1>
+			</header>
+			<p class="lead">
+				Linux on Serverless: a real Linux kernel, compiled to WebAssembly, in a Cloudflare
+				Durable Object.
+			</p>
+			<div class="links">
+				<a
+					class="card"
+					href="typedoc/"
+				>
+					<strong>TypeScript API</strong>
+					<span>The machine host: boot, run, checkpoint and restore</span>
+				</a>
+				<a
+					class="card"
+					href="doxygen/"
+				>
+					<strong>C Reference</strong>
+					<span>The runtime linked into programs, and Katybug</span>
+				</a>
+				<a
+					class="card"
+					href="https://github.com/gmitch215/gmux"
+				>
+					<strong>Source</strong>
+					<span>github.com/gmitch215/gmux</span>
+				</a>
+			</div>
+			<div class="readme">
+				<p class="badges"><img src="https://img.shields.io/github/v/release/gmitch215/gmux"> <img src="https://img.shields.io/github/downloads/gmitch215/gmux/total"> <img src="https://img.shields.io/github/license/gmitch215/gmux"> <img src="https://img.shields.io/github/stars/gmitch215/gmux?style=flat"> <img src="https://img.shields.io/github/commit-activity/t/gmitch215/gmux?color=violet"></p>
 <p>A real Linux kernel, compiled to WebAssembly, running inside one Cloudflare Worker. Each machine is a
 Durable Object with a BusyBox userland and a browser terminal.</p>
-<h2>📋 Table of Contents</h2>
+<h2 id="-table-of-contents">📋 Table of Contents</h2>
 <ul>
 <li><a href="#-why-gmux">🎯 Why gmux</a></li>
 <li><a href="#-quick-start">🚀 Quick Start</a></li>
@@ -48,65 +299,56 @@ Durable Object with a BusyBox userland and a browser terminal.</p>
 <li><a href="#-documentation">📚 Documentation</a></li>
 <li><a href="#-license">📄 License</a></li>
 </ul>
-<h2>🎯 Why gmux</h2>
+<h2 id="-why-gmux">🎯 Why gmux</h2>
 <p>Serverless platforms run functions, not machines. gmux runs the machine: Linux 7.0 boots to a shell
 inside a Durable Object, and ordinary Linux programs run on it unmodified, with processes, pipes,
 job control, signals, threads, sockets, <code>fork</code> and <code>dlopen</code>. A job that needs more CPU than one
 event allows continues across events. The host can turn a running machine into bytes
 (<code>Machine.checkpoint</code>) and resume it exactly in a fresh isolate (<code>Machine.restore</code>).</p>
-<h2>🚀 Quick Start</h2>
+<h2 id="-quick-start">🚀 Quick Start</h2>
 <p>Run a machine locally with Docker:</p>
-<pre><code class="language-sh">docker run --rm -p 8787:8787 ghcr.io/gmitch215/gmux
-</code></pre>
-<p>Open <code>http://localhost:8787/_gmux/term</code>, claim the machine, and you are at a root shell. The container's
-<code>/var/lib/gmux</code> volume holds the machine's Durable Object storage.</p>
+<pre class="shiki shiki-themes github-light github-dark" style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;--shiki-light-bg:#fff;--shiki-dark-bg:#24292e" tabindex="0"><code><span class="line"><span style="--shiki-light:#6F42C1;--shiki-dark:#B392F0">docker</span><span style="--shiki-light:#032F62;--shiki-dark:#9ECBFF"> run</span><span style="--shiki-light:#005CC5;--shiki-dark:#79B8FF"> --rm</span><span style="--shiki-light:#005CC5;--shiki-dark:#79B8FF"> -p</span><span style="--shiki-light:#032F62;--shiki-dark:#9ECBFF"> 8787:8787</span><span style="--shiki-light:#032F62;--shiki-dark:#9ECBFF"> ghcr.io/gmitch215/gmux</span></span></code></pre><p>Open <code>http://localhost:8787/_gmux/term</code>, claim the machine, and you are at a root shell. The container&#39;s
+<code>/var/lib/gmux</code> volume holds the machine&#39;s Durable Object storage.</p>
 <p>Deploy your own to Cloudflare:</p>
-<pre><code class="language-sh">git clone https://github.com/gmitch215/gmux &amp;&amp; cd gmux
-bun install --ignore-scripts
-bun run hydrate              # the released kernel build
-bash scripts/build-assets.sh # the terminal page
-bunx wrangler deploy
-</code></pre>
-<p>The first visitor to <code>/_gmux/term</code> claims the machine and receives its owner token.</p>
-<h2>📥 Install the Library</h2>
+<pre class="shiki shiki-themes github-light github-dark" style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;--shiki-light-bg:#fff;--shiki-dark-bg:#24292e" tabindex="0"><code><span class="line"><span style="--shiki-light:#6F42C1;--shiki-dark:#B392F0">git</span><span style="--shiki-light:#032F62;--shiki-dark:#9ECBFF"> clone</span><span style="--shiki-light:#032F62;--shiki-dark:#9ECBFF"> https://github.com/gmitch215/gmux</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8"> &#x26;&#x26; </span><span style="--shiki-light:#005CC5;--shiki-dark:#79B8FF">cd</span><span style="--shiki-light:#032F62;--shiki-dark:#9ECBFF"> gmux</span></span>
+<span class="line"><span style="--shiki-light:#6F42C1;--shiki-dark:#B392F0">bun</span><span style="--shiki-light:#032F62;--shiki-dark:#9ECBFF"> install</span><span style="--shiki-light:#005CC5;--shiki-dark:#79B8FF"> --ignore-scripts</span></span>
+<span class="line"><span style="--shiki-light:#6F42C1;--shiki-dark:#B392F0">bun</span><span style="--shiki-light:#032F62;--shiki-dark:#9ECBFF"> run</span><span style="--shiki-light:#032F62;--shiki-dark:#9ECBFF"> hydrate</span><span style="--shiki-light:#6A737D;--shiki-dark:#6A737D">              # the released kernel build</span></span>
+<span class="line"><span style="--shiki-light:#6F42C1;--shiki-dark:#B392F0">bash</span><span style="--shiki-light:#032F62;--shiki-dark:#9ECBFF"> scripts/build-assets.sh</span><span style="--shiki-light:#6A737D;--shiki-dark:#6A737D"> # the terminal page</span></span>
+<span class="line"><span style="--shiki-light:#6F42C1;--shiki-dark:#B392F0">bunx</span><span style="--shiki-light:#032F62;--shiki-dark:#9ECBFF"> wrangler</span><span style="--shiki-light:#032F62;--shiki-dark:#9ECBFF"> deploy</span></span></code></pre><p>The first visitor to <code>/_gmux/term</code> claims the machine and receives its owner token.</p>
+<h2 id="-install-the-library">📥 Install the Library</h2>
 <p>The machine host is an npm package with the kernel, BusyBox, Katybug and the initramfs inside it:</p>
-<pre><code class="language-sh">bun add @gmitch215/gmux
-</code></pre>
-<pre><code class="language-ts">import { createHash } from 'node:crypto';
-import { Machine } from '@gmitch215/gmux';
-import manifest from '@gmitch215/gmux/kernel/manifest.json';
-import vmlinux from '@gmitch215/gmux/kernel/vmlinux.wasm';
-import busybox from '@gmitch215/gmux/kernel/busybox.wasm';
-import initrd from '@gmitch215/gmux/kernel/initramfs.bin';
-
-const machine = new Machine({
-  vmlinux,
-  initrd: new Uint8Array(initrd),
-  cmdline: 'maxcpus=3 root=/dev/ram0 rootfstype=ramfs init=/init console=hvc',
-  registry: new Map([[manifest.busybox, busybox]]),
-  sharedKernel: true,
-  sha256: (bytes) =&gt; createHash('sha256').update(bytes).digest('hex'),
-  write: (text) =&gt; console.log(text)
-});
-machine.type('uname -a\n');
-const started = Date.now();
-await machine.run(
-  () =&gt; Date.now() - started &gt; 5_000,
-  (ms) =&gt; new Promise((resolve) =&gt; setTimeout(resolve, ms))
-);
-</code></pre>
-<p>The host runs in a Durable Object, workerd, or Node with JSPI (<code>WebAssembly.Suspending</code>). In a Worker,
+<pre class="shiki shiki-themes github-light github-dark" style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;--shiki-light-bg:#fff;--shiki-dark-bg:#24292e" tabindex="0"><code><span class="line"><span style="--shiki-light:#6F42C1;--shiki-dark:#B392F0">bun</span><span style="--shiki-light:#032F62;--shiki-dark:#9ECBFF"> add</span><span style="--shiki-light:#032F62;--shiki-dark:#9ECBFF"> @gmitch215/gmux</span></span></code></pre><pre class="shiki shiki-themes github-light github-dark" style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;--shiki-light-bg:#fff;--shiki-dark-bg:#24292e" tabindex="0"><code><span class="line"><span style="--shiki-light:#D73A49;--shiki-dark:#F97583">import</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8"> { createHash } </span><span style="--shiki-light:#D73A49;--shiki-dark:#F97583">from</span><span style="--shiki-light:#032F62;--shiki-dark:#9ECBFF"> 'node:crypto'</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">;</span></span>
+<span class="line"><span style="--shiki-light:#D73A49;--shiki-dark:#F97583">import</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8"> { Machine } </span><span style="--shiki-light:#D73A49;--shiki-dark:#F97583">from</span><span style="--shiki-light:#032F62;--shiki-dark:#9ECBFF"> '@gmitch215/gmux'</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">;</span></span>
+<span class="line"><span style="--shiki-light:#D73A49;--shiki-dark:#F97583">import</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8"> manifest </span><span style="--shiki-light:#D73A49;--shiki-dark:#F97583">from</span><span style="--shiki-light:#032F62;--shiki-dark:#9ECBFF"> '@gmitch215/gmux/kernel/manifest.json'</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">;</span></span>
+<span class="line"><span style="--shiki-light:#D73A49;--shiki-dark:#F97583">import</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8"> vmlinux </span><span style="--shiki-light:#D73A49;--shiki-dark:#F97583">from</span><span style="--shiki-light:#032F62;--shiki-dark:#9ECBFF"> '@gmitch215/gmux/kernel/vmlinux.wasm'</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">;</span></span>
+<span class="line"><span style="--shiki-light:#D73A49;--shiki-dark:#F97583">import</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8"> busybox </span><span style="--shiki-light:#D73A49;--shiki-dark:#F97583">from</span><span style="--shiki-light:#032F62;--shiki-dark:#9ECBFF"> '@gmitch215/gmux/kernel/busybox.wasm'</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">;</span></span>
+<span class="line"><span style="--shiki-light:#D73A49;--shiki-dark:#F97583">import</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8"> initrd </span><span style="--shiki-light:#D73A49;--shiki-dark:#F97583">from</span><span style="--shiki-light:#032F62;--shiki-dark:#9ECBFF"> '@gmitch215/gmux/kernel/initramfs.bin'</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">;</span></span>
+<span class="line"></span>
+<span class="line"><span style="--shiki-light:#D73A49;--shiki-dark:#F97583">const</span><span style="--shiki-light:#005CC5;--shiki-dark:#79B8FF"> machine</span><span style="--shiki-light:#D73A49;--shiki-dark:#F97583"> =</span><span style="--shiki-light:#D73A49;--shiki-dark:#F97583"> new</span><span style="--shiki-light:#6F42C1;--shiki-dark:#B392F0"> Machine</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">({</span></span>
+<span class="line"><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">  vmlinux,</span></span>
+<span class="line"><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">  initrd: </span><span style="--shiki-light:#D73A49;--shiki-dark:#F97583">new</span><span style="--shiki-light:#6F42C1;--shiki-dark:#B392F0"> Uint8Array</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">(initrd),</span></span>
+<span class="line"><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">  cmdline: </span><span style="--shiki-light:#032F62;--shiki-dark:#9ECBFF">'maxcpus=3 root=/dev/ram0 rootfstype=ramfs init=/init console=hvc'</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">,</span></span>
+<span class="line"><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">  registry: </span><span style="--shiki-light:#D73A49;--shiki-dark:#F97583">new</span><span style="--shiki-light:#6F42C1;--shiki-dark:#B392F0"> Map</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">([[manifest.busybox, busybox]]),</span></span>
+<span class="line"><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">  sharedKernel: </span><span style="--shiki-light:#005CC5;--shiki-dark:#79B8FF">true</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">,</span></span>
+<span class="line"><span style="--shiki-light:#6F42C1;--shiki-dark:#B392F0">  sha256</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">: (</span><span style="--shiki-light:#E36209;--shiki-dark:#FFAB70">bytes</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">) </span><span style="--shiki-light:#D73A49;--shiki-dark:#F97583">=></span><span style="--shiki-light:#6F42C1;--shiki-dark:#B392F0"> createHash</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">(</span><span style="--shiki-light:#032F62;--shiki-dark:#9ECBFF">'sha256'</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">).</span><span style="--shiki-light:#6F42C1;--shiki-dark:#B392F0">update</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">(bytes).</span><span style="--shiki-light:#6F42C1;--shiki-dark:#B392F0">digest</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">(</span><span style="--shiki-light:#032F62;--shiki-dark:#9ECBFF">'hex'</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">),</span></span>
+<span class="line"><span style="--shiki-light:#6F42C1;--shiki-dark:#B392F0">  write</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">: (</span><span style="--shiki-light:#E36209;--shiki-dark:#FFAB70">text</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">) </span><span style="--shiki-light:#D73A49;--shiki-dark:#F97583">=></span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8"> console.</span><span style="--shiki-light:#6F42C1;--shiki-dark:#B392F0">log</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">(text)</span></span>
+<span class="line"><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">});</span></span>
+<span class="line"><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">machine.</span><span style="--shiki-light:#6F42C1;--shiki-dark:#B392F0">type</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">(</span><span style="--shiki-light:#032F62;--shiki-dark:#9ECBFF">'uname -a</span><span style="--shiki-light:#005CC5;--shiki-dark:#79B8FF">\n</span><span style="--shiki-light:#032F62;--shiki-dark:#9ECBFF">'</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">);</span></span>
+<span class="line"><span style="--shiki-light:#D73A49;--shiki-dark:#F97583">const</span><span style="--shiki-light:#005CC5;--shiki-dark:#79B8FF"> started</span><span style="--shiki-light:#D73A49;--shiki-dark:#F97583"> =</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8"> Date.</span><span style="--shiki-light:#6F42C1;--shiki-dark:#B392F0">now</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">();</span></span>
+<span class="line"><span style="--shiki-light:#D73A49;--shiki-dark:#F97583">await</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8"> machine.</span><span style="--shiki-light:#6F42C1;--shiki-dark:#B392F0">run</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">(</span></span>
+<span class="line"><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">  () </span><span style="--shiki-light:#D73A49;--shiki-dark:#F97583">=></span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8"> Date.</span><span style="--shiki-light:#6F42C1;--shiki-dark:#B392F0">now</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">() </span><span style="--shiki-light:#D73A49;--shiki-dark:#F97583">-</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8"> started </span><span style="--shiki-light:#D73A49;--shiki-dark:#F97583">></span><span style="--shiki-light:#005CC5;--shiki-dark:#79B8FF"> 5_000</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">,</span></span>
+<span class="line"><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">  (</span><span style="--shiki-light:#E36209;--shiki-dark:#FFAB70">ms</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">) </span><span style="--shiki-light:#D73A49;--shiki-dark:#F97583">=></span><span style="--shiki-light:#D73A49;--shiki-dark:#F97583"> new</span><span style="--shiki-light:#005CC5;--shiki-dark:#79B8FF"> Promise</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">((</span><span style="--shiki-light:#E36209;--shiki-dark:#FFAB70">resolve</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">) </span><span style="--shiki-light:#D73A49;--shiki-dark:#F97583">=></span><span style="--shiki-light:#6F42C1;--shiki-dark:#B392F0"> setTimeout</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">(resolve, ms))</span></span>
+<span class="line"><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">);</span></span></code></pre><p>The host runs in a Durable Object, workerd, or Node with JSPI (<code>WebAssembly.Suspending</code>). In a Worker,
 <code>.wasm</code> imports compile at deploy time, which is the only place a Worker may compile code.</p>
-<h2>🐧 What Runs</h2>
-<table>
+<h2 id="-what-runs">🐧 What Runs</h2>
+<div class="table"><table>
 <thead>
 <tr>
 <th></th>
 <th></th>
 </tr>
 </thead>
-<tbody>
-<tr>
+<tbody><tr>
 <td>Userland</td>
 <td>BusyBox, with an interactive shell, pipelines and job control</td>
 </tr>
@@ -126,48 +368,48 @@ await machine.run(
 <td>Foreign binaries</td>
 <td>unchanged x86-64 and AArch64 Linux ELFs, through Katybug</td>
 </tr>
-</tbody>
-</table>
+</tbody></table></div>
 <p>Programs are compiled for <code>wasm32-linux</code> with <code>scripts/cc-strict</code>, which refuses any import outside
 the syscall surface. Code that arrives at run time cannot be compiled on Workers, so every native
 executable is built with the deployment.</p>
-<h2>🧱 How It Works</h2>
+<h2 id="-how-it-works">🧱 How It Works</h2>
 <p>The kernel and every process share one WebAssembly memory. A syscall is a direct call from the
-program's instance into the kernel's. Blocking is JSPI: every task that waits is a suspended wasm
-stack, and one pump on the Durable Object's single thread resumes exactly the task the kernel
+program&#39;s instance into the kernel&#39;s. Blocking is JSPI: every task that waits is a suspended wasm
+stack, and one pump on the Durable Object&#39;s single thread resumes exactly the task the kernel
 schedules next. When a machine has to leave memory, its parked stacks become bytes (Asyncify for the
 kernel, resumable frames or Asyncify for programs), and a restore rewinds them into fresh instances.</p>
-<p>Katybug decodes x86-64 and AArch64 into gmux's IR and interprets it, turning guest syscalls into the
-machine's own. <code>binfmt_misc</code> hands it any foreign ELF, so <code>execve</code> of an amd64 binary just works.</p>
-<p><a href="TECHNICAL_REPORT.md">TECHNICAL_REPORT.md</a> has the design, the platform limits that shape it, and
+<p>Katybug decodes x86-64 and AArch64 into gmux&#39;s IR and interprets it, turning guest syscalls into the
+machine&#39;s own. <code>binfmt_misc</code> hands it any foreign ELF, so <code>execve</code> of an amd64 binary just works.</p>
+<p><a href="https://github.com/gmitch215/gmux/blob/master/TECHNICAL_REPORT.md">TECHNICAL_REPORT.md</a> has the design, the platform limits that shape it, and
 what each operation costs.</p>
-<h2>🔒 Security</h2>
+<h2 id="-security">🔒 Security</h2>
 <p>A machine is a Durable Object: code inside it has no Worker bindings, secrets or network authority
 beyond what the host passes to it, and a deployed Worker cannot compile code at run time. Inside one
 machine, root processes share one trust domain; non-root processes cannot write memory they do not
-own, but they can read it. <a href="SECURITY.md">SECURITY.md</a> has the trust model, the import surface and the
+own, but they can read it. <a href="https://github.com/gmitch215/gmux/blob/master/SECURITY.md">SECURITY.md</a> has the trust model, the import surface and the
 threat matrix.</p>
-<h2>🛠️ Building from Source</h2>
+<h2 id="️-building-from-source">🛠️ Building from Source</h2>
 <p>The kernel, musl, BusyBox and Katybug build reproducibly on a Linux host with Docker from the pins in
 <code>src/sources.json</code> and the patches under <code>src/</code>:</p>
-<pre><code class="language-sh">scripts/build-linux.sh ~/gmux-build      # the toolchain, kernel, libc, userland and probes
-scripts/build-kernel.sh ~/gmux-build/out # staged into build/
-bun run test:probes                      # C probes booted in a machine
-</code></pre>
-<p>Two clean builds produce the same bytes in every artifact.</p>
-<pre><code class="language-sh">bun run typecheck
-bun run test
-bun run format:check
-</code></pre>
-<h2>📚 Documentation</h2>
+<pre class="shiki shiki-themes github-light github-dark" style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;--shiki-light-bg:#fff;--shiki-dark-bg:#24292e" tabindex="0"><code><span class="line"><span style="--shiki-light:#6F42C1;--shiki-dark:#B392F0">scripts/build-linux.sh</span><span style="--shiki-light:#032F62;--shiki-dark:#9ECBFF"> ~/gmux-build</span><span style="--shiki-light:#6A737D;--shiki-dark:#6A737D">      # the toolchain, kernel, libc, userland and probes</span></span>
+<span class="line"><span style="--shiki-light:#6F42C1;--shiki-dark:#B392F0">scripts/build-kernel.sh</span><span style="--shiki-light:#032F62;--shiki-dark:#9ECBFF"> ~/gmux-build/out</span><span style="--shiki-light:#6A737D;--shiki-dark:#6A737D"> # staged into build/</span></span>
+<span class="line"><span style="--shiki-light:#6F42C1;--shiki-dark:#B392F0">bun</span><span style="--shiki-light:#032F62;--shiki-dark:#9ECBFF"> run</span><span style="--shiki-light:#032F62;--shiki-dark:#9ECBFF"> test:probes</span><span style="--shiki-light:#6A737D;--shiki-dark:#6A737D">                      # C probes booted in a machine</span></span></code></pre><p>Two clean builds produce the same bytes in every artifact.</p>
+<pre class="shiki shiki-themes github-light github-dark" style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;--shiki-light-bg:#fff;--shiki-dark-bg:#24292e" tabindex="0"><code><span class="line"><span style="--shiki-light:#6F42C1;--shiki-dark:#B392F0">bun</span><span style="--shiki-light:#032F62;--shiki-dark:#9ECBFF"> run</span><span style="--shiki-light:#032F62;--shiki-dark:#9ECBFF"> typecheck</span></span>
+<span class="line"><span style="--shiki-light:#6F42C1;--shiki-dark:#B392F0">bun</span><span style="--shiki-light:#032F62;--shiki-dark:#9ECBFF"> run</span><span style="--shiki-light:#032F62;--shiki-dark:#9ECBFF"> test</span></span>
+<span class="line"><span style="--shiki-light:#6F42C1;--shiki-dark:#B392F0">bun</span><span style="--shiki-light:#032F62;--shiki-dark:#9ECBFF"> run</span><span style="--shiki-light:#032F62;--shiki-dark:#9ECBFF"> format:check</span></span></code></pre><h2 id="-documentation">📚 Documentation</h2>
 <ul>
-<li><a href="TECHNICAL_REPORT.md">Technical report</a>: architecture, platform constraints, measured costs</li>
-<li><a href="SECURITY.md">Security</a>: trust model and threat matrix</li>
-<li>TypeScript API and C reference: the project's GitHub Pages site</li>
+<li><a href="https://github.com/gmitch215/gmux/blob/master/TECHNICAL_REPORT.md">Technical report</a>: architecture, platform constraints, measured costs</li>
+<li><a href="https://github.com/gmitch215/gmux/blob/master/SECURITY.md">Security</a>: trust model and threat matrix</li>
+<li><a href="https://gmux.gmitch215.dev/typedoc/">TypeScript API</a> and <a href="https://gmux.gmitch215.dev/doxygen/">C reference</a></li>
 </ul>
-<h2>📄 License</h2>
+<h2 id="-license">📄 License</h2>
 <p>gmux is GPL-3.0-only. The kernel and its patches are GPL-2.0-only (<code>LICENSES/</code>), BusyBox is
 GPL-2.0-only, and musl is MIT.</p>
-
-</body>
+			</div>
+		</main>
+		<footer>
+			<a href="https://github.com/gmitch215/gmux">github.com/gmitch215/gmux</a> ·
+			<a href="https://gmitch215.dev">gmitch215.dev</a>
+		</footer>
+	</body>
 </html>
