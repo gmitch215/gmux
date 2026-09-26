@@ -4,18 +4,17 @@
   "workspaces": {
     "": {
       "name": "@gmitch215/gmux",
-      "dependencies": {
-        "@drupflare/burrow": "1.1.1",
-      },
       "devDependencies": {
         "@cloudflare/vitest-pool-workers": "^0.22.0",
         "@cloudflare/workers-types": "^5.20260925.1",
+        "@drupflare/burrow": "1.1.1",
         "@playwright/test": "^1.63.0",
         "@types/bun": "latest",
         "@vitest/coverage-istanbul": "^5.0.1",
         "@xterm/xterm": "^6.0.0",
         "binaryen": "^132.0.0",
         "fflate": "^0.8.3",
+        "markdown-it": "^14.1.0",
         "prettier": "^3.9.9",
         "prettier-plugin-organize-imports": "^4.3.0",
         "prettier-plugin-sh": "^0.20.2",

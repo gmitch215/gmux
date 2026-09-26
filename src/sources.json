@@ -44,5 +44,10 @@
 			"linux-wasm:patches/busybox-kernel-headers/busybox-kernel-headers-for-musl.patch"
 		],
 		"patches": "src/busybox/patches"
+	},
+	"zlib": {
+		"url": "https://zlib.net/fossils/zlib-1.3.1.tar.gz",
+		"sha256": "9a93b2b7dfdac77ceba5a558a580e74667dd6fede4585b91eefb60f03b72df23",
+		"license": "Zlib"
 	}
 }

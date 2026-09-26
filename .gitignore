@@ -3,9 +3,16 @@ node_modules
 package-lock.json
 build/
 dist/
+payload/
+build-typedoc/
+build-native/
+docs/index.html
+coverage/
 .wrangler/
 experiments/**/results/
 experiments/**/vendor/
-experiments/**/assets/
+experiments/*/assets/
 experiments/**/*.wasm
 experiments/**/*.bin
+experiments/lane-simd/src/native
+__pycache__/

@@ -16,12 +16,12 @@ EmptyLineAfterAccessModifier: Never
 IndentPPDirectives: BeforeHash
 AllowAllParametersOfDeclarationOnNextLine: true
 BraceWrapping:
-  AfterControlStatement: false
-  AfterFunction: false
-  AfterClass: false
-  AfterStruct: false
-  AfterCaseLabel: false
-  AfterExternBlock: false
+    AfterControlStatement: false
+    AfterFunction: false
+    AfterClass: false
+    AfterStruct: false
+    AfterCaseLabel: false
+    AfterExternBlock: false
 AlignAfterOpenBracket: BlockIndent
 SpaceAfterCStyleCast: true
 SortIncludes: true

@@ -4,25 +4,60 @@
 	"description": "Linux on Cloudflare Workers",
 	"author": "Gregory Mitchell <me@gmitch215.xyz>",
 	"license": "GPL-3.0-only",
+	"type": "module",
+	"main": "./dist/index.js",
+	"types": "./dist/index.d.ts",
+	"exports": {
+		".": {
+			"types": "./dist/index.d.ts",
+			"import": "./dist/index.js"
+		},
+		"./kernel/*": "./dist/kernel/*",
+		"./package.json": "./package.json"
+	},
+	"files": [
+		"dist",
+		"src/sources.json",
+		"src/kernel/patches",
+		"src/musl/patches",
+		"src/busybox/patches",
+		"LICENSE",
+		"LICENSES",
+		"README.md",
+		"SECURITY.md"
+	],
+	"sideEffects": false,
 	"scripts": {
+		"build": "tsc -p ./tsconfig.build.json && bun scripts/package-kernel.ts",
+		"typecheck": "tsc --noEmit",
+		"test": "vitest run",
+		"test:coverage": "vitest run --coverage",
+		"test:probes": "node --no-warnings --experimental-strip-types tests/c/run.ts",
+		"hydrate": "bun scripts/hydrate.ts",
+		"release:payload": "bun scripts/release-payload.ts",
+		"release:sbom": "bun scripts/sbom.ts",
+		"smoke": "bun scripts/smoke.ts",
+		"docs:build": "typedoc",
+		"docs:c": "bash scripts/docs-c.sh",
+		"docs:site": "bun scripts/docs-site.ts",
 		"prettier": "prettier --write .",
 		"prettier:check": "prettier --check .",
 		"format": "bash format.sh && prettier --write .",
 		"format:check": "bash check-format.sh && prettier --check .",
-		"prepare": "bash scripts/setup-hooks.sh"
-	},
-	"dependencies": {
-		"@drupflare/burrow": "1.1.1"
+		"prepare": "bash scripts/setup-hooks.sh",
+		"prepublishOnly": "bun run build"
 	},
 	"devDependencies": {
 		"@cloudflare/vitest-pool-workers": "^0.22.0",
 		"@cloudflare/workers-types": "^5.20260925.1",
+		"@drupflare/burrow": "1.1.1",
 		"@playwright/test": "^1.63.0",
 		"@types/bun": "latest",
 		"@vitest/coverage-istanbul": "^5.0.1",
 		"@xterm/xterm": "^6.0.0",
 		"binaryen": "^132.0.0",
 		"fflate": "^0.8.3",
+		"markdown-it": "^14.1.0",
 		"prettier": "^3.9.9",
 		"prettier-plugin-organize-imports": "^4.3.0",
 		"prettier-plugin-sh": "^0.20.2",
@@ -38,6 +73,7 @@
 		"type": "git",
 		"url": "git+https://github.com/gmitch215/gmux.git"
 	},
+	"homepage": "https://github.com/gmitch215/gmux",
 	"bugs": {
 		"url": "https://github.com/gmitch215/gmux/issues"
 	}
