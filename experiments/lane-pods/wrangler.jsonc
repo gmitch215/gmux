@@ -1,0 +1,24 @@
+{
+	"name": "gmux-lane-pods",
+	"main": "src/index.ts",
+	"compatibility_date": "2026-09-20",
+	"workers_dev": true,
+	"durable_objects": {
+		"bindings": [
+			{
+				"name": "LANE",
+				"class_name": "Lane"
+			},
+			{
+				"name": "POD",
+				"class_name": "Pod"
+			}
+		]
+	},
+	"migrations": [
+		{
+			"tag": "v1",
+			"new_sqlite_classes": ["Lane", "Pod"]
+		}
+	]
+}

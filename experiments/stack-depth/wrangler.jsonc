@@ -1,0 +1,6 @@
+{
+	"name": "gmux-stack-depth",
+	"main": "src/index.ts",
+	"compatibility_date": "2026-09-20",
+	"workers_dev": true
+}

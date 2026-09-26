@@ -1,0 +1,31 @@
+{
+	"name": "gmux-codegen",
+	"main": "src/index.ts",
+	"compatibility_date": "2026-09-20",
+	"workers_dev": true,
+	"durable_objects": {
+		"bindings": [
+			{
+				"name": "PROBE",
+				"class_name": "ProbeDO"
+			}
+		]
+	},
+	"migrations": [
+		{
+			"tag": "v1",
+			"new_sqlite_classes": ["ProbeDO"]
+		}
+	],
+	"rules": [
+		{
+			"type": "Data",
+			"globs": ["**/*.bin"],
+			"fallthrough": true
+		}
+	],
+	"define": {
+		"__COMPILE_PHP__": "false",
+		"__PACK_COPIES__": "0"
+	}
+}

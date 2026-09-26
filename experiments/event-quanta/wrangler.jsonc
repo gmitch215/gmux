@@ -1,0 +1,28 @@
+{
+	"name": "gmux-event-quanta",
+	"main": "src/index.ts",
+	"compatibility_date": "2026-09-20",
+	"compatibility_flags": ["nodejs_compat"],
+	"workers_dev": true,
+	"durable_objects": {
+		"bindings": [
+			{
+				"name": "PROBE",
+				"class_name": "Probe"
+			}
+		]
+	},
+	"migrations": [
+		{
+			"tag": "v1",
+			"new_sqlite_classes": ["Probe"]
+		}
+	],
+	"rules": [
+		{
+			"type": "Data",
+			"globs": ["**/*.bin"],
+			"fallthrough": true
+		}
+	]
+}

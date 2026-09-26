@@ -1,0 +1,20 @@
+{
+	"name": "gmux-baton",
+	"main": "src/index.ts",
+	"compatibility_date": "2026-09-20",
+	"workers_dev": true,
+	"durable_objects": {
+		"bindings": [
+			{
+				"name": "JOB",
+				"class_name": "Job"
+			}
+		]
+	},
+	"migrations": [
+		{
+			"tag": "v1",
+			"new_sqlite_classes": ["Job"]
+		}
+	]
+}
