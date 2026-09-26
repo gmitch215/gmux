@@ -1,0 +1,16 @@
+# autoconf answers for wasm32-linux-musl that a cross build cannot find by running a test program;
+# CONFIG_SITE=scripts/wasm/config.site. Each one is a fact of gmux's kernel and libc
+
+# musl's snprintf is C99 and fread of a directory fails with EISDIR
+ac_cv_snprintf_returns_bogus=no
+ac_cv_fread_reads_directories=no
+# devtmpfs has /dev/ptmx and no /dev/ptc
+ac_cv_file__dev_ptmx=yes
+ac_cv_file__dev_ptc=no
+# musl's getcwd, toupper, memmove and stat, and ncurses' terminfo tgetent
+vim_cv_getcwd_broken=no
+vim_cv_toupper_broken=no
+vim_cv_memmove_handles_overlap=yes
+vim_cv_stat_ignores_slash=no
+vim_cv_terminfo=yes
+vim_cv_tgetent=zero

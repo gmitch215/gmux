@@ -1,0 +1,88 @@
+#!/usr/bin/env bash
+here=$(cd "$(dirname "$0")" && pwd)
+REAL=${LINUX_WASM:-/rig/linux-wasm}/tools/fake-llvm/clang
+TARGET="--target=wasm-linux-musl -march=wasm32 -fPIC -O2"
+# setjmp/longjmp through wasm exceptions; the header overlay routes sigsetjmp to setjmp
+SJLJ="-isystem $here/../src/gmux/include -mexception-handling -mllvm -wasm-enable-sjlj"
+link=1 out=a.out prev=
+args=()
+for a in "$@"; do
+	case "$a" in -c | -E | -S | -M | -MM) link=0 ;; esac
+	if [ "$prev" = -o ]; then
+		out=$a
+	elif [ "$a" != -o ]; then
+		args+=("$a")
+	fi
+	prev=$a
+done
+case " $* " in *" -v "* | *" --version "* | *" -dumpversion "* | *" -dumpmachine "* | *" -print-"*) link=0 ;; esac
+w=${LINUX_WASM:-/rig/linux-wasm}/workspace/install
+# every mode sees the target's headers, since configure preprocesses with $CPP $CPPFLAGS and no
+# CFLAGS (gnulib then found no PATH_MAX, skipped chdir-long.c and still called chdir_long)
+sys=()
+case " $* " in *" --sysroot"*) ;; *)
+	sys=(--target=wasm-linux-musl -march=wasm32 -fPIC --sysroot="$w/musl-wasm32_nommu"
+		-isystem "$w/busybox-kernel-headers-wasm32_nommu")
+	;;
+esac
+[ $link = 0 ] && exec "$REAL" $SJLJ "${sys[@]}" "$@"
+# a program is a shared module (binfmt_wasm needs its dylink.0 section), however the caller links
+case " $* " in *-shared*) ;; *) sys+=(-Wl,-shared) ;; esac
+# fake-llvm only links when it sees -l and imports every undefined symbol; its crt1 breaks
+# main(void) and 3-argument main, so link gmux crt1 and fail on imports the host lacks
+tmp=$(mktemp -d "${TMPDIR:-/tmp}/cc-strict.XXXXXX")
+rt() {
+	local src=$here/../src/gmux/$1
+	local obj=${TMPDIR:-/tmp}/gmux-${1%.*}-$(cksum < "$src" | cut -d' ' -f1).o
+	[ -f "$obj" ] || "$REAL" $TARGET $SJLJ --sysroot="$w/musl-wasm32_nommu" \
+		-isystem "$w/busybox-kernel-headers-wasm32_nommu" -c "$src" -o "$obj" || return 1
+	echo "$obj"
+}
+crt=$(rt crt1.c) || exit 1
+sjlj=$(rt sjlj.c) || exit 1
+tag=$(rt sjlj-tag.S) || exit 1
+vfork=$(rt vfork.c) || exit 1
+# dlopen and friends as an archive member: linked only into programs that call them, since
+# --export-all would otherwise keep them, and their host imports, in every program. It goes before
+# the caller's arguments: lld takes the first archive on the line that defines a symbol, and
+# musl's libc.a (often -lc among them) has stubs
+dlo=$(rt dl.c) || exit 1
+dl=${dlo%.o}.a
+[ -f "$dl" ] || "${LINUX_WASM:-/rig/linux-wasm}/tools/fake-llvm/llvm-ar" rcs "$dl" "$dlo" || exit 1
+printf 'int __gmux_main(int c, char **v, char **e) { return 0; }\n' > "$tmp/probe.c"
+"$REAL" $TARGET -c "$tmp/probe.c" -o "$tmp/probe.o" || exit 1
+# a first link shows which main the program defines (--export-all exports every function)
+"$REAL" $SJLJ "${sys[@]}" -nostartfiles "$crt" "$sjlj" "$tag" "$vfork" "$dl" "${args[@]}" "$tmp/probe.o" -lc -o "$tmp/probe.wasm" 2> "$tmp/probe.log" || {
+	cat "$tmp/probe.log" >&2
+	exit 1
+}
+ex=$(python3 "$here/wasm-imports.py" --exports "$tmp/probe.wasm")
+if grep -qx __main_argc_argv <<< "$ex"; then
+	call='int __main_argc_argv(int, char **); return __main_argc_argv(c, v);'
+elif grep -qx __main_void <<< "$ex"; then
+	call='int __main_void(void); return __main_void();'
+elif grep -qx main <<< "$ex"; then
+	call='int main(int, char **, char **); return main(c, v, e);'
+else
+	echo "cc-strict: no main" >&2
+	exit 1
+fi
+printf 'int __gmux_main(int c, char **v, char **e) { %s }\n' "$call" > "$tmp/main.c"
+"$REAL" $TARGET -c "$tmp/main.c" -o "$tmp/main.o" || exit 1
+"$REAL" $SJLJ "${sys[@]}" -nostartfiles "$crt" "$sjlj" "$tag" "$vfork" "$dl" "$@" "$tmp/main.o" -lc || exit $?
+[ -f "$out" ] || exit 0
+allowed='^(__wasm_syscall_[0-6]|__wasm_abort|__gmux_vfork|__gmux_vfork_exec|__gmux_vfork_exit|__gmux_fork|__gmux_dl(prep|open|sym|close|error)|__stack_pointer|__memory_base|__table_base|__indirect_function_table|memory)$'
+bad=$(python3 "$here/wasm-imports.py" "$out" | grep -v -E "$allowed")
+if [ -n "$bad" ]; then
+	echo "cc-strict: unresolved: $(echo $bad | cut -c1-300)" >&2
+	mv -f "$out" "$out.unresolved"
+	exit 1
+fi
+# GMUX_TARGET_RUN=<runner> (during a configure): the output is a script that runs the program on
+# the target through the runner, so a configure that executes its tests gets real answers
+# (the module's absolute path: perl's Cross/run copies only the script to its target directory)
+if [ -n "${GMUX_TARGET_RUN:-}" ]; then
+	mv -f "$out" "$out.wasm"
+	printf '#!/bin/sh\nexec %s %s "$@"\n' "$GMUX_TARGET_RUN" "$(cd "$(dirname "$out")" && pwd)/$(basename "$out").wasm" > "$out"
+	chmod +x "$out"
+fi

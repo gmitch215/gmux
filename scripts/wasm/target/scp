@@ -1,0 +1,18 @@
+#!/bin/sh
+# scp to and from a target that shares this filesystem (see ssh here): host:path is path
+args=
+while [ $# -gt 0 ]; do
+	case "$1" in
+		-P) shift ;;
+		-*) ;;
+		*) args="$args ${1#*:}" ;;
+	esac
+	shift
+done
+set -- $args
+[ $# -ge 2 ] || exit 1
+eval "dest=\${$#}"
+while [ $# -gt 1 ]; do
+	[ "$1" -ef "$dest" ] || [ "$1" -ef "$dest/$(basename "$1")" ] || cp -R "$1" "$dest"
+	shift
+done

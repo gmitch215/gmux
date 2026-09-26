@@ -1,0 +1,6 @@
+#!/bin/sh
+# ssh for a configure that runs its tests on a "target host" (perl's Cross/run): the target shares
+# this filesystem, and a test program built with GMUX_TARGET_RUN runs on gmux through its runner.
+# the last argument is the command
+while [ $# -gt 1 ]; do shift; done
+exec sh -c "$1"
