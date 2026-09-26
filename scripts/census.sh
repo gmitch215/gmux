@@ -135,7 +135,7 @@ lib jansson https://github.com/akheron/jansson/releases/download/v2.14/jansson-2
 (unpack lua https://www.lua.org/ftp/lua-5.4.7.tar.gz lua.tgz && cd src \
 	&& mk lua lua CC=$CC MYCFLAGS="$CFLAGS -DLUA_USE_POSIX" MYLDFLAGS="$LDFLAGS" AR="$AR rcu" RANLIB=$RANLIB && checkwasm lua lua)
 (mkdir -p $B/sqlite && cd $B/sqlite && fetch https://www.sqlite.org/2024/sqlite-amalgamation-3470200.zip sqlite.zip \
-	&& python3 -c "import zipfile;zipfile.ZipFile('$D/src/sqlite.zip').extractall('.')" && cd sqlite-amalgamation-3470200 \
+	&& unzip -q "$D/src/sqlite.zip" && cd sqlite-amalgamation-3470200 \
 	&& {
 		$CC $CFLAGS -DSQLITE_THREADSAFE=0 -DSQLITE_OMIT_LOAD_EXTENSION shell.c sqlite3.c $LDFLAGS -o sqlite3 > $D/logs$ROUND/sqlite.make.log 2>&1
 		checkwasm sqlite sqlite3
