@@ -1,0 +1,173 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>gmux</title>
+<link rel="icon" href="https://cdn.gmitch215.xyz/gmux.png">
+<style>
+:root { color-scheme: light dark; --fg: #1d1d1f; --bg: #fff; --muted: #6e6e73; --code: #f2f2f5; }
+@media (prefers-color-scheme: dark) { :root { --fg: #f2f2f5; --bg: #111114; --muted: #a1a1a6; --code: #1f1f24; } }
+body { margin: 0 auto; max-width: 52rem; padding: 2rem 1rem; font: 16px/1.6 system-ui, sans-serif; color: var(--fg); background: var(--bg); }
+nav { display: flex; gap: 1.5rem; margin-bottom: 2rem; }
+a { color: inherit; }
+code, pre { background: var(--code); border-radius: 6px; }
+pre { padding: 1rem; overflow-x: auto; }
+code { padding: 0.1rem 0.3rem; }
+table { border-collapse: collapse; }
+td, th { border: 1px solid var(--muted); padding: 0.3rem 0.6rem; }
+img { max-width: 100%; }
+</style>
+</head>
+<body>
+<nav><a href="./typedoc/">TypeScript API</a><a href="./doxygen/">C Reference</a><a href="https://github.com/gmitch215/gmux">Source</a></nav>
+<div style="display: flex; align-items: center; flex-direction: column;" align="center">
+    <img align="center" style="align-self: center; max-width: 256px" src="https://cdn.gmitch215.xyz/gmux.png" width="30%" alt="" />
+    <h1 style="text-align: center;">gmux</h1>
+    <p style="text-align: center;">Linux on Serverless</p>
+    <div align="center">
+        <img src="https://img.shields.io/github/v/release/gmitch215/gmux">
+        <img src="https://img.shields.io/github/downloads/gmitch215/gmux/total">
+        <img src="https://img.shields.io/github/license/gmitch215/gmux">
+        <img src="https://img.shields.io/github/stars/gmitch215/gmux?style=flat">
+        <img src="https://img.shields.io/github/commit-activity/t/gmitch215/gmux?color=violet">
+    </div>
+</div>
+<hr>
+<p>A real Linux kernel, compiled to WebAssembly, running inside one Cloudflare Worker. Each machine is a
+Durable Object with a BusyBox userland and a browser terminal.</p>
+<h2>📋 Table of Contents</h2>
+<ul>
+<li><a href="#-why-gmux">🎯 Why gmux</a></li>
+<li><a href="#-quick-start">🚀 Quick Start</a></li>
+<li><a href="#-install-the-library">📥 Install the Library</a></li>
+<li><a href="#-what-runs">🐧 What Runs</a></li>
+<li><a href="#-how-it-works">🧱 How It Works</a></li>
+<li><a href="#-security">🔒 Security</a></li>
+<li><a href="#%EF%B8%8F-building-from-source">🛠️ Building from Source</a></li>
+<li><a href="#-documentation">📚 Documentation</a></li>
+<li><a href="#-license">📄 License</a></li>
+</ul>
+<h2>🎯 Why gmux</h2>
+<p>Serverless platforms run functions, not machines. gmux runs the machine: Linux 7.0 boots to a shell
+inside a Durable Object, and ordinary Linux programs run on it unmodified, with processes, pipes,
+job control, signals, threads, sockets, <code>fork</code> and <code>dlopen</code>. A job that needs more CPU than one
+event allows continues across events. The host can turn a running machine into bytes
+(<code>Machine.checkpoint</code>) and resume it exactly in a fresh isolate (<code>Machine.restore</code>).</p>
+<h2>🚀 Quick Start</h2>
+<p>Run a machine locally with Docker:</p>
+<pre><code class="language-sh">docker run --rm -p 8787:8787 ghcr.io/gmitch215/gmux
+</code></pre>
+<p>Open <code>http://localhost:8787/_gmux/term</code>, claim the machine, and you are at a root shell. The container's
+<code>/var/lib/gmux</code> volume holds the machine's Durable Object storage.</p>
+<p>Deploy your own to Cloudflare:</p>
+<pre><code class="language-sh">git clone https://github.com/gmitch215/gmux &amp;&amp; cd gmux
+bun install --ignore-scripts
+bun run hydrate              # the released kernel build
+bash scripts/build-assets.sh # the terminal page
+bunx wrangler deploy
+</code></pre>
+<p>The first visitor to <code>/_gmux/term</code> claims the machine and receives its owner token.</p>
+<h2>📥 Install the Library</h2>
+<p>The machine host is an npm package with the kernel, BusyBox, Katybug and the initramfs inside it:</p>
+<pre><code class="language-sh">bun add @gmitch215/gmux
+</code></pre>
+<pre><code class="language-ts">import { createHash } from 'node:crypto';
+import { Machine } from '@gmitch215/gmux';
+import manifest from '@gmitch215/gmux/kernel/manifest.json';
+import vmlinux from '@gmitch215/gmux/kernel/vmlinux.wasm';
+import busybox from '@gmitch215/gmux/kernel/busybox.wasm';
+import initrd from '@gmitch215/gmux/kernel/initramfs.bin';
+
+const machine = new Machine({
+  vmlinux,
+  initrd: new Uint8Array(initrd),
+  cmdline: 'maxcpus=3 root=/dev/ram0 rootfstype=ramfs init=/init console=hvc',
+  registry: new Map([[manifest.busybox, busybox]]),
+  sharedKernel: true,
+  sha256: (bytes) =&gt; createHash('sha256').update(bytes).digest('hex'),
+  write: (text) =&gt; console.log(text)
+});
+machine.type('uname -a\n');
+const started = Date.now();
+await machine.run(
+  () =&gt; Date.now() - started &gt; 5_000,
+  (ms) =&gt; new Promise((resolve) =&gt; setTimeout(resolve, ms))
+);
+</code></pre>
+<p>The host runs in a Durable Object, workerd, or Node with JSPI (<code>WebAssembly.Suspending</code>). In a Worker,
+<code>.wasm</code> imports compile at deploy time, which is the only place a Worker may compile code.</p>
+<h2>🐧 What Runs</h2>
+<table>
+<thead>
+<tr>
+<th></th>
+<th></th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Userland</td>
+<td>BusyBox, with an interactive shell, pipelines and job control</td>
+</tr>
+<tr>
+<td>Processes</td>
+<td><code>fork</code>, <code>vfork</code>, <code>execve</code>, pthreads, signals with handlers that block</td>
+</tr>
+<tr>
+<td>System</td>
+<td>sockets (Unix and loopback TCP), <code>epoll</code>, <code>eventfd</code>, <code>timerfd</code>, <code>inotify</code>, <code>flock</code>, System V IPC</td>
+</tr>
+<tr>
+<td>Libraries</td>
+<td><code>dlopen</code> of wasm side modules shipped with the deployment</td>
+</tr>
+<tr>
+<td>Foreign binaries</td>
+<td>unchanged x86-64 and AArch64 Linux ELFs, through Katybug</td>
+</tr>
+</tbody>
+</table>
+<p>Programs are compiled for <code>wasm32-linux</code> with <code>scripts/cc-strict</code>, which refuses any import outside
+the syscall surface. Code that arrives at run time cannot be compiled on Workers, so every native
+executable is built with the deployment.</p>
+<h2>🧱 How It Works</h2>
+<p>The kernel and every process share one WebAssembly memory. A syscall is a direct call from the
+program's instance into the kernel's. Blocking is JSPI: every task that waits is a suspended wasm
+stack, and one pump on the Durable Object's single thread resumes exactly the task the kernel
+schedules next. When a machine has to leave memory, its parked stacks become bytes (Asyncify for the
+kernel, resumable frames or Asyncify for programs), and a restore rewinds them into fresh instances.</p>
+<p>Katybug decodes x86-64 and AArch64 into gmux's IR and interprets it, turning guest syscalls into the
+machine's own. <code>binfmt_misc</code> hands it any foreign ELF, so <code>execve</code> of an amd64 binary just works.</p>
+<p><a href="TECHNICAL_REPORT.md">TECHNICAL_REPORT.md</a> has the design, the platform limits that shape it, and
+what each operation costs.</p>
+<h2>🔒 Security</h2>
+<p>A machine is a Durable Object: code inside it has no Worker bindings, secrets or network authority
+beyond what the host passes to it, and a deployed Worker cannot compile code at run time. Inside one
+machine, root processes share one trust domain; non-root processes cannot write memory they do not
+own, but they can read it. <a href="SECURITY.md">SECURITY.md</a> has the trust model, the import surface and the
+threat matrix.</p>
+<h2>🛠️ Building from Source</h2>
+<p>The kernel, musl, BusyBox and Katybug build reproducibly on a Linux host with Docker from the pins in
+<code>src/sources.json</code> and the patches under <code>src/</code>:</p>
+<pre><code class="language-sh">scripts/build-linux.sh ~/gmux-build      # the toolchain, kernel, libc, userland and probes
+scripts/build-kernel.sh ~/gmux-build/out # staged into build/
+bun run test:probes                      # C probes booted in a machine
+</code></pre>
+<p>Two clean builds produce the same bytes in every artifact.</p>
+<pre><code class="language-sh">bun run typecheck
+bun run test
+bun run format:check
+</code></pre>
+<h2>📚 Documentation</h2>
+<ul>
+<li><a href="TECHNICAL_REPORT.md">Technical report</a>: architecture, platform constraints, measured costs</li>
+<li><a href="SECURITY.md">Security</a>: trust model and threat matrix</li>
+<li>TypeScript API and C reference: the project's GitHub Pages site</li>
+</ul>
+<h2>📄 License</h2>
+<p>gmux is GPL-3.0-only. The kernel and its patches are GPL-2.0-only (<code>LICENSES/</code>), BusyBox is
+GPL-2.0-only, and musl is MIT.</p>
+
+</body>
+</html>

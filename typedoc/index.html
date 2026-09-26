@@ -1,0 +1,156 @@
+<!DOCTYPE html><html class="default" lang="en" data-base="./"><head><meta charset="utf-8"/><meta http-equiv="x-ua-compatible" content="IE=edge"/><title>gmux - v1.0.0</title><meta name="description" content="Documentation for gmux"/><meta name="viewport" content="width=device-width, initial-scale=1"/><link rel="stylesheet" href="assets/style.css"/><link rel="stylesheet" href="assets/highlight.css"/><script defer src="assets/main.js"></script><script async src="assets/icons.js" id="tsd-icons-script"></script><script async src="assets/search.js" id="tsd-search-script"></script><script async src="assets/navigation.js" id="tsd-nav-script"></script></head><body><script>document.documentElement.dataset.theme = localStorage.getItem("tsd-theme") || "os";document.body.style.display="none";setTimeout(() => window.app?app.showPage():document.body.style.removeProperty("display"),500)</script><header class="tsd-page-toolbar">
+<div class="tsd-toolbar-contents container"><a href="index.html" class="title">gmux - v1.0.0</a>
+<div id="tsd-toolbar-links"></div><button id="tsd-search-trigger" class="tsd-widget" aria-label="Search"><svg width="16" height="16" viewBox="0 0 16 16" fill="none" aria-hidden="true"><use href="assets/icons.svg#icon-search"></use></svg></button><dialog id="tsd-search" aria-label="Search"><input role="combobox" id="tsd-search-input" aria-controls="tsd-search-results" aria-autocomplete="list" aria-expanded="true" autocapitalize="off" autocomplete="off" placeholder="Search the docs" maxLength="100"/>
+<ul role="listbox" id="tsd-search-results"></ul>
+<div id="tsd-search-status" aria-live="polite" aria-atomic="true">
+<div>Preparing search index...</div></div></dialog><a href="#" class="tsd-widget menu" id="tsd-toolbar-menu-trigger" data-toggle="menu" aria-label="Menu"><svg width="16" height="16" viewBox="0 0 16 16" fill="none" aria-hidden="true"><use href="assets/icons.svg#icon-menu"></use></svg></a></div></header>
+<div class="container container-main">
+<div class="col-content">
+<div class="tsd-page-title">
+<h1>gmux - v1.0.0</h1></div>
+<div class="tsd-panel tsd-typography"><div style="display: flex; align-items: center; flex-direction: column;" align="center">
+    <img align="center" style="align-self: center; max-width: 256px" src="https://cdn.gmitch215.xyz/gmux.png" width="30%" alt="" />
+    <h1 style="text-align: center;">gmux</h1>
+    <p style="text-align: center;">Linux on Serverless</p>
+    <div align="center">
+        <img src="https://img.shields.io/github/v/release/gmitch215/gmux">
+        <img src="https://img.shields.io/github/downloads/gmitch215/gmux/total">
+        <img src="https://img.shields.io/github/license/gmitch215/gmux">
+        <img src="https://img.shields.io/github/stars/gmitch215/gmux?style=flat">
+        <img src="https://img.shields.io/github/commit-activity/t/gmitch215/gmux?color=violet">
+    </div>
+</div>
+<hr>
+<p>A real Linux kernel, compiled to WebAssembly, running inside one Cloudflare Worker. Each machine is a
+Durable Object with a BusyBox userland and a browser terminal.</p>
+<h2 id="📋-table-of-contents" class="tsd-anchor-link">📋 Table of Contents<a href="#📋-table-of-contents" aria-label="Permalink" class="tsd-anchor-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="assets/icons.svg#icon-anchor"></use></svg></a></h2>
+<ul>
+<li><a href="#-why-gmux">🎯 Why gmux</a></li>
+<li><a href="#-quick-start">🚀 Quick Start</a></li>
+<li><a href="#-install-the-library">📥 Install the Library</a></li>
+<li><a href="#-what-runs">🐧 What Runs</a></li>
+<li><a href="#-how-it-works">🧱 How It Works</a></li>
+<li><a href="#-security">🔒 Security</a></li>
+<li><a href="#%EF%B8%8F-building-from-source">🛠️ Building from Source</a></li>
+<li><a href="#-documentation">📚 Documentation</a></li>
+<li><a href="#-license">📄 License</a></li>
+</ul>
+<h2 id="🎯-why-gmux" class="tsd-anchor-link">🎯 Why gmux<a href="#🎯-why-gmux" aria-label="Permalink" class="tsd-anchor-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="assets/icons.svg#icon-anchor"></use></svg></a></h2>
+<p>Serverless platforms run functions, not machines. gmux runs the machine: Linux 7.0 boots to a shell
+inside a Durable Object, and ordinary Linux programs run on it unmodified, with processes, pipes,
+job control, signals, threads, sockets, <code>fork</code> and <code>dlopen</code>. A job that needs more CPU than one
+event allows continues across events. The host can turn a running machine into bytes
+(<code>Machine.checkpoint</code>) and resume it exactly in a fresh isolate (<code>Machine.restore</code>).</p>
+<h2 id="🚀-quick-start" class="tsd-anchor-link">🚀 Quick Start<a href="#🚀-quick-start" aria-label="Permalink" class="tsd-anchor-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="assets/icons.svg#icon-anchor"></use></svg></a></h2>
+<p>Run a machine locally with Docker:</p>
+<pre><code class="sh"><span class="hl-0">docker</span><span class="hl-1"> </span><span class="hl-2">run</span><span class="hl-1"> </span><span class="hl-3">--rm</span><span class="hl-1"> </span><span class="hl-3">-p</span><span class="hl-1"> </span><span class="hl-2">8787:8787</span><span class="hl-1"> </span><span class="hl-2">ghcr.io/gmitch215/gmux</span>
+</code><button type="button">Copy</button></pre>
+
+<p>Open <code>http://localhost:8787/_gmux/term</code>, claim the machine, and you are at a root shell. The container's
+<code>/var/lib/gmux</code> volume holds the machine's Durable Object storage.</p>
+<p>Deploy your own to Cloudflare:</p>
+<pre><code class="sh"><span class="hl-0">git</span><span class="hl-1"> </span><span class="hl-2">clone</span><span class="hl-1"> </span><span class="hl-2">https://github.com/gmitch215/gmux</span><span class="hl-1"> &amp;&amp; </span><span class="hl-0">cd</span><span class="hl-1"> </span><span class="hl-2">gmux</span><br/><span class="hl-0">bun</span><span class="hl-1"> </span><span class="hl-2">install</span><span class="hl-1"> </span><span class="hl-3">--ignore-scripts</span><br/><span class="hl-0">bun</span><span class="hl-1"> </span><span class="hl-2">run</span><span class="hl-1"> </span><span class="hl-2">hydrate</span><span class="hl-1">              </span><span class="hl-4"># the released kernel build</span><br/><span class="hl-0">bash</span><span class="hl-1"> </span><span class="hl-2">scripts/build-assets.sh</span><span class="hl-1"> </span><span class="hl-4"># the terminal page</span><br/><span class="hl-0">bunx</span><span class="hl-1"> </span><span class="hl-2">wrangler</span><span class="hl-1"> </span><span class="hl-2">deploy</span>
+</code><button type="button">Copy</button></pre>
+
+<p>The first visitor to <code>/_gmux/term</code> claims the machine and receives its owner token.</p>
+<h2 id="📥-install-the-library" class="tsd-anchor-link">📥 Install the Library<a href="#📥-install-the-library" aria-label="Permalink" class="tsd-anchor-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="assets/icons.svg#icon-anchor"></use></svg></a></h2>
+<p>The machine host is an npm package with the kernel, BusyBox, Katybug and the initramfs inside it:</p>
+<pre><code class="sh"><span class="hl-0">bun</span><span class="hl-1"> </span><span class="hl-2">add</span><span class="hl-1"> </span><span class="hl-2">@gmitch215/gmux</span>
+</code><button type="button">Copy</button></pre>
+
+<pre><code class="ts"><span class="hl-5">import</span><span class="hl-1"> { </span><span class="hl-6">createHash</span><span class="hl-1"> } </span><span class="hl-5">from</span><span class="hl-1"> </span><span class="hl-2">&#39;node:crypto&#39;</span><span class="hl-1">;</span><br/><span class="hl-5">import</span><span class="hl-1"> { </span><span class="hl-6">Machine</span><span class="hl-1"> } </span><span class="hl-5">from</span><span class="hl-1"> </span><span class="hl-2">&#39;@gmitch215/gmux&#39;</span><span class="hl-1">;</span><br/><span class="hl-5">import</span><span class="hl-1"> </span><span class="hl-6">manifest</span><span class="hl-1"> </span><span class="hl-5">from</span><span class="hl-1"> </span><span class="hl-2">&#39;@gmitch215/gmux/kernel/manifest.json&#39;</span><span class="hl-1">;</span><br/><span class="hl-5">import</span><span class="hl-1"> </span><span class="hl-6">vmlinux</span><span class="hl-1"> </span><span class="hl-5">from</span><span class="hl-1"> </span><span class="hl-2">&#39;@gmitch215/gmux/kernel/vmlinux.wasm&#39;</span><span class="hl-1">;</span><br/><span class="hl-5">import</span><span class="hl-1"> </span><span class="hl-6">busybox</span><span class="hl-1"> </span><span class="hl-5">from</span><span class="hl-1"> </span><span class="hl-2">&#39;@gmitch215/gmux/kernel/busybox.wasm&#39;</span><span class="hl-1">;</span><br/><span class="hl-5">import</span><span class="hl-1"> </span><span class="hl-6">initrd</span><span class="hl-1"> </span><span class="hl-5">from</span><span class="hl-1"> </span><span class="hl-2">&#39;@gmitch215/gmux/kernel/initramfs.bin&#39;</span><span class="hl-1">;</span><br/><br/><span class="hl-3">const</span><span class="hl-1"> </span><span class="hl-7">machine</span><span class="hl-1"> = </span><span class="hl-3">new</span><span class="hl-1"> </span><span class="hl-0">Machine</span><span class="hl-1">({</span><br/><span class="hl-1">  </span><span class="hl-6">vmlinux</span><span class="hl-1">,</span><br/><span class="hl-1">  </span><span class="hl-6">initrd:</span><span class="hl-1"> </span><span class="hl-3">new</span><span class="hl-1"> </span><span class="hl-0">Uint8Array</span><span class="hl-1">(</span><span class="hl-6">initrd</span><span class="hl-1">),</span><br/><span class="hl-1">  </span><span class="hl-6">cmdline:</span><span class="hl-1"> </span><span class="hl-2">&#39;maxcpus=3 root=/dev/ram0 rootfstype=ramfs init=/init console=hvc&#39;</span><span class="hl-1">,</span><br/><span class="hl-1">  </span><span class="hl-6">registry:</span><span class="hl-1"> </span><span class="hl-3">new</span><span class="hl-1"> </span><span class="hl-0">Map</span><span class="hl-1">([[</span><span class="hl-6">manifest</span><span class="hl-1">.</span><span class="hl-6">busybox</span><span class="hl-1">, </span><span class="hl-6">busybox</span><span class="hl-1">]]),</span><br/><span class="hl-1">  </span><span class="hl-6">sharedKernel:</span><span class="hl-1"> </span><span class="hl-3">true</span><span class="hl-1">,</span><br/><span class="hl-1">  </span><span class="hl-0">sha256</span><span class="hl-6">:</span><span class="hl-1"> (</span><span class="hl-6">bytes</span><span class="hl-1">) </span><span class="hl-3">=&gt;</span><span class="hl-1"> </span><span class="hl-0">createHash</span><span class="hl-1">(</span><span class="hl-2">&#39;sha256&#39;</span><span class="hl-1">).</span><span class="hl-0">update</span><span class="hl-1">(</span><span class="hl-6">bytes</span><span class="hl-1">).</span><span class="hl-0">digest</span><span class="hl-1">(</span><span class="hl-2">&#39;hex&#39;</span><span class="hl-1">),</span><br/><span class="hl-1">  </span><span class="hl-0">write</span><span class="hl-6">:</span><span class="hl-1"> (</span><span class="hl-6">text</span><span class="hl-1">) </span><span class="hl-3">=&gt;</span><span class="hl-1"> </span><span class="hl-6">console</span><span class="hl-1">.</span><span class="hl-0">log</span><span class="hl-1">(</span><span class="hl-6">text</span><span class="hl-1">)</span><br/><span class="hl-1">});</span><br/><span class="hl-6">machine</span><span class="hl-1">.</span><span class="hl-0">type</span><span class="hl-1">(</span><span class="hl-2">&#39;uname -a</span><span class="hl-8">\n</span><span class="hl-2">&#39;</span><span class="hl-1">);</span><br/><span class="hl-3">const</span><span class="hl-1"> </span><span class="hl-7">started</span><span class="hl-1"> = </span><span class="hl-6">Date</span><span class="hl-1">.</span><span class="hl-0">now</span><span class="hl-1">();</span><br/><span class="hl-5">await</span><span class="hl-1"> </span><span class="hl-6">machine</span><span class="hl-1">.</span><span class="hl-0">run</span><span class="hl-1">(</span><br/><span class="hl-1">  () </span><span class="hl-3">=&gt;</span><span class="hl-1"> </span><span class="hl-6">Date</span><span class="hl-1">.</span><span class="hl-0">now</span><span class="hl-1">() - </span><span class="hl-6">started</span><span class="hl-1"> &gt; </span><span class="hl-9">5_000</span><span class="hl-1">,</span><br/><span class="hl-1">  (</span><span class="hl-6">ms</span><span class="hl-1">) </span><span class="hl-3">=&gt;</span><span class="hl-1"> </span><span class="hl-3">new</span><span class="hl-1"> </span><span class="hl-10">Promise</span><span class="hl-1">((</span><span class="hl-6">resolve</span><span class="hl-1">) </span><span class="hl-3">=&gt;</span><span class="hl-1"> </span><span class="hl-0">setTimeout</span><span class="hl-1">(</span><span class="hl-6">resolve</span><span class="hl-1">, </span><span class="hl-6">ms</span><span class="hl-1">))</span><br/><span class="hl-1">);</span>
+</code><button type="button">Copy</button></pre>
+
+<p>The host runs in a Durable Object, workerd, or Node with JSPI (<code>WebAssembly.Suspending</code>). In a Worker,
+<code>.wasm</code> imports compile at deploy time, which is the only place a Worker may compile code.</p>
+<h2 id="🐧-what-runs" class="tsd-anchor-link">🐧 What Runs<a href="#🐧-what-runs" aria-label="Permalink" class="tsd-anchor-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="assets/icons.svg#icon-anchor"></use></svg></a></h2>
+<table>
+<thead>
+<tr>
+<th></th>
+<th></th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Userland</td>
+<td>BusyBox, with an interactive shell, pipelines and job control</td>
+</tr>
+<tr>
+<td>Processes</td>
+<td><code>fork</code>, <code>vfork</code>, <code>execve</code>, pthreads, signals with handlers that block</td>
+</tr>
+<tr>
+<td>System</td>
+<td>sockets (Unix and loopback TCP), <code>epoll</code>, <code>eventfd</code>, <code>timerfd</code>, <code>inotify</code>, <code>flock</code>, System V IPC</td>
+</tr>
+<tr>
+<td>Libraries</td>
+<td><code>dlopen</code> of wasm side modules shipped with the deployment</td>
+</tr>
+<tr>
+<td>Foreign binaries</td>
+<td>unchanged x86-64 and AArch64 Linux ELFs, through Katybug</td>
+</tr>
+</tbody>
+</table>
+<p>Programs are compiled for <code>wasm32-linux</code> with <code>scripts/cc-strict</code>, which refuses any import outside
+the syscall surface. Code that arrives at run time cannot be compiled on Workers, so every native
+executable is built with the deployment.</p>
+<h2 id="🧱-how-it-works" class="tsd-anchor-link">🧱 How It Works<a href="#🧱-how-it-works" aria-label="Permalink" class="tsd-anchor-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="assets/icons.svg#icon-anchor"></use></svg></a></h2>
+<p>The kernel and every process share one WebAssembly memory. A syscall is a direct call from the
+program's instance into the kernel's. Blocking is JSPI: every task that waits is a suspended wasm
+stack, and one pump on the Durable Object's single thread resumes exactly the task the kernel
+schedules next. When a machine has to leave memory, its parked stacks become bytes (Asyncify for the
+kernel, resumable frames or Asyncify for programs), and a restore rewinds them into fresh instances.</p>
+<p>Katybug decodes x86-64 and AArch64 into gmux's IR and interprets it, turning guest syscalls into the
+machine's own. <code>binfmt_misc</code> hands it any foreign ELF, so <code>execve</code> of an amd64 binary just works.</p>
+<p><a href="media/TECHNICAL_REPORT.md">TECHNICAL_REPORT.md</a> has the design, the platform limits that shape it, and
+what each operation costs.</p>
+<h2 id="🔒-security" class="tsd-anchor-link">🔒 Security<a href="#🔒-security" aria-label="Permalink" class="tsd-anchor-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="assets/icons.svg#icon-anchor"></use></svg></a></h2>
+<p>A machine is a Durable Object: code inside it has no Worker bindings, secrets or network authority
+beyond what the host passes to it, and a deployed Worker cannot compile code at run time. Inside one
+machine, root processes share one trust domain; non-root processes cannot write memory they do not
+own, but they can read it. <a href="media/SECURITY.md">SECURITY.md</a> has the trust model, the import surface and the
+threat matrix.</p>
+<h2 id="🛠️-building-from-source" class="tsd-anchor-link">🛠️ Building from Source<a href="#🛠️-building-from-source" aria-label="Permalink" class="tsd-anchor-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="assets/icons.svg#icon-anchor"></use></svg></a></h2>
+<p>The kernel, musl, BusyBox and Katybug build reproducibly on a Linux host with Docker from the pins in
+<code>src/sources.json</code> and the patches under <code>src/</code>:</p>
+<pre><code class="sh"><span class="hl-0">scripts/build-linux.sh</span><span class="hl-1"> </span><span class="hl-2">~/gmux-build</span><span class="hl-1">      </span><span class="hl-4"># the toolchain, kernel, libc, userland and probes</span><br/><span class="hl-0">scripts/build-kernel.sh</span><span class="hl-1"> </span><span class="hl-2">~/gmux-build/out</span><span class="hl-1"> </span><span class="hl-4"># staged into build/</span><br/><span class="hl-0">bun</span><span class="hl-1"> </span><span class="hl-2">run</span><span class="hl-1"> </span><span class="hl-2">test:probes</span><span class="hl-1">                      </span><span class="hl-4"># C probes booted in a machine</span>
+</code><button type="button">Copy</button></pre>
+
+<p>Two clean builds produce the same bytes in every artifact.</p>
+<pre><code class="sh"><span class="hl-0">bun</span><span class="hl-1"> </span><span class="hl-2">run</span><span class="hl-1"> </span><span class="hl-2">typecheck</span><br/><span class="hl-0">bun</span><span class="hl-1"> </span><span class="hl-2">run</span><span class="hl-1"> </span><span class="hl-2">test</span><br/><span class="hl-0">bun</span><span class="hl-1"> </span><span class="hl-2">run</span><span class="hl-1"> </span><span class="hl-2">format:check</span>
+</code><button type="button">Copy</button></pre>
+
+<h2 id="📚-documentation" class="tsd-anchor-link">📚 Documentation<a href="#📚-documentation" aria-label="Permalink" class="tsd-anchor-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="assets/icons.svg#icon-anchor"></use></svg></a></h2>
+<ul>
+<li><a href="media/TECHNICAL_REPORT.md">Technical report</a>: architecture, platform constraints, measured costs</li>
+<li><a href="media/SECURITY.md">Security</a>: trust model and threat matrix</li>
+<li>TypeScript API and C reference: the project's GitHub Pages site</li>
+</ul>
+<h2 id="📄-license" class="tsd-anchor-link">📄 License<a href="#📄-license" aria-label="Permalink" class="tsd-anchor-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="assets/icons.svg#icon-anchor"></use></svg></a></h2>
+<p>gmux is GPL-3.0-only. The kernel and its patches are GPL-2.0-only (<code>LICENSES/</code>), BusyBox is
+GPL-2.0-only, and musl is MIT.</p>
+</div></div>
+<div class="col-sidebar">
+<div class="page-menu">
+<div class="tsd-navigation settings">
+<details class="tsd-accordion"><summary class="tsd-accordion-summary"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" aria-hidden="true"><use href="assets/icons.svg#icon-chevronDown"></use></svg>
+<h3>Settings</h3></summary>
+<div class="tsd-accordion-details">
+<div class="tsd-filter-visibility"><span class="settings-label">Member Visibility</span>
+<ul id="tsd-filter-options">
+<li class="tsd-filter-item"><label class="tsd-filter-input"><input type="checkbox" id="tsd-filter-protected" name="protected"/><svg width="32" height="32" viewBox="0 0 32 32" aria-hidden="true"><rect class="tsd-checkbox-background" width="30" height="30" x="1" y="1" rx="6" fill="none"></rect><path class="tsd-checkbox-checkmark" d="M8.35422 16.8214L13.2143 21.75L24.6458 10.25" stroke="none" stroke-width="3.5" stroke-linejoin="round" fill="none"></path></svg><span>Protected</span></label></li>
+<li class="tsd-filter-item"><label class="tsd-filter-input"><input type="checkbox" id="tsd-filter-inherited" name="inherited" checked/><svg width="32" height="32" viewBox="0 0 32 32" aria-hidden="true"><rect class="tsd-checkbox-background" width="30" height="30" x="1" y="1" rx="6" fill="none"></rect><path class="tsd-checkbox-checkmark" d="M8.35422 16.8214L13.2143 21.75L24.6458 10.25" stroke="none" stroke-width="3.5" stroke-linejoin="round" fill="none"></path></svg><span>Inherited</span></label></li>
+<li class="tsd-filter-item"><label class="tsd-filter-input"><input type="checkbox" id="tsd-filter-external" name="external"/><svg width="32" height="32" viewBox="0 0 32 32" aria-hidden="true"><rect class="tsd-checkbox-background" width="30" height="30" x="1" y="1" rx="6" fill="none"></rect><path class="tsd-checkbox-checkmark" d="M8.35422 16.8214L13.2143 21.75L24.6458 10.25" stroke="none" stroke-width="3.5" stroke-linejoin="round" fill="none"></path></svg><span>External</span></label></li></ul></div>
+<div class="tsd-theme-toggle"><label class="settings-label" for="tsd-theme">Theme</label><select id="tsd-theme"><option value="os">OS</option><option value="light">Light</option><option value="dark">Dark</option></select></div></div></details></div>
+<details open class="tsd-accordion tsd-page-navigation"><summary class="tsd-accordion-summary"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" aria-hidden="true"><use href="assets/icons.svg#icon-chevronDown"></use></svg>
+<h3>On This Page</h3></summary>
+<div class="tsd-accordion-details"><a href="#📋-table-of-contents"><span>📋 <wbr/>Table of <wbr/>Contents</span></a><a href="#🎯-why-gmux"><span>🎯 <wbr/>Why gmux</span></a><a href="#🚀-quick-start"><span>🚀 <wbr/>Quick <wbr/>Start</span></a><a href="#📥-install-the-library"><span>📥 <wbr/>Install the <wbr/>Library</span></a><a href="#🐧-what-runs"><span>🐧 <wbr/>What <wbr/>Runs</span></a><a href="#🧱-how-it-works"><span>🧱 <wbr/>How <wbr/>It <wbr/>Works</span></a><a href="#🔒-security"><span>🔒 <wbr/>Security</span></a><a href="#🛠️-building-from-source"><span>🛠️ <wbr/>Building from <wbr/>Source</span></a><a href="#📚-documentation"><span>📚 <wbr/>Documentation</span></a><a href="#📄-license"><span>📄 <wbr/>License</span></a></div></details></div>
+<div class="site-menu">
+<nav class="tsd-navigation"><a href="modules.html">gmux - v1.0.0</a>
+<ul class="tsd-small-nested-navigation" id="tsd-nav-container">
+<li>Loading...</li></ul></nav></div></div></div><footer>
+<p class="tsd-generator">Generated using <a href="https://typedoc.org/" target="_blank">TypeDoc</a></p></footer>
+<div class="overlay"></div></body></html>
