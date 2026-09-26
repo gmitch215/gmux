@@ -644,7 +644,7 @@ static int decode(uint32_t index) {
             }
             case 0x11: { /* call_indirect */
                 uint32_t type = U32(p);
-                U32(p); /* table 0 */
+                (void) U32(p); /* table 0 */
                 get(&d, T + 4, --d.h);
                 put(&d, KB_MOVI, 8, T + 5, 0, 0, m.ntable);
                 put(&d, KB_SUB, 8, T + 6, T + 4, T + 5, 0);
@@ -722,7 +722,7 @@ static int decode(uint32_t index) {
             case 0x3d: memory_op(&d, &p, KB_ST, 2, 0); break;
             case 0x3e: memory_op(&d, &p, KB_ST, 4, 0); break;
             case 0x3f: /* memory.size */
-                U32(p);
+                (void) U32(p);
                 put(&d, KB_MOVI, 8, T, 0, 0, m.mem_pages);
                 set(&d, T, d.h++);
                 break;
@@ -920,20 +920,20 @@ int kb_wasm_load(struct kb_cpu* cpu, const char* path) {
                 break;
             }
             case 4:
-                U32(s);
+                (void) U32(s);
                 s++; /* funcref */
                 if (*s++ & 1) {
                     m.ntable = U32(s);
-                    U32(s);
+                    (void) U32(s);
                 }
                 else
                     m.ntable = U32(s);
                 break;
             case 5:
-                U32(s);
+                (void) U32(s);
                 if (*s++ & 1) {
                     m.mem_pages = U32(s);
-                    U32(s);
+                    (void) U32(s);
                 }
                 else
                     m.mem_pages = U32(s);

@@ -9,9 +9,9 @@ root=$(cd "$here/../../.." && pwd)
 llvm=${LLVM:-/opt/homebrew/opt/llvm/bin}
 out=$(mktemp -d)
 cc -std=c11 -D_DEFAULT_SOURCE -D_DARWIN_C_SOURCE -O2 -Wall -Wextra -Werror \
-	-o "$out/katybug" "$root"/src/gmux/katybug/*.c
+	-o "$out/katybug" "$root"/src/gmux/katybug/*.c -lm
 cc -DKB_HOST -O2 -o "$out/guest-native" "$here/guest.c"
-flags=(-nostdlib -static -fuse-ld=lld -O2 -fno-stack-protector -fno-builtin)
+flags=(-nostdlib -static -fuse-ld=lld -O2 -ffreestanding -fno-stack-protector -fno-builtin)
 "$llvm/clang" --target=x86_64-linux-gnu "${flags[@]}" -mno-sse -mno-mmx -o "$out/guest-x86" "$here/guest.c"
 "$llvm/clang" --target=aarch64-linux-gnu "${flags[@]}" -mgeneral-regs-only -o "$out/guest-a64" "$here/guest.c"
 "$llvm/clang" --target=x86_64-linux-gnu "${flags[@]}" -mno-sse -mno-mmx -o "$out/signals-x86" "$here/signals.c"
