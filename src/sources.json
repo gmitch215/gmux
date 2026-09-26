@@ -1,0 +1,48 @@
+{
+	"linux-wasm": {
+		"repo": "https://github.com/joelseverin/linux-wasm.git",
+		"ref": "master",
+		"commit": "3103d5c877a8f6251b4b451c866a46941fd1fab3",
+		"license": "GPL-2.0-only"
+	},
+	"linux": {
+		"repo": "https://github.com/joelseverin/linux.git",
+		"ref": "wasm-7.0",
+		"commit": "039e5f3e583f56f329657d1fe9945510dba10f41",
+		"base": {
+			"ref": "v7.0",
+			"commit": "028ef9c96e96197026887c0f092424679298aae8"
+		},
+		"license": "GPL-2.0-only",
+		"patches": "src/kernel/patches",
+		"overlay": "src/kernel/files"
+	},
+	"llvm": {
+		"repo": "https://github.com/joelseverin/llvm.git",
+		"ref": "wasm-18.1.2",
+		"commit": "30dfc8fca8c206fa4f483e300937637291f61716",
+		"license": "Apache-2.0 WITH LLVM-exception",
+		"patches": "src/llvm/patches"
+	},
+	"musl": {
+		"repo": "https://git.musl-libc.org/git/musl",
+		"ref": "v1.2.5",
+		"commit": "0784374d561435f7c787a555aeab8ede699ed298",
+		"license": "MIT",
+		"upstreamPatches": [
+			"linux-wasm:patches/musl/0001-NOMERGE-Hacks-to-get-Linux-Wasm-to-compile-minimal-a.patch"
+		],
+		"patches": "src/musl/patches"
+	},
+	"busybox": {
+		"repo": "https://git.busybox.net/busybox",
+		"ref": "1_36_1",
+		"commit": "1a64f6a20aaf6ea4dbba68bbfa8cc1ab7e5c57c4",
+		"license": "GPL-2.0-only",
+		"upstreamPatches": [
+			"linux-wasm:patches/busybox/0001-NOMERGE-Hacks-to-build-Wasm-Linux-arch-minimal-and-i.patch",
+			"linux-wasm:patches/busybox-kernel-headers/busybox-kernel-headers-for-musl.patch"
+		],
+		"patches": "src/busybox/patches"
+	}
+}
