@@ -1,0 +1,68 @@
+ls -1 ubin | head -5; ls -1d busybox input.txt ubin
+cat -n input.txt | tail -3
+sort -r input.txt | head -3
+sort -n numbers.txt | uniq -c
+sort -g -r numbers.txt | tr '\n' ' '
+wc -lwc input.txt numbers.txt
+cut -d' ' -f2 input.txt | tr a-z A-Z
+seq 1 0.25 3 | paste -sd,
+seq -w 8 12 | tr '\n' ' '
+seq -f '%.2e' 1 3 1000
+printf '%08.3f|%x|%o|%e|%g|%a\n' 3.14159 255 8 12345.678 0.0001 1.5
+od -An -tx1 -c input.txt | head -4
+od -An -tf8 -tf4 numbers.txt
+expr 7 \* 6 + 1 : '\(.\)'
+echo hello world | sha256sum; echo hello | md5sum; echo hi | b2sum -l 64; cksum input.txt
+base64 input.txt | head -2; echo aGVsbG8= | base64 -d; basenc --base32 input.txt | head -1
+factor 1234567 600851475143 18446744073709551557
+numfmt --to=iec 1048576 123456789; numfmt --from=si 1.5K
+date -u -d @1700000000 '+%Y-%m-%dT%H:%M:%S %j %A %s'
+tac numbers.txt | head -3; nl -ba -s: input.txt | head -2
+split -l 2 input.txt "$TMPDIR/p." && cat "$TMPDIR/p.ab" && ls "$TMPDIR" | grep -c '^p\.'
+stat -c '%s %F %n' input.txt numbers.txt; stat -c '%F %n' bin
+ln -s input.txt "$TMPDIR/l" && readlink "$TMPDIR/l"; realpath --relative-to=bin input.txt
+yes x | head -3; false; echo $?
+dd if=input.txt bs=4 count=2 status=none | od -c
+timeout 5 sleep 0.1; echo $?; timeout 0.2 sleep 5; echo $?
+env -i A=1 B=2 env
+shuf -i 1-9 --random-source=input.txt | tr '\n' ' '
+fold -w 10 input.txt | head -3; fmt -w 20 input.txt | head -3
+pr -2 -t -w 40 numbers.txt
+printf 'a 1\nb 2\n' > "$TMPDIR/j"; join "$TMPDIR/j" "$TMPDIR/j"
+tsort <<< 'a b b c a c'
+csplit -s -f "$TMPDIR/c" input.txt 3 && cat "$TMPDIR/c01"
+printf 'x\ty\n' | expand -t 4 | od -c | head -1; sum input.txt
+mkdir -p "$TMPDIR/d/e" && touch -d @1000000000 "$TMPDIR/d/e/f" && stat -c '%Y' "$TMPDIR/d/e/f" && { rmdir "$TMPDIR/d/e" 2>&1 | sed "s,$TMPDIR,T,"; }; echo $?
+cp input.txt "$TMPDIR/cp" && truncate -s 7 "$TMPDIR/cp" && cat "$TMPDIR/cp"; echo; mv "$TMPDIR/cp" "$TMPDIR/mv" && wc -c < "$TMPDIR/mv"
+test 3 -gt 2 && [ -f input.txt ] && [ ! -d input.txt ] && echo ok
+ptx -A input.txt | head -3
+bash -c 'a=(3 1 2); echo ${#a[@]} ${a[@]:1}; declare -A m=([x]=1 [y]=2); echo ${m[y]} ${!m[@]}'
+bash -c 'for i in {1..5}; do (( s += i * i )); done; echo $s; echo ${BASH_VERSION%%.*}'
+bash -c 'f() { local x=$1; echo ${x^^} ${x:1:2}; }; f hello; [[ abc =~ ^a(b)c$ ]] && echo ${BASH_REMATCH[1]}'
+bash -c 'echo $(( 2**40 )) $(( -7 / 2 )) $(( 7 % -3 )) $(( 16#ff ))'
+bash -c 'while read -r a b; do echo "$b:$a"; done < input.txt | head -3'
+bash -c 'cat <(echo proc) <<< here; cat <<< "$(seq 3 | paste -sd+)"'
+bash -c 'trap "echo caught" USR1; kill -USR1 $$; echo after'
+bash -c 'set -o pipefail; false | true; echo $?; true | false; echo $?'
+bash -c 'printf -v v "%05d" 42; echo $v ${v//0/o}; printf "%q\n" "a b"'
+bash -c 'sleep 0.1 & wait $!; echo $?; (exit 7); echo $?'
+bash -c 'x=1; { x=2; }; ( x=3 ); echo $x; mapfile -t l < input.txt; echo ${#l[@]} "${l[1]}"'
+bash -c 'shopt -s extglob; f=aaab.txt; echo ${f%%+(a)*} ${f/#+(a)/X}; echo {a,b}{1,2}'
+bash -c 'coproc cat; echo hi >&${COPROC[1]}; read -r l <&${COPROC[0]}; echo $l; kill $COPROC_PID'
+bash -c 'echo $((RANDOM >= 0)); type -t cd ls; hash -r; x=$(command -v sort); echo ${x##*/}'
+sqlite3 :memory: 'select 1+1, 7/2.0, 7/2, 1e308*10, round(2.675,2), 0.1+0.2, cast("12.5e3" as real);'
+sqlite3 :memory: "create table t(a,b); insert into t values(1,'x'),(2,'y'),(3,'z'); select group_concat(b,'-'), sum(a), avg(a), total(a) from t;"
+sqlite3 :memory: 'with recursive c(x) as (select 1 union all select x+1 from c where x<10000) select count(*), sum(x), max(x), sum(x*x) % 1000003 from c;'
+sqlite3 "$TMPDIR/a.db" 'create table k(i integer primary key, v); insert into k(v) with recursive c(x) as (select 1 union all select x+1 from c where x<5000) select hex(x*x) from c; create index kv on k(v); select count(*), min(v), max(v) from k;'
+sqlite3 "$TMPDIR/a.db" 'pragma integrity_check; select sum(length(v)), count(distinct substr(v,1,1)) from k where v > "4"; pragma page_count;'
+sqlite3 -csv :memory: '.import numbers.txt n' 'select count(*), sum("10") from n;'
+sqlite3 :memory: "select json_extract('{\"a\":[1,2,{\"b\":3}]}','\$.a[2].b'), json_array(1,2.5,'x'), printf('%.6f %5.1e', 1.0/3, 12345.678);"
+sqlite3 -header -column :memory: 'create table p(n text, v real); insert into p values("pi", 3.14159), ("e", 2.71828); select * from p order by v;'
+sqlite3 :memory: 'begin; create table z(x); insert into z values(1); savepoint s; insert into z values(2); rollback to s; commit; select count(*) from z;'
+curl -s "file://$PWD/input.txt" | head -2
+curl -s -o /dev/null -w '%{size_download}\n' "file://$PWD/numbers.txt"
+curl -sS "file:///nonexistent/x" 2>&1; echo $?
+{ printf 'HTTP/1.0 200 OK\r\nContent-Length: 6\r\n\r\nhello\n' | nc -l -p 18080 > "$TMPDIR/req"; } & p=$!; sleep 1; curl -s http://127.0.0.1:18080/x; wait $p; head -1 "$TMPDIR/req" | tr -d '\r'
+{ printf 'pong\n' | nc -l -p 18081 > "$TMPDIR/b"; } & p=$!; sleep 1; bash -c 'exec 3<>/dev/tcp/127.0.0.1/18081; echo ping >&3; cat <&3'; wait $p; cat "$TMPDIR/b"
+{ printf 'HTTP/1.0 200 OK\r\n\r\nbody\n' | nc -l -p 18083 > /dev/null; } & p=$!; sleep 1; wget -q -O - http://127.0.0.1:18083/; wait $p
+nc -l -p 18082 > "$TMPDIR/nc" & p=$!; sleep 1; curl -s -m 2 -T numbers.txt http://127.0.0.1:18082/up > /dev/null; wait $p; grep -c . "$TMPDIR/nc"; tail -6 "$TMPDIR/nc"

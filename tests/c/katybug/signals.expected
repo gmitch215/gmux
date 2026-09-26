@@ -1,0 +1,11 @@
+usr1 1
+usr1 signo 10
+usr1 code 0
+usr2 while blocked 0
+usr2 after unblock 1
+segv 1
+load after repair 42
+mapped 7
+remapped 0
+unmapped 42
+segv 2

@@ -1,0 +1,49 @@
+echo hello world
+printf '%s-%d-%x-%5.2s|\n' abc 42 255 xyzzy
+seq 1 10
+seq 5 -2 -5
+sort input.txt
+sort -n -r numbers.txt
+sort input.txt | uniq -c
+wc input.txt
+md5sum input.txt numbers.txt
+sha1sum input.txt
+sha256sum input.txt
+sha512sum input.txt
+tr a-z A-Z < input.txt
+cut -d' ' -f2 input.txt
+head -3 input.txt
+tail -2 input.txt
+grep -n o input.txt
+grep -c e input.txt
+sed -e 's/o/0/g' -e '2d' input.txt
+awk '{ n += length($0) } END { print n, NR }' input.txt
+awk 'BEGIN { for (i = 1; i <= 5; i++) s = s i*i ","; print s }'
+awk 'BEGIN { printf "%.3f %e %g\n", 3.14159265, 12345.678, 0.0001 }'
+expr 7 \* 6 + 1
+expr length abcdef
+od -A x -t x1z input.txt
+xxd numbers.txt
+base64 input.txt
+base64 input.txt | base64 -d
+gzip -c input.txt | gunzip -c
+bzip2 -c input.txt | bunzip2 -c
+gzip -c input.txt | wc -c
+echo $((0x10 * 3 - 7)) $((1 << 40)) $((-7 / 2)) $((-7 % 3))
+for w in alpha beta gamma; do echo ${#w}:$w; done
+x=abcdef; echo ${x:2:3} ${x#ab} ${x%ef}
+i=0; while [ $i -lt 5 ]; do i=$((i+1)); done; echo $i
+case foo.c in *.c) echo C;; *) echo other;; esac
+printf 'a\nb\nc\n' | tac
+printf 'x y z\n' | awk '{ print $3 $2 $1 }'
+factor 360 1001 65537
+cal 9 2026
+date -d @1790000000 -u +%Y-%m-%dT%H:%M:%S
+basename /a/b/c.txt .txt
+dirname /a/b/c.txt
+yes | head -3
+nl input.txt
+rev input.txt
+fold -w 5 input.txt
+comm -12 input.txt input.txt
+paste input.txt numbers.txt

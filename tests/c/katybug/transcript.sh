@@ -1,0 +1,91 @@
+#!/usr/bin/env bash
+# the transcript check: unchanged static amd64 programs run every line of a command file natively on
+# a Linux host (NATIVE_HOST, default paisley-park, in an Alpine container capped at 2 CPUs and 1 GB,
+# work under ~/gmux-rig/) and under a native build of katybug here; each line's output and exit
+# status must match. busybox/commands.txt runs against Alpine's busybox-static; userland/commands.txt
+# adds coreutils, bash, sqlite3 and curl built from pinned sources by userland-build.sh.
+# usage: tests/c/katybug/transcript.sh [busybox|userland]...  (default: both); KATYBUG_FORK=exec sends
+# every guest fork through fork.c's exec and state transfer, as on wasm
+set -euo pipefail
+here=$(cd "$(dirname "$0")" && pwd)
+root=$(cd "$here/../../.." && pwd)
+host=${NATIVE_HOST:-paisley-park}
+suites=${*:-busybox userland}
+out=$(mktemp -d)
+cc -std=c11 -D_DEFAULT_SOURCE -D_DARWIN_C_SOURCE -O2 -o "$out/katybug" "$root"/src/gmux/katybug/*.c -lm
+
+# the work tree both sides see: inputs, the binaries, bin/ and ubin/ of links, and the runner
+mkdir -p "$out/t/bin" "$out/t/ubin" "$out/tmp"
+cp "$here"/busybox/input.txt "$here"/busybox/numbers.txt "$out/t/"
+ssh "$host" 'docker run --rm --memory 1g --cpus 2 alpine:3.20 sh -c "apk add --no-cache busybox-static > /dev/null && cat /bin/busybox.static"' > "$out/t/busybox"
+case " $suites " in *" userland "*)
+	scp -q "$here/userland-build.sh" "$host:gmux-rig/k3/build.sh"
+	ssh "$host" 'mkdir -p ~/gmux-rig/k3/src ~/gmux-rig/k3/out && cd ~/gmux-rig/k3 &&
+		{ [ -f out/curl ] || docker run --rm --memory 4g --cpus 6 -v "$PWD/src:/src" -v "$PWD/out:/out" \
+			-v "$PWD/build.sh:/build.sh:ro" alpine:3.20 sh /build.sh > build.log 2>&1; } &&
+		tar -C out -cf - bash coreutils curl sqlite3' | tar -C "$out/t/ubin" -xf -
+	for p in $(ssh "$host" 'docker run --rm --memory 1g --cpus 2 -v "$HOME/gmux-rig/k3/out:/o:ro" alpine:3.20 /o/coreutils --help' | sed -n 's/^ \[ //p'); do
+		ln -s coreutils "$out/t/ubin/$p"
+	done
+	ln -s coreutils "$out/t/ubin/["
+	;;
+esac
+chmod +x "$out/t/busybox"
+cat > "$out/t/run.sh" << 'EOF'
+#!/bin/sh
+# run.sh <suite> <launcher...>: each line of <suite>.txt through busybox sh, with its exit status
+cd "$(dirname "$0")"
+suite=$1
+shift
+for a in $("$@" ./busybox --list); do ln -sf ../busybox "bin/$a"; done
+path=$PWD/bin
+[ "$suite" = userland ] && path=$PWD/ubin:$path
+n=0
+while IFS= read -r line; do
+	n=$((n + 1))
+	printf '== %s %s\n' "$n" "$line"
+	env -i PATH="$path" HOME=/ LC_ALL=C TZ=UTC TMPDIR="${TMPDIR:-/tmp}" ${KATYBUG_FORK:+KATYBUG_FORK=$KATYBUG_FORK} \
+		"$@" ./busybox sh -c "$line" < /dev/null 2>&1
+	printf '== rc %s\n' "$?"
+done < "$suite.txt"
+EOF
+chmod +x "$out/t/run.sh"
+for s in $suites; do cp "$here/$s/commands.txt" "$out/t/$s.txt"; done
+
+tar -C "$out" -cf - t | ssh "$host" 'mkdir -p ~/gmux-rig/t1/bbt && tar -C ~/gmux-rig/t1/bbt -xf -'
+# the same tree, less its links, for transcript-gmux.ts and tests/c/run.ts's userland probe
+keep=$root/build/katybug/transcript
+mkdir -p "$keep/ubin"
+cp "$out"/t/{busybox,run.sh} "$out"/t/*.txt "$keep/"
+if [ -f "$out/t/ubin/bash" ]; then
+	cp "$out"/t/ubin/{bash,coreutils,curl,sqlite3} "$keep/ubin/"
+	find "$out/t/ubin" -type l -exec basename {} \; | sort > "$keep/ubin.list"
+fi
+fail=0
+for s in $suites; do
+	ssh "$host" "docker run --rm --memory 1g --cpus 2 -v \"\$HOME/gmux-rig/t1/bbt/t:/t\" alpine:3.20 /t/run.sh $s" > "$out/$s.native.txt"
+	cp "$out/$s.native.txt" "$keep/"
+	TMPDIR=$out/tmp "$out/t/run.sh" "$s" "$out/katybug" > "$out/$s.katybug.txt"
+	echo "# $s"
+	python3 - "$out/$s.native.txt" "$out/$s.katybug.txt" << 'EOF' || fail=1
+import re, sys
+def split(p):
+    parts = re.split(r'^== (\d+) (.*)$', open(p, errors='replace').read(), flags=re.M)
+    return {int(parts[i]): (parts[i + 1], parts[i + 2]) for i in range(1, len(parts), 3)}
+a, b = split(sys.argv[1]), split(sys.argv[2])
+ok = 0
+for n in sorted(a):
+    line, x = a[n]
+    y = b.get(n, ('', ''))[1]
+    if x == y:
+        ok += 1
+        print(f'PASS {line}')
+    else:
+        print(f'FAIL {line}')
+        print('  native :', x.strip()[:300].replace('\n', ' | '))
+        print('  katybug:', y.strip()[:300].replace('\n', ' | '))
+print(f'{ok}/{len(a)} lines equal')
+sys.exit(0 if ok == len(a) else 1)
+EOF
+done
+exit $fail
