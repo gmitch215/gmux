@@ -1,0 +1,484 @@
+#include <errno.h>
+#include <signal.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/time.h>
+#include <time.h>
+#include <unistd.h>
+
+#include "kb.h"
+
+/** Linux signal numbers (the same on both guests) to the host's; 0 for none */
+int kb_host_sig(int s) {
+    switch (s) {
+        case 1: return SIGHUP;
+        case 2: return SIGINT;
+        case 3: return SIGQUIT;
+        case 4: return SIGILL;
+        case 5: return SIGTRAP;
+        case 6: return SIGABRT;
+        case 7: return SIGBUS;
+        case 8: return SIGFPE;
+        case 9: return SIGKILL;
+        case 10: return SIGUSR1;
+        case 11: return SIGSEGV;
+        case 12: return SIGUSR2;
+        case 13: return SIGPIPE;
+        case 14: return SIGALRM;
+        case 15: return SIGTERM;
+        case 17: return SIGCHLD;
+        case 18: return SIGCONT;
+        case 19: return SIGSTOP;
+        case 20: return SIGTSTP;
+        case 21: return SIGTTIN;
+        case 22: return SIGTTOU;
+        case 23: return SIGURG;
+        case 24: return SIGXCPU;
+        case 25: return SIGXFSZ;
+        case 26: return SIGVTALRM;
+        case 27: return SIGPROF;
+        case 28: return SIGWINCH;
+        default: return 0;
+    }
+}
+
+static int guest_sig(int h) {
+    for (int s = 1; s < 32; s++)
+        if (kb_host_sig(s) == h) return s;
+    return 0;
+}
+
+static volatile sig_atomic_t pending_bits[65];
+static int pending_code[65]; /* si_code: SI_USER 0 from kill and other
+                                processes, SI_TKILL -6 */
+static volatile sig_atomic_t any_pending;
+
+static int timer_sig; /* the guest's one POSIX timer, on the host's ITIMER_REAL;
+                         0 for none */
+
+static void on_host_signal(int h) {
+    int s = h == SIGALRM && timer_sig ? timer_sig : guest_sig(h);
+    if (s) {
+        pending_code[s] = 0;
+        pending_bits[s] = 1;
+        any_pending = 1;
+    }
+}
+
+/* default actions: ignore for these, terminate (by the host signal itself) for
+ * the rest */
+static int ignored_by_default(int s) {
+    return s == 17 || s == 18 || s == 23 || s == 28;
+}
+
+static void terminate(struct kb_cpu* cpu, int s) {
+    if (cpu->trace) fflush(cpu->trace);
+    if (getenv("KATYBUG_DEBUG")) {
+        uint8_t* p = kb_host(cpu, cpu->ipc, 8);
+        fprintf(
+            stderr, "katybug: signal %d (%s) at %#llx", s,
+            cpu->last_fault ? cpu->last_fault : "sent",
+            (unsigned long long) cpu->ipc
+        );
+        for (int i = 0; p && i < 8; i++) fprintf(stderr, " %02x", p[i]);
+        fprintf(
+            stderr, " address %#llx after %llu blocks\n",
+            (unsigned long long) cpu->fault_addr,
+            (unsigned long long) cpu->steps
+        );
+    }
+    int h = kb_host_sig(s);
+    if (h) {
+        signal(h, SIG_DFL);
+        sigset_t set;
+        sigemptyset(&set);
+        sigaddset(&set, h);
+        sigprocmask(SIG_UNBLOCK, &set, NULL);
+        raise(h);
+    }
+    cpu->exited = 1;
+    cpu->status = 128 + s;
+}
+
+static void host_install(struct kb_cpu* cpu, int s);
+
+int64_t kb_sigaction(struct kb_cpu* cpu, int s, uint64_t act, uint64_t old) {
+    if (s < 1 || s > 64 || s == 9 || s == 19) return -22;
+    struct kb_sigaction* a = &cpu->sig[s];
+    if (old) {
+        kb_store(cpu, old, a->handler, 8);
+        kb_store(cpu, old + 8, a->flags, 8);
+        kb_store(cpu, old + 16, a->restorer, 8);
+        kb_store(cpu, old + 24, a->mask, 8);
+    }
+    if (!act) return 0;
+    a->handler = kb_load(cpu, act, 8);
+    a->flags = kb_load(cpu, act + 8, 8);
+    a->restorer = kb_load(cpu, act + 16, 8);
+    a->mask = kb_load(cpu, act + 24, 8);
+    host_install(cpu, s);
+    return 0;
+}
+
+/** after kb_resume: the host handlers for the guest's, which exec reset */
+void kb_sig_reinstall(struct kb_cpu* cpu) {
+    for (int s = 1; s <= 64; s++)
+        if (cpu->sig[s].handler > 1) host_install(cpu, s);
+}
+
+static void host_install(struct kb_cpu* cpu, int s) {
+    struct kb_sigaction* a = &cpu->sig[s];
+    int h = kb_host_sig(s);
+    if (!h || s == 11 || s == 8 || s == 4 || s == 7)
+        return; /* faults are raised by katybug */
+    struct sigaction hs;
+    memset(&hs, 0, sizeof hs);
+    if (a->handler == 0)
+        hs.sa_handler = SIG_DFL;
+    else if (a->handler == 1)
+        hs.sa_handler = SIG_IGN;
+    else {
+        hs.sa_handler = on_host_signal;
+        if (a->flags & 0x10000000) hs.sa_flags |= SA_RESTART;
+    }
+    sigfillset(&hs.sa_mask);
+    sigaction(h, &hs, NULL);
+}
+
+int64_t kb_sigprocmask(
+    struct kb_cpu* cpu, int how, uint64_t set, uint64_t old
+) {
+    if (old) kb_store(cpu, old, cpu->sigmask, 8);
+    if (!set) return 0;
+    uint64_t m = kb_load(cpu, set, 8);
+    if (how == 0)
+        cpu->sigmask |= m;
+    else if (how == 1)
+        cpu->sigmask &= ~m;
+    else if (how == 2)
+        cpu->sigmask = m;
+    else
+        return -22;
+    cpu->sigmask &=
+        ~((1ull << 8) | (1ull << 18)); /* sigkill and sigstop never block */
+    return 0;
+}
+
+/* a signal sent to this process: pending until unmasked; faults are delivered
+ * at once */
+void kb_raise(struct kb_cpu* cpu, int s, int code) {
+    if (s < 1 || s > 64) return;
+    pending_code[s] = code;
+    pending_bits[s] = 1;
+    any_pending = 1;
+    (void) cpu;
+}
+
+/* x86 rflags from the flag bits, and back */
+static uint64_t rflags(struct kb_cpu* cpu) {
+    return 0x202 | (uint64_t) cpu->c | ((uint64_t) cpu->p << 2) |
+           ((uint64_t) cpu->z << 6) | ((uint64_t) cpu->n << 7) |
+           ((uint64_t) cpu->v << 11);
+}
+
+static void set_rflags(struct kb_cpu* cpu, uint64_t f) {
+    cpu->c = (int) (f & 1);
+    cpu->p = (int) ((f >> 2) & 1);
+    cpu->z = (int) ((f >> 6) & 1);
+    cpu->n = (int) ((f >> 7) & 1);
+    cpu->v = (int) ((f >> 11) & 1);
+}
+
+/* the kernel's sigcontext order for x86-64: r8..r15, rdi, rsi, rbp, rbx, rdx,
+ * rax, rcx, rsp, rip */
+static const int x86_order[17] = {8, 9, 10, 11, 12, 13, 14, 15, 7,
+                                  6, 5, 3,  2,  0,  1,  4,  -1};
+
+static void deliver(struct kb_cpu* cpu, int s, int code, uint64_t addr) {
+    struct kb_sigaction* a = &cpu->sig[s];
+    uint64_t* r = cpu->r;
+    uint64_t frame;
+    if (cpu->arch == KB_X86) {
+        /* pretcode, then ucontext (uc_flags, uc_link, uc_stack[3],
+         * mcontext[32], sigmask), then siginfo */
+        uint64_t sp = (r[4] - 128) & ~15ull; /* the red zone */
+        uint64_t uc_size = 8 * (5 + 32 + 1);
+        frame = ((sp - 128 - uc_size - 8) & ~15ull) - 8;
+        uint64_t uc = frame + 8, info = uc + uc_size;
+        kb_store(cpu, frame, a->restorer, 8);
+        for (uint64_t i = 0; i < uc_size; i += 8) kb_store(cpu, uc + i, 0, 8);
+        uint64_t mc = uc + 40;
+        for (int i = 0; i < 16; i++)
+            kb_store(cpu, mc + 8 * (uint64_t) i, r[x86_order[i]], 8);
+        kb_store(cpu, mc + 8 * 16, cpu->pc, 8);
+        kb_store(cpu, mc + 8 * 17, rflags(cpu), 8);
+        kb_store(
+            cpu, uc + 40 + 8 * 32,
+            cpu->restore_mask ? cpu->saved_mask : cpu->sigmask, 8
+        );
+        for (uint64_t i = 0; i < 128; i += 8) kb_store(cpu, info + i, 0, 8);
+        kb_store(cpu, info, (uint64_t) s, 4);
+        kb_store(cpu, info + 8, (uint64_t) (uint32_t) code, 4);
+        kb_store(cpu, info + 16, addr, 8);
+        r[7] = (uint64_t) s;
+        r[6] = info;
+        r[2] = uc;
+        r[4] = frame;
+        r[0] = 0;
+    }
+    else {
+        /* siginfo, then ucontext: uc_flags, uc_link, uc_stack[3], sigmask[16],
+         * mcontext (16-aligned) */
+        uint64_t sp = r[31] & ~15ull;
+        uint64_t mc_off = 8 * 5 + 128; /* 168, aligned below */
+        mc_off = (mc_off + 15) & ~15ull;
+        uint64_t uc_size = mc_off + 8 + 8 * 31 + 8 * 3 + 16;
+        frame = (sp - 128 - uc_size) & ~15ull;
+        uint64_t info = frame, uc = frame + 128;
+        for (uint64_t i = 0; i < 128 + uc_size; i += 8)
+            kb_store(cpu, frame + i, 0, 8);
+        kb_store(cpu, info, (uint64_t) s, 4);
+        kb_store(cpu, info + 8, (uint64_t) (uint32_t) code, 4);
+        kb_store(cpu, info + 16, addr, 8);
+        kb_store(
+            cpu, uc + 40, cpu->restore_mask ? cpu->saved_mask : cpu->sigmask, 8
+        );
+        uint64_t mc = uc + mc_off;
+        kb_store(cpu, mc, addr, 8);
+        for (int i = 0; i < 31; i++)
+            kb_store(cpu, mc + 8 + 8 * (uint64_t) i, r[i], 8);
+        kb_store(cpu, mc + 8 + 8 * 31, r[31], 8);
+        kb_store(cpu, mc + 8 + 8 * 32, cpu->pc, 8);
+        uint64_t nzcv = ((uint64_t) cpu->n << 31) | ((uint64_t) cpu->z << 30) |
+                        ((uint64_t) cpu->c << 29) | ((uint64_t) cpu->v << 28);
+        kb_store(cpu, mc + 8 + 8 * 33, nzcv, 8);
+        r[0] = (uint64_t) s;
+        r[1] = info;
+        r[2] = uc;
+        r[30] = a->restorer;
+        r[31] = frame;
+    }
+    cpu->restore_mask = 0;
+    cpu->sigmask |= a->mask;
+    if (!(a->flags & 0x40000000))
+        cpu->sigmask |= 1ull << (s - 1);       /* SA_NODEFER */
+    if (a->flags & 0x80000000) a->handler = 0; /* SA_RESETHAND */
+    cpu->pc = a->handler;
+}
+
+/* rt_sigreturn: the handler's frame is at the stack pointer (x86: past the
+ * popped pretcode) */
+void kb_sigreturn(struct kb_cpu* cpu) {
+    uint64_t* r = cpu->r;
+    if (cpu->arch == KB_X86) {
+        uint64_t uc = r[4], mc = uc + 40;
+        uint64_t regs[18];
+        for (int i = 0; i < 18; i++)
+            regs[i] = kb_load(cpu, mc + 8 * (uint64_t) i, 8);
+        for (int i = 0; i < 16; i++) r[x86_order[i]] = regs[i];
+        cpu->pc = regs[16];
+        set_rflags(cpu, regs[17]);
+        cpu->sigmask = kb_load(cpu, uc + 40 + 8 * 32, 8);
+    }
+    else {
+        uint64_t uc = r[31] + 128;
+        uint64_t mc = uc + ((8 * 5 + 128 + 15) & ~15ull);
+        for (int i = 0; i < 31; i++)
+            r[i] = kb_load(cpu, mc + 8 + 8 * (uint64_t) i, 8);
+        r[31] = kb_load(cpu, mc + 8 + 8 * 31, 8);
+        cpu->pc = kb_load(cpu, mc + 8 + 8 * 32, 8);
+        uint64_t nzcv = kb_load(cpu, mc + 8 + 8 * 33, 8);
+        cpu->n = (int) ((nzcv >> 31) & 1);
+        cpu->z = (int) ((nzcv >> 30) & 1);
+        cpu->c = (int) ((nzcv >> 29) & 1);
+        cpu->v = (int) ((nzcv >> 28) & 1);
+        cpu->sigmask = kb_load(cpu, uc + 40, 8);
+    }
+    cpu->sigreturned = 1;
+}
+
+static void deliver_one(struct kb_cpu* cpu);
+
+/* delivers the lowest pending unmasked signal, if any; called between blocks */
+void kb_signals(struct kb_cpu* cpu) {
+    deliver_one(cpu);
+    if (cpu->restore_mask) {
+        cpu->sigmask = cpu->saved_mask;
+        cpu->restore_mask = 0;
+    }
+}
+
+/* a pending signal the mask lets through that would run a handler or end the
+ * process */
+static int deliverable(struct kb_cpu* cpu) {
+    for (int s = 1; s <= 64; s++) {
+        if (!pending_bits[s] || (cpu->sigmask & (1ull << (s - 1)))) continue;
+        uint64_t h = cpu->sig[s].handler;
+        if (h > 1 || (h == 0 && !ignored_by_default(s))) return 1;
+    }
+    return 0;
+}
+
+/** rt_sigsuspend: waits under the given mask for a signal to act on, then
+   returns EINTR; the handler's frame carries the caller's mask so sigreturn
+   restores it */
+int64_t kb_sigsuspend(struct kb_cpu* cpu, uint64_t mask) {
+    uint64_t old = cpu->sigmask;
+    cpu->sigmask = mask & ~((1ull << 8) | (1ull << 18));
+    sigset_t all, none, prev;
+    sigfillset(&all);
+    sigemptyset(&none);
+    sigprocmask(SIG_BLOCK, &all, &prev);
+    while (!deliverable(cpu)) sigsuspend(&none);
+    sigprocmask(SIG_SETMASK, &prev, NULL);
+    cpu->saved_mask = old;
+    cpu->restore_mask = 1;
+    return -4;
+}
+
+int64_t kb_sigpending(struct kb_cpu* cpu, uint64_t set) {
+    uint64_t m = 0;
+    for (int s = 1; s <= 64; s++)
+        if (pending_bits[s]) m |= 1ull << (s - 1);
+    kb_store(cpu, set, m & cpu->sigmask, 8);
+    return 0;
+}
+
+static void get_ts(struct kb_cpu* cpu, uint64_t va, struct timeval* tv) {
+    tv->tv_sec = (time_t) kb_load(cpu, va, 8);
+    tv->tv_usec = (suseconds_t) ((kb_load(cpu, va + 8, 8) + 999) / 1000);
+}
+
+static void put_itimer(
+    struct kb_cpu* cpu, uint64_t va, const struct itimerval* v, int nano
+) {
+    uint64_t k = nano ? 1000 : 1;
+    kb_store(cpu, va, (uint64_t) v->it_interval.tv_sec, 8);
+    kb_store(cpu, va + 8, (uint64_t) v->it_interval.tv_usec * k, 8);
+    kb_store(cpu, va + 16, (uint64_t) v->it_value.tv_sec, 8);
+    kb_store(cpu, va + 24, (uint64_t) v->it_value.tv_usec * k, 8);
+}
+
+/** getitimer, setitimer, alarm (-6) and one POSIX timer (timer_create,
+   _settime, _gettime, _getoverrun, _delete), all on the host's ITIMER_REAL;
+   generic syscall numbers */
+int64_t kb_timer(struct kb_cpu* cpu, int64_t nr, const uint64_t* a) {
+    struct itimerval nv, ov;
+    switch (nr) {
+        case -6: return (int64_t) alarm((unsigned) a[0]);
+        case 102:
+            if (a[0] != 0) return -22;
+            getitimer(ITIMER_REAL, &ov);
+            put_itimer(cpu, a[1], &ov, 0);
+            return 0;
+        case 103:
+            if (a[0] != 0) return -22;
+            nv.it_interval.tv_sec = (time_t) kb_load(cpu, a[1], 8);
+            nv.it_interval.tv_usec = (suseconds_t) kb_load(cpu, a[1] + 8, 8);
+            nv.it_value.tv_sec = (time_t) kb_load(cpu, a[1] + 16, 8);
+            nv.it_value.tv_usec = (suseconds_t) kb_load(cpu, a[1] + 24, 8);
+            if (setitimer(ITIMER_REAL, &nv, &ov) < 0) return kb_err(errno);
+            if (a[2]) put_itimer(cpu, a[2], &ov, 0);
+            return 0;
+        case 107: /* timer_create(clock, sigevent or NULL, id): SIGEV_SIGNAL
+                     only */
+        {
+            if (timer_sig) return -11;
+            int sig = 14;
+            if (a[1]) {
+                if (kb_load(cpu, a[1] + 12, 4) != 0) return -22;
+                sig = (int) kb_load(cpu, a[1] + 8, 4);
+            }
+            if (sig < 1 || sig > 64) return -22;
+            timer_sig = sig;
+            struct sigaction hs;
+            memset(&hs, 0, sizeof hs);
+            hs.sa_handler = on_host_signal;
+            hs.sa_flags = SA_RESTART;
+            sigfillset(&hs.sa_mask);
+            sigaction(SIGALRM, &hs, NULL);
+            kb_store(cpu, a[2], 0, 4);
+            return 0;
+        }
+        case 110: /* timer_settime(id, flags, new, old) */
+        {
+            if (!timer_sig || a[0] != 0) return -22;
+            get_ts(cpu, a[2], &nv.it_interval);
+            get_ts(cpu, a[2] + 16, &nv.it_value);
+            if ((a[1] & 1) &&
+                (nv.it_value.tv_sec || nv.it_value.tv_usec)) /* TIMER_ABSTIME */
+            {
+                struct timespec now;
+                clock_gettime(CLOCK_REALTIME, &now);
+                int64_t us =
+                    ((int64_t) nv.it_value.tv_sec - now.tv_sec) * 1000000 +
+                    nv.it_value.tv_usec - now.tv_nsec / 1000;
+                if (us < 1) us = 1;
+                nv.it_value.tv_sec = (time_t) (us / 1000000);
+                nv.it_value.tv_usec = (suseconds_t) (us % 1000000);
+            }
+            if (setitimer(ITIMER_REAL, &nv, &ov) < 0) return kb_err(errno);
+            if (a[3]) put_itimer(cpu, a[3], &ov, 1);
+            return 0;
+        }
+        case 108:
+            if (!timer_sig || a[0] != 0) return -22;
+            getitimer(ITIMER_REAL, &ov);
+            put_itimer(cpu, a[1], &ov, 1);
+            return 0;
+        case 109: return timer_sig && a[0] == 0 ? 0 : -22;
+        case 111:
+            if (!timer_sig || a[0] != 0) return -22;
+            memset(&nv, 0, sizeof nv);
+            setitimer(ITIMER_REAL, &nv, NULL);
+            timer_sig = 0;
+            return 0;
+    }
+    return -38;
+}
+
+static void deliver_one(struct kb_cpu* cpu) {
+    if (!any_pending) return;
+    any_pending = 0;
+    for (int s = 1; s <= 64; s++) {
+        if (!pending_bits[s]) continue;
+        if (cpu->sigmask & (1ull << (s - 1))) {
+            any_pending = 1;
+            continue;
+        }
+        pending_bits[s] = 0;
+        uint64_t h = cpu->sig[s].handler;
+        if (h == 1 || (h == 0 && ignored_by_default(s))) continue;
+        if (h == 0) {
+            terminate(cpu, s);
+            return;
+        }
+        deliver(cpu, s, pending_code[s], 0);
+        if (cpu->fault) {
+            cpu->fault = NULL;
+            terminate(cpu, 11);
+        }
+        return;
+    }
+}
+
+/** a fault in the guest: its handler if it has one, else death by that signal
+ */
+int kb_fault(struct kb_cpu* cpu, int s, int code, uint64_t addr) {
+    uint64_t h = cpu->sig[s].handler;
+    if (h <= 1 || (cpu->sigmask & (1ull << (s - 1)))) {
+        terminate(cpu, s);
+        return 0;
+    }
+    cpu->fault_code = code;
+    cpu->fault_addr = addr;
+    deliver(cpu, s, code, addr);
+    if (cpu->fault) /* the frame itself could not be written */
+    {
+        cpu->fault = NULL;
+        terminate(cpu, 11);
+        return 0;
+    }
+    return 1;
+}
