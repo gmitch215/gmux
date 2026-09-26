@@ -24,7 +24,7 @@ ln -s input.txt "$TMPDIR/l" && readlink "$TMPDIR/l"; realpath --relative-to=bin 
 yes x | head -3; false; echo $?
 dd if=input.txt bs=4 count=2 status=none | od -c
 timeout 5 sleep 0.1; echo $?; timeout 0.2 sleep 5; echo $?
-env -i A=1 B=2 env
+env -i A=1 B=2 ubin/env
 shuf -i 1-9 --random-source=input.txt | tr '\n' ' '
 fold -w 10 input.txt | head -3; fmt -w 20 input.txt | head -3
 pr -2 -t -w 40 numbers.txt

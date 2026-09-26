@@ -5,11 +5,22 @@
 # status must match. busybox/commands.txt runs against Alpine's busybox-static; userland/commands.txt
 # adds coreutils, bash, sqlite3 and curl built from pinned sources by userland-build.sh.
 # usage: tests/c/katybug/transcript.sh [busybox|userland]...  (default: both); KATYBUG_FORK=exec sends
-# every guest fork through fork.c's exec and state transfer, as on wasm
+# every guest fork through fork.c's exec and state transfer, as on wasm; NATIVE_HOST=local runs the
+# native side on this machine, which must be Linux x86-64 with docker (CI's runner)
 set -euo pipefail
 here=$(cd "$(dirname "$0")" && pwd)
 root=$(cd "$here/../../.." && pwd)
 host=${NATIVE_HOST:-paisley-park}
+on_host() {
+	if [ "$host" = local ]; then (cd && sh -c "$1"); else ssh "$host" "$1"; fi
+}
+to_host() {
+	if [ "$host" = local ]; then
+		mkdir -p "$HOME/$(dirname "$2")" && cp "$1" "$HOME/$2"
+	else
+		scp -q "$1" "$host:$2"
+	fi
+}
 suites=${*:-busybox userland}
 out=$(mktemp -d)
 cc -std=c11 -D_DEFAULT_SOURCE -D_DARWIN_C_SOURCE -O2 -o "$out/katybug" "$root"/src/gmux/katybug/*.c -lm
@@ -17,14 +28,14 @@ cc -std=c11 -D_DEFAULT_SOURCE -D_DARWIN_C_SOURCE -O2 -o "$out/katybug" "$root"/s
 # the work tree both sides see: inputs, the binaries, bin/ and ubin/ of links, and the runner
 mkdir -p "$out/t/bin" "$out/t/ubin" "$out/tmp"
 cp "$here"/busybox/input.txt "$here"/busybox/numbers.txt "$out/t/"
-ssh "$host" 'docker run --rm --memory 1g --cpus 2 alpine:3.20 sh -c "apk add --no-cache busybox-static > /dev/null && cat /bin/busybox.static"' > "$out/t/busybox"
+on_host 'docker run --rm --memory 1g --cpus 2 alpine:3.20 sh -c "apk add --no-cache busybox-static > /dev/null && cat /bin/busybox.static"' > "$out/t/busybox"
 case " $suites " in *" userland "*)
-	scp -q "$here/userland-build.sh" "$host:gmux-rig/k3/build.sh"
-	ssh "$host" 'mkdir -p ~/gmux-rig/k3/src ~/gmux-rig/k3/out && cd ~/gmux-rig/k3 &&
+	to_host "$here/userland-build.sh" gmux-rig/k3/build.sh
+	on_host 'mkdir -p ~/gmux-rig/k3/src ~/gmux-rig/k3/out && cd ~/gmux-rig/k3 &&
 		{ [ -f out/curl ] || docker run --rm --memory 4g --cpus 6 -v "$PWD/src:/src" -v "$PWD/out:/out" \
 			-v "$PWD/build.sh:/build.sh:ro" alpine:3.20 sh /build.sh > build.log 2>&1; } &&
 		tar -C out -cf - bash coreutils curl sqlite3' | tar -C "$out/t/ubin" -xf -
-	for p in $(ssh "$host" 'docker run --rm --memory 1g --cpus 2 -v "$HOME/gmux-rig/k3/out:/o:ro" alpine:3.20 /o/coreutils --help' | sed -n 's/^ \[ //p'); do
+	for p in $(on_host 'docker run --rm --memory 1g --cpus 2 -v "$HOME/gmux-rig/k3/out:/o:ro" alpine:3.20 /o/coreutils --help' | sed -n 's/^ \[ //p'); do
 		ln -s coreutils "$out/t/ubin/$p"
 	done
 	ln -s coreutils "$out/t/ubin/["
@@ -52,7 +63,7 @@ EOF
 chmod +x "$out/t/run.sh"
 for s in $suites; do cp "$here/$s/commands.txt" "$out/t/$s.txt"; done
 
-tar -C "$out" -cf - t | ssh "$host" 'mkdir -p ~/gmux-rig/t1/bbt && tar -C ~/gmux-rig/t1/bbt -xf -'
+tar -C "$out" -cf - t | on_host 'mkdir -p ~/gmux-rig/t1/bbt && tar -C ~/gmux-rig/t1/bbt -xf -'
 # the same tree, less its links, for transcript-gmux.ts and tests/c/run.ts's userland probe
 keep=$root/build/katybug/transcript
 mkdir -p "$keep/ubin"
@@ -63,7 +74,7 @@ if [ -f "$out/t/ubin/bash" ]; then
 fi
 fail=0
 for s in $suites; do
-	ssh "$host" "docker run --rm --memory 1g --cpus 2 -v \"\$HOME/gmux-rig/t1/bbt/t:/t\" alpine:3.20 /t/run.sh $s" > "$out/$s.native.txt"
+	on_host "docker run --rm --memory 1g --cpus 2 -v \"\$HOME/gmux-rig/t1/bbt/t:/t\" alpine:3.20 /t/run.sh $s" > "$out/$s.native.txt"
 	cp "$out/$s.native.txt" "$keep/"
 	TMPDIR=$out/tmp "$out/t/run.sh" "$s" "$out/katybug" > "$out/$s.katybug.txt"
 	echo "# $s"
