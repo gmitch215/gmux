@@ -33,7 +33,8 @@ fi
 
 # staged before the branch switch, because these only exist on the source branch
 cp docs/index.html "$tmpdir/index.html"
-cp docs/CNAME "$tmpdir/CNAME"
+# a custom domain is optional: without docs/CNAME, Pages serves the github.io address
+[[ -f docs/CNAME ]] && cp docs/CNAME "$tmpdir/CNAME"
 
 if git fetch origin gh-pages 2> /dev/null; then
 	git branch --no-track -f gh-pages origin/gh-pages 2> /dev/null || true
@@ -55,11 +56,12 @@ rm -rf typedoc
 cp -R "$tmpdir/typedoc" typedoc
 cp "$tmpdir/index.html" index.html
 # rewritten every deploy, because an orphan branch starts without it and Pages drops the domain
-cp "$tmpdir/CNAME" CNAME
+[[ -f "$tmpdir/CNAME" ]] && cp "$tmpdir/CNAME" CNAME
 
 # scoped rather than 'git add -A': the working tree still holds source, build output and
 # node_modules, and gh-pages carries no .gitignore to keep them out
-git add -A -- typedoc index.html CNAME
+git add -A -- typedoc index.html
+[[ -f CNAME ]] && git add -- CNAME
 
 if git diff --cached --quiet; then
 	echo "No TypeDoc changes to deploy."

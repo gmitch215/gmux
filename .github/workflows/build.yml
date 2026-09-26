@@ -1,0 +1,213 @@
+name: Build Project
+
+on:
+  push:
+    branches: [master, ver/*, feat/*, renovate/*]
+  pull_request:
+    branches: [master, ver/*, feat/*, renovate/*]
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  gate:
+    name: Gate Suite
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    permissions:
+      contents: read
+
+    steps:
+      - uses: actions/checkout@v7
+      - name: Set up Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 'latest'
+      - name: Set up Node with JSPI
+        uses: actions/setup-node@v7
+        with:
+          node-version: '26'
+      - name: Install Dependencies
+        run: bun install --frozen-lockfile --ignore-scripts
+      - name: Typecheck
+        run: bun run typecheck
+      - name: Run Vitest Suite
+        run: bun run test
+      - name: Build the Library
+        run: bunx tsc -p ./tsconfig.build.json
+      - name: Install wabt
+        run: sudo apt-get install -y wabt
+      - name: Katybug Wasm Corpus Against V8
+        run: bash tests/c/katybug/wasm-ops.sh
+
+  probes:
+    name: Kernel Probes
+    runs-on: ubuntu-latest
+    needs: gate
+    timeout-minutes: 30
+    outputs:
+      pinned: ${{ steps.lock.outputs.pinned }}
+
+    permissions:
+      contents: read
+
+    steps:
+      - uses: actions/checkout@v7
+      - name: Check for a Pinned Build
+        id: lock
+        run: |
+          if [ -f build.lock.json ]; then
+            echo "pinned=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "pinned=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::build.lock.json is absent, so there is no kernel to probe. Publish one with bun run release:payload --publish."
+          fi
+      - name: Set up Bun
+        if: steps.lock.outputs.pinned == 'true'
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 'latest'
+      - name: Set up Node
+        if: steps.lock.outputs.pinned == 'true'
+        uses: actions/setup-node@v7
+        with:
+          node-version: '26'
+      - name: Install Dependencies
+        if: steps.lock.outputs.pinned == 'true'
+        run: bun install --frozen-lockfile --ignore-scripts
+      - name: Hydrate the Pinned Build
+        if: steps.lock.outputs.pinned == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: bun run hydrate
+      - name: Run the Probes
+        if: steps.lock.outputs.pinned == 'true'
+        run: bun run test:probes
+      - name: Run the Probes on a Frozen Clock
+        if: steps.lock.outputs.pinned == 'true'
+        run: FROZEN=1 bun run test:probes
+      - name: Run the Probes on Shared Instances
+        if: steps.lock.outputs.pinned == 'true'
+        run: SHARE=1 bun run test:probes
+      - name: Run the amd64 Transcripts Inside a Machine
+        if: steps.lock.outputs.pinned == 'true'
+        run: node --no-warnings --experimental-strip-types tests/c/katybug/transcript-gmux.ts
+
+  snapshot:
+    name: Snapshot Publish
+    runs-on: ubuntu-latest
+    needs: [gate, probes]
+    if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/master' && needs.probes.outputs.pinned == 'true' }}
+    timeout-minutes: 15
+
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - uses: actions/checkout@v7
+      - name: Set up Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 'latest'
+      - name: Set up Node for GitHub Packages
+        uses: actions/setup-node@v7
+        with:
+          node-version: '26'
+          registry-url: 'https://npm.pkg.github.com'
+          scope: '@gmitch215'
+      - name: Install Dependencies
+        run: bun install --frozen-lockfile --ignore-scripts
+      - name: Hydrate the Pinned Build
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: bun run hydrate
+      - name: Stamp the Version with the Commit
+        id: stamp
+        run: |
+          VERSION=$(node -p "require('./package.json').version")
+          SNAPSHOT="${VERSION}-${GITHUB_SHA::7}"
+          npm version "$SNAPSHOT" --no-git-tag-version
+          echo "version=$SNAPSHOT" >> $GITHUB_OUTPUT
+      - name: Build
+        run: bun run build
+      - name: Publish to GitHub Packages
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: npm publish --access public --tag snapshot --ignore-scripts
+      - name: Snapshot to Job Summary
+        if: always()
+        env:
+          SNAPSHOT: ${{ steps.stamp.outputs.version }}
+        run: |
+          echo "## Snapshot publish" >> $GITHUB_STEP_SUMMARY
+          echo "- Package: \`@gmitch215/gmux@${SNAPSHOT}\`" >> $GITHUB_STEP_SUMMARY
+          echo "- Registry: GitHub Packages" >> $GITHUB_STEP_SUMMARY
+          echo "- Install: \`bun add @gmitch215/gmux@${SNAPSHOT}\`" >> $GITHUB_STEP_SUMMARY
+
+  image:
+    name: Publish Dev Image to ghcr.io
+    runs-on: ubuntu-latest
+    needs: [gate, probes]
+    if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/master' && needs.probes.outputs.pinned == 'true' }}
+    timeout-minutes: 30
+
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - uses: actions/checkout@v7
+      - name: Set up Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 'latest'
+      - name: Install Dependencies
+        run: bun install --frozen-lockfile --ignore-scripts
+      - name: Hydrate the Pinned Build
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: bun run hydrate
+      - name: Set Up Buildx
+        uses: docker/setup-buildx-action@v3
+      - name: Log In to ghcr.io
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Build the Image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: docker/Dockerfile
+          load: true
+          tags: gmux:check
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+      - name: Smoke the Image
+        run: |
+          docker run -d --rm --name gmux-check -p 8787:8787 gmux:check
+          for i in $(seq 1 60); do curl -fs http://127.0.0.1:8787/_gmux/status > /dev/null && break; sleep 1; done
+          bun run smoke http://127.0.0.1:8787
+          docker stop gmux-check
+      - name: Derive the Tags
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/gmitch215/gmux
+          tags: |
+            type=raw,value=dev
+            type=sha,format=long
+      - name: Push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: docker/Dockerfile
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha

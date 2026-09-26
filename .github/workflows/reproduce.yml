@@ -1,0 +1,75 @@
+name: Reproduce the Build
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '17 6 * * 0'
+
+concurrency:
+  group: ${{ github.workflow }}
+
+jobs:
+  reproduce:
+    name: Rebuild from Source and Compare
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+
+    permissions:
+      contents: read
+
+    steps:
+      - uses: actions/checkout@v7
+      - name: Check for a Pinned Build
+        id: lock
+        run: |
+          if [ -f build.lock.json ]; then
+            echo "pinned=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "pinned=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::build.lock.json is absent, so there is no published build to compare against."
+          fi
+      - name: Free Disk for the LLVM Build
+        if: steps.lock.outputs.pinned == 'true'
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          df -h /
+      - name: Install the Staging Tools
+        if: steps.lock.outputs.pinned == 'true'
+        run: sudo apt-get install -y wabt
+      - name: Set up Bun
+        if: steps.lock.outputs.pinned == 'true'
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 'latest'
+      - name: Install Dependencies
+        if: steps.lock.outputs.pinned == 'true'
+        run: bun install --frozen-lockfile --ignore-scripts
+      - name: Run the Pipeline from Source
+        if: steps.lock.outputs.pinned == 'true'
+        run: CPUS=4 MEMORY=14g scripts/build-linux.sh "$RUNNER_TEMP/rebuild"
+      - name: Stage the Rebuild
+        if: steps.lock.outputs.pinned == 'true'
+        run: |
+          scripts/build-kernel.sh "$RUNNER_TEMP/rebuild/out"
+          mkdir -p build/probes
+          cp "$RUNNER_TEMP/rebuild/out/probes/"* build/probes/
+      - name: Compare Against the Published Build
+        if: steps.lock.outputs.pinned == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/published"
+          gh release download "$(jq -r .tag build.lock.json)" --dir "$RUNNER_TEMP/published" --pattern manifest.json
+          jq -r '.files | to_entries[] | select(.key | test("^(kernel|probes)/")) | "\(.value)  build/\(.key)"' \
+            "$RUNNER_TEMP/published/manifest.json" > "$RUNNER_TEMP/expected.sums"
+          sha256sum -c "$RUNNER_TEMP/expected.sums" | tee "$RUNNER_TEMP/result.txt"
+      - name: Reproduction to Job Summary
+        if: always() && steps.lock.outputs.pinned == 'true'
+        run: |
+          echo "## Reproduction" >> $GITHUB_STEP_SUMMARY
+          echo "Pinned build: \`$(jq -r .tag build.lock.json)\`" >> $GITHUB_STEP_SUMMARY
+          {
+            echo '```txt'
+            cat "$RUNNER_TEMP/result.txt" 2> /dev/null || echo 'the comparison did not run'
+            echo '```'
+          } >> $GITHUB_STEP_SUMMARY

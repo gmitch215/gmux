@@ -1,0 +1,40 @@
+name: Publish Documentation
+
+on:
+  push:
+    branches: [master]
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - name: Set up Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 'latest'
+      - name: Install Doxygen
+        run: sudo apt-get install -y doxygen
+      - name: Install Dependencies
+        run: bun install --frozen-lockfile --ignore-scripts
+      - name: Build the TypeScript Reference
+        run: bun run docs:build
+      - name: Build the C Reference
+        run: bun run docs:c
+      - name: Build the Front Page
+        run: bun run docs:site
+      - name: Deploy the TypeScript Reference
+        run: bash typedoc.sh "${GITHUB_SHA::7}"
+      - name: Deploy the C Reference
+        run: bash doxygen.sh "${GITHUB_SHA::7}"
