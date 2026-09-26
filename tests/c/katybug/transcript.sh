@@ -31,9 +31,12 @@ cp "$here"/busybox/input.txt "$here"/busybox/numbers.txt "$out/t/"
 on_host 'docker run --rm --memory 1g --cpus 2 alpine:3.20 sh -c "apk add --no-cache busybox-static > /dev/null && cat /bin/busybox.static"' > "$out/t/busybox"
 case " $suites " in *" userland "*)
 	to_host "$here/userland-build.sh" gmux-rig/k3/build.sh
-	on_host 'mkdir -p ~/gmux-rig/k3/src ~/gmux-rig/k3/out && cd ~/gmux-rig/k3 &&
-		{ [ -f out/curl ] || docker run --rm --memory 4g --cpus 6 -v "$PWD/src:/src" -v "$PWD/out:/out" \
-			-v "$PWD/build.sh:/build.sh:ro" alpine:3.20 sh /build.sh > build.log 2>&1; } &&
+	# docker refuses --cpus above the host's count (a CI runner has 4)
+	on_host 'c=$(nproc); [ "$c" -le 6 ] || c=6
+		mkdir -p ~/gmux-rig/k3/src ~/gmux-rig/k3/out && cd ~/gmux-rig/k3 &&
+		{ [ -f out/curl ] || docker run --rm --memory 4g --cpus "$c" -v "$PWD/src:/src" -v "$PWD/out:/out" \
+			-v "$PWD/build.sh:/build.sh:ro" alpine:3.20 sh /build.sh > build.log 2>&1 ||
+			{ tail -40 build.log >&2; false; }; } &&
 		tar -C out -cf - bash coreutils curl sqlite3' | tar -C "$out/t/ubin" -xf -
 	for p in $(on_host 'docker run --rm --memory 1g --cpus 2 -v "$HOME/gmux-rig/k3/out:/o:ro" alpine:3.20 /o/coreutils --help' | sed -n 's/^ \[ //p'); do
 		ln -s coreutils "$out/t/ubin/$p"
