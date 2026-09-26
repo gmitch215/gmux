@@ -1,0 +1,13 @@
+#!/bin/sh
+# linux-wasm's init, plus gmux's boot script: init -s is single-user mode, which skips rcS
+mount -t proc none /proc
+mount -t sysfs none /sys
+# devtmpfs does not mount itself over an initramfs; without it /dev/null is a file that fills RAM
+mkdir -p /dev
+mount -t devtmpfs none /dev
+# the links every Linux userland assumes (bash's process substitution opens /dev/fd/N)
+[ -e /dev/fd ] || ln -s /proc/self/fd /dev/fd
+for n in 0:stdin 1:stdout 2:stderr; do [ -e /dev/${n#*:} ] || ln -s /proc/self/fd/${n%%:*} /dev/${n#*:}; done
+[ -x /etc/init.d/rcS ] && /etc/init.d/rcS
+
+exec /sbin/init -s
