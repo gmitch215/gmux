@@ -213,6 +213,14 @@ static uint64_t trap_block(struct dec* d, int kind) {
     return d->trap_pc[kind] = pc;
 }
 
+/* ends the current block in a trap; the trap block first, since adding it can
+ * move the block array under a pointer taken before */
+static void end_in_trap(struct dec* d, int kind) {
+    uint64_t pc = trap_block(d, kind);
+    blk(d)->next = pc;
+    d->cur = -1;
+}
+
 /* leaves to `target` when register a is zero (nz 0) or nonzero (nz 1), else
    continues in a new block */
 static void branch_if(struct dec* d, int a, int nz, uint64_t target) {
@@ -524,8 +532,7 @@ static int decode(uint32_t index) {
         }
         switch (op) {
             case 0x00: /* unreachable */
-                blk(&d)->next = trap_block(&d, TR_UNREACHABLE);
-                d.cur = -1;
+                end_in_trap(&d, TR_UNREACHABLE);
                 top->dead = 1;
                 break;
             case 0x01: break;
@@ -628,8 +635,7 @@ static int decode(uint32_t index) {
             case 0x10: { /* call */
                 uint32_t callee = U32(p);
                 if ((int) callee < m.nimports) {
-                    blk(&d)->next = trap_block(&d, TR_IMPORT);
-                    d.cur = -1;
+                    end_in_trap(&d, TR_IMPORT);
                     top->dead = 1;
                     break;
                 }
@@ -798,8 +804,7 @@ static int decode(uint32_t index) {
                 /* floats, memory.grow, bulk memory, SIMD: trap where they run
                  */
                 skip(&p, op);
-                blk(&d)->next = trap_block(&d, TR_UNSUPPORTED);
-                d.cur = -1;
+                end_in_trap(&d, TR_UNSUPPORTED);
                 top->dead = 1;
                 break;
         }
