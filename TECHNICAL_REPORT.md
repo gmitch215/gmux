@@ -936,7 +936,11 @@ bash tests/c/katybug/wasm-ops.sh  # Katybug's wasm frontend against V8 (needs a 
 
 The probes boot the real kernel from `build/`, which is not committed. Either download a release's
 build (`bun run hydrate`, checked against its `SHA256SUMS`) or build it on a Linux host with Docker
-(`scripts/build-linux.sh <new dir>`, then `scripts/build-kernel.sh <dir>/out`). Then:
+(`scripts/build-linux.sh <new dir>`, then `scripts/build-kernel.sh <dir>/out`). CI does the second on
+every push: `build.yml` runs the pipeline from source with the LLVM toolchain cached by its pins,
+stages the result, uploads it as the `gmux-build` artifact, and the probes, the snapshot package and
+the dev image all use that artifact (`bun run hydrate --from=payload/gmux-build.tar.gz`).
+`build.lock.json` pins the payload a cut release ships. Then:
 
 ```sh
 node --no-warnings --experimental-strip-types tests/c/run.ts            # every probe
