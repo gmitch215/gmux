@@ -154,7 +154,7 @@ bun run format:check
 
 - [Technical report](TECHNICAL_REPORT.md): architecture, platform constraints, measured costs
 - [Security](SECURITY.md): trust model and threat matrix
-- TypeScript API and C reference: the project's GitHub Pages site
+- [TypeScript API](https://gmux.gmitch215.dev/typedoc/) and [C reference](https://gmux.gmitch215.dev/doxygen/)
 
 ## 📄 License
 

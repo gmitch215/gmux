@@ -1,0 +1,48 @@
+@import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;600&family=Noto+Sans:wght@400;600&family=Space+Grotesk:wght@500;700&display=swap');
+
+/* gmitch215.dev's brand over Doxygen's generated theme; HTML_COLORSTYLE_HUE tints the rest */
+body,
+table,
+div,
+p,
+dl {
+	font-family: 'Noto Sans', ui-sans-serif, system-ui, sans-serif;
+}
+
+#projectname,
+.title,
+h1,
+h2,
+h3,
+.memtitle {
+	font-family: 'Space Grotesk', 'Noto Sans', ui-sans-serif, sans-serif;
+}
+
+code,
+pre,
+div.fragment,
+div.line,
+.memname,
+.memproto {
+	font-family: 'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, monospace;
+}
+
+a,
+a.el,
+.contents a:visited {
+	color: #497800;
+}
+
+div.fragment,
+.memproto,
+.memdoc {
+	border-radius: 0.6rem;
+}
+
+@media (prefers-color-scheme: dark) {
+	a,
+	a.el,
+	.contents a:visited {
+		color: #bcff43;
+	}
+}

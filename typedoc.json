@@ -4,6 +4,8 @@
 	"out": "build-typedoc",
 	"name": "gmux",
 	"readme": "./README.md",
+	"customCss": "./docs/typedoc.css",
+	"favicon": "./assets/gmux.ico",
 	"includeVersion": true,
 	"excludeInternal": true,
 	"excludePrivate": true,
