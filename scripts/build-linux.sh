@@ -10,10 +10,19 @@ if [ -e "$work" ]; then
 	echo "$work exists; the pipeline only builds into a new directory" >&2
 	exit 1
 fi
-pin() { python3 -c "import json; print(json.load(open('$root/src/sources.json'))['$1']['$2'])"; }
 cpus=${CPUS:-8}
 mkdir -p "$work/repo" "$work/out/probes"
 work=$(cd "$work" && pwd)
+# the host's TypeScript steps: bun or node, or node in docker on a host with neither
+ts() {
+	if command -v bun > /dev/null 2>&1 || command -v node > /dev/null 2>&1; then
+		"$root/scripts/ts" "$@"
+	else
+		docker run --rm -u "$(id -u):$(id -g)" -v "$root:$root:ro" -v "$work:$work" node:26-bookworm-slim \
+			node --no-warnings --experimental-strip-types "$@"
+	fi
+}
+pin() { ts "$root/scripts/pin.ts" "$1" "$2"; }
 # the container sees the patches, the gmux runtime, cc-strict and the probes through /rig/repo
 cp -R "$root/scripts" "$root/src" "$root/tests" "$work/repo/"
 
@@ -84,9 +93,9 @@ done
 run "cd $W/src/kernel && make O=$W/build/kernel-$V ARCH=wasm LLVM=/rig/linux-wasm/tools/fake-llvm/ \
 	REAL_LLVM=$W/install/llvm/bin/ CROSS_COMPILE=wasm32-unknown-unknown- HOSTCC=gcc \
 	arch/wasm/kernel/syscall_table.i > /dev/null
-	cp $W/build/kernel-$V/arch/wasm/kernel/syscall_table.i /rig/out/
-	python3 /rig/repo/scripts/kernel/syscall-adapters.py /rig/out/syscall_table.i \
-		$W/install/kernel-$V/vmlinux.wasm /rig/out/syscall_adapters.c"
+	cp $W/build/kernel-$V/arch/wasm/kernel/syscall_table.i /rig/out/"
+ts "$root/scripts/kernel/syscall-adapters.ts" "$work/out/syscall_table.i" \
+	"$lw/workspace/install/kernel-$V/vmlinux.wasm" "$work/out/syscall_adapters.c" >> "$work/out/build.log"
 if ! cmp -s "$work/out/syscall_adapters.c" "$src/kernel/arch/wasm/kernel/syscall_adapters.c"; then
 	echo "the built kernel generates different syscall adapters: put $work/out/syscall_adapters.c" \
 		"in patch 0004 and build again" >&2

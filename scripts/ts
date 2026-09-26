@@ -1,0 +1,6 @@
+#!/bin/sh
+# runs a TypeScript script with bun, or with node (which strips the types) where there is no bun
+if command -v bun > /dev/null 2>&1; then
+	exec bun "$@"
+fi
+exec node --no-warnings --experimental-strip-types "$@"

@@ -4,6 +4,7 @@ import { mkdtempSync, readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { Machine } from '../../src/worker/machine/machine.ts';
+import { appendCpio } from './cpio-append.ts';
 
 /**
  * Runs a wasm32-linux program on the target: a machine booted from $GMUX_BUILD (default build/) runs
@@ -24,12 +25,7 @@ const kernel = join(build, 'kernel');
 const manifest = JSON.parse(readFileSync(join(kernel, 'manifest.json'), 'utf8'));
 const scratch = mkdtempSync(join(tmpdir(), 'gmux-target-'));
 execFileSync(join(root, 'scripts/wasm/instrument.sh'), [program, join(scratch, 'fueled.wasm')]);
-execFileSync('python3', [
-	join(root, 'scripts/wasm/cpio-append.py'),
-	join(kernel, 'initramfs.bin'),
-	join(scratch, 'initrd.cpio'),
-	`/t=${program}`
-]);
+appendCpio(join(kernel, 'initramfs.bin'), join(scratch, 'initrd.cpio'), [`/t=${program}`]);
 
 let output = '';
 const machine = new Machine({

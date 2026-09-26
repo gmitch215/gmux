@@ -13,20 +13,20 @@ keep+=,wasm_user_stack_low,wasm_user_stack_high,wasm_trap_unwound_kernel,wasm_us
 keep+=,wasm_owner_table,wasm_current_owner,wasm_current_euid,wasm_current_mm,wasm_console_irq
 for n in 0 1 2 3 4 5 6; do keep+=",wasm_syscall_$n"; done
 wasm2wat --enable-threads "$in/vmlinux.wasm" -o "$tmp/vmlinux.wat"
-python3 "$root/scripts/wasm/strip-exports.py" "$tmp/vmlinux.wat" "$tmp/vmlinux.min.wat" "$keep"
+"$root/scripts/ts" "$root/scripts/wasm/strip-exports.ts" "$tmp/vmlinux.wat" "$tmp/vmlinux.min.wat" "$keep"
 wat2wasm --enable-threads "$tmp/vmlinux.min.wat" -o "$tmp/vmlinux.min.wasm"
-python3 "$root/scripts/wasm/export-globals.py" "$tmp/vmlinux.min.wasm" "$out/vmlinux.wasm" \
+"$root/scripts/ts" "$root/scripts/wasm/export-globals.ts" "$tmp/vmlinux.min.wasm" "$out/vmlinux.wasm" \
 	gmux_sp=0 gmux_tls=1 gmux_current=4 gmux_usp=5 gmux_utls=6
-python3 "$root/scripts/wasm/memory-note.py" "$out/vmlinux.wasm"
+"$root/scripts/ts" "$root/scripts/wasm/memory-note.ts" "$out/vmlinux.wasm"
 "$root/scripts/wasm/instrument.sh" "$in/busybox.wasm" "$out/busybox.wasm"
 # the same BusyBox runnable by every process on one instance (MachineOptions.shareInstances)
-python3 "$root/scripts/wasm/share.py" "$in/busybox.wasm" "$out/busybox.wasm" "$out/busybox.share.wasm"
+"$root/scripts/ts" "$root/scripts/wasm/share.ts" "$in/busybox.wasm" "$out/busybox.wasm" "$out/busybox.share.wasm"
 # and the build a non-root task runs, every store checked against the page owner table
 wasm2wat --enable-threads --enable-exceptions --generate-names "$in/busybox.wasm" -o "$tmp/busybox.wat"
-python3 "$root/scripts/wasm/guard-pass.py" "$tmp/busybox.wat" "$tmp/busybox.guard.wat" --inline > /dev/null
+"$root/scripts/ts" "$root/scripts/wasm/guard-pass.ts" "$tmp/busybox.wat" "$tmp/busybox.guard.wat" --inline > /dev/null
 wat2wasm --enable-threads --enable-exceptions --enable-multi-memory "$tmp/busybox.guard.wat" -o "$tmp/busybox.guard.wasm"
 "$root/scripts/wasm/instrument.sh" "$tmp/busybox.guard.wasm" "$out/busybox.guard.wasm"
-python3 "$root/scripts/wasm/exec-stubs.py" "$in/initramfs.cpio.gz" "$out/initramfs.bin"
+"$root/scripts/ts" "$root/scripts/wasm/exec-stubs.ts" "$in/initramfs.cpio.gz" "$out/initramfs.bin"
 # the registry keys: the hashes of the unfueled busybox and katybug the stubs carry
 sum=$(shasum -a 256 "$in/busybox.wasm" | cut -d' ' -f1)
 if [ -f "$in/katybug.wasm" ]; then

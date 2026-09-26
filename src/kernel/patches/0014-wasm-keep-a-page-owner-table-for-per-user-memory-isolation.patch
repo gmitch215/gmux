@@ -170,7 +170,7 @@ tasks are not checked.
 + * tag of the mm whose private mapping covers it, WASM_OWNER_SHARED for a writable shared mapping,
 + * WASM_OWNER_SHARED_RO for a read-only shared or overlaid one, 0 for the kernel's and free pages. The
 + * host runs a non-root task's programs in a build that checks every store against it
-+ * (scripts/wasm/guard-pass.py), and access_ok checks a non-root task's syscall buffers against it.
++ * (scripts/wasm/guard-pass.ts), and access_ok checks a non-root task's syscall buffers against it.
 + */
 +
 +#include <linux/cred.h>

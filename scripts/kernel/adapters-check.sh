@@ -8,7 +8,7 @@ tree=${3:?}
 here=$(cd "$(dirname "$0")" && pwd)
 current=$tree/arch/wasm/kernel/syscall_adapters.c
 next=$(mktemp)
-python3 "$here/syscall-adapters.py" "$table" "$vmlinux" "$next"
+"$here/../ts" "$here/syscall-adapters.ts" "$table" "$vmlinux" "$next"
 if cmp -s "$next" "$current"; then
 	echo "fixed point"
 else
