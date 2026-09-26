@@ -49,6 +49,11 @@ vfork=$(rt vfork.c) || exit 1
 dlo=$(rt dl.c) || exit 1
 dl=${dlo%.o}.a
 [ -f "$dl" ] || "${LINUX_WASM:-/rig/linux-wasm}/tools/fake-llvm/llvm-ar" rcs "$dl" "$dlo" || exit 1
+# the module reader, built once with the host's cc (renamed into place: make runs links in parallel)
+imports=${TMPDIR:-/tmp}/gmux-wasm-imports-$(cksum < "$here/wasm-imports.c" | cut -d' ' -f1)
+if [ ! -x "$imports" ]; then
+	cc -O2 -o "$imports.$$" "$here/wasm-imports.c" && mv -f "$imports.$$" "$imports" || exit 1
+fi
 printf 'int __gmux_main(int c, char **v, char **e) { return 0; }\n' > "$tmp/probe.c"
 "$REAL" $TARGET -c "$tmp/probe.c" -o "$tmp/probe.o" || exit 1
 # a first link shows which main the program defines (--export-all exports every function)
@@ -56,7 +61,7 @@ printf 'int __gmux_main(int c, char **v, char **e) { return 0; }\n' > "$tmp/prob
 	cat "$tmp/probe.log" >&2
 	exit 1
 }
-ex=$(python3 "$here/wasm-imports.py" --exports "$tmp/probe.wasm")
+ex=$("$imports" --exports "$tmp/probe.wasm")
 if grep -qx __main_argc_argv <<< "$ex"; then
 	call='int __main_argc_argv(int, char **); return __main_argc_argv(c, v);'
 elif grep -qx __main_void <<< "$ex"; then
@@ -72,7 +77,7 @@ printf 'int __gmux_main(int c, char **v, char **e) { %s }\n' "$call" > "$tmp/mai
 "$REAL" $SJLJ "${sys[@]}" -nostartfiles "$crt" "$sjlj" "$tag" "$vfork" "$dl" "$@" "$tmp/main.o" -lc || exit $?
 [ -f "$out" ] || exit 0
 allowed='^(__wasm_syscall_[0-6]|__wasm_abort|__gmux_vfork|__gmux_vfork_exec|__gmux_vfork_exit|__gmux_fork|__gmux_dl(prep|open|sym|close|error)|__stack_pointer|__memory_base|__table_base|__indirect_function_table|memory)$'
-bad=$(python3 "$here/wasm-imports.py" "$out" | grep -v -E "$allowed")
+bad=$("$imports" "$out" | grep -v -E "$allowed")
 if [ -n "$bad" ]; then
 	echo "cc-strict: unresolved: $(echo $bad | cut -c1-300)" >&2
 	mv -f "$out" "$out.unresolved"

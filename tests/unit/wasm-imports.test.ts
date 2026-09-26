@@ -28,12 +28,15 @@ function build() {
 	return { bytes, path };
 }
 
+// built as cc-strict builds it, with the host's cc
+const reader = join(mkdtempSync(join(tmpdir(), 'wasm-imports-')), 'wasm-imports');
+execFileSync('cc', ['-O2', '-o', reader, 'scripts/wasm-imports.c']);
 const run = (...args: string[]) =>
-	execFileSync('python3', ['scripts/wasm-imports.py', ...args], { encoding: 'utf8' })
+	execFileSync(reader, args, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] })
 		.trim()
 		.split('\n');
 
-describe('scripts/wasm-imports.py', () => {
+describe('scripts/wasm-imports.c', () => {
 	const { bytes, path } = build();
 	const module = new WebAssembly.Module(bytes);
 
