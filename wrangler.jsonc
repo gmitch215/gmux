@@ -1,0 +1,12 @@
+{
+	"$schema": "node_modules/wrangler/config-schema.json",
+	"name": "gmux",
+	"main": "src/site.ts",
+	"minify": true,
+	"compatibility_date": "2026-08-01",
+	"compatibility_flags": ["nodejs_compat"],
+	"assets": { "directory": "build/assets", "binding": "ASSETS" },
+	"durable_objects": { "bindings": [{ "name": "MACHINE", "class_name": "MachineDO" }] },
+	"migrations": [{ "tag": "v1", "new_sqlite_classes": ["MachineDO"] }],
+	"rules": [{ "type": "Data", "globs": ["**/*.bin"], "fallthrough": true }]
+}
