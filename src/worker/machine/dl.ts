@@ -254,7 +254,7 @@ export class DlView {
 	private readonly instances = new Map<number, WebAssembly.Instance>();
 	private limits: [number, number] | null = null;
 
-	/** the program's stack segment (scripts/wasm/stack-pass.py), which its side modules share */
+	/** the program's stack segment (scripts/wasm/stack-pass.ts), which its side modules share */
 	stackLimits(high: number, low: number): void {
 		this.limits = [high, low];
 		for (const instance of this.instances.values())

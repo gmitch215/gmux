@@ -12,7 +12,7 @@ const root = new URL('../../../', import.meta.url).pathname;
 const build = join(root, 'build');
 const sha256 = (bytes: Uint8Array) => createHash('sha256').update(bytes).digest('hex');
 const manifest = JSON.parse(readFileSync(join(build, 'kernel/manifest.json'), 'utf8'));
-// SHARE=<scripts/wasm/share.py output>: every BusyBox process on one instance
+// SHARE=<scripts/wasm/share.ts output>: every BusyBox process on one instance
 const share = process.env.SHARE;
 const busybox = new WebAssembly.Module(readFileSync(share ?? join(build, 'kernel/busybox.wasm')));
 

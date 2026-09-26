@@ -6,7 +6,7 @@ import { Machine } from '../../../src/worker/machine/machine.ts';
 
 /**
  * what a machine pays for executables in its rootfs: full files against exec stubs
- * (scripts/wasm/exec-stubs.py). Per arm and round, a fresh boot: guest MemFree, 300 execs of
+ * (scripts/wasm/exec-stubs.ts). Per arm and round, a fresh boot: guest MemFree, 300 execs of
  * /bin/busybox true (host ms), and the checkpoint image's non-zero pages and gzip size.
  * `node --experimental-strip-types experiments/exec-stubs/scripts/measure.ts <full initrd> <stub initrd> [rounds]`
  */

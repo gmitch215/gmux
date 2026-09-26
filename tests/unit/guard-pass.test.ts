@@ -5,7 +5,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
 
-// wasm2wat --generate-names layout, which scripts/wasm/guard-pass.py reads line by line
+// wasm2wat --generate-names layout, which scripts/wasm/guard-pass.ts reads line by line
 const TOY = `(module
   (import "env" "memory" (memory $env.memory 1))
   (func $store (export "store") (param $p0 i32) (param $p1 i32)
@@ -32,8 +32,8 @@ const TAG = 5;
 function guarded(inline: boolean) {
 	const dir = mkdtempSync(join(tmpdir(), 'gmux-guard-'));
 	writeFileSync(join(dir, 'in.wat'), TOY);
-	execFileSync('python3', [
-		'scripts/wasm/guard-pass.py',
+	execFileSync('scripts/ts', [
+		'scripts/wasm/guard-pass.ts',
 		join(dir, 'in.wat'),
 		join(dir, 'out.wat'),
 		...(inline ? ['--inline'] : [])
@@ -65,7 +65,7 @@ function guarded(inline: boolean) {
 	return { x, view, denied };
 }
 
-describe('guard-pass.py', () => {
+describe('guard-pass.ts', () => {
 	for (const inline of [false, true]) {
 		describe(inline ? 'inlined check' : 'called check', () => {
 			it('lets a store reach its own pages and writable shared pages, at its own offset', () => {

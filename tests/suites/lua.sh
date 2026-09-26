@@ -32,18 +32,4 @@ ssh "$host" 'docker pull -q alpine:3.20 > /dev/null && docker run --rm --memory 
 
 node --no-warnings --experimental-strip-types "$here/lua-gmux.ts" "$lua" "$testdir" > "$out/gmux.txt"
 
-python3 - "$out/native.txt" "$out/gmux.txt" << 'EOF'
-import sys
-def load(p):
-    return {l.split()[1]: l.split()[0] for l in open(p) if l.split()[:1] in (['PASS'], ['FAIL'])}
-native, gmux = load(sys.argv[1]), load(sys.argv[2])
-files = sorted(set(native) | set(gmux))
-agree = 0
-print(f"{'file':<18} {'native':<7} {'gmux':<7}")
-for f in files:
-    n, g = native.get(f, '-'), gmux.get(f, '-')
-    agree += n == g
-    print(f"{f:<18} {n:<7} {g:<7}{'' if n == g else '  differs'}")
-print(f"native {sum(v == 'PASS' for v in native.values())}/{len(native)}, "
-      f"gmux {sum(v == 'PASS' for v in gmux.values())}/{len(gmux)}, agree on {agree}/{len(files)}")
-EOF
+"$root/scripts/ts" "$here/lua-diff.ts" "$out/native.txt" "$out/gmux.txt"

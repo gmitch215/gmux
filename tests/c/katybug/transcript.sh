@@ -67,25 +67,6 @@ for s in $suites; do
 	cp "$out/$s.native.txt" "$keep/"
 	TMPDIR=$out/tmp "$out/t/run.sh" "$s" "$out/katybug" > "$out/$s.katybug.txt"
 	echo "# $s"
-	python3 - "$out/$s.native.txt" "$out/$s.katybug.txt" << 'EOF' || fail=1
-import re, sys
-def split(p):
-    parts = re.split(r'^== (\d+) (.*)$', open(p, errors='replace').read(), flags=re.M)
-    return {int(parts[i]): (parts[i + 1], parts[i + 2]) for i in range(1, len(parts), 3)}
-a, b = split(sys.argv[1]), split(sys.argv[2])
-ok = 0
-for n in sorted(a):
-    line, x = a[n]
-    y = b.get(n, ('', ''))[1]
-    if x == y:
-        ok += 1
-        print(f'PASS {line}')
-    else:
-        print(f'FAIL {line}')
-        print('  native :', x.strip()[:300].replace('\n', ' | '))
-        print('  katybug:', y.strip()[:300].replace('\n', ' | '))
-print(f'{ok}/{len(a)} lines equal')
-sys.exit(0 if ok == len(a) else 1)
-EOF
+	"$root/scripts/ts" "$here/transcript-diff.ts" "$out/$s.native.txt" "$out/$s.katybug.txt" || fail=1
 done
 exit $fail

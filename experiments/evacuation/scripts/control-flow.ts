@@ -3,6 +3,7 @@ import { createHash } from 'node:crypto';
 import { mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { basename, join } from 'node:path';
+import { appendCpio } from '../../../scripts/wasm/cpio-append.ts';
 import { Machine, type MachineOptions } from '../../../src/worker/machine/machine.ts';
 
 /**
@@ -31,7 +32,7 @@ function evacuated(plain: string): [string, WebAssembly.Module] {
 	sh(join(root, 'scripts/wasm/instrument.sh'), [plain, at('fuel')]);
 	// PLAIN=1 runs the host's ordinary build, to tell an evacuation fault from the program's own
 	if (process.env.PLAIN) return [sha256(new Uint8Array(readFileSync(plain))), new WebAssembly.Module(readFileSync(at('fuel')))];
-	sh('python3', [join(root, 'scripts/wasm/export-globals.py'), at('fuel'), at('g'), '--all-mutable']);
+	sh(join(root, 'scripts/ts'), [join(root, 'scripts/wasm/export-globals.ts'), at('fuel'), at('g'), '--all-mutable']);
 	sh(process.execPath, [join(root, 'experiments/evacuation/scripts/evacuate.mjs'), at('g'), at('evac'), '--resume']);
 	return [sha256(new Uint8Array(readFileSync(plain))), new WebAssembly.Module(readFileSync(at('evac')))];
 }
@@ -67,7 +68,7 @@ const files = [
 	...(lua ? [`/bin/lua=${lua}`, `/control-flow.lua=${script}`] : []),
 	...(process.env.BASH ? [`/bin/kbbash=${process.env.BASH}`] : [])
 ];
-sh('python3', [join(root, 'scripts/wasm/cpio-append.py'), join(build, 'kernel/initramfs.bin'), initrd, ...files]);
+appendCpio(join(build, 'kernel/initramfs.bin'), initrd, files);
 
 const flow = evacuated(plain);
 const luaProgram = lua ? evacuated(lua) : null;

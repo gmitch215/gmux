@@ -16,9 +16,9 @@ mkdir -p "$vendor/programs"
 cp "$build/kernel/vmlinux.wasm" "$vendor/vmlinux.shared.wasm"
 cp "$build/kernel/busybox.wasm" "$vendor/busybox.fuel.wasm"
 cp "$build/kernel/busybox.guard.wasm" "$vendor/busybox.guard.wasm"
-busybox=$(python3 -c "import json; print(json.load(open('$build/kernel/manifest.json'))['busybox'])")
+busybox=$(sed -n 's/.*"busybox": "\([0-9a-f]*\)".*/\1/p' "$build/kernel/manifest.json")
 # the build's own katybug (already fueled by build-kernel.sh), which binfmt_misc runs from the image
-katybug=$(python3 -c "import json; print(json.load(open('$build/kernel/manifest.json')).get('katybug', ''))")
+katybug=$(sed -n 's/.*"katybug": "\([0-9a-f]*\)".*/\1/p' "$build/kernel/manifest.json")
 [ -n "$katybug" ] && cp "$build/kernel/katybug.wasm" "$vendor/programs/katybug.build.wasm"
 
 programs=("$build"/probes/*.wasm)
@@ -36,7 +36,7 @@ args=()
 		"$root/scripts/wasm/instrument.sh" "$p" "$vendor/programs/$name.wasm"
 		# a forking program runs with resumable frames
 		if [ "$name" = fork ]; then
-			python3 "$root/scripts/wasm/export-globals.py" "$vendor/programs/$name.wasm" "$tmp/$name.g.wasm" --all-mutable > /dev/null
+			"$root/scripts/ts" "$root/scripts/wasm/export-globals.ts" "$vendor/programs/$name.wasm" "$tmp/$name.g.wasm" --all-mutable > /dev/null
 			node "$root/experiments/evacuation/scripts/evacuate.mjs" "$tmp/$name.g.wasm" "$vendor/programs/$name.wasm" --resume > /dev/null
 		fi
 		echo "import program$n from '../vendor/programs/$name.wasm';"
@@ -50,7 +50,7 @@ args=()
 		case $p in *.so) continue ;; esac
 		name=$(basename "$p" .wasm)
 		wasm2wat --enable-threads --enable-exceptions --generate-names "$p" -o "$tmp/$name.wat"
-		python3 "$root/scripts/wasm/guard-pass.py" "$tmp/$name.wat" "$tmp/$name.guard.wat" --inline > /dev/null
+		"$root/scripts/ts" "$root/scripts/wasm/guard-pass.ts" "$tmp/$name.wat" "$tmp/$name.guard.wat" --inline > /dev/null
 		wat2wasm --enable-threads --enable-exceptions --enable-multi-memory "$tmp/$name.guard.wat" -o "$tmp/$name.guard.wasm"
 		"$root/scripts/wasm/instrument.sh" "$tmp/$name.guard.wasm" "$vendor/programs/$name.guard.wasm"
 		echo "import guarded$g from '../vendor/programs/$name.guard.wasm';"
@@ -82,7 +82,7 @@ if [ -n "$binfiles" ]; then
 	for f in "$binfiles"/*; do [ -f "$f" ] && args+=("/bin/$(basename "$f")=$f"); done
 fi
 gunzip -c "$build/kernel/initramfs.bin" > "$tmp/base.cpio"
-python3 "$root/scripts/wasm/cpio-append.py" "$tmp/base.cpio" "$tmp/image.cpio" "${args[@]}" > /dev/null
+"$root/scripts/ts" "$root/scripts/wasm/cpio-append.ts" "$tmp/base.cpio" "$tmp/image.cpio" "${args[@]}" > /dev/null
 gzip -n -9 -c "$tmp/image.cpio" > "$vendor/initramfs.bin"
 "$root/experiments/machine-checkpoint/scripts/build-async.sh" > /dev/null
 ls -la "$vendor/vmlinux.shared.wasm" "$vendor/vmlinux.async.wasm" "$vendor/busybox.async.wasm" "$vendor/initramfs.bin"

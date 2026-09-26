@@ -1,8 +1,8 @@
-import { execFileSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { mkdtempSync, readdirSync, readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { appendCpio } from '../../../scripts/wasm/cpio-append.ts';
 import { Machine } from '../../../src/worker/machine/machine.ts';
 
 /**
@@ -27,12 +27,11 @@ const files = readdirSync(tree, { recursive: true, withFileTypes: true })
 	.filter((f) => f.isFile())
 	.map((f) => join(f.parentPath, f.name));
 const initrd = join(mkdtempSync(join(tmpdir(), 'gmux-transcript-')), 'initramfs.cpio');
-execFileSync('python3', [
-	join(root, 'scripts/wasm/cpio-append.py'),
+appendCpio(
 	join(build, 'kernel/initramfs.bin'),
 	initrd,
-	...files.map((f) => `/t${f.slice(tree.length)}=${f}`)
-]);
+	files.map((f) => `/t${f.slice(tree.length)}=${f}`)
+);
 
 const links = 'for p in $(cat ubin.list); do ln -s coreutils "ubin/$p"; done';
 const script =

@@ -3,6 +3,7 @@ import { createHash } from 'node:crypto';
 import { copyFileSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { Session } from 'node:inspector/promises';
 import { join } from 'node:path';
+import { appendCpio } from '../../../scripts/wasm/cpio-append.ts';
 import { Machine } from '../../../src/worker/machine/machine.ts';
 
 /**
@@ -10,7 +11,7 @@ import { Machine } from '../../../src/worker/machine/machine.ts';
  * machine on the same host, timed between output markers by the host clock, and a CPU profile of the
  * Katybug run bucketed by phase.
  *
- * `prepare <bundle> <katybug-profile.wasm> <static busybox>` (needs python3 and wabt) stages build/,
+ * `prepare <bundle> <katybug-profile.wasm> <static busybox>` (needs wabt) stages build/,
  * the transcript binaries and a profiling Katybug (`-DKB_PROFILE`) into a bundle;
  * `run <bundle> [rounds]` times each workload natively and in the machine (an x86-64 Linux host);
  * `profile <bundle>` samples the machine run of each workload (node --no-wasm-inlining)
@@ -46,7 +47,7 @@ if (mode === 'prepare') {
 	});
 	const files = ['bash', 'coreutils', 'curl', 'sqlite3', 'busybox-amd64'].map((n) => `/bin/${n}=${join(bundle, 'bin', n)}`);
 	const cpio = (out: string, extra: string[]) =>
-		execFileSync('python3', [join(root, 'scripts/wasm/cpio-append.py'), join(build, 'kernel/initramfs.bin'), out, ...files, ...extra]);
+		appendCpio(join(build, 'kernel/initramfs.bin'), out, [...files, ...extra]);
 	cpio(join(bundle, 'initrd.cpio'), []);
 	// the later entry replaces the build's katybug stub
 	cpio(join(bundle, 'initrd-profile.cpio'), [`/bin/katybug=${profileWasm}`]);

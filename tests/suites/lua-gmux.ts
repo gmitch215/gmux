@@ -3,6 +3,7 @@ import { createHash } from 'node:crypto';
 import { mkdtempSync, readdirSync, readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { appendCpio } from '../../scripts/wasm/cpio-append.ts';
 import { Machine } from '../../src/worker/machine/machine.ts';
 
 /**
@@ -29,10 +30,7 @@ const files = readdirSync(testsDir)
 	.filter((f) => f.endsWith('.lua') && f !== 'all.lua')
 	.sort();
 const initrd = join(scratch, 'initramfs.cpio');
-execFileSync('python3', [
-	join(root, 'scripts/wasm/cpio-append.py'),
-	join(build, 'kernel/initramfs.bin'),
-	initrd,
+appendCpio(join(build, 'kernel/initramfs.bin'), initrd, [
 	`/bin/lua=${luaPath}`,
 	...files.map((f) => `/lua-tests/${f}=${join(testsDir, f)}`)
 ]);

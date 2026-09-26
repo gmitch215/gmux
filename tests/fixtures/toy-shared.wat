@@ -1,4 +1,4 @@
-;; a program made shareable as scripts/wasm/share.py does, for toy-kernel.wat's "w": a mutable memory base,
+;; a program made shareable as scripts/wasm/share.ts does, for toy-kernel.wat's "w": a mutable memory base,
 ;; an exported GOT-style global, data relocated per process. Each process yields once and then checks that the
 ;; base, the global and its data are still its own
 (module

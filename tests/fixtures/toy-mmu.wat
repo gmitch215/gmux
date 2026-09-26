@@ -1,4 +1,4 @@
-;; a user program for toy-kernel.wat ("m" on its console) built as scripts/wasm/mmu-pass.py builds them: its
+;; a user program for toy-kernel.wat ("m" on its console) built as scripts/wasm/mmu-pass.ts builds them: its
 ;; start function reads page 9 through the page table, then _start reads page 10, stores the word at 0x830
 ;; for the test, and parks
 (module

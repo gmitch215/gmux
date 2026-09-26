@@ -13,13 +13,13 @@ export interface MachineOptions {
 	/** precompiled user programs keyed by the hex SHA-256 of their bytes */
 	registry: Map<string, WebAssembly.Module>;
 	/**
-	 * a program made shareable by scripts/wasm/share.py runs every process on one instance, its
+	 * a program made shareable by scripts/wasm/share.ts runs every process on one instance, its
 	 * bases, stack pointer and globals swapped at each switch (needs `sharedKernel`; no checkpoints)
 	 */
 	shareInstances?: boolean;
 	/**
 	 * builds of the registry's programs that check every store against the kernel's page owner
-	 * table (scripts/wasm/guard-pass.py), by the same hash. A task whose effective uid is not 0 runs
+	 * table (scripts/wasm/guard-pass.ts), by the same hash. A task whose effective uid is not 0 runs
 	 * these, and one with no guarded build for its program cannot run it
 	 */
 	guarded?: Map<string, WebAssembly.Module>;
@@ -36,7 +36,7 @@ export interface MachineOptions {
 	/** log every task switch and release through `log` */
 	trace?: boolean;
 	/**
-	 * called on a software-TLB miss for a page of a program built with scripts/wasm/mmu-pass.py; a
+	 * called on a software-TLB miss for a page of a program built with scripts/wasm/mmu-pass.ts; a
 	 * promise parks the task until the page is in place (a lazy restore faulting pages in). With
 	 * canWait false the program runs outside WebAssembly.promising (its start function, relocations
 	 * and constructors), so the page must be in place before this returns
@@ -58,7 +58,7 @@ export interface MachineOptions {
 	stepNs?: bigint;
 	/**
 	 * one vmlinux instance for every task, switching the task's mutable globals at each park and
-	 * resume; needs a vmlinux that exports them (scripts/export-globals.py)
+	 * resume; needs a vmlinux that exports them (scripts/export-globals.ts)
 	 */
 	sharedKernel?: boolean;
 	/**
@@ -177,7 +177,7 @@ const SYS_MUNMAP = 215;
 const SYS_MMAP = 222;
 const SYS_PRLIMIT64 = 261;
 const RLIMIT_STACK = 3;
-// a split stack grows by this much at a time (scripts/wasm/stack-pass.py)
+// a split stack grows by this much at a time (scripts/wasm/stack-pass.ts)
 const STACK_SEGMENT = 1 << 20;
 // room left under the checked limit for the small leaf frames the stack pass does not check
 const STACK_GUARD = 4096;
@@ -203,7 +203,7 @@ interface Fork {
 	top: number;
 	sp: number;
 	entry: 'start' | 'clone';
-	/** the parent's exported mutable globals (scripts/wasm/export-globals.py) */
+	/** the parent's exported mutable globals (scripts/wasm/export-globals.ts) */
 	globals: [string, number][];
 	segments?: { low: number; high: number }[];
 	segment?: number;
@@ -250,7 +250,7 @@ interface Runner {
 		entry: 'start' | 'clone';
 		/** made for a signal the task took on its way to user mode, before its entry ran */
 		early?: boolean;
-		/** the stack's segments in stack order (scripts/wasm/stack-pass.py), the first where the kernel put it */
+		/** the stack's segments in stack order (scripts/wasm/stack-pass.ts), the first where the kernel put it */
 		segments?: { low: number; high: number }[];
 		/** the segment the stack pointer is in */
 		segment?: number;
@@ -292,7 +292,7 @@ interface Runner {
 	signal?: HandlerStacks | null;
 }
 
-/** the function table a program needs (scripts/wasm/table-note.py), or 4096 without the note */
+/** the function table a program needs (scripts/wasm/table-note.ts), or 4096 without the note */
 /** one instance for every process running a program */
 interface SharedProgram {
 	exports: Record<string, any>;
@@ -321,7 +321,7 @@ function sharedDataSize(module: WebAssembly.Module): number {
 	);
 }
 
-/** the registry key an exec stub carries (scripts/wasm/exec-stubs.py), or null for a full file */
+/** the registry key an exec stub carries (scripts/wasm/exec-stubs.ts), or null for a full file */
 export function stubHash(bytes: Uint8Array): string | null {
 	let p = 8;
 	const leb = () => {
@@ -380,7 +380,7 @@ export interface MachineStats {
 	signals: number;
 	/** fuel yields: a user loop giving up the host thread */
 	fuelYields: number;
-	/** software-TLB misses in programs built with scripts/wasm/mmu-pass.py */
+	/** software-TLB misses in programs built with scripts/wasm/mmu-pass.ts */
 	mmuMisses: number;
 	/** misses that parked a task until the host brought its page in */
 	pageFaults: number;
@@ -460,7 +460,7 @@ export class Machine {
 	 */
 	constructor(options: MachineOptions, initialPages = 15) {
 		this.options = options;
-		// the kernel's static memory, recorded at build time (scripts/wasm/memory-note.py)
+		// the kernel's static memory, recorded at build time (scripts/wasm/memory-note.ts)
 		const note = WebAssembly.Module.customSections(options.vmlinux, 'gmux.memory')[0];
 		const kernelPages = note ? new DataView(note).getUint32(0, true) : 0;
 		const initial = Math.max(initialPages, kernelPages);
@@ -1042,7 +1042,7 @@ export class Machine {
 				(i) => i.module === 'gmux' && i.name === 'table'
 			)
 		) {
-			// scripts/wasm/guard-pass.py: stores checked against the kernel's page owner table
+			// scripts/wasm/guard-pass.ts: stores checked against the kernel's page owner table
 			const kernel = this.exp(runner);
 			const fixed = (value: number) =>
 				new WebAssembly.Global({ value: 'i32', mutable: false }, value);
@@ -1090,7 +1090,7 @@ export class Machine {
 			__wasm_abort: () => {
 				throw new WebAssembly.RuntimeError('abort');
 			},
-			// scripts/wasm/stack-pass.py: a frame allocation left its stack segment
+			// scripts/wasm/stack-pass.ts: a frame allocation left its stack segment
 			__gmux_stack_move: (sp: number) =>
 				this.stackMove(this.shared ? this.current! : runner, sp),
 			// fuel ran out in a user loop: give the other cpus the host thread, then refill
@@ -1229,7 +1229,7 @@ export class Machine {
 	}
 
 	/**
-	 * limits a program's stack pointer to the mapping it is in (scripts/wasm/stack-pass.py), as a guard
+	 * limits a program's stack pointer to the mapping it is in (scripts/wasm/stack-pass.ts), as a guard
 	 * page would: a signal frame on an alternate stack gets that stack's bounds while its handler runs
 	 */
 	private boundStack(runner: Runner, program: NonNullable<Runner['program']>) {
@@ -1248,7 +1248,7 @@ export class Machine {
 	}
 
 	/**
-	 * split stacks (scripts/wasm/stack-pass.py): a frame allocation left its segment. The segments form
+	 * split stacks (scripts/wasm/stack-pass.ts): a frame allocation left its segment. The segments form
 	 * a chain in stack order, and the stack pointer before the allocation says which one the program
 	 * is in: after a return that is an older one, found by the most recent segment holding it (two
 	 * segments can share a boundary). A frame that fits there stays; one that does not goes to the top

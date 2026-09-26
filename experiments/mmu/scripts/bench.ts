@@ -3,6 +3,7 @@ import { createHash } from 'node:crypto';
 import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { appendCpio } from '../../../scripts/wasm/cpio-append.ts';
 import { Machine } from '../../../src/worker/machine/machine.ts';
 
 /**
@@ -59,11 +60,11 @@ for (const name of Object.keys(workloads)) {
 			sh('node', [join(root, 'experiments/evacuation/scripts/evacuate.mjs'), plain, file, ...flag]);
 		} else if (arm === 'guard' || arm === 'guardi') {
 			const wat = join(work, `${name}.${arm}.wat`);
-			sh('python3', [join(root, 'scripts/wasm/guard-pass.py'), join(work, `${name}.wat`), wat, ...(arm === 'guardi' ? ['--inline'] : [])]);
+			sh(join(root, 'scripts/ts'), [join(root, 'scripts/wasm/guard-pass.ts'), join(work, `${name}.wat`), wat, ...(arm === 'guardi' ? ['--inline'] : [])]);
 			sh('wat2wasm', ['--enable-threads', '--enable-exceptions', '--enable-multi-memory', wat, '-o', file]);
 		} else {
 			const wat = join(work, `${name}.${arm}.wat`);
-			sh('python3', [join(root, 'scripts/wasm/mmu-pass.py'), join(work, `${name}.wat`), wat, ...(arm === 'inline' ? ['--inline'] : [])]);
+			sh(join(root, 'scripts/ts'), [join(root, 'scripts/wasm/mmu-pass.ts'), join(work, `${name}.wat`), wat, ...(arm === 'inline' ? ['--inline'] : [])]);
 			sh('wat2wasm', ['--enable-threads', '--enable-exceptions', '--enable-multi-memory', wat, '-o', file]);
 		}
 		const fueled = join(work, `${name}.${arm}.fuel.wasm`);
@@ -79,7 +80,7 @@ const build = join(root, 'build');
 const manifest = JSON.parse(readFileSync(join(build, 'kernel/manifest.json'), 'utf8'));
 registry.set(manifest.busybox, new WebAssembly.Module(readFileSync(join(build, 'kernel/busybox.wasm'))));
 const initrd = join(work, 'initramfs.cpio');
-sh('python3', [join(root, 'scripts/wasm/cpio-append.py'), join(build, 'kernel/initramfs.bin'), initrd, ...files]);
+appendCpio(join(build, 'kernel/initramfs.bin'), initrd, files);
 
 let output = '';
 const marks = new Map<string, number>();

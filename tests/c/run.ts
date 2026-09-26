@@ -3,6 +3,7 @@ import { createHash } from 'node:crypto';
 import { mkdtempSync, readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { appendCpio } from '../../scripts/wasm/cpio-append.ts';
 import { Machine } from '../../src/worker/machine/machine.ts';
 
 /**
@@ -179,8 +180,8 @@ for (const name of added) {
 	let runs = fueled;
 	if (probes[name]!.evacuate) {
 		execFileSync(
-			'python3',
-			[join(root, 'scripts/wasm/export-globals.py'), fueled, `${fueled}.g`, '--all-mutable'],
+			join(root, 'scripts/ts'),
+			[join(root, 'scripts/wasm/export-globals.ts'), fueled, `${fueled}.g`, '--all-mutable'],
 			{
 				stdio: 'ignore'
 			}
@@ -198,13 +199,13 @@ for (const name of added) {
 		runs = `${fueled}.evac`;
 	}
 	if (share && !probes[name]!.evacuate) {
-		// share.py refuses programs that call dlopen, and a forking program's frames are its own
+		// share.ts refuses programs that call dlopen, and a forking program's frames are its own
 		// instance's; those keep an instance each
 		try {
 			execFileSync(
-				'python3',
+				join(root, 'scripts/ts'),
 				[
-					join(root, 'scripts/wasm/share.py'),
+					join(root, 'scripts/wasm/share.ts'),
 					join(build, program(name)!),
 					fueled,
 					`${fueled}.share`
@@ -221,7 +222,7 @@ for (const path of names.flatMap((name) => probes[name]!.side ?? [])) {
 	execFileSync(join(root, 'scripts/wasm/instrument.sh'), [join(build, path), fueled]);
 	registry.set(sha256(read(path)), new WebAssembly.Module(readFileSync(fueled)));
 }
-// the guarded builds a non-root task runs (scripts/wasm/guard-pass.py), for the isolation probe
+// the guarded builds a non-root task runs (scripts/wasm/guard-pass.ts), for the isolation probe
 const guarded = new Map<string, WebAssembly.Module>();
 if (names.includes('isolation')) {
 	const plain = join(build, program('isolation')!);
@@ -235,8 +236,8 @@ if (names.includes('isolation')) {
 		wat
 	]);
 	execFileSync(
-		'python3',
-		[join(root, 'scripts/wasm/guard-pass.py'), wat, `${wat}.guard`, '--inline'],
+		join(root, 'scripts/ts'),
+		[join(root, 'scripts/wasm/guard-pass.ts'), wat, `${wat}.guard`, '--inline'],
 		{ stdio: 'ignore' }
 	);
 	execFileSync('wat2wasm', [
@@ -257,10 +258,7 @@ if (names.includes('isolation')) {
 	);
 }
 const initrd = join(scratch, 'initramfs.cpio');
-execFileSync('python3', [
-	join(root, 'scripts/wasm/cpio-append.py'),
-	join(build, 'kernel/initramfs.bin'),
-	initrd,
+appendCpio(join(build, 'kernel/initramfs.bin'), initrd, [
 	...added.map((name) => `/bin/${name}=${join(build, program(name)!)}`),
 	...names.flatMap((name) =>
 		Object.entries(probes[name]!.files ?? {}).map(([to, from]) => `${to}=${join(build, from)}`)

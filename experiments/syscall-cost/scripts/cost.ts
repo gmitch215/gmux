@@ -3,6 +3,7 @@ import { createHash } from 'node:crypto';
 import { mkdtempSync, readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { appendCpio } from '../../../scripts/wasm/cpio-append.ts';
 import { Machine } from '../../../src/worker/machine/machine.ts';
 
 /**
@@ -18,12 +19,7 @@ const work = mkdtempSync(join(tmpdir(), 'gmux-syscall-cost-'));
 const sha256 = (bytes: Uint8Array) => createHash('sha256').update(bytes).digest('hex');
 const manifest = JSON.parse(readFileSync(join(kernel, 'manifest.json'), 'utf8'));
 execFileSync(join(root, 'scripts/wasm/instrument.sh'), [plain, join(work, 'cost.fuel.wasm')]);
-execFileSync('python3', [
-	join(root, 'scripts/wasm/cpio-append.py'),
-	join(kernel, 'initramfs.bin'),
-	join(work, 'initramfs.cpio'),
-	`/bin/cost=${plain}`
-]);
+appendCpio(join(kernel, 'initramfs.bin'), join(work, 'initramfs.cpio'), [`/bin/cost=${plain}`]);
 
 let output = '';
 const marks: [string, number, number][] = [];

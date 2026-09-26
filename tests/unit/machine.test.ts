@@ -57,7 +57,7 @@ function toyUser(name = 'toy-user.wat'): WebAssembly.Module {
 	return new WebAssembly.Module(bytes);
 }
 
-/** tests/fixtures/toy-shared.wat with share.py's mark: 16 bytes of data */
+/** tests/fixtures/toy-shared.wat with share.ts's mark: 16 bytes of data */
 function toyShared(): WebAssembly.Module {
 	const module = parse('toy-shared.wat');
 	module.setFeatures(binaryen.Features.Atomics | binaryen.Features.MutableGlobals);

@@ -3,11 +3,12 @@ import { createHash } from 'node:crypto';
 import { mkdtempSync, readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { appendCpio } from '../../../scripts/wasm/cpio-append.ts';
 import { Machine } from '../../../src/worker/machine/machine.ts';
 
 /**
  * the shared-instance exactness check: tests/c/katybug/busybox/commands.txt on the machine's own BusyBox, each line
- * with its output and exit status, printed for comparison between arms. SHARE=<scripts/wasm/share.py
+ * with its output and exit status, printed for comparison between arms. SHARE=<scripts/wasm/share.ts
  * output> runs every process on one instance.
  * `node --experimental-strip-types experiments/instances/scripts/transcript.ts > out.txt`
  */
@@ -18,12 +19,11 @@ const sha256 = (bytes: Uint8Array) => createHash('sha256').update(bytes).digest(
 const manifest = JSON.parse(readFileSync(join(build, 'kernel/manifest.json'), 'utf8'));
 const share = process.env.SHARE;
 const initrd = join(mkdtempSync(join(tmpdir(), 'gmux-g4-')), 'initramfs.cpio');
-execFileSync('python3', [
-	join(root, 'scripts/wasm/cpio-append.py'),
+appendCpio(
 	join(build, 'kernel/initramfs.bin'),
 	initrd,
-	...['commands.txt', 'input.txt', 'numbers.txt'].map((f) => `/t/${f}=${join(inputs, f)}`)
-]);
+	['commands.txt', 'input.txt', 'numbers.txt'].map((f) => `/t/${f}=${join(inputs, f)}`)
+);
 let output = '';
 const machine = new Machine({
 	vmlinux: new WebAssembly.Module(readFileSync(join(build, 'kernel/vmlinux.wasm'))),

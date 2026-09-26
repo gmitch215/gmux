@@ -49,8 +49,8 @@ function stubbed(...archives: [string, Uint8Array, number][][]) {
 	const dir = mkdtempSync(join(tmpdir(), 'gmux-stubs-'));
 	const padded = archives.flatMap((files) => [cpio(files), Buffer.alloc(4)]);
 	writeFileSync(join(dir, 'in.gz'), gzipSync(Buffer.concat(padded)));
-	execFileSync('python3', [
-		'scripts/wasm/exec-stubs.py',
+	execFileSync('scripts/ts', [
+		'scripts/wasm/exec-stubs.ts',
 		join(dir, 'in.gz'),
 		join(dir, 'out.gz')
 	]);
