@@ -1,0 +1,14 @@
+.git
+.remember
+.wrangler
+.claude
+node_modules
+experiments
+coverage
+dist
+payload
+build-typedoc
+build-native
+build/*
+!build/kernel
+!build/assets
