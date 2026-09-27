@@ -278,8 +278,11 @@ jobs:
       - name: Smoke the Image
         run: |
           docker run -d --rm --name gmux-check -p 8787:8787 gmux:check
-          for i in $(seq 1 60); do curl -fs http://127.0.0.1:8787/_gmux/status > /dev/null && break; sleep 1; done
-          bun run smoke http://127.0.0.1:8787
+          for _ in $(seq 1 60); do curl -fs http://127.0.0.1:8787/_gmux/status > /dev/null && break; sleep 1; done
+          if ! curl -fs http://127.0.0.1:8787/_gmux/status || ! bun run smoke http://127.0.0.1:8787; then
+            docker logs gmux-check 2>&1 | tail -100
+            exit 1
+          fi
           docker stop gmux-check
       - name: Derive the Tags
         id: meta
