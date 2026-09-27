@@ -370,6 +370,52 @@ the kernel and the host together under 1%. curl moves bytes through syscalls (64
 runs near native speed. A faster Katybug is a faster dispatch loop: fused blocks, guest registers
 held in locals, or blocks translated to wasm.
 
+Four taxes in the dispatch loop can be switched off at build time, each keeping the corpus, the
+transcripts and the signal checks exact: the per-instruction `KB_PC` op (`-DKB_LEAN_PC` keeps each
+op's instruction offset in a side table, 4 bytes an op), the fault check after every op
+(`-DKB_LEAN_FAULT` checks only after ops that can fault), the zero register's reset after every op
+(`-DKB_LEAN_ZERO` sends its writes to a sink), and reading both operands ahead of the switch
+(`-DKB_LEAN_OPERANDS`). Six builds ran at once on paisley-park, one physical core each, 3 rounds, twice
+with the cores rotated; Katybug's time in the machine against the plain build
+(`experiments/katybug-profile/scripts/variants.sh`, `bench.ts` with `VARIANT`):
+
+| workload | plain | `KB_PC` | fault check | zero | operands | all four |
+| --- | --- | --- | --- | --- | --- | --- |
+| factor | 4,213-4,329 ms | -17.3% | -9.3% | -6.4% | -14.2% | -16.9% |
+| gzip | 11,621-12,966 ms | -15.6% | -9.8% | -6.9% | -16.0% | -18.8% |
+| bzip2 | 20,236-21,205 ms | -13.2% | -7.1% | -4.3% | -12.7% | -18.2% |
+| sqlite | 4,790-4,898 ms | -8.6% | -3.8% | -1.6% | -4.0% | -11.0% |
+| bash | 26,005-29,149 ms | -7.8% | -3.1% | -1.4% | -2.2% | -9.5% |
+| sha256 | 1,898-1,952 ms | +2.5% | +0.1% | +0.8% | +4.8% | -3.3% |
+
+Those taxes are at most about a fifth of Katybug's time; the rest is interpretation itself.
+
+What translation can reach was measured by lifting instead of interpreting. A `-DKB_HOT` build dumps
+every block it ran with its IR and run count; `experiments/aot-oracle/scripts/lift.ts` writes the
+blocks holding 99% (or 99.9%) of the executed ops as C, one function per process, with guest
+registers and flags in locals and `goto` between lifted blocks. Loads and stores go through the same
+inline caches as the interpreter's, and a fault leaves the registers as the interpreter would. A
+`-DKB_AOT` build attaches that code to a decoded block only when the block's IR matches the lifted
+copy exactly. The outputs equal the interpreter's. `r` against native x86-64, in a machine and
+natively:
+
+| workload | interpreter, in gmux | lifted 99%, in gmux | lifted 99.9%, in gmux | lifted 99%, native x86 |
+| --- | --- | --- | --- | --- |
+| factor | 79-82 | 9 | 8 | 5 |
+| sqlite | 269-283 | 29 | 23 | 25 |
+| sha256 | 329-342 | 9 | 10 | 10 |
+
+The lifted code runs nearly as slowly compiled for x86 as it does in the machine, so wasm and V8 add
+little: the representation carries the rest. Every load and store still checks its cached mapping's
+generation and range; removing the range check crashes both workloads that were run without it, so
+the check can only move to a block or loop entry. The pending-signal check at each block
+transition is 16% of sha256. In wasm, x86's 128-by-64-bit `div` becomes a compiler-rt call (about a tenth of
+factor), and the interpreted 1% is 6-10% of the samples. The first lifting called the flag helper
+instead of inlining it, which put the flags in memory and cost 13-17% of the samples; forcing it
+inline took factor, sqlite and sha256 from 11, 34 and 12 to 9, 29 and 9. katybug.wasm grows from
+239 KB to 1.35 MB with the 99% lifting. Peak RSS natively is 1.5 MiB for the binaries, 4.8-9.3 MiB
+under Katybug, and 0.1-1.2 MiB more with the lifted code.
+
 Katybug also decodes wasm (`src/gmux/katybug/wasm.c`, `katybug --wasm <module> <export> [args]`), so
 the IR has a third frontend and a planner over it sees native wasm programs too. Validated wasm has a
 static operand-stack height at every instruction, so each local and stack slot is a fixed cell in the
@@ -676,6 +722,52 @@ TLS connection to dns.google for 901 s and answered 19 DoH queries exact while i
 aborted or idle-evicted four times (`experiments/socket`). The request that opened the socket keeps
 it, since I/O objects belong to the request that created them. Without a 60 s keepalive the
 connection dropped within 300 s idle while its object stayed resident.
+
+### The Interpreted Tier
+
+Wasm that arrives at run time runs on burrow's wasm3, itself compiled to wasm. Seven integer kernels
+with no imports (`experiments/interp-topology/src/guests.c`) ran on V8 directly, on burrow's shipped
+`wasm3.wasm`, and on Katybug's IR interpreter through its wasm frontend built with emscripten, and
+both interpreters also ran as native builds (clang; wasm3 with burrow's pin, patches and fusion
+catalog). paisley-park, one kernel per physical core, time at 2n less time at n, median of 3:
+
+| kernel | V8 | wasm3, hosted | wasm3, native | Katybug, hosted | Katybug, native |
+| --- | --- | --- | --- | --- | --- |
+| chain (dependent multiply-add) | 10.2 ms | 4.2x | 3.4x | 232x | 87x |
+| crc32 | 24.2 ms | 5.6x | 2.8x | 184x | 87x |
+| sort | 31.0 ms | 8.3x | 4.2x | 208x | 87x |
+| sieve | 17.5 ms | 12.5x | 7.2x | 485x | 196x |
+| fib | 17.8 ms | 23.3x | 9.5x | 430x | 166x |
+| matmul | 3.8 ms | 33.1x | 21.0x | 1,056x | 417x |
+| sha256 | 35.3 ms | 54.9x | 16.2x | 817x | 363x |
+
+Hosting costs wasm3 1.23-3.40x over its native build and Katybug 2.12-2.67x, so wasm3's tail-called
+handlers lose no more on V8 than a `switch` loop does (sha256 is the exception). Katybug's wasm
+frontend keeps a function's locals in guest memory behind inline caches, which puts it 15-55x behind
+wasm3; it is a correctness frontend, not a candidate cold tier.
+
+What promotion to native code buys was measured on zlib 1.3.1's deflate
+(`experiments/promotion-ladder`). A counted copy run in V8 gives each function's dynamic instructions
+per deflate, the stand-in for its interpreted time: `longest_match` 74.0%, `deflate_slow` 13.3%,
+`fill_window` 5.0%, `compress_block` 3.0%, `zmemcpy` 3.0%, `adler32_z` 1.6%. A promoted function runs
+natively over wasm3's own memory, every load and store at the guest's base plus the address, with
+the stack pointer passed on entry. wasm3 cannot be re-entered from a host call, so a function goes
+native only once every function it calls has, which fixes the rungs:
+
+| promoted share | `r` against V8 | Amdahl | crossings per deflate |
+| --- | --- | --- | --- |
+| none | 13.48 | 13.48 | 0 |
+| 74.0% (`longest_match`) | 7.21 | 4.32 | 91,105 |
+| 77.0% | 6.41 | 3.95 | 91,108 |
+| 80.0% | 6.11 | 3.58 | 91,143 |
+| 81.5% | 5.97 | 3.39 | 91,161 |
+| 86.7% (`fill_window` and its callees) | 5.27 | 2.75 | 91,190 |
+| 100% (`deflate_slow` and its callees) | 1.10 | 1.10 | 14 |
+
+Amdahl holds when the boundary is cold and misses by 1.6-1.9x when it is crossed 91,000 times a
+deflate, about 0.5 us per crossing through JavaScript. No rung lies between 86.7% and 100%:
+`deflate_slow` goes native only together with the functions it calls. On an Apple M-series laptop
+the same ladder runs at 7.40 interpreted and 0.97 promoted.
 
 ---
 
@@ -1052,7 +1144,9 @@ allocations now go through a `volatile` pointer.
 | `scripts/census.sh`, `docker/census.Dockerfile` | the package census, and its image (the toolchain with node, wabt, pkg-config and unzip) |
 | `scripts/wasm/config.site`, `toolchain.cmake`, `target-run.ts`, `target/` | autoconf answers for the target, a CMake toolchain file, and running a configure's test programs on gmux (`GMUX_TARGET_RUN`, ssh and scp for perl) |
 | `scripts/kernel/unbuilt-syscalls.ts`, `adapters-into-patch.sh` | the syscalls a build leaves unbuilt, and regenerated syscall adapters put into patch 0004 |
-| `experiments/katybug-profile/` | Katybug against native x86-64: timings and a CPU profile by phase |
+| `experiments/katybug-profile/` | Katybug against native x86-64: timings, a CPU profile by phase, and Katybug built per flag set (`variants.sh`) |
+| `experiments/aot-oracle/` | hot blocks lifted to C and compiled into Katybug, attached by exact IR match; native attribution arms |
+| `experiments/interp-topology/`, `promotion-ladder/` | wasm3 against Katybug's IR interpreter, hosted and native; zlib with its hottest functions promoted to native code |
 
 ---
 
