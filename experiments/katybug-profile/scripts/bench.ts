@@ -14,7 +14,9 @@ import { Machine } from '../../../src/worker/machine/machine.ts';
  * `prepare <bundle> <katybug-profile.wasm> <static busybox>` (needs wabt) stages build/,
  * the transcript binaries and a profiling Katybug (`-DKB_PROFILE`) into a bundle;
  * `run <bundle> [rounds]` times each workload natively and in the machine (an x86-64 Linux host);
- * `profile <bundle>` samples the machine run of each workload (node --no-wasm-inlining)
+ * `profile <bundle>` samples the machine run of each workload (node --no-wasm-inlining);
+ * `variant <bundle> <name> <katybug.wasm>` (needs wabt) stages another Katybug build, which
+ * `VARIANT=<name> run <bundle>` then times in place of the build's own
  */
 const root = new URL('../../../', import.meta.url).pathname;
 const [mode, bundle = '', ...rest] = process.argv.slice(2);
@@ -67,18 +69,34 @@ if (mode === 'prepare') {
 }
 // #endregion
 
+// #region variant
+if (mode === 'variant') {
+	const [name = '', raw = ''] = rest;
+	const dir = join(bundle, 'variants');
+	mkdirSync(dir, { recursive: true });
+	copyFileSync(raw, join(dir, `${name}.raw.wasm`));
+	execFileSync(join(root, 'scripts/wasm/instrument.sh'), [raw, join(dir, `${name}.wasm`)]);
+	const files = ['bash', 'coreutils', 'curl', 'sqlite3', 'busybox-amd64'].map((n) => `/bin/${n}=${join(bundle, 'bin', n)}`);
+	appendCpio(join(root, 'build/kernel/initramfs.bin'), join(dir, `${name}.cpio`), [...files, `/bin/katybug=${raw}`]);
+	console.log(`staged variant ${name}`);
+	process.exit(0);
+}
+// #endregion
+
 const read = (name: string) => new Uint8Array(readFileSync(join(bundle, name)));
 const manifest = JSON.parse(readFileSync(join(bundle, 'manifest.json'), 'utf8'));
 const profiling = mode === 'profile';
+const variant = process.env.VARIANT;
 
 function machine() {
 	const registry = new Map<string, WebAssembly.Module>([[manifest.busybox, new WebAssembly.Module(read('busybox.wasm'))]]);
-	if (profiling) registry.set(sha256(read('katybug-profile.raw.wasm')), new WebAssembly.Module(read('katybug-profile.wasm')));
+	if (variant) registry.set(sha256(read(`variants/${variant}.raw.wasm`)), new WebAssembly.Module(read(`variants/${variant}.wasm`)));
+	else if (profiling) registry.set(sha256(read('katybug-profile.raw.wasm')), new WebAssembly.Module(read('katybug-profile.wasm')));
 	else registry.set(manifest.katybug, new WebAssembly.Module(read('katybug.wasm')));
 	let output = '';
 	const m = new Machine({
 		vmlinux: new WebAssembly.Module(read('vmlinux.wasm')),
-		initrd: read(profiling ? 'initrd-profile.cpio' : 'initrd.cpio'),
+		initrd: read(variant ? `variants/${variant}.cpio` : profiling ? 'initrd-profile.cpio' : 'initrd.cpio'),
 		cmdline: 'maxcpus=3 root=/dev/ram0 rootfstype=ramfs init=/init console=hvc console=ttyS0',
 		registry,
 		maximumPages: 4096,
@@ -141,6 +159,8 @@ if (profiling) {
 	const run = new Set(['step', 'kb_run', 'muldiv', 'string', 'mask', 'sext', 'kb_put']);
 	const flag = new Set(['flags', 'kb_cond', 'plan_flags', 'parity', 'cond_reads', 'flags_may', 'flags_must', 'transparent']);
 	const phase = (name: string, url: string, katybugUrl: string | undefined) => {
+		// experiments/aot-oracle's lifted regions
+		if (/^r\d+_run$/.test(name)) return 'lifted code';
 		const file = functions[name];
 		if (file === 'run.c')
 			return run.has(name) ? 'dispatch and execute' : flag.has(name) ? 'flags' : name === 'block' ? 'block lookup' : name === 'load' || name === 'store' ? 'memory lookup' : 'dispatch and execute';
@@ -159,7 +179,7 @@ if (profiling) {
 	session.connect();
 	await session.post('Profiler.enable');
 	await session.post('Profiler.setSamplingInterval', { interval: 100 });
-	const phases = ['decode', 'dispatch and execute', 'flags', 'memory lookup', 'block lookup', 'x87', 'SSE', 'syscalls (Katybug)', "Katybug's libc", 'kernel and other wasm', 'host JS', 'startup'];
+	const phases = ['lifted code', 'decode', 'dispatch and execute', 'flags', 'memory lookup', 'block lookup', 'x87', 'SSE', 'syscalls (Katybug)', "Katybug's libc", 'kernel and other wasm', 'host JS', 'startup'];
 	console.log(`| workload | samples | ${phases.join(' | ')} |`);
 	console.log(`| --- | --- | ${phases.map(() => '---').join(' | ')} |`);
 	for (const name of names) {
