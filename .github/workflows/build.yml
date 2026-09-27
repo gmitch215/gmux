@@ -159,6 +159,8 @@ jobs:
           node-version: '26'
       - name: Install Dependencies
         run: bun install --frozen-lockfile --ignore-scripts
+      - name: Install wabt
+        run: sudo apt-get install -y wabt
       - name: Download the Payload
         uses: actions/download-artifact@v8
         with:
