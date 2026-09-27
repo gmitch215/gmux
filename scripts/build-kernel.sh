@@ -10,7 +10,8 @@ mkdir -p "$out"
 keep=boot_command_line,init_task,initrd_start,initrd_end,get_user_stack_pointer,get_user_tls_base
 keep+=,ret_from_fork,_start,_start_secondary,raise_exception,wasm_user_work_pending
 keep+=,wasm_user_stack_low,wasm_user_stack_high,wasm_trap_unwound_kernel,wasm_user_interrupt
-keep+=,wasm_owner_table,wasm_current_owner,wasm_current_euid,wasm_current_mm,wasm_console_irq
+keep+=,wasm_owner_table,wasm_current_owner,wasm_current_set,wasm_current_euid,wasm_current_mm,wasm_console_irq
+keep+=,wasm_free_pages
 for n in 0 1 2 3 4 5 6; do keep+=",wasm_syscall_$n"; done
 wasm2wat --enable-threads "$in/vmlinux.wasm" -o "$tmp/vmlinux.wat"
 "$root/scripts/ts" "$root/scripts/wasm/strip-exports.ts" "$tmp/vmlinux.wat" "$tmp/vmlinux.min.wat" "$keep"
@@ -21,7 +22,7 @@ wat2wasm --enable-threads "$tmp/vmlinux.min.wat" -o "$tmp/vmlinux.min.wasm"
 "$root/scripts/wasm/instrument.sh" "$in/busybox.wasm" "$out/busybox.wasm"
 # the same BusyBox runnable by every process on one instance (MachineOptions.shareInstances)
 "$root/scripts/ts" "$root/scripts/wasm/share.ts" "$in/busybox.wasm" "$out/busybox.wasm" "$out/busybox.share.wasm"
-# and the build a non-root task runs, every store checked against the page owner table
+# and the build a non-root task runs, every load and store checked against the page owner table
 wasm2wat --enable-threads --enable-exceptions --generate-names "$in/busybox.wasm" -o "$tmp/busybox.wat"
 "$root/scripts/ts" "$root/scripts/wasm/guard-pass.ts" "$tmp/busybox.wat" "$tmp/busybox.guard.wat" --inline > /dev/null
 wat2wasm --enable-threads --enable-exceptions --enable-multi-memory "$tmp/busybox.guard.wat" -o "$tmp/busybox.guard.wasm"

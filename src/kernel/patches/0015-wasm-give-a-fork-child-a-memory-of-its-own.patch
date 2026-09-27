@@ -40,10 +40,11 @@ pages. wasm_current_mm tells the host which memory a task runs on.
  #endif
  	return vma->vm_start;
  }
-@@ -1915,10 +1921,63 @@
+@@ -1914,11 +1920,64 @@
+ 	return 0;
  }
  subsys_initcall(init_admin_reserve);
- 
++
 +#ifdef CONFIG_WASM
 +/*
 + * A fork child's mm on wasm: the parent's mappings at the same addresses, each sharing the parent's
@@ -56,7 +57,7 @@ pages. wasm_current_mm tells the host which memory a task runs on.
 +	struct vm_area_struct *vma, *new;
 +	VMA_ITERATOR(old_vmi, oldmm, 0);
 +	int ret = 0;
-+
+ 
 +	mm->context.private_memory = 1;
 +	mm->context.owner = 0;
 +	mmap_write_lock_nested(mm, SINGLE_DEPTH_NESTING);
@@ -223,50 +224,51 @@ pages. wasm_current_mm tells the host which memory a task runs on.
  	case FUTEX_OP_SET:
 --- a/arch/wasm/include/asm/wasm.h
 +++ b/arch/wasm/include/asm/wasm.h
-@@ -44,6 +44,12 @@
+@@ -44,7 +44,13 @@
  unsigned long wasm_owner_table(void);
  unsigned int wasm_current_owner(void);
  unsigned int wasm_current_euid(void);
 +unsigned long wasm_current_mm(void);
-+
+ 
 +/* gmux: a fork child's own memory (arch/wasm/mm/private.c): the host fills and forgets it */
 +struct mm_struct;
 +extern void wasm_user_mapped(struct mm_struct *mm, unsigned long start, unsigned long end);
 +extern void wasm_user_forget(struct mm_struct *mm);
- 
++
  /* gmux: the page owner table (arch/wasm/mm/owner.c) */
  struct vm_area_struct;
+ void wasm_owner_map(struct vm_area_struct *vma);
 --- a/arch/wasm/mm/owner.c
 +++ b/arch/wasm/mm/owner.c
-@@ -64,6 +64,9 @@
+@@ -111,6 +111,9 @@
  {
  	u16 tag;
  
 +	/* a fork child's bytes are not at these pages: they stay the parent's */
 +	if (vma->vm_mm->context.private_memory)
 +		return;
- 	if (is_nommu_shared_mapping(vma->vm_flags))
- 		tag = vma->vm_flags & VM_WRITE ? WASM_OWNER_SHARED : WASM_OWNER_SHARED_RO;
- 	else
-@@ -73,6 +76,8 @@
- 
- void wasm_owner_unmap(struct vm_area_struct *vma, unsigned long start, unsigned long end)
+ 	if (is_nommu_shared_mapping(vma->vm_flags)) {
+ 		/* without an MMU every mapping of a region is at the same address */
+ 		tag = tag_at(vma->vm_start);
+@@ -132,6 +135,8 @@
  {
+ 	u16 tag = tag_at(start);
+ 
 +	if (vma->vm_mm->context.private_memory)
 +		return;
- 	/* pages other mappings still share keep their tag */
- 	if (is_nommu_shared_mapping(vma->vm_flags) && vma->vm_region && vma->vm_region->vm_usage > 1)
- 		return;
-@@ -81,6 +86,8 @@
+ 	if (is_nommu_shared_mapping(vma->vm_flags) && is_region(tag) &&
+ 	    start == vma->vm_start && end == vma->vm_end) {
+ 		/* the mm keeps what its other mappings of the region give it */
+@@ -157,6 +162,8 @@
  
  void wasm_owner_release(struct mm_struct *mm)
  {
 +	if (mm->context.private_memory)
 +		wasm_user_forget(mm);
- 	if (mm->context.owner)
+ 	if (mm->context.owner) {
+ 		kfree(xa_erase(&owner_sets, mm->context.owner));
  		ida_free(&owner_ida, mm->context.owner);
- 	mm->context.owner = 0;
-@@ -93,6 +100,9 @@
+@@ -172,6 +179,9 @@
  
  	if (!size || !owners || !current->mm || uid_eq(current_euid(), GLOBAL_ROOT_UID))
  		return 1;

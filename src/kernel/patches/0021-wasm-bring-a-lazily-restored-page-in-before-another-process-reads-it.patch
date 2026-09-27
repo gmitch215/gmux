@@ -1,0 +1,38 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Gregory Mitchell <me@gmitch215.xyz>
+Date: Sun, 27 Sep 2026 15:45:00 -0400
+Subject: [PATCH] wasm: bring a lazily restored page in before another process reads it
+
+A lazy restore writes a parked process's own pages only when one of its
+tasks is about to run. The kernel can reach those pages for another task
+first: /proc/<pid>/cmdline and environ, /proc/<pid>/mem and ptrace all go
+through access_remote_vm, which on nommu copies straight from the target's
+addresses and read zeros. It now calls wasm_user_touch on the range first,
+and the host writes whatever of it the restore still holds back.
+---
+--- a/mm/nommu.c
++++ b/mm/nommu.c
+@@ -1681,6 +1681,10 @@
+ 		if (addr + len >= vma->vm_end)
+ 			len = vma->vm_end - addr;
+ 
++#ifdef CONFIG_WASM
++		/* a lazily restored process's pages come in when it runs; this reads them first */
++		wasm_user_touch(addr, len);
++#endif
+ 		/* only read or write mappings where it is permitted */
+ 		if (write && vma->vm_flags & VM_MAYWRITE)
+ 			copy_to_user_page(vma, NULL, addr,
+--- a/arch/wasm/include/asm/wasm.h
++++ b/arch/wasm/include/asm/wasm.h
+@@ -51,6 +51,8 @@
+ struct mm_struct;
+ extern void wasm_user_mapped(struct mm_struct *mm, unsigned long start, unsigned long end);
+ extern void wasm_user_forget(struct mm_struct *mm);
++/* gmux: a lazy restore's pages in [addr, addr + len), brought in before the kernel reaches them */
++extern void wasm_user_touch(unsigned long addr, unsigned long len);
+ 
+ /* gmux: the page owner table (arch/wasm/mm/owner.c) */
+ struct vm_area_struct;
+-- 
+2.43.0

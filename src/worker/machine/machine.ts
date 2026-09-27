@@ -18,8 +18,8 @@ export interface MachineOptions {
 	 */
 	shareInstances?: boolean;
 	/**
-	 * builds of the registry's programs that check every store against the kernel's page owner
-	 * table (scripts/wasm/guard-pass.ts), by the same hash. A task whose effective uid is not 0 runs
+	 * builds of the registry's programs that check every load and store against the kernel's page
+	 * owner table (scripts/wasm/guard-pass.ts), by the same hash. A task whose effective uid is not 0 runs
 	 * these, and one with no guarded build for its program cannot run it
 	 */
 	guarded?: Map<string, WebAssembly.Module>;
@@ -125,7 +125,7 @@ export interface HandlerStacks {
 	user: Uint8Array;
 }
 
-/** built by experiments/evacuation/scripts/evacuate.mjs --resume: checkpoints without asyncify */
+/** built by experiments/evacuation/scripts/evacuate.ts --resume: checkpoints without asyncify */
 function evacuable(exports: Record<string, any>): boolean {
 	return 'gmux_ckpt' in exports;
 }
@@ -392,6 +392,10 @@ export interface MachineStats {
 	deferredPages: number;
 	/** deferred pages brought in since */
 	filledPages: number;
+	/** of those, pages the kernel reached for another process first (kernel patch 0021) */
+	touchedPages: number;
+	/** free pages the last checkpoint zeroed instead of saving (kernel patch 0020) */
+	freePages: number;
 	/** processes that joined a shared program instance instead of instantiating */
 	sharedEntries: number;
 	/** the console driver's reads from the host */
@@ -436,6 +440,8 @@ export class Machine {
 		forks: 0,
 		deferredPages: 0,
 		filledPages: 0,
+		touchedPages: 0,
+		freePages: 0,
 		sharedEntries: 0,
 		consoleReads: 0,
 		consoleRaises: 0,
@@ -781,6 +787,10 @@ export class Machine {
 					from
 				);
 			},
+			// the kernel is about to read or write another process's pages (kernel patch 0021)
+			wasm_user_touch: new WebAssembly.Suspending((addr: number, len: number) =>
+				self.fillDeferredRange(addr >>> 0, len >>> 0)
+			),
 			wasm_user_forget: (mm: number) => {
 				self.privateMemories.delete(mm >>> 0);
 				self.forkChildren.delete(mm >>> 0);
@@ -1042,14 +1052,16 @@ export class Machine {
 				(i) => i.module === 'gmux' && i.name === 'table'
 			)
 		) {
-			// scripts/wasm/guard-pass.ts: stores checked against the kernel's page owner table
+			// scripts/wasm/guard-pass.ts: loads and stores checked against the kernel's page owner
+			// table and the process's set of shared regions
 			const kernel = this.exp(runner);
 			const fixed = (value: number) =>
 				new WebAssembly.Global({ value: 'i32', mutable: false }, value);
 			imports.gmux = {
 				...imports.gmux,
 				table: fixed(Number(kernel.wasm_owner_table())),
-				tag: fixed(Number(kernel.wasm_current_owner()))
+				tag: fixed(Number(kernel.wasm_current_owner())),
+				set: fixed(Number(kernel.wasm_current_set?.() ?? 0))
 			};
 			env.__gmux_denied = (address: number) => {
 				throw new WebAssembly.RuntimeError(`memory access denied at ${address >>> 0}`);
@@ -1506,7 +1518,7 @@ export class Machine {
 
 	/**
 	 * fork, from musl's _Fork: the first call spills the program's frames (it must be evacuable,
-	 * experiments/evacuation/scripts/evacuate.mjs --resume) and forkUnwound forks the task; the
+	 * experiments/evacuation/scripts/evacuate.ts --resume) and forkUnwound forks the task; the
 	 * frames resume in the parent and in the child, whose re-issued call gets the pid or 0
 	 */
 	private fork(me: Runner): number {
@@ -1728,7 +1740,7 @@ export class Machine {
 
 	/**
 	 * called as a parked stack resumes for a checkpoint: start asyncify on the kernel. An asyncified
-	 * program unwinds with it; an evacuable one (experiments/evacuation/scripts/evacuate.mjs)
+	 * program unwinds with it; an evacuable one (experiments/evacuation/scripts/evacuate.ts)
 	 * throws when the kernel returns into it, each frame writing its live locals from gmux_fp up
 	 */
 	private beginUnwind(runner: Runner): number {
@@ -1758,8 +1770,12 @@ export class Machine {
 	private deferredSource:
 		((start: number, end: number) => Uint8Array | Promise<Uint8Array>) | null = null;
 
+	/** fills the kernel started for another process, by owner tag, which a task of the owner awaits */
+	private touching = new Map<number, Promise<void>>();
+
 	/** writes a process's deferred pages before any of its tasks runs again */
 	private async fillDeferred(tag: number) {
+		await this.touching.get(tag);
 		const pages = this.deferred.get(tag);
 		if (!pages) return;
 		this.deferred.delete(tag);
@@ -1772,6 +1788,35 @@ export class Machine {
 		}
 		this.stats.filledPages += pages.length;
 		if (!this.deferred.size) this.deferredSource = null;
+	}
+
+	/** writes the deferred pages in [addr, addr + len) now, whichever processes own them */
+	private async fillDeferredRange(addr: number, len: number) {
+		if (!this.deferred.size || !len) return;
+		const [first, last] = [addr >>> 12, (addr + len - 1) >>> 12];
+		for (const [tag, pages] of [...this.deferred]) {
+			const hit = pages.filter((p) => p >= first && p <= last);
+			if (!hit.length) continue;
+			// out of the list first: a later fill must not overwrite what the kernel writes now
+			const rest = pages.filter((p) => p < first || p > last);
+			if (rest.length) this.deferred.set(tag, rest);
+			else this.deferred.delete(tag);
+			const source = this.deferredSource!;
+			const fill = (async () => {
+				await this.touching.get(tag);
+				for (const page of hit)
+					new Uint8Array(this.memory.buffer).set(
+						await source(page * 0x1000, (page + 1) * 0x1000),
+						page * 0x1000
+					);
+			})();
+			this.touching.set(tag, fill);
+			await fill;
+			if (this.touching.get(tag) === fill) this.touching.delete(tag);
+			this.stats.filledPages += hit.length;
+			this.stats.touchedPages += hit.length;
+		}
+		if (!this.deferred.size && !this.touching.size) this.deferredSource = null;
 	}
 
 	/** fork children's own memories, by the kernel's mm (kernel patch 0015) */
@@ -1856,6 +1901,9 @@ export class Machine {
 				'checkpoint during a nested, interrupt-time or asyncified signal handler'
 			);
 		this.ensureScratch();
+		// a machine restored lazily saves every page: what its parked processes never brought in too
+		for (const tag of [...this.deferred.keys()]) await this.fillDeferred(tag);
+		await Promise.all(this.touching.values());
 		const now = this.now();
 		// the owner of every page (kernel patch 0014), so a restore can leave idle processes' pages out
 		const table = Number(this.exp(this.cpuZero).wasm_owner_table?.() ?? 0) >>> 0;
@@ -1923,6 +1971,26 @@ export class Machine {
 			signal: r.signal ?? null
 		}));
 		this.spent = true;
+		// the page allocator's free pages hold dead bytes (kernel patch 0020); zeroed, they save as nothing
+		const free = Number(this.exp(this.cpuZero).wasm_free_pages?.() ?? 0) >>> 0;
+		if (free) {
+			const bytes = new Uint8Array(this.memory.buffer);
+			// the frame count first, then a bit per frame
+			const frames = Math.min(
+				new Uint32Array(this.memory.buffer, free, 1)[0]!,
+				bytes.byteLength >>> 12
+			);
+			const words = new Uint32Array(this.memory.buffer, free + 4, Math.ceil(frames / 32));
+			let pages = 0;
+			for (let w = 0; w < words.length; w++)
+				for (let bits = words[w]!; bits; bits &= bits - 1) {
+					const page = w * 32 + (31 - Math.clz32(bits & -bits));
+					if (page >= frames) break;
+					bytes.fill(0, page * 0x1000, (page + 1) * 0x1000);
+					pages++;
+				}
+			this.stats.freePages = pages;
+		}
 		return {
 			version: 1,
 			memory: new Uint8Array(this.memory.buffer),

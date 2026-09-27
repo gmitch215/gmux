@@ -214,6 +214,10 @@
 	;; a page owner table (kernel patch 0014) at 0x1000: page 16, where "i" puts task 3's data, is tag 7
 	(data (i32.const 0x1020) "\07\00")
 	(func (export "wasm_owner_table") (result i32) (i32.const 0x1000))
+	;; the page allocator's free pages (kernel patch 0020) at 0x1100: 150 frames, frame 120 free, and a
+	;; bit for frame 200, past the count, that the host must ignore
+	(data (i32.const 0x1100) "\96\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\01\00\00\00\00\00\00\00\00\00\01\00\00")
+	(func (export "wasm_free_pages") (result i32) (i32.const 0x1100))
 	;; cpu 1 sleeps on its interrupt word and reports the console's interrupt (2) when the host raises it
 	(func (export "_start_secondary") (param $idle i32)
 		(loop $wait

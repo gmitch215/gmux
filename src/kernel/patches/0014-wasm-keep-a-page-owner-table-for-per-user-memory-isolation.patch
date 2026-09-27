@@ -7,17 +7,20 @@ Without an MMU every process and the kernel share one memory, so any
 process could write the kernel's memory and every other process's, and
 nommu's access_ok let a syscall do the same on its behalf. The kernel now
 keeps a u16 per page of RAM: the tag of the mm whose private mapping
-covers it (allocated per mm, freed in destroy_context), 0xffff for a
-writable shared mapping, 0xfffe for a read-only shared or overlaid one,
-0 for its own and free pages. nommu's mapping paths keep it current: a
-VMA set up, cleaned up, shrunk or resized.
+covers it (allocated per mm, freed in destroy_context), a shared region's
+tag (0x8000 | its id) for a shared or overlaid mapping, 0 for its own and
+free pages. Each mm has a set with two bits per region, readable and
+writable, for the regions it maps, so a shared page is open only to the
+processes that map it. nommu's mapping paths keep both current: a VMA set
+up, cleaned up, shrunk or resized. When the 4,095 region ids run out, a
+shared mapping takes 0xffff (writable) or 0xfffe (read-only), open to all.
 
-access_ok checks a non-root task's buffers against the table, so a
-syscall refuses kernel memory and other processes' memory with EFAULT.
-The host runs a non-root task's programs in a build that checks every
-store against the same table; wasm_owner_table, wasm_current_owner and
-wasm_current_euid give it the table, the task's tag and its euid. Root
-tasks are not checked.
+access_ok checks a non-root task's buffers against the table and its set,
+so a syscall refuses kernel memory and other processes' memory with
+EFAULT. The host runs a non-root task's programs in a build that checks
+every load and store the same way; wasm_owner_table, wasm_current_owner,
+wasm_current_set and wasm_current_euid give it the table, the task's tag,
+its set and its euid. Root tasks are not checked.
 ---
 --- a/mm/nommu.c
 +++ b/mm/nommu.c
@@ -117,12 +120,12 @@ tasks are not checked.
 +unsigned long wasm_owner_table(void);
 +unsigned int wasm_current_owner(void);
 +unsigned int wasm_current_euid(void);
-+
+ 
 +/* gmux: the page owner table (arch/wasm/mm/owner.c) */
 +struct vm_area_struct;
 +void wasm_owner_map(struct vm_area_struct *vma);
 +void wasm_owner_unmap(struct vm_area_struct *vma, unsigned long start, unsigned long end);
- 
++
  #endif /* _ASM_WASM_WASM_H */
 --- /dev/null
 +++ b/arch/wasm/include/asm/mmu.h
@@ -163,14 +166,16 @@ tasks are not checked.
 +#endif /* _ASM_WASM_UACCESS_H */
 --- /dev/null
 +++ b/arch/wasm/mm/owner.c
-@@ -0,0 +1,124 @@
+@@ -0,0 +1,215 @@
 +// SPDX-License-Identifier: GPL-2.0-only
 +/*
 + * The page owner table, for per-user memory isolation without an MMU: one u16 per page of RAM, the
-+ * tag of the mm whose private mapping covers it, WASM_OWNER_SHARED for a writable shared mapping,
-+ * WASM_OWNER_SHARED_RO for a read-only shared or overlaid one, 0 for the kernel's and free pages. The
-+ * host runs a non-root task's programs in a build that checks every store against it
-+ * (scripts/wasm/guard-pass.ts), and access_ok checks a non-root task's syscall buffers against it.
++ * tag of the mm whose private mapping covers it (below WASM_OWNER_REGION), a shared region's tag
++ * (WASM_OWNER_REGION | its id) for a shared or overlaid mapping, 0 for the kernel's and free pages.
++ * Each mm has a set: two bits per region, readable and writable, for the regions it maps. The host
++ * runs a non-root task's programs in a build that checks every load and store against both
++ * (scripts/wasm/guard-pass.ts), and access_ok checks a non-root task's syscall buffers against them.
++ * When region ids run out a shared mapping falls back to WASM_OWNER_SHARED(_RO), open to every task.
 + */
 +
 +#include <linux/cred.h>
@@ -181,14 +186,20 @@ tasks are not checked.
 +#include <linux/sched.h>
 +#include <linux/slab.h>
 +#include <linux/uidgid.h>
++#include <linux/xarray.h>
 +#include <asm/wasm.h>
 +
 +#define WASM_OWNER_SHARED	0xffff
 +#define WASM_OWNER_SHARED_RO	0xfffe
++#define WASM_OWNER_REGION	0x8000
++#define WASM_REGIONS		4096
 +
 +static u16 *owners;
 +static unsigned long owners_pages;
 +static DEFINE_IDA(owner_ida);
++static DEFINE_IDA(region_ida);
++/* each mm's set, by its tag: WASM_REGIONS / 4 bytes, region id's bits at byte id / 4 */
++static DEFINE_XARRAY(owner_sets);
 +
 +static int __init wasm_owner_init(void)
 +{
@@ -202,10 +213,11 @@ tasks are not checked.
 +{
 +	unsigned int tag = READ_ONCE(mm->context.owner);
 +	int fresh;
++	u8 *set;
 +
 +	if (tag)
 +		return tag;
-+	fresh = ida_alloc_range(&owner_ida, 1, WASM_OWNER_SHARED_RO - 1, GFP_KERNEL);
++	fresh = ida_alloc_range(&owner_ida, 1, WASM_OWNER_REGION - 1, GFP_KERNEL);
 +	if (fresh < 0)
 +		return 0;
 +	tag = cmpxchg(&mm->context.owner, 0, fresh);
@@ -213,7 +225,23 @@ tasks are not checked.
 +		ida_free(&owner_ida, fresh);
 +		return tag;
 +	}
++	/* without a set the mm reaches no region, which the checks refuse */
++	set = kzalloc(WASM_REGIONS / 4, GFP_KERNEL);
++	if (set && xa_err(xa_store(&owner_sets, fresh, set, GFP_KERNEL)))
++		kfree(set);
 +	return fresh;
++}
++
++static u8 *mm_set(struct mm_struct *mm)
++{
++	unsigned int tag = mm_owner(mm);
++
++	return tag ? xa_load(&owner_sets, tag) : NULL;
++}
++
++static bool is_region(u16 tag)
++{
++	return (tag & WASM_OWNER_REGION) && tag < WASM_OWNER_SHARED_RO;
 +}
 +
 +static void set_range(unsigned long start, unsigned long end, u16 tag)
@@ -226,19 +254,70 @@ tasks are not checked.
 +		WRITE_ONCE(owners[page], tag);
 +}
 +
++static u16 tag_at(unsigned long addr)
++{
++	unsigned long page = addr >> PAGE_SHIFT;
++
++	return owners && page < owners_pages ? READ_ONCE(owners[page]) : 0;
++}
++
++/* the region's bits in the mm's set: readable (1) and writable (2) */
++static void set_bits(struct mm_struct *mm, u16 tag, unsigned int bits)
++{
++	unsigned int id = tag & (WASM_REGIONS - 1);
++	u8 *set = mm_set(mm);
++
++	if (set)
++		set[id / 4] = (set[id / 4] & ~(3 << (id % 4 * 2))) | (bits << (id % 4 * 2));
++}
++
++static unsigned int vma_bits(struct vm_area_struct *vma)
++{
++	return 1 | (vma->vm_flags & VM_WRITE ? 2 : 0);
++}
++
 +void wasm_owner_map(struct vm_area_struct *vma)
 +{
 +	u16 tag;
 +
-+	if (is_nommu_shared_mapping(vma->vm_flags))
-+		tag = vma->vm_flags & VM_WRITE ? WASM_OWNER_SHARED : WASM_OWNER_SHARED_RO;
-+	else
++	if (is_nommu_shared_mapping(vma->vm_flags)) {
++		/* without an MMU every mapping of a region is at the same address */
++		tag = tag_at(vma->vm_start);
++		if (!is_region(tag)) {
++			int id = ida_alloc_range(&region_ida, 1, WASM_REGIONS - 1, GFP_KERNEL);
++
++			tag = id < 0 ? (vma->vm_flags & VM_WRITE ? WASM_OWNER_SHARED : WASM_OWNER_SHARED_RO)
++				     : WASM_OWNER_REGION | id;
++		}
++		if (is_region(tag))
++			set_bits(vma->vm_mm, tag, vma_bits(vma));
++	} else {
 +		tag = mm_owner(vma->vm_mm);
++	}
 +	set_range(vma->vm_start, vma->vm_end, tag);
 +}
 +
 +void wasm_owner_unmap(struct vm_area_struct *vma, unsigned long start, unsigned long end)
 +{
++	u16 tag = tag_at(start);
++
++	if (is_nommu_shared_mapping(vma->vm_flags) && is_region(tag) &&
++	    start == vma->vm_start && end == vma->vm_end) {
++		/* the mm keeps what its other mappings of the region give it */
++		struct vm_area_struct *other;
++		unsigned int bits = 0;
++		VMA_ITERATOR(vmi, vma->vm_mm, 0);
++
++		for_each_vma(vmi, other)
++			if (other != vma && other->vm_start == vma->vm_start)
++				bits |= vma_bits(other);
++		set_bits(vma->vm_mm, tag, bits);
++		if (vma->vm_region && vma->vm_region->vm_usage > 1)
++			return;
++		set_range(start, end, 0);
++		ida_free(&region_ida, tag & (WASM_REGIONS - 1));
++		return;
++	}
 +	/* pages other mappings still share keep their tag */
 +	if (is_nommu_shared_mapping(vma->vm_flags) && vma->vm_region && vma->vm_region->vm_usage > 1)
 +		return;
@@ -247,8 +326,10 @@ tasks are not checked.
 +
 +void wasm_owner_release(struct mm_struct *mm)
 +{
-+	if (mm->context.owner)
++	if (mm->context.owner) {
++		kfree(xa_erase(&owner_sets, mm->context.owner));
 +		ida_free(&owner_ida, mm->context.owner);
++	}
 +	mm->context.owner = 0;
 +}
 +
@@ -256,24 +337,31 @@ tasks are not checked.
 +{
 +	unsigned long page, last;
 +	unsigned int mine;
++	u8 *set;
 +
 +	if (!size || !owners || !current->mm || uid_eq(current_euid(), GLOBAL_ROOT_UID))
 +		return 1;
 +	if (addr + size < addr)
 +		return 0;
 +	mine = READ_ONCE(current->mm->context.owner);
++	set = mine ? xa_load(&owner_sets, mine) : NULL;
 +	last = (addr + size - 1) >> PAGE_SHIFT;
 +	for (page = addr >> PAGE_SHIFT; page <= last; page++) {
 +		u16 tag = page < owners_pages ? READ_ONCE(owners[page]) : 0;
++		unsigned int id = tag & (WASM_REGIONS - 1);
 +
-+		if (tag != WASM_OWNER_SHARED && tag != WASM_OWNER_SHARED_RO && (!mine || tag != mine))
-+			return 0;
++		if (tag == WASM_OWNER_SHARED || tag == WASM_OWNER_SHARED_RO || (mine && tag == mine))
++			continue;
++		/* access_ok has no direction: a region the mm can read passes */
++		if (is_region(tag) && set && ((set[id / 4] >> (id % 4 * 2)) & 1))
++			continue;
++		return 0;
 +	}
 +	return 1;
 +}
 +EXPORT_SYMBOL(wasm_user_range_ok);
 +
-+/* for the host: the table's address, and the current task's tag and effective uid */
++/* for the host: the table's address, the current task's tag, set and effective uid */
 +__visible unsigned long wasm_owner_table(void)
 +{
 +	return (unsigned long)owners;
@@ -282,6 +370,12 @@ tasks are not checked.
 +__visible unsigned int wasm_current_owner(void)
 +{
 +	return current->mm ? mm_owner(current->mm) : 0;
++}
++
++__visible unsigned long wasm_current_set(void);
++__visible unsigned long wasm_current_set(void)
++{
++	return current->mm ? (unsigned long)mm_set(current->mm) : 0;
 +}
 +
 +__visible unsigned int wasm_current_euid(void)

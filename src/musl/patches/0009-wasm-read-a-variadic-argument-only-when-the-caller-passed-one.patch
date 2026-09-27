@@ -1,0 +1,67 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Gregory Mitchell <me@gmitch215.xyz>
+Date: Sun, 27 Sep 2026 15:55:00 -0400
+Subject: [PATCH] wasm: read a variadic argument only when the caller passed
+ one
+
+fcntl, ioctl, prctl and ptrace read their variadic arguments whether or
+not the call had any: fcntl(fd, F_GETFD) still reads one. On wasm a call
+with no variadic arguments passes a null va_list, so those reads loaded
+from address 0, which is the kernel's memory, and a program that checks
+its loads (a non-root task's guarded build) was ended there. A null
+va_list now reads as zeros, which is what those commands ignore.
+---
+--- a/src/fcntl/fcntl.c
++++ b/src/fcntl/fcntl.c
+@@ -9,7 +9,8 @@
+ 	unsigned long arg;
+ 	va_list ap;
+ 	va_start(ap, cmd);
+-	arg = va_arg(ap, unsigned long);
++	/* wasm passes a null va_list for a call with no variadic arguments */
++	arg = ap ? va_arg(ap, unsigned long) : 0;
+ 	va_end(ap);
+ 	if (cmd == F_SETFL) arg |= O_LARGEFILE;
+ 	if (cmd == F_SETLKW) return syscall_cp(SYS_fcntl, fd, cmd, (void *)arg);
+--- a/src/misc/ioctl.c
++++ b/src/misc/ioctl.c
+@@ -130,7 +130,8 @@
+ 	void *arg;
+ 	va_list ap;
+ 	va_start(ap, req);
+-	arg = va_arg(ap, void *);
++	/* wasm passes a null va_list for a call with no variadic arguments */
++	arg = ap ? va_arg(ap, void *) : 0;
+ 	va_end(ap);
+ 	int r = __syscall(SYS_ioctl, fd, req, arg);
+ 	if (SIOCGSTAMP != SIOCGSTAMP_OLD && req && r==-ENOTTY) {
+--- a/src/linux/prctl.c
++++ b/src/linux/prctl.c
+@@ -8,7 +8,8 @@
+ 	int i;
+ 	va_list ap;
+ 	va_start(ap, op);
+-	for (i=0; i<4; i++) x[i] = va_arg(ap, unsigned long);
++	/* wasm passes a null va_list for a call with no variadic arguments */
++	for (i=0; i<4; i++) x[i] = ap ? va_arg(ap, unsigned long) : 0;
+ 	va_end(ap);
+ 	return syscall(SYS_prctl, op, x[0], x[1], x[2], x[3]);
+ }
+--- a/src/linux/ptrace.c
++++ b/src/linux/ptrace.c
+@@ -11,9 +11,10 @@
+ 	long ret, result;
+ 
+ 	va_start(ap, req);
+-	pid = va_arg(ap, pid_t);
+-	addr = va_arg(ap, void *);
+-	data = va_arg(ap, void *);
++	/* wasm passes a null va_list for a call with no variadic arguments */
++	pid = ap ? va_arg(ap, pid_t) : 0;
++	addr = ap ? va_arg(ap, void *) : 0;
++	data = ap ? va_arg(ap, void *) : 0;
+ 	/* PTRACE_{READ,WRITE}{DATA,TEXT} (16...19) are specific to SPARC. */
+ #ifdef PTRACE_READDATA
+ 	if ((unsigned)req - PTRACE_READDATA < 4)
+-- 
+2.43.0

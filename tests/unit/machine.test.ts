@@ -67,7 +67,7 @@ function toyShared(): WebAssembly.Module {
 	return new WebAssembly.Module(bytes);
 }
 
-/** a toy user program built with experiments/evacuation/scripts/evacuate.mjs --resume */
+/** a toy user program built with experiments/evacuation/scripts/evacuate.ts --resume */
 function evacuated(name: string): WebAssembly.Module {
 	const module = parse(name);
 	module.setFeatures(
@@ -78,7 +78,7 @@ function evacuated(name: string): WebAssembly.Module {
 	const dir = mkdtempSync(join(tmpdir(), 'gmux-evac-'));
 	writeFileSync(join(dir, 'in.wasm'), module.emitBinary());
 	module.dispose();
-	const script = new URL('../../experiments/evacuation/scripts/evacuate.mjs', import.meta.url);
+	const script = new URL('../../experiments/evacuation/scripts/evacuate.ts', import.meta.url);
 	execFileSync(process.execPath, [
 		script.pathname,
 		join(dir, 'in.wasm'),
@@ -454,6 +454,20 @@ describe('Machine', () => {
 			for (let i = 0; i < snapshot.memory.byteLength; i++)
 				if ((i < from || i >= to) && now[i] !== snapshot.memory[i]) changed++;
 			expect(changed).toBe(0);
+		});
+
+		it('zeroes the pages the kernel reports free, within its frame count', async () => {
+			const r = rig({ asyncify: true });
+			const machine = new Machine(r.machineOptions);
+			await r.run(machine, () => r.output().includes('parent ok'));
+			const bytes = new Uint8Array(machine.memory.buffer);
+			bytes.set(new TextEncoder().encode('free page'), 120 * 0x1000);
+			bytes.set(new TextEncoder().encode('past count'), 200 * 0x1000);
+			const snapshot = await machine.checkpoint();
+			const page = (n: number) => snapshot.memory.subarray(n * 0x1000, (n + 1) * 0x1000);
+			expect(page(120).every((b) => b === 0)).toBe(true);
+			expect(new TextDecoder().decode(page(200).subarray(0, 10))).toBe('past count');
+			expect(snapshot.stats.freePages).toBe(1);
 		});
 
 		it("restores into its own predecessor's memory", async () => {

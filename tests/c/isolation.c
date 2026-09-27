@@ -1,9 +1,12 @@
 #include <errno.h>
+#include <pthread.h>
+#include <sched.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/ipc.h>
+#include <sys/mman.h>
 #include <sys/shm.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -36,9 +39,66 @@ static int run(char* const* args) {
 
 static char own[64];
 
-/* as uid 1000: the kernel's memory and another process's refused, to syscalls
- * and to stores; loads and shared segments are open (SECURITY.md) */
-static int nonroot(char* other, char* shared) {
+/* as uid 1000 in a child: attaches the segment, then stores and loads in it */
+static int attach_and_touch(int id) {
+    volatile char* p = shmat(id, 0, 0);
+    if (p == (char*) -1) return 2;
+    p[1] = 'y';
+    int ok = p[1] == 'y';
+    shmdt((char*) p);
+    return ok ? 0 : 3;
+}
+
+static volatile int go, revoked;
+static volatile char* page;
+static int by_shmdt;
+
+static void* revoker(void* arg) {
+    (void) arg;
+    while (!go) sched_yield();
+    if (by_shmdt)
+        shmdt((char*) page);
+    else
+        munmap((void*) page, 4096);
+    revoked = 1;
+    return 0;
+}
+
+/* as uid 1000: reads a page, then a sibling thread unmaps or detaches it while
+ * this thread is parked (at a fuel yield, or in sched_yield with "syscall");
+ * the same load after that must fault, however the check remembered the page */
+static int read_revoked(const char* how) {
+    by_shmdt = !strcmp(how, "shmdt");
+    if (by_shmdt) {
+        int id = shmget(IPC_PRIVATE, 4096, IPC_CREAT | 0600);
+        page = id >= 0 ? shmat(id, 0, 0) : (char*) -1;
+        if (id >= 0) shmctl(id, IPC_RMID, 0);
+    }
+    else {
+        page = mmap(
+            0, 4096, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0
+        );
+    }
+    if (page == (char*) -1 || page == MAP_FAILED) return 2;
+    page[0] = 1;
+    pthread_t t;
+    if (pthread_create(&t, 0, revoker, 0)) return 2;
+    int yielding = !strcmp(how, "syscall"), seen = 0;
+    long sum = 0;
+    for (long i = 0; i < 400000000; i++) {
+        if (revoked) seen++;
+        sum += page[0];
+        if (seen > 1) return 3;
+        go = 1;
+        if (yielding) sched_yield();
+    }
+    return sum ? 4 : 5;
+}
+
+/* as uid 1000: the kernel's memory, another process's and a segment it never
+ * attached refused, to syscalls, loads and stores; a segment it attaches is
+ * open (SECURITY.md) */
+static int nonroot(char* other, char* shared, char* open_id) {
     void* kernel = (void*) 0x10000;
     void* theirs = (void*) strtoul(other, 0, 0);
     int fds[2];
@@ -72,27 +132,74 @@ static int nonroot(char* other, char* shared) {
         run(their_poke) == 128 + SIGSEGV
     );
     CHECK("nonroot store to its own memory", run(own_poke) == 0);
-    printf(
-        "TRUST nonroot load from another process %s\n",
-        !memcmp(theirs, "root's", 6) ? "accepted" : "refused"
+    char* kernel_peek[] = {"isolation", "peek", "0x10000", NULL};
+    char* their_peek[] = {"isolation", "peek", other, NULL};
+    char* own_peek[] = {"isolation", "peek", "own", NULL};
+    CHECK(
+        "nonroot load from kernel memory ends it with SIGSEGV",
+        run(kernel_peek) == 128 + SIGSEGV
     );
+    CHECK(
+        "nonroot load from another process ends it with SIGSEGV",
+        run(their_peek) == 128 + SIGSEGV
+    );
+    CHECK("nonroot load from its own memory", run(own_peek) == 0);
     char* shared_poke[] = {"isolation", "poke", shared, NULL};
-    printf(
-        "TRUST nonroot store to a segment it never attached %s\n",
-        run(shared_poke) == 0 ? "accepted" : "refused"
+    char* shared_peek[] = {"isolation", "peek", shared, NULL};
+    CHECK(
+        "nonroot store to a segment it never attached ends it with SIGSEGV",
+        run(shared_poke) == 128 + SIGSEGV
     );
+    CHECK(
+        "nonroot load from a segment it never attached ends it with SIGSEGV",
+        run(shared_peek) == 128 + SIGSEGV
+    );
+    char* attach[] = {"isolation", "attach", open_id, NULL};
+    CHECK("nonroot store and load in a segment it attached", run(attach) == 0);
+    char* unmapped[] = {"isolation", "revoke", "munmap", NULL};
+    char* unmapped_syscall[] = {"isolation", "revoke", "syscall", NULL};
+    char* detached[] = {"isolation", "revoke", "shmdt", NULL};
+    CHECK(
+        "nonroot load after a sibling unmaps the page ends it with SIGSEGV",
+        run(unmapped) == 128 + SIGSEGV
+    );
+    CHECK(
+        "nonroot load after a sibling unmaps the page during a syscall ends it "
+        "with SIGSEGV",
+        run(unmapped_syscall) == 128 + SIGSEGV
+    );
+    CHECK(
+        "nonroot load after a sibling detaches the segment ends it with "
+        "SIGSEGV",
+        run(detached) == 128 + SIGSEGV
+    );
+    /* nommu has no MAP_FIXED, so a page reaches another owner only through an
+     * unmap, which the checks above cover */
+    void* mine = mmap(
+        0, 4096, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0
+    );
+    void* fixed = mmap(
+        mine, 4096, PROT_READ, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0
+    );
+    CHECK("MAP_FIXED refused", fixed == MAP_FAILED && errno == EINVAL);
     return 0;
 }
 
 int main(int argc, char** argv) {
     if (argc == 3 && !strcmp(argv[1], "child"))
         return attach_as_child(atoi(argv[2]));
-    if (argc == 4 && !strcmp(argv[1], "nonroot"))
-        return nonroot(argv[2], argv[3]);
-    if (argc == 3 && !strcmp(argv[1], "poke")) {
+    if (argc == 5 && !strcmp(argv[1], "nonroot"))
+        return nonroot(argv[2], argv[3], argv[4]);
+    if (argc == 3 && !strcmp(argv[1], "attach"))
+        return attach_and_touch(atoi(argv[2]));
+    if (argc == 3 && !strcmp(argv[1], "revoke")) return read_revoked(argv[2]);
+    if (argc == 3 && (!strcmp(argv[1], "poke") || !strcmp(argv[1], "peek"))) {
         volatile char* at =
             !strcmp(argv[2], "own") ? own : (char*) strtoul(argv[2], 0, 0);
-        *at = 'x';
+        if (argv[1][1] == 'o')
+            *at = 'x';
+        else
+            (void) *at;
         return 0;
     }
 
@@ -167,9 +274,14 @@ int main(int argc, char** argv) {
     CHECK("root-only segment", seg != (char*) -1);
     if (seg == (char*) -1) return 1;
     snprintf(seg_addr, sizeof seg_addr, "%p", (void*) seg);
+    /* a segment anyone may attach, which the nonroot process attaches itself */
+    int open_seg = shmget(IPC_PRIVATE, 4096, IPC_CREAT | 0666);
+    CHECK("open segment", open_seg >= 0);
+    char open_id[16];
+    snprintf(open_id, sizeof open_id, "%d", open_seg);
     pid = vfork();
     if (pid == 0) {
-        char* args[] = {"isolation", "nonroot", addr, seg_addr, NULL};
+        char* args[] = {"isolation", "nonroot", addr, seg_addr, open_id, NULL};
         if (setuid(1000) == 0) execv("/bin/isolation", args);
         dprintf(2, "nonroot: %s\n", strerror(errno));
         _exit(127);
@@ -185,11 +297,9 @@ int main(int argc, char** argv) {
             WIFEXITED(st) ? WEXITSTATUS(st) : -1,
             WIFSIGNALED(st) ? WTERMSIG(st) : 0
         );
-    printf(
-        "TRUST root sees the nonroot store %s\n",
-        *seg == 'x' ? "landed" : "absent"
-    );
+    CHECK("root's segment untouched by the nonroot store", *seg != 'x');
     shmdt(seg);
     shmctl(seg_id, IPC_RMID, 0);
+    shmctl(open_seg, IPC_RMID, 0);
     return 0;
 }

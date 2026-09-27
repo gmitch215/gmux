@@ -1,0 +1,92 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Gregory Mitchell <me@gmitch215.xyz>
+Date: Sun, 27 Sep 2026 15:40:00 -0400
+Subject: [PATCH] wasm: tell the host which pages are free at a checkpoint
+
+A checkpoint saved every page of RAM, including the ones the page
+allocator holds free, whose bytes are whatever was freed there last.
+wasm_free_pages hands the host a bitmap of the pages on the buddy free
+lists (allocated once at boot), and the host zeroes them before it saves
+the memory, so an image carries only live pages. A free page's list
+links live in its struct page, and this kernel neither poisons nor zeroes
+freed pages, so nothing reads their bytes before the next allocation.
+---
+--- a/arch/wasm/mm/Makefile
++++ b/arch/wasm/mm/Makefile
+@@ -1,3 +1,3 @@
+ # SPDX-License-Identifier: GPL-2.0-only
+ 
+-obj-y += init.o owner.o private.o advice.o
++obj-y += init.o owner.o private.o advice.o checkpoint.o
+--- a/arch/wasm/include/asm/wasm.h
++++ b/arch/wasm/include/asm/wasm.h
+@@ -45,6 +45,7 @@
+ unsigned int wasm_current_owner(void);
+ unsigned int wasm_current_euid(void);
+ unsigned long wasm_current_mm(void);
++unsigned long wasm_free_pages(void);
+ 
+ /* gmux: a fork child's own memory (arch/wasm/mm/private.c): the host fills and forgets it */
+ struct mm_struct;
+--- /dev/null
++++ b/arch/wasm/mm/checkpoint.c
+@@ -0,0 +1,57 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * For the host's checkpoint: the pages of RAM the page allocator holds free, so the image can leave
++ * them out. A free page's bytes are dead: its list links live in its struct page, and this kernel
++ * neither poisons nor zeroes freed pages, so the host zeroes them before it saves the memory.
++ */
++
++#include <linux/bitmap.h>
++#include <linux/init.h>
++#include <linux/memblock.h>
++#include <linux/mm.h>
++#include <linux/mmzone.h>
++#include <linux/slab.h>
++#include <linux/spinlock.h>
++#include <asm/wasm.h>
++
++/* the number of page frames, then a bit per frame */
++static unsigned long *free_bits;
++
++static int __init wasm_free_init(void)
++{
++	free_bits = kvcalloc(1 + BITS_TO_LONGS(max_pfn), sizeof(*free_bits), GFP_KERNEL);
++	return free_bits ? 0 : -ENOMEM;
++}
++core_initcall(wasm_free_init);
++
++/* the frame count and a bit per frame, set for each page on a buddy free list; 0 without them */
++__visible unsigned long wasm_free_pages(void)
++{
++	unsigned long *bits = free_bits + 1;
++	struct zone *zone;
++
++	if (!free_bits)
++		return 0;
++	free_bits[0] = max_pfn;
++	bitmap_zero(bits, max_pfn);
++	for_each_populated_zone(zone) {
++		unsigned long flags;
++		unsigned int order, mt;
++
++		spin_lock_irqsave(&zone->lock, flags);
++		for (order = 0; order < NR_PAGE_ORDERS; order++) {
++			for (mt = 0; mt < MIGRATE_TYPES; mt++) {
++				struct page *page;
++
++				list_for_each_entry(page, &zone->free_area[order].free_list[mt], buddy_list) {
++					unsigned long pfn = page_to_pfn(page);
++
++					if (pfn + (1UL << order) <= max_pfn)
++						bitmap_set(bits, pfn, 1U << order);
++				}
++			}
++		}
++		spin_unlock_irqrestore(&zone->lock, flags);
++	}
++	return (unsigned long)free_bits;
++}
+-- 
+2.43.0

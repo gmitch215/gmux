@@ -7,7 +7,11 @@ import { Machine, type MachineOptions } from '../../../src/worker/machine/machin
  * lazy restore: two processes park holding 6 MB each, the machine checkpoints, and a restore
  * writes only the pages no parked process owns (kernel patch 0014's owner table). Each process's pages
  * come in when one of its tasks is next scheduled. Reads the bytes written at restore, after a shell
- * command, and after each sleeper wakes, and checks each sleeper still holds its 6 MB.
+ * command, and after each sleeper wakes, and checks each sleeper still holds its 6 MB. Before either
+ * wakes, `ps` reads their /proc/<pid>/cmdline, which kernel patch 0021 brings in for it. The
+ * checkpoint zeroes the page allocator's free pages (patch 0020), counted here. Every read of the
+ * image is traced: those the restore makes, those in a second with no input (by window), and those the
+ * commands cause.
  * `node --experimental-strip-types experiments/mmu/scripts/lazy-restore.ts` (after boot stage.sh)
  */
 const root = new URL('../../../', import.meta.url).pathname;
@@ -53,10 +57,16 @@ const nonzero = (page: number) => {
 	return false;
 };
 let bytes = 0;
+// every read the restore makes, ms after the restore returned (negative: during it), and its bytes
+let restored = 0;
+const mib = (n: number) => +(n / 2 ** 20).toFixed(2);
+const reads: [number, number][] = [];
 const source = {
 	byteLength: full.byteLength,
 	read: (start: number, end: number) => {
+		const before = bytes;
 		for (let page = start >>> 12; page < end >>> 12; page++) if (nonzero(page)) bytes += 4096;
+		reads.push([restored ? performance.now() - restored : -1, bytes - before]);
 		return full.slice(start, end);
 	}
 };
@@ -67,11 +77,29 @@ machine = await Machine.restore(options, { ...snapshot, memory: new Uint8Array(0
 const restoreMs = performance.now() - t0;
 const atRestore = bytes;
 const deferred = machine.stats.deferredPages;
+const readsAtRestore = reads.length;
+// a second with no input: what the machine brings in on its own, by window
+restored = performance.now();
+await run(machine, () => false, 1000);
+const idle = Object.fromEntries(
+	[1, 10, 100, 1000].map((ms) => {
+		const hit = reads.slice(readsAtRestore).filter(([t]) => t <= ms);
+		return [`${ms}ms`, { reads: hit.length, MiB: mib(hit.reduce((n, [, b]) => n + b, 0)) }];
+	})
+);
+const readsIdle = reads.length;
 
 const mark = output.length;
 machine.type('echo shell-$((1+1))\n');
 await run(machine, () => output.slice(mark).includes('shell-2'));
 const afterShell = bytes;
+// the sleepers' command lines, read through /proc while their pages are still held back
+const psMark = output.length;
+// busybox ps prints [sh] for a command line it reads as empty; [r] keeps grep off its own line
+machine.type('ps w | grep -c "[r]ead go" ; echo ps-$((2+1))\n');
+await run(machine, () => output.slice(psMark).includes('ps-3'));
+const psLines = Number(/\n(\d+)\r?\n/.exec(output.slice(psMark))?.[1] ?? -1);
+const touched = machine.stats.touchedPages;
 machine.type('echo go > /tmp/w1\n');
 await run(machine, () => output.slice(mark).includes('woke /tmp/w1'));
 await run(machine, () => output.endsWith('# '));
@@ -79,19 +107,29 @@ const afterFirst = bytes;
 machine.type('echo go > /tmp/w2\n');
 await run(machine, () => output.slice(mark).includes('woke /tmp/w2'));
 const tail = output.slice(mark);
-const mib = (n: number) => +(n / 2 ** 20).toFixed(2);
+const later = reads.slice(readsIdle);
 console.log(
 	JSON.stringify({
 		machineMiB: mib(full.byteLength),
 		storedMiB: mib(stored),
 		restoreMs: Math.round(restoreMs),
 		fetchedAtRestoreMiB: mib(atRestore),
+		readsAtRestore,
+		// with no input, by window after the restore returned
+		idle,
+		// after the idle second, driven by the commands below: reads, and bytes per read
+		readsAfterIdle: later.length,
+		bytesPerReadAfterIdle: later.length ? Math.round(later.reduce((n, [, b]) => n + b, 0) / later.length) : 0,
 		deferredPages: deferred,
 		deferredMiB: mib(deferred * 4096),
 		afterShellMiB: mib(afterShell - atRestore),
 		afterFirstSleeperMiB: mib(afterFirst - afterShell),
 		afterSecondSleeperMiB: mib(bytes - afterFirst),
 		filledPages: machine.stats.filledPages,
+		// both sleepers' full command lines; without patch 0021 ps sees none
+		psSleepers: psLines,
+		touchedPages: touched,
+		freePagesZeroed: snapshot.stats.freePages,
 		// the command substitution drops the last newline of the 6,000,000 bytes
 		sleepersExact: /woke \/tmp\/w1 5999999/.test(tail) && /woke \/tmp\/w2 5999999/.test(tail),
 		crashed: String(machine.crashed)
