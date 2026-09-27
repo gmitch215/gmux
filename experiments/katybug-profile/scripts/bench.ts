@@ -138,6 +138,7 @@ native(setup);
 // #region run
 if (mode === 'run') {
 	const rounds = Number(rest[0] ?? 3);
+	console.log(`${variant ?? 'katybug'}: node ${process.version}, V8 ${process.versions.v8}`);
 	console.log('| workload | native ms | Katybug in gmux, ms | r |');
 	console.log('| --- | --- | --- | --- |');
 	for (const name of names) {

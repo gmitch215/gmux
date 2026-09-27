@@ -249,7 +249,7 @@ if (mode === 'run') {
 	}
 	const rI = rows[0]!.ms / v8ms;
 	const rN = rows.at(-1)!.ms / v8ms;
-	console.log(`V8: ${v8ms.toFixed(1)} ms per ${n} deflates; all interpreted r ${rI.toFixed(2)}, all native through one crossing r ${rN.toFixed(2)}`);
+	console.log(`V8 ${process.versions.v8} (node ${process.version}): ${v8ms.toFixed(1)} ms per ${n} deflates; all interpreted r ${rI.toFixed(2)}, all native through one crossing r ${rN.toFixed(2)}`);
 	console.log('| rung | target | closed share | ms | r | Amdahl r | crossings per deflate |');
 	console.log('| --- | --- | --- | --- | --- | --- | --- |');
 	for (const row of rows) {
