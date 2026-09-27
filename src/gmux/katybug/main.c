@@ -91,5 +91,8 @@ int main(int argc, char** argv) {
             (unsigned long long) cpu->plan_flags_run,
             (unsigned long long) cpu->plan_flags_ran
         );
+#ifdef KB_HOT
+    kb_hot_dump(cpu);
+#endif
     return status;
 }

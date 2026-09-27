@@ -4,6 +4,10 @@
 
 #include "kb.h"
 
+#ifdef KB_HOT
+    #include <unistd.h>
+#endif
+
 void kb_put(
     struct kb_emit* e, int op, int w, int a, int b, int c, int64_t imm
 ) {
@@ -260,6 +264,12 @@ enum
     FALL = 31
 };
 
+#ifdef KB_AOT
+void kb_aot_string(struct kb_cpu* cpu, int stos, int w, int rep) {
+    string(cpu, stos, w, rep);
+}
+#endif
+
 /* the flags a condition reads, as kb_cond does */
 static int cond_reads(int cond) {
     static const int x86[8] = {FV, FC, FZ,      FC | FZ,
@@ -340,6 +350,40 @@ static void plan_flags(struct kb_cpu* cpu, struct kb_block* b) {
     b->n = n;
 }
 
+#ifdef KB_LEAN_ZERO
+/* ops that write their a field; a write to KB_ZERO goes to KB_SINK when
+ * -DKB_LEAN_ZERO keeps the zero register untouched instead of resetting it */
+static int writes_a(const struct kb_ins* x) {
+    return x->op <= KB_INS || x->op == KB_LD || x->op == KB_LDS ||
+           x->op == KB_SETCC || x->op == KB_SEL || x->op == KB_CARRY ||
+           x->op == KB_BSWAP || x->op == KB_CLZ || x->op == KB_CTZ ||
+           x->op == KB_POPCNT || x->op == KB_TPIDR || x->op == KB_FSBASE ||
+           x->op == KB_X86SHD || (x->op == KB_X86FLAGS && x->imm == 0);
+}
+#endif
+
+#ifdef KB_LEAN_PC
+/* -DKB_LEAN_PC: KB_PC ops out of the stream, each op's instruction kept
+ * beside it for a fault to report */
+static int lean_pcs(struct kb_cpu* cpu, struct kb_block* b) {
+    if (cpu->trace) return 0;
+    if (!(b->pcs = malloc((size_t) (b->n ? b->n : 1) * sizeof *b->pcs)))
+        return 1;
+    uint64_t at = b->pc;
+    int n = 0;
+    for (int i = 0; i < b->n; i++) {
+        if (b->ins[i].op == KB_PC) {
+            at = (uint64_t) b->ins[i].imm;
+            continue;
+        }
+        b->pcs[n] = (uint32_t) (at - b->pc);
+        b->ins[n++] = b->ins[i];
+    }
+    b->n = n;
+    return 0;
+}
+#endif
+
 KB_NOINLINE static struct kb_block* block(struct kb_cpu* cpu, uint64_t pc) {
     unsigned h = (unsigned) ((pc >> 2) ^ (pc >> 14)) & 4095u;
     for (struct kb_block* b = cpu->cache[h]; b; b = b->chain)
@@ -350,6 +394,14 @@ KB_NOINLINE static struct kb_block* block(struct kb_cpu* cpu, uint64_t pc) {
               : cpu->arch == KB_A64 ? kb_a64_block(cpu, b)
                                     : kb_wasm_block(cpu, b);
     if (!bad && !cpu->noplan) plan_flags(cpu, b);
+#ifdef KB_LEAN_ZERO
+    for (int i = 0; !bad && i < b->n; i++)
+        if (b->ins[i].a == KB_ZERO && writes_a(&b->ins[i]))
+            b->ins[i].a = KB_SINK;
+#endif
+#ifdef KB_LEAN_PC
+    if (!bad) bad = lean_pcs(cpu, b);
+#endif
     int mem = 0;
     for (int i = 0; !bad && i < b->n; i++)
         mem += b->ins[i].op == KB_LD || b->ins[i].op == KB_LDS ||
@@ -357,13 +409,44 @@ KB_NOINLINE static struct kb_block* block(struct kb_cpu* cpu, uint64_t pc) {
     if (mem && !bad && !(b->ic = calloc((size_t) mem, sizeof *b->ic))) bad = 1;
     if (bad) {
         free(b->ins);
+        free(b->pcs);
         free(b);
         return NULL;
     }
     b->chain = cpu->cache[h];
     cpu->cache[h] = b;
+#ifdef KB_AOT
+    if (!cpu->trace) kb_aot_attach(cpu, b);
+#endif
     return b;
 }
+
+#ifdef KB_HOT
+void kb_hot_dump(struct kb_cpu* cpu) {
+    const char* dir = getenv("KATYBUG_HOT");
+    if (!dir) return;
+    char path[4096];
+    snprintf(path, sizeof path, "%s/%ld.hot", dir, (long) getpid());
+    FILE* f = fopen(path, "w");
+    if (!f) return;
+    for (int h = 0; h < 4096; h++)
+        for (struct kb_block* b = cpu->cache[h]; b; b = b->chain) {
+            if (!b->runs) continue;
+            fprintf(
+                f, "block %llx %llx %llx %d %llu\n", (unsigned long long) b->pc,
+                (unsigned long long) b->next, (unsigned long long) b->target,
+                b->n, (unsigned long long) b->runs
+            );
+            for (int i = 0; i < b->n; i++)
+                fprintf(
+                    f, "%d %d %d %d %d %lld\n", b->ins[i].op, b->ins[i].w,
+                    b->ins[i].a, b->ins[i].b, b->ins[i].c,
+                    (long long) b->ins[i].imm
+                );
+        }
+    fclose(f);
+}
+#endif
 
 /* a load or store translated once per mapping, not per access; kb_load_ic
  * refills a stale cache */
@@ -386,6 +469,32 @@ KB_NOINLINE static inline void store(
         memcpy(ic->host + (va - ic->lo), &v, (size_t) w);
 }
 
+/* -DKB_LEAN_OPERANDS reads an op's b and c registers only in the cases that use
+ * them; otherwise both are read ahead of the switch for every op */
+#ifdef KB_LEAN_OPERANDS
+    #define B (r[x->b])
+    #define C (r[x->c])
+#else
+    #define B b
+    #define C c
+#endif
+/* a fault in op i leaves the block at its start; -DKB_LEAN_PC names the
+ * instruction from the side table */
+#ifdef KB_LEAN_PC
+    #define FAULTED()                                                          \
+        ((blk->pcs ? (void) (cpu->ipc = blk->pc + blk->pcs[i]) : (void) 0),    \
+         blk->pc)
+#else
+    #define FAULTED() blk->pc
+#endif
+/* -DKB_LEAN_FAULT checks for a fault only after the ops that can raise one */
+#ifdef KB_LEAN_FAULT
+    #define CHECK()                                                            \
+        if (cpu->fault) return FAULTED()
+#else
+    #define CHECK() (void) 0
+#endif
+
 /* runs one block; returns the next pc */
 static uint64_t step(struct kb_cpu* cpu, struct kb_block* blk) {
     uint64_t* r = cpu->r;
@@ -393,76 +502,80 @@ static uint64_t step(struct kb_cpu* cpu, struct kb_block* blk) {
         blk->ic; /* the next load or store's; ops never jump inside a block */
     for (int i = 0; i < blk->n; i++) {
         struct kb_ins* x = &blk->ins[i];
+#ifndef KB_LEAN_OPERANDS
         uint64_t b = r[x->b], c = r[x->c];
+#endif
         switch (x->op) {
             case KB_MOVI: r[x->a] = (uint64_t) x->imm; break;
-            case KB_MOV: r[x->a] = b; break;
-            case KB_ADD: r[x->a] = b + c; break;
-            case KB_SUB: r[x->a] = b - c; break;
-            case KB_AND: r[x->a] = b & c; break;
-            case KB_OR: r[x->a] = b | c; break;
-            case KB_XOR: r[x->a] = b ^ c; break;
-            case KB_SHL: r[x->a] = c >= 64 ? 0 : b << c; break;
-            case KB_SHR: r[x->a] = c >= 64 ? 0 : b >> c; break;
+            case KB_MOV: r[x->a] = B; break;
+            case KB_ADD: r[x->a] = B + C; break;
+            case KB_SUB: r[x->a] = B - C; break;
+            case KB_AND: r[x->a] = B & C; break;
+            case KB_OR: r[x->a] = B | C; break;
+            case KB_XOR: r[x->a] = B ^ C; break;
+            case KB_SHL: r[x->a] = C >= 64 ? 0 : B << C; break;
+            case KB_SHR: r[x->a] = C >= 64 ? 0 : B >> C; break;
             case KB_SAR:
-                r[x->a] = (uint64_t) ((int64_t) b >> (c >= 64 ? 63 : c));
+                r[x->a] = (uint64_t) ((int64_t) B >> (C >= 64 ? 63 : C));
                 break;
             case KB_ROR: {
                 int bits = 8 * x->w;
-                uint64_t v = b & mask(x->w);
-                c %= (uint64_t) bits;
-                r[x->a] = c ? ((v >> c) | (v << (bits - c))) & mask(x->w) : v;
+                uint64_t v = B & mask(x->w), n = C % (uint64_t) bits;
+                r[x->a] = n ? ((v >> n) | (v << (bits - n))) & mask(x->w) : v;
                 break;
             }
-            case KB_MUL: r[x->a] = b * c; break;
+            case KB_MUL: r[x->a] = B * C; break;
             case KB_UMULH:
-                r[x->a] = (uint64_t) (((unsigned __int128) b * c) >> 64);
+                r[x->a] = (uint64_t) (((unsigned __int128) B * C) >> 64);
                 break;
             case KB_SMULH:
                 r[x->a] =
-                    (uint64_t) (((__int128) (int64_t) b * (int64_t) c) >> 64);
+                    (uint64_t) (((__int128) (int64_t) B * (int64_t) C) >> 64);
                 break;
-            case KB_UDIV: r[x->a] = c ? b / c : 0; break;
+            case KB_UDIV: r[x->a] = C ? B / C : 0; break;
             case KB_SDIV:
-                r[x->a] = c ? ((int64_t) b == INT64_MIN && (int64_t) c == -1
-                                   ? b
-                                   : (uint64_t) ((int64_t) b / (int64_t) c))
+                r[x->a] = C ? ((int64_t) B == INT64_MIN && (int64_t) C == -1
+                                   ? B
+                                   : (uint64_t) ((int64_t) B / (int64_t) C))
                             : 0;
                 break;
-            case KB_UREM: r[x->a] = c ? b % c : b; break;
+            case KB_UREM: r[x->a] = C ? B % C : B; break;
             case KB_SREM:
-                r[x->a] = c ? ((int64_t) c == -1
+                r[x->a] = C ? ((int64_t) C == -1
                                    ? 0
-                                   : (uint64_t) ((int64_t) b % (int64_t) c))
-                            : b;
+                                   : (uint64_t) ((int64_t) B % (int64_t) C))
+                            : B;
                 break;
-            case KB_ZEXT: r[x->a] = b & mask(x->w); break;
-            case KB_SEXT: r[x->a] = (uint64_t) sext(b, x->w); break;
+            case KB_ZEXT: r[x->a] = B & mask(x->w); break;
+            case KB_SEXT: r[x->a] = (uint64_t) sext(B, x->w); break;
             case KB_INS: {
                 uint64_t m = mask(x->w) << x->imm;
-                r[x->a] = (r[x->a] & ~m) | ((b << x->imm) & m);
+                r[x->a] = (r[x->a] & ~m) | ((B << x->imm) & m);
                 break;
             }
             case KB_LD:
-                r[x->a] = load(cpu, ic++, b + (uint64_t) x->imm, x->w);
+                r[x->a] = load(cpu, ic++, B + (uint64_t) x->imm, x->w);
+                CHECK();
                 break;
             case KB_LDS:
                 r[x->a] = (uint64_t) sext(
-                    load(cpu, ic++, b + (uint64_t) x->imm, x->w), x->w
+                    load(cpu, ic++, B + (uint64_t) x->imm, x->w), x->w
                 );
+                CHECK();
                 break;
             case KB_ST:
-                store(cpu, ic++, b + (uint64_t) x->imm, r[x->a], x->w);
+                store(cpu, ic++, B + (uint64_t) x->imm, r[x->a], x->w);
+                CHECK();
                 break;
-            case KB_FLAGS: flags(cpu, (int) x->imm, b, c, r[x->a], x->w); break;
+            case KB_FLAGS: flags(cpu, (int) x->imm, B, C, r[x->a], x->w); break;
             case KB_SETCC:
                 r[x->a] = (uint64_t) kb_cond(cpu, (int) x->imm);
                 break;
-            case KB_SEL: r[x->a] = kb_cond(cpu, (int) x->imm) ? b : c; break;
+            case KB_SEL: r[x->a] = kb_cond(cpu, (int) x->imm) ? B : C; break;
             case KB_BR:
                 if (kb_cond(cpu, (int) x->imm)) return blk->target;
                 break;
-            case KB_JMP: return b;
+            case KB_JMP: return B;
             case KB_SYSCALL:
                 cpu->pc = blk->next;
                 kb_syscall(cpu);
@@ -471,11 +584,12 @@ static uint64_t step(struct kb_cpu* cpu, struct kb_block* blk) {
                     cpu->sigreturned = 0;
                     return cpu->pc;
                 }
+                CHECK();
                 break;
             case KB_TRAP:
                 cpu->fault = "unknown instruction";
                 cpu->fault_sig = 4;
-                return blk->pc;
+                return FAULTED();
             case KB_PC:
                 cpu->ipc = (uint64_t) x->imm;
                 if (cpu->trace)
@@ -512,7 +626,7 @@ static uint64_t step(struct kb_cpu* cpu, struct kb_block* blk) {
                 break;
             case KB_X86SHD: {
                 int bits = 8 * x->w;
-                uint64_t m = mask(x->w), v = r[x->a] & m, in = b & m, n = c;
+                uint64_t m = mask(x->w), v = r[x->a] & m, in = B & m, n = C;
                 if (!n) break;
                 uint64_t out, cf;
                 if (x->imm == 0) {
@@ -535,42 +649,44 @@ static uint64_t step(struct kb_cpu* cpu, struct kb_block* blk) {
                     cpu->fault = "unknown x87 instruction";
                     cpu->fault_sig = 4;
                 }
+                CHECK();
                 break;
             case KB_SSE:
                 if (kb_sse(cpu, x) && !cpu->fault) {
                     cpu->fault = "unknown sse instruction";
                     cpu->fault_sig = 4;
                 }
+                CHECK();
                 break;
             case KB_CARRY: r[x->a] = (uint64_t) cpu->c; break;
             case KB_BSWAP: {
-                uint64_t v = __builtin_bswap64(b);
+                uint64_t v = __builtin_bswap64(B);
                 r[x->a] = v >> (64 - 8 * x->w);
                 break;
             }
             case KB_CLZ: {
-                uint64_t v = b & mask(x->w);
+                uint64_t v = B & mask(x->w);
                 r[x->a] = v ? (uint64_t) (__builtin_clzll(v) - (64 - 8 * x->w))
                             : (uint64_t) (8 * x->w);
                 break;
             }
             case KB_CTZ: {
-                uint64_t v = b & mask(x->w);
+                uint64_t v = B & mask(x->w);
                 r[x->a] =
                     v ? (uint64_t) __builtin_ctzll(v) : (uint64_t) (8 * x->w);
                 break;
             }
             case KB_POPCNT:
-                r[x->a] = (uint64_t) __builtin_popcountll(b & mask(x->w));
+                r[x->a] = (uint64_t) __builtin_popcountll(B & mask(x->w));
                 break;
             case KB_WTRAP:
                 cpu->fault = kb_wasm_traps[x->imm];
                 cpu->fault_sig = 4;
-                return blk->pc;
+                return FAULTED();
             case KB_WEXIT: cpu->exited = 1; return 0;
             case KB_TPIDR: r[x->a] = cpu->tpidr; break;
             case KB_FSBASE: r[x->a] = cpu->fs; break;
-            case KB_SETTP: cpu->tpidr = b; break;
+            case KB_SETTP: cpu->tpidr = B; break;
             case KB_BRZ:
                 if ((r[x->a] != 0) == (x->imm != 0)) return blk->target;
                 break;
@@ -580,9 +696,10 @@ static uint64_t step(struct kb_cpu* cpu, struct kb_block* blk) {
                 uint64_t a = r[x->a];
                 if (kb_cond(cpu, KB_C_A64 + cond)) {
                     int add = (int) ((x->imm >> 8) & 1);
+                    uint64_t bb = B;
                     flags(
-                        cpu, add ? KB_F_A_ADD : KB_F_A_SUB, a, b,
-                        add ? a + b : a - b, x->w
+                        cpu, add ? KB_F_A_ADD : KB_F_A_SUB, a, bb,
+                        add ? a + bb : a - bb, x->w
                     );
                 }
                 else
@@ -590,12 +707,19 @@ static uint64_t step(struct kb_cpu* cpu, struct kb_block* blk) {
                 break;
             }
             case KB_X86MD:
-                if (muldiv(cpu, (int) x->imm, x->w, b)) return blk->pc;
+                if (muldiv(cpu, (int) x->imm, x->w, B)) return FAULTED();
                 break;
-            case KB_X86STR: string(cpu, (int) x->imm, x->w, x->c); break;
+            case KB_X86STR:
+                string(cpu, (int) x->imm, x->w, x->c);
+                CHECK();
+                break;
         }
+#ifndef KB_LEAN_ZERO
         r[KB_ZERO] = 0;
-        if (cpu->fault) return blk->pc;
+#endif
+#ifndef KB_LEAN_FAULT
+        if (cpu->fault) return FAULTED();
+#endif
     }
     return blk->next;
 }
@@ -612,7 +736,14 @@ int kb_run(struct kb_cpu* cpu) {
             break;
         }
         cpu->ipc = b->pc;
+#ifdef KB_HOT
+        b->runs++;
+#endif
+#ifdef KB_AOT
+        uint64_t next = b->aot ? b->aot(cpu, b->pc) : step(cpu, b);
+#else
         uint64_t next = step(cpu, b);
+#endif
         cpu->steps++;
         cpu->plan_flags_run += b->dropped;
         cpu->plan_flags_ran += b->flag_writes;

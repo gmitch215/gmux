@@ -27,6 +27,7 @@ enum kb_arch
 enum
 {
     KB_T0 = 32,
+    KB_SINK = 62, /* -DKB_LEAN_ZERO: writes to KB_ZERO land here instead */
     KB_ZERO = 63, /* always 0: AArch64's xzr reads here */
     KB_NREGS = 64
 };
@@ -148,6 +149,8 @@ struct kb_ic {
     uint32_t gen;
 };
 
+struct kb_cpu;
+
 /** one decoded straight-line block: runs its ops, then continues at `next`
  * unless an op left */
 struct kb_block {
@@ -155,9 +158,19 @@ struct kb_block {
     int n;
     struct kb_ins* ins;
     struct kb_ic* ic; /* one per load or store, in op order */
+    uint32_t* pcs;    /* -DKB_LEAN_PC: each op's guest instruction, as an offset
+                         from pc, in place of KB_PC ops */
     int flag_writes,
         dropped; /* flag writes decoded, and those the plan took out */
     struct kb_block* chain; /* the next block in its hash bucket */
+#ifdef KB_HOT
+    uint64_t runs; /* times the interpreter ran it, for kb_hot_dump */
+#endif
+#ifdef KB_AOT
+    /* a region of lifted blocks this block's IR matched exactly; it runs from
+       the given pc and returns the next one */
+    uint64_t (*aot)(struct kb_cpu* cpu, uint64_t pc);
+#endif
 };
 
 struct kb_mapping {
@@ -248,6 +261,18 @@ extern const char* kb_wasm_traps[];
 /* run.c */
 int kb_cond(struct kb_cpu* cpu, int cond);
 int kb_run(struct kb_cpu* cpu);
+#ifdef KB_HOT
+/* KATYBUG_HOT=<dir>: every block the interpreter ran, with its IR and run
+ * count, to <dir>/<pid>.hot */
+void kb_hot_dump(struct kb_cpu* cpu);
+#endif
+#ifdef KB_AOT
+/* the lifted blocks (generated, see experiments/aot-oracle): attaches a region
+ * to a block whose IR matches one exactly */
+void kb_aot_attach(struct kb_cpu* cpu, struct kb_block* b);
+void kb_aot_string(struct kb_cpu* cpu, int stos, int w, int rep);
+extern volatile int* kb_pending_flag;
+#endif
 
 /* elf.c */
 int kb_load_elf(

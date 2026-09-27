@@ -53,6 +53,9 @@ static volatile sig_atomic_t pending_bits[65];
 static int pending_code[65]; /* si_code: SI_USER 0 from kill and other
                                 processes, SI_TKILL -6 */
 static volatile sig_atomic_t any_pending;
+#ifdef KB_AOT
+volatile int* kb_pending_flag = &any_pending;
+#endif
 
 static int timer_sig; /* the guest's one POSIX timer, on the host's ITIMER_REAL;
                          0 for none */
