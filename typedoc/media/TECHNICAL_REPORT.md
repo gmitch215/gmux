@@ -35,11 +35,15 @@ frames for user programs, paid only when a machine leaves memory.
 | Whole booted machine checkpointed mid-job, evicted, restored | **exact**, 1 GiB foreground 3 of 3, background job 2 of 2, idle 4 of 4 | `ctx.abort()`, Free |
 | Pipes, job control, `^C`, background jobs | **5 of 5** cases | `experiments/shell`, Free |
 | `vfork`, `$(...)`, pthreads, a signal handler that blocks, the POSIX surface | **all pass** (execve, `_exit`, failed execve; 4 threads x 10,000 locked increments; sockets, flock, epoll, eventfd, timerfd, inotify) | `experiments/vfork`, `posix`, Free |
-| Lua 5.4.7's own suite, file by file | **25 of 32** on Free at 150 MiB, 28 of 32 in Node at 256 MiB, against **29 of 32** native musl | `experiments/setjmp`, Alpine reference on paisley-park |
+| Lua 5.4.7's own suite, file by file | **30 of 32** on Free, against **29 of 32** native musl; the two agree on 31 files | `tests/suites/lua.sh`, Alpine reference on paisley-park |
+| libc-test's pthread suite | **20 of 24** on Free | `tests/suites/`, Free |
+| A non-root process writing memory it does not own | `SIGSEGV` from the store, `EFAULT` from a syscall; the checked build costs **1.09-1.44x** on the census | `tests/c/isolation.c`, Node and Free |
+| Checkpoint tax on user programs | resumable frames **0.977-1.023x** of the plain build on six census programs, against Asyncify's +63% | local wall clock, Node, interleaved |
+| Restore of an evicted machine | exact **6 of 6** into its predecessor's pooled memory, 0 of 6 into a fresh allocation | `experiments/evicted-memory`, Free |
 | Checkpoint of the whole booted machine, mid-pipeline | **18-53 ms**, 73 stacks in 17.3 KB; restore 19-52 ms; 11 of 11 exact | local wall clock, Node |
 | Asyncify tax on a CPU pipeline | **+63%**, almost all in the user program; kernel +3-9% | local wall clock, Node, interleaved |
 | Native wasm compiled at startup from compressed bytes | **54.5 MB** in 715 ms; 15 copies rejected | wrangler `Worker Startup Time` |
-| Package census | **15 programs and 7 libraries** of 48 recipes build and link cleanly | `scripts/census.sh`, paisley-park |
+| Package census | **24 programs and 7 libraries** of 48 recipes build and link cleanly | `scripts/census.sh`, paisley-park |
 | Unchanged amd64 BusyBox, coreutils, bash, sqlite3 and curl under Katybug | **117 of 117** transcript lines equal native x86-64 Linux, inside a machine; 31,725-case instruction corpus equal | `tests/c/katybug/`, paisley-park reference |
 | `fork` from an unmodified C program | **5 of 5** cases, including a forking server whose handlers fork again; deployed | `tests/c/fork.c`, Free |
 
@@ -60,13 +64,14 @@ are charged, ~10-14 KiB each at 1,025 frames, which an earlier survival test mis
 parked stacks resident past 30 minutes idle. The hibernation API and alarms lose them between 5 and
 15 s. A deploy restarts every resident object. So a machine that must survive idleness, eviction or
 publication has to reach a checkpoint first. The checkpoint path is JSPI park, then Asyncify unwind
-into linear memory, then packed dirty pages in SQLite. It restores a booted kernel with a pipeline
-mid-run exactly under Node; the deployed run is next.
+into linear memory, then packed dirty pages in SQLite. It restores a booted kernel mid-job exactly,
+deployed on Free, after a forced eviction.
 
-**Checkpointing costs user programs, not the kernel.** Asyncifying BusyBox adds 63% to a CPU-bound
-pipeline; asyncifying the kernel adds 3-9% to the same job and 35% to boot. A process only needs the
-instrumentation if it must survive a checkpoint mid-computation, so the next design compiles both
-variants of a program at startup and chooses per process.
+**Checkpointing cost user programs, not the kernel, until resumable frames.** Asyncifying BusyBox
+adds 63% to a CPU-bound pipeline; asyncifying the kernel adds 3-9% to the same job and 35% to boot.
+Resumable frames replace Asyncify in user programs: a call that can reach a syscall spills the
+frame's live locals when a checkpoint unwinds it, and six census programs run at 0.977-1.023x of the
+plain build. Only the kernel stays asyncified.
 
 **Free meters that bind:**
 
@@ -81,10 +86,11 @@ variants of a program at startup and chooses per process.
 
 Root processes share one trust domain, and non-root processes are isolated for writes only: they
 can still read the kernel's and other processes' memory (`SECURITY.md`). A forked child copies its
-parent's memory eagerly and cannot share memory with other processes. Also unmeasured: any serving
-workload, execution memoization, publication of proven responses, energy, and a deployed run of the
-latest kernel (console interrupt, scheduler clock, exec stubs). None of it has a number, and no
-figure here stands in for one.
+parent's memory eagerly and cannot share memory with other processes. The terminal site does not
+checkpoint its machine yet, so a machine evicted there boots again, and checkpoints do not save
+shared instances. Also unmeasured: any serving workload, execution memoization, publication of
+proven responses, energy, and a deployed run of the latest kernel (console interrupt, scheduler
+clock, exec stubs). None of it has a number, and no figure here stands in for one.
 
 ---
 
@@ -100,14 +106,16 @@ filesystem and the terminal.
 The kernel and every process share one `WebAssembly.Memory`. Each user program is its own wasm
 instance importing that memory, `__memory_base`, `__table_base`, `__stack_pointer`, a table, and
 `__wasm_syscall_0..6` directly from the kernel instance, so a syscall is a wasm-to-wasm call with no
-JavaScript frame. One machine is one trust domain: no process is isolated from another by wasm.
+JavaScript frame. wasm isolates no process from another. A page owner table in the kernel keeps a
+non-root process from writing memory it does not own (Isolation, below); root processes share one
+trust domain.
 
 ### One Host Thread, Suspended by JSPI
 
 linux-wasm's browser host backs each task with a Web Worker and blocks it in `Atomics.wait`. A
 Durable Object has one thread and refuses `Atomics.wait`. Every blocking host import is instead a
 `WebAssembly.Suspending` function, every entry into a task goes through `WebAssembly.promising`, and a
-pump in `experiments/boot/src/machine.ts` resumes exactly one task at a time by resolving the promise of
+pump in `src/worker/machine/machine.ts` resumes exactly one task at a time by resolving the promise of
 the task the kernel names next.
 
 | host import | what it does under the pump |
@@ -146,8 +154,19 @@ task starts from the values a fresh instance would have.
 | Node RSS, same runs | 171.9 MB | 96.3 MB |
 | Deployed: processes before the object resets | ~10 in its lifetime | none reset: 16 in one event; a 3-stage pipe in each of 6 events |
 
-User programs still need one instance each, because `__memory_base` and `__table_base` are immutable
-and differ per process. A BusyBox instance costs ~1.9 MiB, so the governor bounds live processes.
+A user program is one instance per process by default, because `__memory_base` and `__table_base`
+are immutable and differ per process. Each program keeps only the exports the host calls and sizes
+its function table from a `gmux.table` note, which cut JS heap per BusyBox process from 820-907 KiB
+to 31 KiB, and fifty processes from 70.6 to 11.7 MiB (`experiments/instances/scripts/cost.ts`). A
+BusyBox instance cost ~1.9 MiB of the object budget before that trimming.
+
+`MachineOptions.shareInstances` runs every process of one program on a single instance instead
+(`scripts/wasm/share.ts` makes it shareable). At each switch the host swaps the memory base, the
+stack pointer and the globals, and it copies a pristine data image to each new process. Against one
+instance per process: about 10 KiB of JS heap per process instead of 115-125 KiB (6.1 MiB against
+18.4 MiB at 50 processes), no instantiation, 300 fork/exec pairs about 19% faster, CPU-bound work
+unchanged. The BusyBox transcript is byte-identical and every probe passes with it on. Checkpoints do
+not save shared instances yet, so it is off by default.
 
 ### Fuel Safepoints
 
@@ -166,6 +185,13 @@ standard-socket messages on one instance, and a 9 s version matched a single-pas
 byte. On the booted kernel, a 1 GiB pipeline ran across one exec event and four run events of 5.8-6.8 s
 wall each.
 
+A job with no terminal attached needs events from somewhere else. Two objects holding one standard
+WebSocket between them, each quantum ending with a message to the other, ran 1,000 quanta in both
+directions on one instance with a JSPI-parked stack alive, writing no rows and making no
+subrequests (`experiments/baton`). An alarm per quantum ran the same 1,000 at one row each, in 148 s
+against 76-82 s. A chain of requests between objects stops at 8 quanta: requests are causal, and the
+platform's subrequest depth is 16 hops.
+
 ### Checkpoints
 
 A parked task's stack is opaque to the host. To checkpoint, the host wakes the park with "unwind",
@@ -174,8 +200,9 @@ frames) lands in linear memory. Restore rewinds into fresh instances and stops a
 back in its JSPI park. Warm switching never pays for this; the Asyncify instrumentation tax is paid on
 the calls it instruments.
 
-On the booted kernel, `Machine.checkpoint()` in `experiments/boot/src/machine.ts` does this for every
-task. The kernel and BusyBox are asyncified at their park imports (`scripts/build-async.sh`), and all
+On the booted kernel, `Machine.checkpoint()` in `src/worker/machine/machine.ts` does this for every
+task. The kernel and BusyBox are asyncified at their park imports
+(`experiments/machine-checkpoint/scripts/build-async.sh`), and all
 tasks share one kernel instance, so a checkpoint unwinds one stack at a time through a 2 MiB scratch
 region and copies each out. The snapshot carries linear memory and each stack, plus host state:
 
@@ -200,7 +227,9 @@ stack that runs program, then library, then program again resumes too.
 `setjmp`/`longjmp`, a `qsort` callback, a signal handler, a side module calling back by pointer and
 by import, and Lua inside `pcall` inside a coroutine; the harness refuses a checkpoint that lands
 outside the phase it tests, and each restore is exact. Against the plain build, the wrapped calls
-cost 0.977-1.023x on six census programs.
+cost 0.977-1.023x on six census programs. The cost is size: BusyBox grows from 1.45 MB to 3.38 MB
+with the spill handlers and to 18.0 MB with the resume variants, because the fuel pass puts a
+safepoint on every loop back-edge (26,958 sites).
 
 Changed pages are found at checkpoint time by hashing each 64 KiB page, packed with a small page index
 into rows of up to 2 MB, and written only after `ctx.storage.sync()` succeeds. There is no store
@@ -221,7 +250,7 @@ the machine's Durable Object, `src/site-do.ts`. The first visitor claims the mac
 (`src/worker/owner.ts`). Both sockets require the token. The control socket is hibernatable and
 carries console bytes. The warm socket is standard, keeps the object resident, and sends a tick
 each second that gives the machine a 5 s quantum; a keystroke gives it 250 ms. A hidden page closes
-its warm socket. Until the deployed checkpoint works, a machine evicted after its last warm socket
+its warm socket. The site does not checkpoint its machine yet, so a machine evicted after its last warm socket
 closes boots again on the next keystroke; on Free, a control socket idle for 70 s saw the object
 evicted, and the next keystroke booted a fresh machine and got an answer. All sessions share the one
 console.
@@ -255,6 +284,16 @@ Execs got faster because the host no longer copies and hashes 1.45 MB twice per 
 and exec each look the program up). MemFree gains less than the page cache drops because a
 full-file initramfs hands its 732 KiB back to the kernel after unpacking.
 
+### Isolation
+
+Kernel patch 0014 keeps an owner for every page of the shared memory. A non-root process runs a
+build of its program that checks each store against that table (`scripts/wasm/guard-pass.ts`), and
+`access_ok` refuses a non-root task's syscall buffers outside its own pages. A non-root process that
+writes the kernel's memory or another process's gets `SIGSEGV` from the store and `EFAULT` from a
+syscall (`tests/c/isolation.c`), in Node and deployed on Free. The checked build costs 1.09-1.44x on
+the census; root processes run the plain build. Reads are not isolated, and a writable shared mapping
+is open to every non-root process (`SECURITY.md`).
+
 ### Foreign Executables
 
 Katybug (`src/gmux/katybug/`) runs x86-64 and AArch64 Linux ELFs inside the machine: `binfmt_misc`
@@ -282,6 +321,11 @@ range, with its old data, where Linux faults. Running the transcript inside the 
 `bts`, which Katybug had never decoded; curl reaches it only when a connect does not finish at
 once, so it came and went with timing. `bts`, `btr` and `btc` now decode, and a register bit offset
 into memory addresses a bit string as the hardware does.
+
+A signal the process inherits as ignored stays ignored for the guest, as `execve` keeps it on Linux.
+Katybug had started every guest disposition at default while the host's stayed ignored, so a guest
+asking `sigaction` was told "default". A CI runner starts its steps with `SIGPIPE` ignored, which is
+where it showed.
 
 Each decoded block then goes through a plan before it runs. The first plan is flag demand: a flag
 write is dropped when every flag it sets is written again before anything reads it. The block's
@@ -368,6 +412,21 @@ Parked tasks have a separate knee. With 16 frames each, 48,000 tasks parked and 
 CPU; 64,000 stopped progressing after 2.06 s and were cancelled at 120 s wall; 80,000 and 100,000
 ended in an exception at ~64 s wall. That knee is narrowed, not attributed.
 
+**An evicted machine's memory stays charged to its isolate.** An evicted object's next instance lands
+in the same isolate every time, and a 2400-page boot there was reset 12 of 12 times, whether the
+machine was aborted 0, 5 or 30 s earlier or idle-evicted 75 s earlier. A restore therefore reuses its
+predecessor's memory: a module-scope pool keyed by object id holds a `WeakRef` to each machine's
+memory, and `Machine` takes it when it is no larger than the machine's start size. Every restore
+qualifies, since a snapshot is full size, and no boot does. A 1600-page (100 MiB) machine
+checkpointed, aborted and restored exact 6 of 6 with the pool and 0 of 6 without, where the restored
+machine was reset once it ran (`experiments/evicted-memory`).
+
+**A booted object can be replaced silently between two requests.** After the first-placement burn,
+a booted machine answered its next request from a new instance in another isolate, unbooted, with no
+exception in the tail: 3 of 24 probe cases and 2 of 32 Lua files in one deployed run. A resident
+machine survives only through its checkpoint, and the deployed rigs compare each response's instance
+against the boot's and rerun a case the platform replaced.
+
 ### First Placement
 
 A new object whose CPU passes ~1 s is replaced after that event: new instance, memory and sockets
@@ -393,6 +452,11 @@ The next request arrives on the replacement instance, which sees that another in
 burning and marks the object placed. Six fresh objects on Free went prime, then placed on the next
 request, then kept their instance through a 1.5 s burn (`placed.mjs`; priming cost 1,459-1,819 ms).
 A large program's startup can then pass a second of CPU without taking the machine with it.
+
+A host that never replaces objects (workerd under `wrangler dev`, which the Docker image runs) keeps
+the priming instance. The object is marked placed once one instance has survived three burns, about
+4.5 s of CPU, four times the ~1 s after which Cloudflare replaces. Before that bound every request on such a host
+burned 1.5 s and answered 503, so the image could never claim a machine.
 
 ### CPU per Event
 
@@ -525,6 +589,15 @@ finished with the exact checksum and the shell answering.
 The heap corruption first read as a defect in the asyncified kernel. It was the frozen clock (One Host
 Thread, Suspended by JSPI). Attribution arms showed the plain kernel crashing too, and only with a background job.
 
+**Lazy restore.** Translating every guest access through a page table, a flat table in a second
+memory with the lookups inlined, costs 2.06-2.66x on the census (lua 2.60, gzip 2.46, bzip2 2.67,
+sqlite 2.06, sed 2.63, gawk 2.35); a 1,024-entry TLB was worse, 2.4-5.7x. Translating once per 4 KiB
+page ran at 0.98-0.99x of the same loop untranslated (`experiments/mmu/src/micro.wat`). So no code
+runs translated, and a restore uses the page owner table instead: it writes the pages no parked
+process owns and brings a process's pages in just before one of its tasks runs. A 127 MiB machine
+fetched 74-76 of its 86-88 MiB of data at restore, and two parked 6 MB processes came in only when
+they woke, intact (`experiments/mmu/scripts/lazy-restore.ts`).
+
 ### Dirty Tracking
 
 | arm, deployed | cost |
@@ -582,6 +655,27 @@ at module scope:
 
 A rejected upload leaves the previous version serving. The cost is ~13 ms per raw MiB, paid by every
 cold isolate.
+
+### Lanes
+
+A lane is another Durable Object of the same deployment doing work for a machine. Deployed on Free:
+
+| arm | result |
+| --- | --- |
+| one lane, SIMD sequential read (client-timed) | 27-28 GB/s at 128 MiB, 31-33 at 64 MiB, 53-62 at 16 MiB; scalar `i64` 13-17 GB/s (laptop 49, paisley-park 62) |
+| plain C loops at `-O3 -msimd128`, lane / Node / native | FP32 GEMM 256^3 10-12 / 24.8 / 22.8 GFLOPS; int8 dot 7.4-9.0 / 9.3 / 59.5 GOPS; 3x3 convolution 16.8 / 36.8 / 49.7 GFLOPS |
+| cold start of N lanes | one flat fan-out 0.76 s at 32 lanes to 5.19 s at 256, linear; pods of 32, 0.96-1.09 s at every size |
+| aggregate read at 256 lanes | flat 0.79-1.03 TB/s with a median lane of 255-284 ms; pods of 32, 1.42-1.59 TB/s with 98-100 ms (a lone lane: 72-106 ms) |
+
+Objects of one class share isolates: 1:1 up to 8 lanes, 204 isolates for 256. Lanes that declared
+128 MiB memories were reset for the shared isolate's limit (3-118 errors a run), and 17 MiB lanes ran
+256 of 256 (`experiments/lane-bandwidth`, `lane-simd`, `lane-pods`).
+
+A connection can outlive the object that uses it when a small object of its own holds it. One held a
+TLS connection to dns.google for 901 s and answered 19 DoH queries exact while its client object was
+aborted or idle-evicted four times (`experiments/socket`). The request that opened the socket keeps
+it, since I/O objects belong to the request that created them. Without a 60 s keepalive the
+connection dropped within 300 s idle while its object stayed resident.
 
 ---
 
@@ -727,6 +821,32 @@ on the shared stack. In a booted kernel an unmodified C program's `vfork` runs `
 `/bin/echo`, `_exit(7)` and a failed `execve` (`ENOENT`) with the right status each time. A checkpoint
 refuses while a vfork is in flight.
 
+### fork
+
+A program built with resumable frames forks. The child gets a memory of its own holding a copy of
+the parent's mappings (kernel patch 0015, musl patch 0008), and the parent's frames, spilled once,
+resume in both. `tests/c/fork.c` (a fork 40 frames deep, a pipe, fork then exec, a forking server
+whose handlers fork from a fork child) passes in Node and deployed on Free; dash and `make -j2` pass
+in Node. The copy is eager rather than copy-on-write, and a forked child cannot share memory with
+other processes.
+
+### dlopen
+
+`src/gmux/dl.c` sends a library's bytes to the host (`src/worker/machine/dl.ts`), which instantiates
+the precompiled side module registered under their hash into the calling process: data in memory the
+process allocated, functions on its table, imports from the program's exports. zlib 1.3.1 built with
+`-shared` loads through `dlopen` and prints what the same program prints natively against the same
+zlib (`tests/c/dl.c`), in Node and deployed on Free. An unregistered library is refused with the
+reason, since a Worker cannot compile code at run time, and so are ELF objects and executables.
+Threads created after `dlopen` see the library, and snapshots carry it.
+
+### Stacks
+
+A process starts on a 128 KiB stack and grows in 1 MiB segments up to `RLIMIT_STACK`, where an
+overflow is `SIGSEGV` instead of a write into the heap below. Each frame allocation is checked by one
+unsigned compare, which costs 2.4% on gawk, 1.8% on sed and nothing measurable on Lua (11 rounds); a
+first form that checked every stack pointer write cost up to 7.6%.
+
 ### Syscall Dispatch
 
 linux-wasm dispatched a syscall by casting the handler to a function of as many arguments as
@@ -748,6 +868,11 @@ it: every thread started with `pthread_self()` = 0 and no clear-tid address, `pt
 woke, and the last worker's exit ended the process with status 0, which read as success. The musl
 patch in `src/musl/patches/` reads each argument its flags use. Four threads counting 40,000 times
 under a mutex and a condition variable, with `join`, are exact in a booted kernel.
+
+libc-test's 24 pthread tests pass 20 on Free. The other four needed `fork` or a real `PROT_NONE`
+when they were run, which was before `fork` landed. Six musl and kernel defects were fixed on the
+way: per-thread TLS, the `siginfo` offset, cancellation points, the `ucontext_t` layout,
+detached-thread exit, and signals to a spinning thread.
 
 ### Signal Handlers
 
@@ -786,14 +911,21 @@ extensions do not yet. nano and tmux now configure and stop at unresolved ncurse
 | recipe or build system | less, htop, vim (configure does not accept the ncurses build); nano, tmux (ncurses data symbols unresolved at link); zstd, lz4 (the program's own library symbols unresolved); git (`--allow-multiple-definition`); perl (dynamic XS extensions); file (runs its own binary to build `magic.mgc`) |
 
 The dash build drops `--enable-static`, which adds `-Wl,--fatal-warnings`. autoconf's `char f()` probes
-are a signature mismatch in typed wasm, so under fatal warnings every such probe fails. BusyBox's
-`$(...)` fails because musl's `vfork()` here prints `vfork() is not implemented yet, use clone()
-instead!`.
+are a signature mismatch in typed wasm, so under fatal warnings every such probe fails.
 
 `EXTRA_CFLAGS=-msimd128` builds the same set with autovectorization (217 to 3,047 SIMD instructions
 per program). Against the plain build, 5 rounds, arms interleaved: Lua 1.020, gzip 0.992, bzip2
 0.991, sqlite 0.986, sed 0.987, gawk 0.997, inside the ~3% noise, at 0.1-2.8% more bytes. For
 scalar programs a SIMD build buys nothing; SIMD pays where a kernel is written for it.
+
+### Upstream Suites
+
+`tests/suites/lua.sh` builds the same Lua 5.4.7 source with musl on a native Linux host and runs its
+suite file by file there and in gmux, then prints both columns. gmux passes 30 of 32 on Free and
+native musl 29 of 32, and the two agree on 31 files: `big` and `literals` fail on both, and
+`heavy.lua` fails natively under the container's 2 GB cap. The suite found three defects on the way:
+the 128 KiB stack overflowing into the heap, a wall clock stuck in 1970, and a missing `/tmp`.
+libc-test's pthread suite is under Threads.
 
 ---
 
