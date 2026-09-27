@@ -5,7 +5,7 @@ set -euo pipefail
 here=$(cd "$(dirname "$0")" && pwd)
 root=$(cd "$here/../../.." && pwd)
 out=$(mktemp -d)
-cc -std=c11 -D_DEFAULT_SOURCE -D_DARWIN_C_SOURCE -O2 -o "$out/katybug" "$root"/src/gmux/katybug/*.c -lm
+cc -std=c11 -D_DEFAULT_SOURCE -D_DARWIN_C_SOURCE -O2 ${KATYBUG_CFLAGS:-} -o "$out/katybug" "$root"/src/gmux/katybug/*.c -lm
 "$root/scripts/ts" "$here/wasm-ops.ts" "$out"
 wat2wasm "$out/wasm-ops.wat" -o "$out/wasm-ops.wasm"
 node "$here/wasm-ops.mjs" "$out" > "$out/v8.txt"

@@ -23,7 +23,7 @@ to_host() {
 }
 suites=${*:-busybox userland}
 out=$(mktemp -d)
-cc -std=c11 -D_DEFAULT_SOURCE -D_DARWIN_C_SOURCE -O2 -o "$out/katybug" "$root"/src/gmux/katybug/*.c -lm
+cc -std=c11 -D_DEFAULT_SOURCE -D_DARWIN_C_SOURCE -O2 ${KATYBUG_CFLAGS:-} -o "$out/katybug" "$root"/src/gmux/katybug/*.c -lm
 
 # the work tree both sides see: inputs, the binaries, bin/ and ubin/ of links, and the runner
 mkdir -p "$out/t/bin" "$out/t/ubin" "$out/tmp"

@@ -2,14 +2,14 @@
 # the differential check: x86-64 and AArch64 ELFs built from tests/c/katybug run under a native
 # build of katybug. guest.c's reference is the same source built natively (-DKB_HOST, freestanding
 # otherwise); signals.expected is the x86-64 signals build's output on native Linux.
-# usage: tests/c/katybug/run.sh
+# usage: tests/c/katybug/run.sh; KATYBUG_CFLAGS adds flags to each check's katybug build
 set -euo pipefail
 here=$(cd "$(dirname "$0")" && pwd)
 root=$(cd "$here/../../.." && pwd)
 llvm=${LLVM:-/opt/homebrew/opt/llvm/bin}
 out=$(mktemp -d)
 cc -std=c11 -D_DEFAULT_SOURCE -D_DARWIN_C_SOURCE -O2 -Wall -Wextra -Werror \
-	-o "$out/katybug" "$root"/src/gmux/katybug/*.c -lm
+	${KATYBUG_CFLAGS:-} -o "$out/katybug" "$root"/src/gmux/katybug/*.c -lm
 cc -DKB_HOST -O2 -o "$out/guest-native" "$here/guest.c"
 flags=(-nostdlib -static -fuse-ld=lld -O2 -ffreestanding -fno-stack-protector -fno-builtin)
 "$llvm/clang" --target=x86_64-linux-gnu "${flags[@]}" -mno-sse -mno-mmx -o "$out/guest-x86" "$here/guest.c"
