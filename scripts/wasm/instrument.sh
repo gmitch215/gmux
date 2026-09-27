@@ -17,6 +17,8 @@ if [ "${GMUX_NO_STACK_CHECK:-}" = 1 ]; then cp "$tmp/fuel.wat" "$tmp/stack.wat";
 fi
 keep=_start,__libc_clone_callback,__libc_handle_signal,__set_tls_base,__get_tls_base,__c_longjmp
 keep+=,__wasm_apply_data_relocs,__wasm_apply_tls_relocs,__wasm_apply_global_relocs,__wasm_call_ctors,__gmux_set_stack_limits
+# GMUX_KEEP_EXPORTS=a,b keeps more (a rig reading its own counters)
+keep+=${GMUX_KEEP_EXPORTS:+,$GMUX_KEEP_EXPORTS}
 # a program that calls dlopen keeps its exports (side modules link against them), and a side
 # module (no _start) is nothing but its exports
 if grep -q '(import "env" "__gmux_dlopen"' "$tmp/stack.wat" || ! grep -q '(export "_start"' "$tmp/stack.wat"; then
