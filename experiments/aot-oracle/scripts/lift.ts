@@ -92,6 +92,9 @@ dumps.forEach((dump, region) => {
 		const name = OPS[x.op]!.replace(/^KB_/, '');
 		if (name === 'SSE' || name === 'X87') return [x.b];
 		if (name === 'X86STR' || name === 'PC' || name === 'SYSCALL') return [];
+		// an access's c and a resolve's a are memory-plan groups
+		if (name === 'LD' || name === 'LDS' || name === 'ST') return [x.a, x.b];
+		if (name === 'RESOLVE') return [x.b];
 		return [x.a, x.b, x.c];
 	};
 	const regs = new Set<number>([0, 2]);
@@ -110,24 +113,28 @@ dumps.forEach((dump, region) => {
 
 	const body: string[] = [];
 	let ipcNow = 0n;
+	// the cpu words each moves: ipc, the registers, five flags and df; a reload also reads mapgen
+	const state = regList.length + 7;
 	const spill = () => {
 		body.push(`\tcpu->ipc = ${hex(ipcNow)};`);
 		body.push(...regList.map((r) => `\tcpu->r[${r}] = g${r};`));
 		body.push('\tcpu->n = f.n; cpu->z = f.z; cpu->c = f.c; cpu->v = f.v; cpu->p = f.p; cpu->df = df;');
+		body.push(`\tAOT_COUNT_WR(${state});`);
 	};
 	const reload = () => {
 		body.push(...regList.map((r) => `\tg${r} = cpu->r[${r}];`));
 		body.push('\tf.n = cpu->n; f.z = cpu->z; f.c = cpu->c; f.v = cpu->v; f.p = cpu->p; df = cpu->df; gen = cpu->mapgen;');
+		body.push(`\tAOT_COUNT_RD(${state});`);
 	};
 	// a block's exit: straight into the next lifted block when there is one and no signal waits
-	const leave = (to: bigint) => {
+	const leave = (from: bigint, to: bigint) => {
 		const k = index.get(to);
 		if (k === undefined) return `{ pc = ${hex(to)}; goto out; }`;
-		return `{ if (AOT_CONTINUE(${R}_ok[${k}])) goto B${k}; pc = ${hex(to)}; goto out; }`;
+		return `{ if (AOT_CONTINUE(${R}_ok[${k}], ${to <= from ? 1 : 0})) goto B${k}; pc = ${hex(to)}; goto out; }`;
 	};
 
 	chosen.forEach((b, j) => {
-		body.push(`B${j}: {`, `\tstruct kb_ic* ic = ${R}_blk[${j}]->ic;`, "\t(void) ic;");
+		body.push(`B${j}: {`, `\tstruct kb_ic* ic = ${R}_blk[${j}]->ic;`, '\t(void) ic;', `\tAOT_COUNT_BLOCK(${R}_blk[${j}]);`);
 		let ipc = b.pc;
 		let m = 0;
 		const fault = (why?: string, sig?: number) =>
@@ -168,31 +175,45 @@ dumps.forEach((dump, region) => {
 				case 'LD':
 				case 'LDS': {
 					const v = name === 'LDS' ? `(uint64_t) aot_sext(v, ${W})` : 'v';
+					// a grouped access reads through its group's resolved bytes when the span resolved
+					const g = x.c - 1;
 					// the interpreter writes a faulting load's destination before it checks, and so does this
 					body.push(
 						`\t{ uint64_t va = ${B} + ${imm64(x.imm)}, v = 0; struct kb_ic* q = &ic[${m}];`,
+						...(x.c ? [`\t  if (gh[${g}]) { memcpy(&v, gh[${g}] + (va - gva[${g}]), ${W}); ${D} = ${v}; } else {`] : []),
 						`\t  int slow = __builtin_expect(AOT_SLOW(q, gen, va, ${W}), 0);`,
 						`\t  if (slow) v = kb_load_ic(cpu, q, va, ${W}); else memcpy(&v, q->host + (va - q->lo), ${W});`,
 						`\t  ${D} = ${v};`,
-						`\t  if (slow && cpu->fault) ${fault()} }`
+						`\t  if (slow && cpu->fault) ${fault()} ${x.c ? '} ' : ''}}`
 					);
 					m++;
 					break;
 				}
-				case 'ST':
+				case 'ST': {
+					const g = x.c - 1;
 					body.push(
 						`\t{ uint64_t va = ${B} + ${imm64(x.imm)}, v = ${A}; struct kb_ic* q = &ic[${m}];`,
+						...(x.c ? [`\t  if (gh[${g}]) memcpy(gh[${g}] + (va - gva[${g}]), &v, ${W}); else`] : []),
 						`\t  if (__builtin_expect(AOT_SLOW(q, gen, va, ${W}), 0)) { kb_store_ic(cpu, q, va, v, ${W}); if (cpu->fault) ${fault()} }`,
 						`\t  else memcpy(q->host + (va - q->lo), &v, ${W}); }`
+					);
+					m++;
+					break;
+				}
+				case 'RESOLVE':
+					// the whole span, range included: AOT_NO_RANGE_CHECK trusts accesses, never a span
+					body.push(
+						`\t{ uint64_t va = ${B} + ${imm64(x.imm)}; struct kb_ic* q = &ic[${m}]; gva[${x.a}] = va;`,
+						`\t  gh[${x.a}] = q->gen == gen && ${16 * W}u <= q->span && va - q->lo <= q->span - ${16 * W}u ? q->host + (va - q->lo) : kb_host_ic(cpu, q, va, ${16 * W}u); }`
 					);
 					m++;
 					break;
 				case 'FLAGS': body.push(`\taot_flags(&f, ${x.imm}, ${B}, ${C}, ${A}, ${W});`); break;
 				case 'SETCC': body.push(`\t${D} = (uint64_t) aot_cond(&f, ${x.imm});`); break;
 				case 'SEL': body.push(`\t${D} = aot_cond(&f, ${x.imm}) ? ${B} : ${C};`); break;
-				case 'BR': body.push(`\tif (aot_cond(&f, ${x.imm})) ${leave(b.target)}`); break;
-				case 'BRZ': body.push(`\tif ((${A} != 0) == ${x.imm !== 0n ? 1 : 0}) ${leave(b.target)}`); break;
-				case 'JMP': body.push(`\tpc = ${B}; goto dispatch;`); break;
+				case 'BR': body.push(`\tif (aot_cond(&f, ${x.imm})) ${leave(b.pc, b.target)}`); break;
+				case 'BRZ': body.push(`\tif ((${A} != 0) == ${x.imm !== 0n ? 1 : 0}) ${leave(b.pc, b.target)}`); break;
+				case 'JMP': body.push(`\tpc = ${B}; if (AOT_CONTINUE(1, pc <= ${hex(b.pc)})) goto dispatch; goto out;`); break;
 				case 'PC': ipc = x.imm; break;
 				case 'CARRY': body.push(`\t${D} = (uint64_t) f.c;`); break;
 				case 'BSWAP': body.push(`\t${D} = __builtin_bswap64(${B}) >> ${64 - 8 * W};`); break;
@@ -201,7 +222,7 @@ dumps.forEach((dump, region) => {
 					break;
 				case 'CTZ': body.push(`\t{ uint64_t v = ${B} & aot_mask(${W}); ${D} = v ? (uint64_t) __builtin_ctzll(v) : ${8 * W}u; }`); break;
 				case 'POPCNT': body.push(`\t${D} = (uint64_t) __builtin_popcountll(${B} & aot_mask(${W}));`); break;
-				case 'FSBASE': body.push(`\t${D} = cpu->fs;`); break;
+				case 'FSBASE': body.push(`\t${D} = cpu->fs;`, '\tAOT_COUNT_RD(1);'); break;
 				case 'X86MD': body.push(`\tif (aot_muldiv(&g0, &g2, &f, ${x.imm}, ${W}, ${B})) ${fault('divide error', 8)}`); break;
 				case 'X86SHD':
 					body.push(
@@ -237,6 +258,7 @@ dumps.forEach((dump, region) => {
 					spill();
 					body.push(
 						`\tcpu->pc = ${hex(b.next)};`,
+						'\tAOT_COUNT_RD(2); AOT_COUNT_WR(1);',
 						'\tkb_syscall(cpu);',
 						'\tif (cpu->exited) return 0;',
 						'\tif (cpu->sigreturned) { cpu->sigreturned = 0; return cpu->pc; }',
@@ -250,7 +272,7 @@ dumps.forEach((dump, region) => {
 			}
 		});
 		const lastOp = OPS[b.ins.at(-1)!.op]!.replace(/^KB_/, '');
-		if (lastOp !== 'JMP' && !(lastOp === 'SYSCALL')) body.push(`\t${leave(b.next)}`);
+		if (lastOp !== 'JMP' && !(lastOp === 'SYSCALL')) body.push(`\t${leave(b.pc, b.next)}`);
 		body.push('}');
 	});
 
@@ -259,18 +281,24 @@ dumps.forEach((dump, region) => {
 	lines.push(
 		'\tuint64_t sink = 0;',
 		'\tstruct aot_fl f = {cpu->n, cpu->z, cpu->c, cpu->v, cpu->p};',
+		'\tuint8_t* gh[8];',
+		'\tuint64_t gva[8];',
+		'\t(void) gh;',
+		'\t(void) gva;',
 		'\tint df = cpu->df;',
 		'\tuint32_t gen = cpu->mapgen;',
+		'\tint fuel = KB_POLL_FUEL;',
 		'\t(void) sink;',
+		'\t(void) fuel;',
+		`\tAOT_COUNT_RD(${regList.length + 7});`,
 		'\tgoto dispatch;',
 		'dispatch:',
-		'\tif (*kb_pending_flag) goto out;',
 		'\tswitch (pc) {'
 	);
 	chosen.forEach((b, j) => lines.push(`\t\tcase ${hex(b.pc)}: if (${R}_ok[${j}]) goto B${j}; goto out;`));
 	lines.push('\t\tdefault: goto out;', '\t}');
 	lines.push(...body);
-	lines.push('out:');
+	lines.push('out:', `\tAOT_COUNT_WR(${regList.length + 6});`);
 	lines.push(...regList.map((r) => `\tcpu->r[${r}] = g${r};`));
 	lines.push('\tcpu->n = f.n; cpu->z = f.z; cpu->c = f.c; cpu->v = f.v; cpu->p = f.p; cpu->df = df;', '\treturn pc;', '}', '');
 });

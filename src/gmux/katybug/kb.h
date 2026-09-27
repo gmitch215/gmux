@@ -27,7 +27,7 @@ enum kb_arch
 enum
 {
     KB_T0 = 32,
-    KB_SINK = 62, /* -DKB_LEAN_ZERO: writes to KB_ZERO land here instead */
+    KB_SINK = 62, /* writes to KB_ZERO land here instead */
     KB_ZERO = 63, /* always 0: AArch64's xzr reads here */
     KB_NREGS = 64
 };
@@ -94,8 +94,29 @@ enum kb_op
               memory; x87.c */
     KB_POPCNT, /* a = the set bits of b's low w bytes */
     KB_WTRAP,  /* a wasm trap: imm indexes kb_wasm_traps */
-    KB_WEXIT   /* the wasm entry function returned */
+    KB_WEXIT,  /* the wasm entry function returned */
+    KB_RESOLVE /* the memory plan: group a resolves [b + imm, + 16w) once, and
+                  lifted loads and stores with c = a + 1 skip their own check;
+                  the interpreter skips these (run.c, step) */
 };
+
+/* semantic classes (run.c, kb_class): the plans read these, not opcodes */
+enum kb_class_bits
+{
+    KB_K_PURE = 1,       /* no flags, memory, fault, control or host state */
+    KB_K_DEF = 2,        /* writes register a and no other register */
+    KB_K_FLAGS_R = 4,    /* reads flags */
+    KB_K_FLAGS_W = 8,    /* writes flags */
+    KB_K_READ = 16,      /* reads guest memory */
+    KB_K_WRITE = 32,     /* writes guest memory */
+    KB_K_CONTROL = 64,   /* may leave the block */
+    KB_K_FAULT = 128,    /* may fault */
+    KB_K_HOST = 256,     /* touches state beyond registers, flags and memory */
+    KB_K_VECTOR = 512,   /* SSE or x87 */
+    KB_K_ADDRESS = 1024, /* resolves addresses (KB_RESOLVE) */
+    KB_K_CLOBBER = 2048  /* writes registers other than a */
+};
+extern const uint16_t kb_class[];
 
 /* flag kinds for KB_FLAGS */
 enum kb_fk
@@ -158,13 +179,18 @@ struct kb_block {
     int n;
     struct kb_ins* ins;
     struct kb_ic* ic; /* one per load or store, in op order */
-    uint32_t* pcs;    /* -DKB_LEAN_PC: each op's guest instruction, as an offset
-                         from pc, in place of KB_PC ops */
+    uint32_t* pcs;    /* each op's guest instruction, as an offset from pc, in
+                         place of KB_PC ops (NULL in a trace, which keeps them) */
     int flag_writes,
-        dropped; /* flag writes decoded, and those the plan took out */
+        dropped;  /* flag writes decoded, and those the plan took out */
+    int resolves; /* the memory plan's KB_RESOLVE ops, which lead the block */
     struct kb_block* chain; /* the next block in its hash bucket */
-#ifdef KB_HOT
+#if defined(KB_HOT) || defined(KB_COUNT)
     uint64_t runs; /* times the interpreter ran it, for kb_hot_dump */
+#endif
+#ifdef KB_COUNT
+    /* guest instructions, and the cpu struct words step() reads and writes */
+    int insns, rd, wr;
 #endif
 #ifdef KB_AOT
     /* a region of lifted blocks this block's IR matched exactly; it runs from
@@ -215,9 +241,11 @@ struct kb_cpu {
         plan_flags_removed; /* flag writes decoded, and dropped as unread */
     uint64_t plan_flags_run,
         plan_flags_ran; /* of those, as executed: dropped, and all */
-    uint64_t ipc;       /* the current guest instruction */
-    uint64_t x[16][2];  /* x86 xmm registers */
-    f80 st[8];          /* the x87 stack, st(i) = st[(top + i) & 7] */
+    uint64_t plan_mem,
+        plan_mem_grouped; /* accesses decoded, and those a KB_RESOLVE covers */
+    uint64_t ipc;         /* the current guest instruction */
+    uint64_t x[16][2];    /* x86 xmm registers */
+    f80 st[8];            /* the x87 stack, st(i) = st[(top + i) & 7] */
     int top;
     uint8_t ftag; /* the x87 registers holding a value */
     uint16_t fcw,
@@ -235,6 +263,9 @@ struct kb_cpu {
 
 /* mem.c */
 uint8_t* kb_host(struct kb_cpu* cpu, uint64_t va, uint64_t len);
+uint8_t* kb_host_ic(
+    struct kb_cpu* cpu, struct kb_ic* ic, uint64_t va, uint64_t len
+);
 struct kb_mapping* kb_map(
     struct kb_cpu* cpu, uint64_t start, uint64_t len, int prot
 );
@@ -261,10 +292,34 @@ extern const char* kb_wasm_traps[];
 /* run.c */
 int kb_cond(struct kb_cpu* cpu, int cond);
 int kb_run(struct kb_cpu* cpu);
+/* -DKB_POLL picks where pending signals are looked for: 2 (default) back-edges
+ * and after a syscall; 0 every block, 1 back-edges only, 3 every KB_POLL_FUEL
+ * blocks (lifted: block transitions); 1 and 3 miss signals, arms only */
+#ifndef KB_POLL
+    #define KB_POLL 2
+#endif
+#ifndef KB_POLL_FUEL
+    #define KB_POLL_FUEL 64
+#endif
+#if KB_POLL == 2
+extern int kb_syscalled;
+#endif
 #ifdef KB_HOT
 /* KATYBUG_HOT=<dir>: every block the interpreter ran, with its IR and run
  * count, to <dir>/<pid>.hot */
 void kb_hot_dump(struct kb_cpu* cpu);
+#endif
+#ifdef KB_COUNT
+/* -DKB_COUNT with KATYBUG_COUNT=<file>: guest-state traffic and mapping checks,
+ * appended to the file at exit (lifted regions add theirs through aot.h) */
+struct kb_count {
+    uint64_t rd, wr, refills, entries;
+    uint64_t lat_n, lat_sum,
+        lat_max;       /* host signal to the poll that sees it, ns */
+    uint64_t sys[512]; /* syscalls by the guest's own number */
+};
+extern struct kb_count kb_count;
+void kb_count_report(struct kb_cpu* cpu);
 #endif
 #ifdef KB_AOT
 /* the lifted blocks (generated, see experiments/aot-oracle): attaches a region

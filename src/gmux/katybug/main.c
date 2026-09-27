@@ -84,15 +84,21 @@ int main(int argc, char** argv) {
         fprintf(
             stderr,
             "katybug: %llu blocks; plan dropped %llu of %llu flag writes "
-            "decoded, %llu of %llu run\n",
+            "decoded, %llu of %llu run; grouped %llu of %llu accesses "
+            "decoded\n",
             (unsigned long long) cpu->steps,
             (unsigned long long) cpu->plan_flags_removed,
             (unsigned long long) cpu->plan_flags,
             (unsigned long long) cpu->plan_flags_run,
-            (unsigned long long) cpu->plan_flags_ran
+            (unsigned long long) cpu->plan_flags_ran,
+            (unsigned long long) cpu->plan_mem_grouped,
+            (unsigned long long) cpu->plan_mem
         );
 #ifdef KB_HOT
     kb_hot_dump(cpu);
+#endif
+#ifdef KB_COUNT
+    if (getenv("KATYBUG_COUNT")) kb_count_report(cpu);
 #endif
     return status;
 }

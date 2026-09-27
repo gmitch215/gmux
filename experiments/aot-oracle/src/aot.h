@@ -226,16 +226,35 @@ static inline __attribute__((always_inline)) int aot_muldiv(
    between lifted blocks without looking for a pending signal (the verification
    check stays: an unmatched block has no IR to run), -DAOT_NO_RANGE_CHECK
    trusts a load or store's cached mapping whenever its generation holds */
+/* back: the transition goes to the same or a lower address; KB_POLL (kb.h)
+   polls only there, or every KB_POLL_FUEL transitions */
 #ifdef AOT_NO_SIGNAL_CHECK
-    #define AOT_CONTINUE(ok) (ok)
+    #define AOT_CONTINUE(ok, back) (ok)
+#elif KB_POLL == 1 || KB_POLL == 2
+    #define AOT_CONTINUE(ok, back) ((!(back) || !*kb_pending_flag) && (ok))
+#elif KB_POLL == 3
+    #define AOT_CONTINUE(ok, back)                                             \
+        ((--fuel || (fuel = KB_POLL_FUEL, !*kb_pending_flag)) && (ok))
 #else
-    #define AOT_CONTINUE(ok) (!*kb_pending_flag && (ok))
+    #define AOT_CONTINUE(ok, back) (!*kb_pending_flag && (ok))
 #endif
 #ifdef AOT_NO_RANGE_CHECK
     #define AOT_SLOW(q, gen, va, w) ((q)->gen != (gen))
 #else
     #define AOT_SLOW(q, gen, va, w)                                            \
         ((q)->gen != (gen) || (va) - (q)->lo > (q)->span - (w))
+#endif
+
+/* -DKB_COUNT: a region's own cpu traffic (entry loads, exit stores, spills
+   around helpers) and its block runs, beside the interpreter's (run.c) */
+#ifdef KB_COUNT
+    #define AOT_COUNT_BLOCK(b) ((b)->runs++)
+    #define AOT_COUNT_RD(n) (kb_count.rd += (n))
+    #define AOT_COUNT_WR(n) (kb_count.wr += (n))
+#else
+    #define AOT_COUNT_BLOCK(b) ((void) 0)
+    #define AOT_COUNT_RD(n) ((void) 0)
+    #define AOT_COUNT_WR(n) ((void) 0)
 #endif
 
 struct aot_entry {

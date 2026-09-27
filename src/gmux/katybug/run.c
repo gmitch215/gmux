@@ -306,11 +306,64 @@ static int flags_must(int kind) {
     }
 }
 
-/* ops that neither read flags nor can fault */
-static int transparent(int op) {
-    return op <= KB_INS || op == KB_BSWAP || op == KB_CLZ || op == KB_CTZ ||
-           op == KB_TPIDR || op == KB_FSBASE || op == KB_PC;
-}
+enum
+{
+    PURE_DEF = KB_K_PURE | KB_K_DEF,
+    OPAQUE = KB_K_READ | KB_K_WRITE | KB_K_FAULT | KB_K_HOST | KB_K_CLOBBER
+};
+const uint16_t kb_class[] = {
+    [KB_MOVI] = PURE_DEF,
+    [KB_MOV] = PURE_DEF,
+    [KB_ADD] = PURE_DEF,
+    [KB_SUB] = PURE_DEF,
+    [KB_AND] = PURE_DEF,
+    [KB_OR] = PURE_DEF,
+    [KB_XOR] = PURE_DEF,
+    [KB_SHL] = PURE_DEF,
+    [KB_SHR] = PURE_DEF,
+    [KB_SAR] = PURE_DEF,
+    [KB_ROR] = PURE_DEF,
+    [KB_MUL] = PURE_DEF,
+    [KB_UMULH] = PURE_DEF,
+    [KB_SMULH] = PURE_DEF,
+    [KB_UDIV] = PURE_DEF,
+    [KB_SDIV] = PURE_DEF,
+    [KB_UREM] = PURE_DEF,
+    [KB_SREM] = PURE_DEF,
+    [KB_ZEXT] = PURE_DEF,
+    [KB_SEXT] = PURE_DEF,
+    [KB_INS] = PURE_DEF,
+    [KB_LD] = KB_K_DEF | KB_K_READ | KB_K_FAULT,
+    [KB_LDS] = KB_K_DEF | KB_K_READ | KB_K_FAULT,
+    [KB_ST] = KB_K_WRITE | KB_K_FAULT,
+    [KB_FLAGS] = KB_K_FLAGS_W,
+    [KB_SETCC] = KB_K_DEF | KB_K_FLAGS_R,
+    [KB_SEL] = KB_K_DEF | KB_K_FLAGS_R,
+    [KB_BR] = KB_K_CONTROL | KB_K_FLAGS_R,
+    [KB_JMP] = KB_K_CONTROL,
+    [KB_SYSCALL] = KB_K_CONTROL | OPAQUE,
+    [KB_TRAP] = KB_K_CONTROL | KB_K_FAULT,
+    [KB_CARRY] = KB_K_DEF | KB_K_FLAGS_R,
+    [KB_BSWAP] = PURE_DEF,
+    [KB_CLZ] = PURE_DEF,
+    [KB_CTZ] = PURE_DEF,
+    [KB_TPIDR] = PURE_DEF,
+    [KB_X86MD] = KB_K_FLAGS_W | KB_K_FAULT | KB_K_CLOBBER,
+    [KB_X86STR] = KB_K_READ | KB_K_WRITE | KB_K_FAULT | KB_K_CLOBBER,
+    [KB_FSBASE] = PURE_DEF,
+    [KB_BRZ] = KB_K_CONTROL,
+    [KB_CCMP] = KB_K_FLAGS_R | KB_K_FLAGS_W,
+    [KB_SETTP] = KB_K_HOST,
+    [KB_PC] = KB_K_PURE, /* bookkeeping: where a fault reports */
+    [KB_SSE] = KB_K_VECTOR | OPAQUE,
+    [KB_X86SHD] = KB_K_DEF | KB_K_FLAGS_W,
+    [KB_X86FLAGS] = KB_K_FLAGS_R | KB_K_FLAGS_W | KB_K_HOST, /* imm 0: a */
+    [KB_X87] = KB_K_VECTOR | OPAQUE,
+    [KB_POPCNT] = PURE_DEF,
+    [KB_WTRAP] = KB_K_CONTROL | KB_K_FAULT,
+    [KB_WEXIT] = KB_K_CONTROL | KB_K_HOST,
+    [KB_RESOLVE] = KB_K_ADDRESS,
+};
 
 /*
  * the flag-demand plan: a KB_FLAGS whose flags are all written again before
@@ -342,7 +395,7 @@ static void plan_flags(struct kb_cpu* cpu, struct kb_block* b) {
             live |= cond_reads((int) x->imm);
         else if (x->op == KB_CARRY)
             live |= FC;
-        else if (!transparent(x->op))
+        else if (!(kb_class[x->op] & KB_K_PURE))
             live = FALL;
     }
     for (int i = 0; i < b->n; i++)
@@ -350,21 +403,116 @@ static void plan_flags(struct kb_cpu* cpu, struct kb_block* b) {
     b->n = n;
 }
 
-#ifdef KB_LEAN_ZERO
-/* ops that write their a field; a write to KB_ZERO goes to KB_SINK when
- * -DKB_LEAN_ZERO keeps the zero register untouched instead of resetting it */
+/* ops that write their a field (and no other register); a write to KB_ZERO
+ * goes to KB_SINK, so the zero register is never written */
 static int writes_a(const struct kb_ins* x) {
-    return x->op <= KB_INS || x->op == KB_LD || x->op == KB_LDS ||
-           x->op == KB_SETCC || x->op == KB_SEL || x->op == KB_CARRY ||
-           x->op == KB_BSWAP || x->op == KB_CLZ || x->op == KB_CTZ ||
-           x->op == KB_POPCNT || x->op == KB_TPIDR || x->op == KB_FSBASE ||
-           x->op == KB_X86SHD || (x->op == KB_X86FLAGS && x->imm == 0);
+    return (kb_class[x->op] & KB_K_DEF) ||
+           (x->op == KB_X86FLAGS && x->imm == 0);
 }
-#endif
 
-#ifdef KB_LEAN_PC
-/* -DKB_LEAN_PC: KB_PC ops out of the stream, each op's instruction kept
- * beside it for a fault to report */
+/* a plain load or store: memory and nothing opaque */
+static int is_access(int op) {
+    int k = kb_class[op];
+    return (k & (KB_K_READ | KB_K_WRITE)) && !(k & KB_K_CLOBBER);
+}
+
+/*
+ * the memory plan: each register's value is followed through the block as a
+ * register's value at entry (or 0) plus a constant; loads and stores whose
+ * address is one root plus an offset share a KB_RESOLVE at the block's start
+ * that resolves the span of their offsets once (at most 4,080 bytes). An
+ * access in a group reads the group's host base; a span that is not one
+ * accessible mapping leaves every access to its own check, so faults stay
+ * where they were. Ops with effects beyond their a field end the analysis
+ */
+static void plan_mem(struct kb_cpu* cpu, struct kb_block* b) {
+    enum
+    {
+        GROUPS = 8,
+        UNKNOWN = -1,
+        CONST = KB_ZERO,
+        SPAN = 16 * 255
+    };
+    int root[KB_NREGS];
+    uint64_t off[KB_NREGS]; /* wrapping, as addresses do */
+    for (int r = 0; r < KB_NREGS; r++) root[r] = r, off[r] = 0;
+    root[KB_ZERO] = CONST;
+    int groot[GROUPS], gn[GROUPS], ng = 0;
+    uint64_t glo[GROUPS], ghi[GROUPS];
+    int* group = calloc((size_t) (b->n ? b->n : 1), sizeof *group);
+    if (!group) return;
+    for (int i = 0; i < b->n; i++) {
+        struct kb_ins* x = &b->ins[i];
+        if (is_access(x->op)) {
+            cpu->plan_mem++;
+            int rt = root[x->b];
+            uint64_t o = off[x->b] + (uint64_t) x->imm, e = o + x->w;
+            int g = 0;
+            while (g < ng && groot[g] != rt) g++;
+            if (rt != UNKNOWN && g < GROUPS) {
+                uint64_t lo = g < ng && (int64_t) (glo[g] - o) < 0 ? glo[g] : o;
+                uint64_t hi = g < ng && (int64_t) (ghi[g] - e) > 0 ? ghi[g] : e;
+                if (hi - lo <= SPAN) {
+                    if (g == ng) groot[ng] = rt, gn[ng++] = 0;
+                    glo[g] = lo, ghi[g] = hi, gn[g]++;
+                    group[i] = g + 1;
+                }
+            }
+        }
+        else if (kb_class[x->op] & KB_K_CLOBBER)
+            break;
+        if (!writes_a(x) || x->a == KB_ZERO) continue;
+        int a = x->a, rb = root[x->b], rc = root[x->c];
+        if (x->op == KB_MOVI)
+            root[a] = CONST, off[a] = (uint64_t) x->imm;
+        else if (x->op == KB_MOV)
+            root[a] = rb, off[a] = off[x->b];
+        else if (x->op == KB_ADD && rc == CONST && rb != UNKNOWN)
+            root[a] = rb, off[a] = off[x->b] + off[x->c];
+        else if (x->op == KB_ADD && rb == CONST && rc != UNKNOWN)
+            root[a] = rc, off[a] = off[x->b] + off[x->c];
+        else if (x->op == KB_SUB && rc == CONST && rb != UNKNOWN)
+            root[a] = rb, off[a] = off[x->b] - off[x->c];
+        else
+            root[a] = UNKNOWN;
+    }
+    int keep[GROUPS], nk = 0;
+    for (int g = 0; g < ng; g++) keep[g] = gn[g] >= 2 ? ++nk : 0;
+    if (!nk) {
+        free(group);
+        return;
+    }
+    struct kb_ins* ins = malloc((size_t) (b->n + nk) * sizeof *ins);
+    if (!ins) {
+        free(group);
+        return;
+    }
+    for (int g = 0; g < ng; g++)
+        if (keep[g])
+            ins[keep[g] - 1] = (struct kb_ins){
+                KB_RESOLVE,
+                (uint8_t) ((ghi[g] - glo[g] + 15) / 16),
+                (uint8_t) (keep[g] - 1),
+                (uint8_t) groot[g],
+                0,
+                (int64_t) glo[g]
+            };
+    for (int i = 0; i < b->n; i++) {
+        ins[nk + i] = b->ins[i];
+        if (group[i] && keep[group[i] - 1]) {
+            ins[nk + i].c = (uint8_t) keep[group[i] - 1];
+            cpu->plan_mem_grouped++;
+        }
+    }
+    free(group);
+    free(b->ins);
+    b->ins = ins;
+    b->n += nk;
+    b->resolves = nk;
+}
+
+/* KB_PC ops out of the stream, each op's instruction kept beside it for a fault
+ * to report (a trace keeps them: it prints each instruction as it runs) */
 static int lean_pcs(struct kb_cpu* cpu, struct kb_block* b) {
     if (cpu->trace) return 0;
     if (!(b->pcs = malloc((size_t) (b->n ? b->n : 1) * sizeof *b->pcs)))
@@ -382,6 +530,112 @@ static int lean_pcs(struct kb_cpu* cpu, struct kb_block* b) {
     b->n = n;
     return 0;
 }
+
+#if KB_POLL == 2
+int kb_syscalled;
+#endif
+
+#ifdef KB_COUNT
+struct kb_count kb_count;
+
+/* the flags a KB_FLAGS kind stores, and the ones it reads first */
+static void flag_traffic(int kind, int* rd, int* wr) {
+    switch (kind) {
+        case KB_F_MULOV:
+        case KB_F_CNT: *wr += 2; return;
+        case KB_F_SETC:
+        case KB_F_ZERO: *wr += 1; return;
+        case KB_F_ROL:
+            *rd += 1;
+            *wr += 2;
+            return;
+        case KB_F_ROR: *wr += 2; return;
+        case KB_F_INC:
+        case KB_F_DEC: *wr += 4; return;
+        case KB_F_NZCV: *wr += 7; return;
+        case KB_F_ADC:
+        case KB_F_SBB:
+        case KB_F_SHL: *rd += 1; /* fall through */
+        default: *wr += 5; return;
+    }
+}
+
+/* the cpu words step() touches for one block besides the ops' register
+ * operands: results, flags, the mapping generation, pc and helper state; the
+ * driver's bookkeeping and the helpers' insides (SSE, x87, syscalls, string
+ * ops) are left out, in both arms */
+static void traffic(const struct kb_block* b, int* rd, int* wr) {
+    for (int i = 0; i < b->n; i++) {
+        const struct kb_ins* x = &b->ins[i];
+        int r = 0, w = 0;
+        switch (x->op) {
+            case KB_LD:
+            case KB_LDS:
+                r += 1;
+                w += 1;
+                break; /* cpu->mapgen */
+            case KB_ST: r += 2; break;
+            case KB_INS:
+                r += 1;
+                w += 1;
+                break;
+            case KB_FLAGS: flag_traffic((int) x->imm, &r, &w); break;
+            case KB_SETCC:
+            case KB_SEL:
+                r += 4 + ((int) x->imm < KB_C_A64 && x->imm >> 1 == 5);
+                w += 1;
+                break;
+            case KB_BR:
+                r += 4 + ((int) x->imm < KB_C_A64 && x->imm >> 1 == 5);
+                break;
+            case KB_BRZ: r += 1; break;
+            case KB_CCMP:
+                r += 5;
+                w += 5;
+                break;
+            case KB_CARRY:
+            case KB_TPIDR:
+            case KB_FSBASE:
+                r += 1;
+                w += 1;
+                break;
+            case KB_SETTP: w += 1; break;
+            case KB_PC:
+                r += 1;
+                w += 1;
+                break;
+            case KB_SYSCALL:
+                r += 2;
+                w += 1;
+                break;
+            case KB_X86MD:
+                r += 2;
+                w += x->imm < 6 ? 4 : 2;
+                break;
+            case KB_X86SHD:
+                r += 1;
+                w += 6;
+                break;
+            case KB_X86FLAGS:
+                if (x->imm == 0)
+                    r += 6, w += 1;
+                else if (x->imm == 1)
+                    r += 1, w += 6;
+                else
+                    w += 1 + (x->imm == 2), r += x->imm == 2;
+                break;
+            case KB_POPCNT:
+            case KB_BSWAP:
+            case KB_CLZ:
+            case KB_CTZ: w += 1; break;
+            default:
+                if (x->op <= KB_SEXT) w += 1;
+                break;
+        }
+        *rd += r;
+        *wr += w;
+    }
+}
 #endif
 
 KB_NOINLINE static struct kb_block* block(struct kb_cpu* cpu, uint64_t pc) {
@@ -394,18 +648,20 @@ KB_NOINLINE static struct kb_block* block(struct kb_cpu* cpu, uint64_t pc) {
               : cpu->arch == KB_A64 ? kb_a64_block(cpu, b)
                                     : kb_wasm_block(cpu, b);
     if (!bad && !cpu->noplan) plan_flags(cpu, b);
-#ifdef KB_LEAN_ZERO
+    if (!bad && !cpu->noplan) plan_mem(cpu, b);
     for (int i = 0; !bad && i < b->n; i++)
         if (b->ins[i].a == KB_ZERO && writes_a(&b->ins[i]))
             b->ins[i].a = KB_SINK;
+#ifdef KB_COUNT
+    for (int i = 0; !bad && i < b->n; i++) b->insns += b->ins[i].op == KB_PC;
 #endif
-#ifdef KB_LEAN_PC
     if (!bad) bad = lean_pcs(cpu, b);
+#ifdef KB_COUNT
+    if (!bad) traffic(b, &b->rd, &b->wr);
 #endif
     int mem = 0;
     for (int i = 0; !bad && i < b->n; i++)
-        mem += b->ins[i].op == KB_LD || b->ins[i].op == KB_LDS ||
-               b->ins[i].op == KB_ST;
+        mem += is_access(b->ins[i].op) || b->ins[i].op == KB_RESOLVE;
     if (mem && !bad && !(b->ic = calloc((size_t) mem, sizeof *b->ic))) bad = 1;
     if (bad) {
         free(b->ins);
@@ -469,42 +725,26 @@ KB_NOINLINE static inline void store(
         memcpy(ic->host + (va - ic->lo), &v, (size_t) w);
 }
 
-/* -DKB_LEAN_OPERANDS reads an op's b and c registers only in the cases that use
- * them; otherwise both are read ahead of the switch for every op */
-#ifdef KB_LEAN_OPERANDS
-    #define B (r[x->b])
-    #define C (r[x->c])
-#else
-    #define B b
-    #define C c
-#endif
-/* a fault in op i leaves the block at its start; -DKB_LEAN_PC names the
- * instruction from the side table */
-#ifdef KB_LEAN_PC
-    #define FAULTED()                                                          \
-        ((blk->pcs ? (void) (cpu->ipc = blk->pc + blk->pcs[i]) : (void) 0),    \
-         blk->pc)
-#else
-    #define FAULTED() blk->pc
-#endif
-/* -DKB_LEAN_FAULT checks for a fault only after the ops that can raise one */
-#ifdef KB_LEAN_FAULT
-    #define CHECK()                                                            \
-        if (cpu->fault) return FAULTED()
-#else
-    #define CHECK() (void) 0
-#endif
+/* an op's b and c registers, read only in the cases that use them */
+#define B (r[x->b])
+#define C (r[x->c])
+/* a fault in op i leaves the block at its start, and names the instruction from
+ * the side table (a trace's KB_PC ops name it as they run) */
+#define FAULTED()                                                              \
+    ((blk->pcs ? (void) (cpu->ipc = blk->pc + blk->pcs[i]) : (void) 0), blk->pc)
+/* only the ops that can raise a fault check for one after them */
+#define CHECK()                                                                \
+    if (cpu->fault) return FAULTED()
 
-/* runs one block; returns the next pc */
+/* runs one block; returns the next pc. The memory plan's groups are for lifted
+ * code: the interpreter skips the leading KB_RESOLVE ops and checks each access
+ * itself (measured: using the groups here cost 2-3%, skipping them nothing) */
 static uint64_t step(struct kb_cpu* cpu, struct kb_block* blk) {
     uint64_t* r = cpu->r;
-    struct kb_ic* ic =
-        blk->ic; /* the next load or store's; ops never jump inside a block */
-    for (int i = 0; i < blk->n; i++) {
+    struct kb_ic* ic = blk->ic + blk->resolves; /* the next load or store's; ops
+                                                   never jump inside a block */
+    for (int i = blk->resolves; i < blk->n; i++) {
         struct kb_ins* x = &blk->ins[i];
-#ifndef KB_LEAN_OPERANDS
-        uint64_t b = r[x->b], c = r[x->c];
-#endif
         switch (x->op) {
             case KB_MOVI: r[x->a] = (uint64_t) x->imm; break;
             case KB_MOV: r[x->a] = B; break;
@@ -714,19 +954,115 @@ static uint64_t step(struct kb_cpu* cpu, struct kb_block* blk) {
                 CHECK();
                 break;
         }
-#ifndef KB_LEAN_ZERO
-        r[KB_ZERO] = 0;
-#endif
-#ifndef KB_LEAN_FAULT
-        if (cpu->fault) return FAULTED();
-#endif
     }
     return blk->next;
 }
 
+#ifdef KB_COUNT
+/* mapping checks a run of the block makes: every access when interpreted;
+ * lifted, the accesses outside a group and each KB_RESOLVE */
+static int mem_ops(const struct kb_block* b) {
+    int mem = 0, lifted = 0;
+    #ifdef KB_AOT
+    lifted = b->aot != NULL;
+    #endif
+    for (int i = 0; i < b->n; i++)
+        mem += lifted ? (is_access(b->ins[i].op) && !b->ins[i].c) ||
+                            b->ins[i].op == KB_RESOLVE
+                      : is_access(b->ins[i].op);
+    return mem;
+}
+
+static int distinct_maps(const struct kb_block* b, uint64_t* seen, int n) {
+    int slots = 0;
+    for (int i = 0; i < b->n; i++)
+        slots += is_access(b->ins[i].op) || b->ins[i].op == KB_RESOLVE;
+    for (int k = 0; k < slots; k++) {
+        if (!b->ic[k].host) continue;
+        int j = 0;
+        while (j < n && seen[j] != b->ic[k].lo) j++;
+        if (j == n && n < 64) seen[n++] = b->ic[k].lo;
+    }
+    return n;
+}
+
+/* one line per process: guest instructions, cpu words read and written,
+ * mapping checks and refills, the mappings a block's (and a lifted region's)
+ * accesses fall in, weighted by runs */
+void kb_count_report(struct kb_cpu* cpu) {
+    uint64_t insns = 0, blocks = 0, checks = 0, maps = 0, lifted = 0,
+             lchecks = 0;
+    for (int h = 0; h < 4096; h++)
+        for (struct kb_block* b = cpu->cache[h]; b; b = b->chain) {
+            if (!b->runs) continue;
+            uint64_t seen[64];
+            int mem = mem_ops(b);
+            insns += b->runs * (uint64_t) b->insns;
+            blocks += b->runs;
+            checks += b->runs * (uint64_t) mem;
+            maps += b->runs * (uint64_t) distinct_maps(b, seen, 0);
+    #ifdef KB_AOT
+            if (b->aot) {
+                lifted += b->runs * (uint64_t) b->insns;
+                lchecks += b->runs * (uint64_t) mem;
+            }
+    #endif
+        }
+    /* a region's mappings: the union over its blocks */
+    uint64_t rmaps = 0, regions = 0;
+    #ifdef KB_AOT
+    for (int h = 0; h < 4096; h++)
+        for (struct kb_block* b = cpu->cache[h]; b; b = b->chain) {
+            if (!b->aot || !b->runs) continue;
+            struct kb_block* rep = NULL;
+            for (int g = 0; g < 4096 && !rep; g++)
+                for (struct kb_block* o = cpu->cache[g]; o && !rep;
+                     o = o->chain)
+                    if (o->aot == b->aot && o->runs) rep = o;
+            if (rep != b) continue;
+            regions++;
+            uint64_t seen[64];
+            int n = 0;
+            for (int g = 0; g < 4096; g++)
+                for (struct kb_block* o = cpu->cache[g]; o; o = o->chain)
+                    if (o->aot == b->aot && o->runs)
+                        n = distinct_maps(o, seen, n);
+            rmaps += (uint64_t) n;
+        }
+    #endif
+    /* a file, not stderr: coreutils closes its stderr on the way out */
+    FILE* f = fopen(getenv("KATYBUG_COUNT"), "a");
+    if (!f) return;
+    fprintf(
+        f,
+        "katybug count: insns %llu blocks %llu rd %llu wr %llu checks %llu "
+        "refills %llu blockmaps %llu lifted %llu lchecks %llu entries %llu "
+        "regionmaps %llu regions %llu signals %llu latsum %llu latmax %llu\n",
+        (unsigned long long) insns, (unsigned long long) blocks,
+        (unsigned long long) kb_count.rd, (unsigned long long) kb_count.wr,
+        (unsigned long long) checks, (unsigned long long) kb_count.refills,
+        (unsigned long long) maps, (unsigned long long) lifted,
+        (unsigned long long) lchecks, (unsigned long long) kb_count.entries,
+        (unsigned long long) rmaps, (unsigned long long) regions,
+        (unsigned long long) kb_count.lat_n,
+        (unsigned long long) kb_count.lat_sum,
+        (unsigned long long) kb_count.lat_max
+    );
+    fprintf(f, "katybug syscalls:");
+    for (int nr = 0; nr < 512; nr++)
+        if (kb_count.sys[nr])
+            fprintf(f, " %d=%llu", nr, (unsigned long long) kb_count.sys[nr]);
+    fprintf(f, "\n");
+    fclose(f);
+}
+#endif
+
 /** runs the guest until it exits; the exit status (128 + a signal when one
  * ended it) */
 int kb_run(struct kb_cpu* cpu) {
+#if KB_POLL == 3
+    int fuel = 0;
+#endif
     while (!cpu->exited) {
         struct kb_block* b = block(cpu, cpu->pc);
         if (!b) {
@@ -738,6 +1074,18 @@ int kb_run(struct kb_cpu* cpu) {
         cpu->ipc = b->pc;
 #ifdef KB_HOT
         b->runs++;
+#endif
+#ifdef KB_COUNT
+    #ifdef KB_AOT
+        if (b->aot)
+            kb_count.entries++; /* the region counts its own blocks */
+        else
+    #endif
+        {
+            b->runs++;
+            kb_count.rd += (uint64_t) b->rd;
+            kb_count.wr += (uint64_t) b->wr;
+        }
 #endif
 #ifdef KB_AOT
         uint64_t next = b->aot ? b->aot(cpu, b->pc) : step(cpu, b);
@@ -768,7 +1116,21 @@ int kb_run(struct kb_cpu* cpu) {
             continue;
         }
         cpu->pc = next;
+#if KB_POLL == 1
+        if (next <= b->pc) kb_signals(cpu);
+#elif KB_POLL == 2
+        if (next <= b->pc || kb_syscalled) {
+            kb_syscalled = 0;
+            kb_signals(cpu);
+        }
+#elif KB_POLL == 3
+        if (++fuel == KB_POLL_FUEL) {
+            fuel = 0;
+            kb_signals(cpu);
+        }
+#else
         kb_signals(cpu);
+#endif
     }
     return cpu->status;
 }

@@ -51,6 +51,16 @@ uint8_t* kb_host(struct kb_cpu* cpu, uint64_t va, uint64_t len) {
     return translate(cpu, NULL, va, len);
 }
 
+/** kb_host for a KB_RESOLVE whose inline cache missed; it refills the cache */
+uint8_t* kb_host_ic(
+    struct kb_cpu* cpu, struct kb_ic* ic, uint64_t va, uint64_t len
+) {
+#ifdef KB_COUNT
+    kb_count.refills++;
+#endif
+    return translate(cpu, ic, va, len);
+}
+
 static struct kb_mapping* add(
     struct kb_cpu* cpu, uint64_t s, uint64_t e, uint8_t* host, int prot
 ) {
@@ -111,6 +121,9 @@ void kb_store(struct kb_cpu* cpu, uint64_t va, uint64_t v, int w) {
 /* the slow path of a load or store whose inline cache missed; run.c holds the
  * fast one */
 uint64_t kb_load_ic(struct kb_cpu* cpu, struct kb_ic* ic, uint64_t va, int w) {
+#ifdef KB_COUNT
+    kb_count.refills += ic != NULL;
+#endif
     uint8_t* p = translate(cpu, ic, va, (uint64_t) w);
     if (!p) {
         cpu->fault = "load outside the address space";
@@ -126,6 +139,9 @@ uint64_t kb_load_ic(struct kb_cpu* cpu, struct kb_ic* ic, uint64_t va, int w) {
 void kb_store_ic(
     struct kb_cpu* cpu, struct kb_ic* ic, uint64_t va, uint64_t v, int w
 ) {
+#ifdef KB_COUNT
+    kb_count.refills += ic != NULL;
+#endif
     uint8_t* p = translate(cpu, ic, va, (uint64_t) w);
     if (!p) {
         cpu->fault = "store outside the address space";

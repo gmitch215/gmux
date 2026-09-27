@@ -60,8 +60,21 @@ volatile int* kb_pending_flag = &any_pending;
 static int timer_sig; /* the guest's one POSIX timer, on the host's ITIMER_REAL;
                          0 for none */
 
+#ifdef KB_COUNT
+static volatile uint64_t raised_ns;
+
+static uint64_t now_ns(void) {
+    struct timespec t;
+    clock_gettime(CLOCK_MONOTONIC, &t);
+    return (uint64_t) t.tv_sec * 1000000000ull + (uint64_t) t.tv_nsec;
+}
+#endif
+
 static void on_host_signal(int h) {
     int s = h == SIGALRM && timer_sig ? timer_sig : guest_sig(h);
+#ifdef KB_COUNT
+    if (s && !raised_ns) raised_ns = now_ns();
+#endif
     if (s) {
         pending_code[s] = 0;
         pending_bits[s] = 1;
@@ -455,6 +468,15 @@ int64_t kb_timer(struct kb_cpu* cpu, int64_t nr, const uint64_t* a) {
 static void deliver_one(struct kb_cpu* cpu) {
     if (!any_pending) return;
     any_pending = 0;
+#ifdef KB_COUNT
+    if (raised_ns) {
+        uint64_t d = now_ns() - raised_ns;
+        raised_ns = 0;
+        kb_count.lat_n++;
+        kb_count.lat_sum += d;
+        if (d > kb_count.lat_max) kb_count.lat_max = d;
+    }
+#endif
     for (int s = 1; s <= 64; s++) {
         if (!pending_bits[s]) continue;
         if (cpu->sigmask & (1ull << (s - 1))) {

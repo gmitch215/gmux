@@ -648,10 +648,16 @@ static int64_t rlimit(struct kb_cpu* cpu, int res, uint64_t nv, uint64_t ov) {
 }
 
 void kb_syscall(struct kb_cpu* cpu) {
+#if KB_POLL == 2
+    kb_syscalled = 1;
+#endif
     uint64_t* r = cpu->r;
     int x86 = cpu->arch == KB_X86;
     uint64_t guest = x86 ? r[0] : r[8];
     int64_t nr = x86 ? x86_to_generic(r[0]) : (int64_t) r[8];
+#ifdef KB_COUNT
+    if (guest < 512) kb_count.sys[guest]++;
+#endif
     uint64_t a[6];
     if (x86) {
         uint64_t x[6] = {r[7], r[6], r[2], r[10], r[8], r[9]};
