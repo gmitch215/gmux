@@ -11,8 +11,9 @@ import { Machine } from '../../../src/worker/machine/machine.ts';
  * build/kernel in Node, arms interleaved and timed by the host between output markers. ARMS picks them:
  * plain, mmu and inline (the software MMU, the lookup as a call and inlined), flat, eh and ehr (evacuation:
  * binaryen's flatten and -O2, the same with a checkpoint handler around every call, and with resume
- * variants too), guard and guardi (every store checked against a page owner table, the check
- * called and inlined), nostack
+ * variants too), ehf (the handlers with resume folded into each function), guard and guardi (every load and store checked against a page owner table, the
+ * check called and inlined), guardsi (the guard pass at GUARD_STORES inlined, to price loads), count
+ * (provable.ts: which checked accesses a check outside the access could cover, counts printed), nostack
  * (plain without the stack pointer check, to price it), simd (the program from SIMD_CENSUS, a census
  * built with EXTRA_CFLAGS=-msimd128).
  * `node --experimental-strip-types experiments/mmu/scripts/bench.ts <census dir> [rounds]`
@@ -45,6 +46,18 @@ function tagged(bytes: Uint8Array, arm: string): Uint8Array {
 }
 const files: string[] = [];
 const registry = new Map<string, WebAssembly.Module>();
+// count: provable.ts's counters, read from every instance of a counted program after its run
+const counted = new Set<WebAssembly.Module>();
+const live: WebAssembly.Instance[] = [];
+const counts: Record<string, Record<string, number>> = {};
+if (arms.includes('count'))
+	WebAssembly.Instance = new Proxy(WebAssembly.Instance, {
+		construct(target, args: [WebAssembly.Module, WebAssembly.Imports?]) {
+			const instance = Reflect.construct(target, args);
+			if (counted.has(args[0])) live.push(instance);
+			return instance;
+		}
+	});
 for (const name of Object.keys(workloads)) {
 	const plain = join(census, `${name}.wasm`);
 	sh('wasm2wat', ['--enable-threads', '--enable-exceptions', '--generate-names', plain, '-o', join(work, `${name}.wat`)]);
@@ -55,12 +68,16 @@ for (const name of Object.keys(workloads)) {
 		writeFileSync(image, arm === 'plain' || arm === 'simd' ? readFileSync(source) : tagged(readFileSync(plain), arm));
 		const file = join(work, `${name}.${arm}.wasm`);
 		if (arm === 'plain' || arm === 'nostack' || arm === 'simd') writeFileSync(file, readFileSync(source));
-		else if (arm === 'flat' || arm === 'eh' || arm === 'ehr' || arm === 'eh1' || arm === 'ehn' || arm === 'eha') {
-			const flag = { flat: ['--no-handlers'], eh: [], ehr: ['--resume'], eh1: ['--one-try'], ehn: ['--no-spill'], eha: ['--all-locals'] }[arm]!;
-			sh('node', [join(root, 'experiments/evacuation/scripts/evacuate.mjs'), plain, file, ...flag]);
-		} else if (arm === 'guard' || arm === 'guardi') {
+		else if (arm === 'flat' || arm === 'eh' || arm === 'ehr' || arm === 'ehf' || arm === 'eh1' || arm === 'ehn' || arm === 'eha') {
+			const flag = { flat: ['--no-handlers'], eh: [], ehr: ['--resume'], ehf: ['--fold'], eh1: ['--one-try'], ehn: ['--no-spill'], eha: ['--all-locals'] }[arm]!;
+			sh('node', [join(root, 'experiments/evacuation/scripts/evacuate.ts'), plain, file, ...flag]);
+		} else if (arm === 'count') {
+			sh('node', ['--no-warnings', '--experimental-strip-types', join(root, 'experiments/mmu/scripts/provable.ts'), plain, file]);
+		} else if (arm === 'guard' || arm === 'guardi' || arm === 'guardsi') {
 			const wat = join(work, `${name}.${arm}.wat`);
-			sh(join(root, 'scripts/ts'), [join(root, 'scripts/wasm/guard-pass.ts'), join(work, `${name}.wat`), wat, ...(arm === 'guardi' ? ['--inline'] : [])]);
+			// guardsi: another guard pass (GUARD_STORES, e.g. a stores-only one) inlined, beside guardi
+			const pass = arm === 'guardsi' ? process.env.GUARD_STORES! : join(root, 'scripts/wasm/guard-pass.ts');
+			sh(join(root, 'scripts/ts'), [pass, join(work, `${name}.wat`), wat, ...(arm === 'guard' ? [] : ['--inline'])]);
 			sh('wat2wasm', ['--enable-threads', '--enable-exceptions', '--enable-multi-memory', wat, '-o', file]);
 		} else {
 			const wat = join(work, `${name}.${arm}.wat`);
@@ -70,13 +87,25 @@ for (const name of Object.keys(workloads)) {
 		const fueled = join(work, `${name}.${arm}.fuel.wasm`);
 		execFileSync(join(root, 'scripts/wasm/instrument.sh'), [file, fueled], {
 			stdio: ['ignore', 'ignore', 'inherit'],
-			env: { ...process.env, GMUX_NO_STACK_CHECK: arm === 'nostack' ? '1' : '' }
+			env: {
+				...process.env,
+				GMUX_NO_STACK_CHECK: arm === 'nostack' ? '1' : '',
+				GMUX_KEEP_EXPORTS:
+					arm === 'count'
+						? WebAssembly.Module.exports(new WebAssembly.Module(readFileSync(file)))
+								.map((e) => e.name)
+								.filter((n) => n.startsWith('gmux_n_'))
+								.join(',')
+						: ''
+			}
 		});
-		registry.set(sha256(readFileSync(image)), new WebAssembly.Module(readFileSync(fueled)));
+		const compiled = new WebAssembly.Module(readFileSync(fueled));
+		if (arm === 'count') counted.add(compiled);
+		registry.set(sha256(readFileSync(image)), compiled);
 		files.push(`/bin/${arm === 'plain' ? name : `${name}.${arm}`}=${image}`);
 	}
 }
-const build = join(root, 'build');
+const build = process.env.GMUX_BUILD ?? join(root, 'build');
 const manifest = JSON.parse(readFileSync(join(build, 'kernel/manifest.json'), 'utf8'));
 registry.set(manifest.busybox, new WebAssembly.Module(readFileSync(join(build, 'kernel/busybox.wasm'))));
 const initrd = join(work, 'initramfs.cpio');
@@ -106,6 +135,7 @@ const machine = new Machine({
 	sha256,
 	sharedKernel: true,
 	pageIn,
+	log: process.env.DEBUG ? (line) => console.error(line) : undefined,
 	write: (text) => {
 		output += text;
 		for (const m of output.matchAll(/@@(\w+)@@/g)) if (!marks.has(m[1]!)) marks.set(m[1]!, performance.now());
@@ -137,6 +167,11 @@ for (let round = 0; round < rounds; round++) {
 			await run(() => marks.has(`b0${b.slice(1)}`));
 			const ms = marks.get(`b0${b.slice(1)}`)! - marks.get(`a0${a.slice(1)}`)!;
 			((results[name] ??= {})[arm] ??= []).push(ms);
+			if (arm === 'count' && round === 0)
+				for (const instance of live.splice(0))
+					for (const [k, v] of Object.entries(instance.exports))
+						if (k.startsWith('gmux_n_'))
+							(counts[name] ??= {})[k.slice(7)] = ((counts[name] ??= {})[k.slice(7)] ?? 0) + Number((v as WebAssembly.Global).value);
 		}
 	}
 }
@@ -147,6 +182,23 @@ for (const [name, byArm] of Object.entries(results)) {
 		arms.filter((a) => a !== 'plain').map((a) => [a, +(median(byArm[a]!) / plain).toFixed(3)])
 	);
 	console.log(JSON.stringify({ workload: name, plainMs: Math.round(plain), ...ratios }));
+}
+// full owner checks per 1,000 checked accesses at each level (see provable.ts), and the cheap
+// compares that replace the rest
+for (const [name, c] of Object.entries(counts)) {
+	const n = c.loads! + c.stores!;
+	const per = (x: number) => Math.round((1000 * x) / n);
+	const hoisted = c.hoistFn! + c.hoistLoop!;
+	const levels = {
+		block: per(n - c.stackShared! - c.fnShared! - c.loopShared! - c.varShared!),
+		hoisted: per(c.stackOwn! + c.varOwn! + c.computed! + hoisted),
+		stackFree: per(c.varOwn! + c.computed! + hoisted),
+		frameCache: per(c.varOwn! - c.frameVar! + c.computed! - c.frameComputed! + hoisted),
+		lastingCache: per(c.varOwn! - c.cacheVar! + c.computed! - c.cacheComputed! + hoisted),
+		epochCompares: per(c.epoch!),
+		frameCompares: per(c.frameVar! + c.frameComputed!)
+	};
+	console.log(JSON.stringify({ workload: name, accesses: n, levels, counts: c }));
 }
 if (process.env.DEBUG) console.log(output.slice(-3000), String((machine.crashed as Error)?.stack ?? machine.crashed));
 console.log(JSON.stringify({ mmuMisses: machine.stats.mmuMisses, pageFaults: machine.stats.pageFaults, parked, fuelYields: machine.stats.fuelYields }));

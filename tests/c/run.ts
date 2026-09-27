@@ -24,20 +24,15 @@ interface Probe {
 	files?: Record<string, string>;
 	/** wasm side modules under build/ that dlopen may load: registered by the hash of the file */
 	side?: string[];
-	/** build it with resumable frames (experiments/evacuation/scripts/evacuate.mjs), as fork needs */
+	/** build it with resumable frames (experiments/evacuation/scripts/evacuate.ts), as fork needs */
 	evacuate?: boolean;
 }
 const probes: Record<string, Probe> = {
 	// SECURITY.md: root is trusted with the machine; a non-root task runs its guarded build, which
-	// checks stores but not loads, and any writable shared page is open to it
+	// checks loads and stores, and reaches a shared segment only once it attaches it
 	isolation: {
-		lines: [
-			'TRUST kernel-address write accepted',
-			'TRUST nonroot load from another process accepted',
-			'TRUST nonroot store to a segment it never attached accepted',
-			'TRUST root sees the nonroot store landed'
-		],
-		passes: 15
+		lines: ['TRUST kernel-address write accepted'],
+		passes: 27
 	},
 	vf: { lines: ['from-exec', 'child 1 exited 0', 'second exited 7', 'third exited 9'] },
 	sig: { lines: ['handler slept', 'after pause'] },
@@ -189,10 +184,10 @@ for (const name of added) {
 		execFileSync(
 			process.execPath,
 			[
-				join(root, 'experiments/evacuation/scripts/evacuate.mjs'),
+				join(root, 'experiments/evacuation/scripts/evacuate.ts'),
 				`${fueled}.g`,
 				`${fueled}.evac`,
-				'--resume'
+				process.env.GMUX_EVACUATE ?? '--fold'
 			],
 			{ stdio: 'ignore' }
 		);

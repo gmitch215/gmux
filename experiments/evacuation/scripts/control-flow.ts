@@ -33,7 +33,7 @@ function evacuated(plain: string): [string, WebAssembly.Module] {
 	// PLAIN=1 runs the host's ordinary build, to tell an evacuation fault from the program's own
 	if (process.env.PLAIN) return [sha256(new Uint8Array(readFileSync(plain))), new WebAssembly.Module(readFileSync(at('fuel')))];
 	sh(join(root, 'scripts/ts'), [join(root, 'scripts/wasm/export-globals.ts'), at('fuel'), at('g'), '--all-mutable']);
-	sh(process.execPath, [join(root, 'experiments/evacuation/scripts/evacuate.mjs'), at('g'), at('evac'), '--resume']);
+	sh(process.execPath, [join(root, 'experiments/evacuation/scripts/evacuate.ts'), at('g'), at('evac'), process.env.GMUX_EVACUATE ?? '--fold']);
 	return [sha256(new Uint8Array(readFileSync(plain))), new WebAssembly.Module(readFileSync(at('evac')))];
 }
 

@@ -222,7 +222,7 @@ describe('dlopen', () => {
 	});
 });
 
-// an evacuable program (experiments/evacuation/scripts/evacuate.mjs --resume) and a side module that
+// an evacuable program (experiments/evacuation/scripts/evacuate.ts --resume) and a side module that
 // shares its unwind state and resume table instead of having its own
 const RESUMABLE_PROGRAM = build(`(module
 	(tag (export "gmux_ckpt"))

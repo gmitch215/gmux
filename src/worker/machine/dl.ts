@@ -317,7 +317,7 @@ export class DlView {
 	}
 
 	/**
-	 * an evacuable program's resume table (experiments/evacuation/scripts/evacuate.mjs): slot i holds
+	 * an evacuable program's resume table (experiments/evacuation/scripts/evacuate.ts): slot i holds
 	 * the resume variant of the function in slot i of the call table, side modules' slots included
 	 */
 	private get resume(): WebAssembly.Table | undefined {
@@ -402,7 +402,8 @@ export class DlView {
 					ckpt: 'gmux_ckpt',
 					fp: 'gmux_fp',
 					unwinding: 'gmux_unwinding',
-					resume: 'gmux_resume'
+					resume: 'gmux_resume',
+					resuming: 'gmux_resuming'
 				}[i.name];
 				const value = shared && this.instance!.exports[shared];
 				if (!value)

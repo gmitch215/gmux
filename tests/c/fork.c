@@ -1,5 +1,5 @@
 // fork in a program built with resumable frames (tests/c/run.ts builds it with
-// experiments/evacuation/scripts/evacuate.mjs --resume). The child gets a
+// experiments/evacuation/scripts/evacuate.ts --resume). The child gets a
 // copy of the parent's memory and the parent's frames, which resume in both
 #include <arpa/inet.h>
 #include <errno.h>

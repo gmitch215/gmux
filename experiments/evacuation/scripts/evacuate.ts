@@ -5,7 +5,7 @@
 // a block resumes inside its child and runs the siblings after it, a loop runs the rest of the current
 // iteration and then an unmodified copy of itself, and the call is re-issued to the callee's
 // F$resume (an import is called again). Normal execution never enters a variant.
-// `node evacuate.mjs in.wasm out.wasm [--no-handlers] [--resume]`; without handlers it is the same
+// `node evacuate.ts in.wasm out.wasm [--no-handlers] [--resume]`; without handlers it is the same
 // flatten and -O2, the baseline that isolates the handlers' cost
 import binaryen from 'binaryen';
 import { readFileSync, writeFileSync } from 'node:fs';
@@ -13,6 +13,8 @@ import { readFileSync, writeFileSync } from 'node:fs';
 const [input, output, ...flags] = process.argv.slice(2);
 const handlers = !flags.includes('--no-handlers');
 const resume = flags.includes('--resume');
+// resume inside each function instead of in a variant copy of it (see Fold below)
+const fold = flags.includes('--fold');
 // measurement arm: one try per function, the current site kept in a local (no resume variants yet)
 const oneTry = flags.includes('--one-try');
 // measurement arm: handlers that save no locals, the bound on what spilling fewer of them can gain
@@ -41,6 +43,10 @@ const foreign = new Map();
 // a side module (no _start) shares the program's unwind state and resume table instead of its own
 let side = true;
 for (let e = 0; e < module.getNumExports(); e++) if (binaryen.getExportInfo(module.getExportByIndex(e)).name === '_start') side = false;
+// --program: a module that owns its unwind state without a _start and whose env imports are all the
+// host's (resume-test.c)
+const program = flags.includes('--program');
+if (program) side = false;
 /** the signatures some table function reaching a safepoint has, as "params:results" */
 const reachingSignatures = new Set();
 // a table other modules put functions in (a side module's, a program's that dlopens): an indirect call
@@ -52,7 +58,7 @@ const signature = (params, results) => `${params}:${results}`;
 	const text = module.emitText();
 	for (const m of text.matchAll(/\(import "([^"]*)" "([^"]*)" \(func \$([^\s)]+)/g)) {
 		if (!(noFuelSites && m[2] === '__gmux_fuel')) imports.add(m[3]);
-		if (m[1] === 'env' && !/^__(wasm|gmux)_/.test(m[2])) foreign.set(m[3], m[2]);
+		if (m[1] === 'env' && !program && !/^__(wasm|gmux)_/.test(m[2])) foreign.set(m[3], m[2]);
 		if (m[2] === '__gmux_dlopen') loadsLibraries = true;
 	}
 	// a text type name to its signature, through the functions declared with it
@@ -353,6 +359,42 @@ function callOf(stmt) {
 }
 
 const variant = (name) => `${name}$resume`;
+/** every path from a function body to one of its site trys, as child steps */
+function pathsOf(body) {
+	const found = new Map();
+	const walk = (expr, path) => {
+		const id = E.getExpressionId(expr);
+		if (id === E.BlockId) {
+			const b = new E.Block(expr);
+			for (let i = 0; i < b.numChildren; i++) walk(b.getChildAt(i), [...path, i]);
+		} else if (id === E.LoopId) walk(new E.Loop(expr).body, [...path, 'body']);
+		else if (id === E.IfId) {
+			const e = new E.If(expr);
+			walk(e.ifTrue, [...path, 'true']);
+			if (e.ifFalse) walk(e.ifFalse, [...path, 'false']);
+		} else if (id === E.TryId) {
+			const e = new E.Try(expr);
+			const m = /^gmux\.try\.(\d+)$/.exec(e.name ?? '');
+			if (m) found.set(Number(m[1]), path);
+			else {
+				walk(e.body, [...path, 'body']);
+				for (let i = 0; i < e.numCatchBodies; i++) walk(e.getCatchBodyAt(i), [...path, `catch${i}`]);
+			}
+		}
+	};
+	walk(body, []);
+	return found;
+}
+/** sites grouped by their first path step, each keeping the rest of its path */
+function groupSites(sites) {
+	const by = new Map();
+	for (const s of sites) {
+		const k = s.path[0];
+		if (!by.has(k)) by.set(k, []);
+		by.get(k).push({ id: s.id, path: s.path.slice(1) });
+	}
+	return by;
+}
 /** the expression a site path leads to */
 function tryAt(expr, path) {
 	for (const step of path) {
@@ -365,139 +407,113 @@ function tryAt(expr, path) {
 	return expr;
 }
 const stats = { variants: 0, resumableSites: 0, unresumableSites: 0 };
+let label = 0;
+const fresh = (kind) => `gmux.${kind}.${label++}`;
+const tryParts = (t) => {
+	const catches = [], tags = [];
+	for (let i = 0; i < t.numCatchBodies; i++) catches.push(module.copyExpression(t.getCatchBodyAt(i)));
+	for (let i = 0; i < t.numCatchTags; i++) tags.push(t.getCatchTagAt(i));
+	return { catches, tags };
+};
+/** the call statement of a site try, re-issued to the callee's variant (an import is called again) */
+const redo = (t) => {
+	const stmt = siteStmt(t.body);
+	const call = callOf(stmt);
+	let again;
+	if (E.getExpressionId(call) === E.CallId) {
+		const c = new E.Call(call);
+		again = imports.has(c.target) && !foreign.has(c.target) ? module.copyExpression(call) : module.call(variant(c.target), [], E.getExpressionType(call));
+	} else {
+		const c = new E.CallIndirect(call);
+		again = module.call_indirect(`gmux.resume.${c.table}`, module.copyExpression(c.target), [], none, c.results);
+	}
+	const sid = E.getExpressionId(stmt);
+	const call2 = sid === E.LocalSetId ? module.local.set(new E.LocalSet(stmt).index, again) : sid === E.DropId ? module.drop(again) : again;
+	return stmt === t.body ? call2 : module.block(null, [call2, unwindCheck()], none);
+};
+
+/**
+ * one variant per function, shared by all its sites. res(expr, sites) runs with $resuming set,
+ * enters expr at the site $rid names and finishes expr as written; dual(expr, sites) is for a
+ * position normal execution can also reach: res when resuming, the original otherwise. A block
+ * dispatches once into the region holding the target child (the first region is reached only by
+ * the dispatch); a loop runs the rest of the current iteration, then an unmodified copy of itself
+ */
+const makeBuilder = (frame, rid, resuming, reissue = redo) => {
+	const n = frame.last - frame.first + 1;
+	// br_table on $rid over the function's sites, each to the label of its group
+	const dispatch = (groups) => {
+		const targets = new Array(n).fill(groups[0].label);
+		for (const g of groups) for (const s of g.sites) targets[s.id - frame.first] = g.label;
+		return module.switch(targets, groups[0].label, module.local.get(rid, i32));
+	};
+	const group = (sites) => {
+		const by = new Map();
+		for (const s of sites) {
+			const k = s.path[0];
+			if (!by.has(k)) by.set(k, []);
+			by.get(k).push({ id: s.id, path: s.path.slice(1) });
+		}
+		return by;
+	};
+	const res = (expr, sites) => {
+		const id = E.getExpressionId(expr);
+		if (sites.length === 1 && !sites[0].path.length) {
+			const t = new E.Try(expr);
+			const { catches, tags } = tryParts(t);
+			return module.block(null, [module.local.set(resuming, module.i32.const(0)), module.try(t.name, reissue(t), tags, catches)], none);
+		}
+		const by = group(sites);
+		if (id === E.BlockId) {
+			const b = new E.Block(expr);
+			const idx = [...by.keys()].sort((x, y) => x - y);
+			const groups = idx.map((i) => ({ i, label: fresh('j'), sites: by.get(i) }));
+			let acc = [dispatch(groups)];
+			groups.forEach((g, j) => {
+				const end = j + 1 < groups.length ? groups[j + 1].i : b.numChildren;
+				const region = [(j === 0 ? res : dual)(b.getChildAt(g.i), g.sites)];
+				for (let c = g.i + 1; c < end; c++) region.push(module.copyExpression(b.getChildAt(c)));
+				acc = [module.block(g.label, acc, none), ...region];
+			});
+			return module.block(b.name, acc, b.type);
+		}
+		if (id === E.LoopId) {
+			const l = new E.Loop(expr);
+			const inner = res(l.body, by.get('body'));
+			if (!l.name) return inner;
+			// a branch to the loop's label inside the peel leaves a block of that name and enters the
+			// full loop; falling off the peel's end leaves the loop
+			const after = fresh('after');
+			return module.block(after, [module.block(l.name, [inner, module.br(after)], none), module.copyExpression(expr)], l.type);
+		}
+		if (id === E.IfId) {
+			const e = new E.If(expr);
+			const arms = [...by.keys()];
+			if (arms.length === 1) return res(arms[0] === 'true' ? e.ifTrue : e.ifFalse, by.get(arms[0]));
+			const out = fresh('if'), t = fresh('j'), f = fresh('j');
+			const d = dispatch([{ label: t, sites: by.get('true') }, { label: f, sites: by.get('false') }]);
+			return module.block(out, [
+				module.block(f, [module.block(t, [d], none), res(e.ifTrue, by.get('true')), module.br(out)], none),
+				res(e.ifFalse, by.get('false'))
+			], E.getExpressionType(expr));
+		}
+		if (id === E.TryId) {
+			const e = new E.Try(expr);
+			const { catches, tags } = tryParts(e);
+			return module.try(e.name, res(e.body, by.get('body')), tags, catches);
+		}
+		throw new Error(`unexpected expression ${id} on a resume path`);
+	};
+	const dual = (expr, sites) =>
+		module.if(module.local.get(resuming, i32), res(expr, sites), module.copyExpression(expr));
+	return res;
+};
+
 if (resume && handlers) {
 	const tables = [];
 	for (let t = 0; t < module.getNumTables(); t++) tables.push(binaryen.getTableInfo(module.getTableByIndex(t)));
 	for (const [name, base] of foreign)
 		module.addFunctionImport(variant(name), 'env', variant(base), none, binaryen.getFunctionInfo(module.getFunction(name)).results);
-	// every path from a function body to one of its site trys, as child steps
-	const pathsOf = (body) => {
-		const found = new Map();
-		const walk = (expr, path) => {
-			const id = E.getExpressionId(expr);
-			if (id === E.BlockId) {
-				const b = new E.Block(expr);
-				for (let i = 0; i < b.numChildren; i++) walk(b.getChildAt(i), [...path, i]);
-			} else if (id === E.LoopId) walk(new E.Loop(expr).body, [...path, 'body']);
-			else if (id === E.IfId) {
-				const e = new E.If(expr);
-				walk(e.ifTrue, [...path, 'true']);
-				if (e.ifFalse) walk(e.ifFalse, [...path, 'false']);
-			} else if (id === E.TryId) {
-				const e = new E.Try(expr);
-				const m = /^gmux\.try\.(\d+)$/.exec(e.name ?? '');
-				if (m) found.set(Number(m[1]), path);
-				else {
-					walk(e.body, [...path, 'body']);
-					for (let i = 0; i < e.numCatchBodies; i++) walk(e.getCatchBodyAt(i), [...path, `catch${i}`]);
-				}
-			}
-		};
-		walk(body, []);
-		return found;
-	};
-
-	let label = 0;
-	const fresh = (kind) => `gmux.${kind}.${label++}`;
-	const tryParts = (t) => {
-		const catches = [], tags = [];
-		for (let i = 0; i < t.numCatchBodies; i++) catches.push(module.copyExpression(t.getCatchBodyAt(i)));
-		for (let i = 0; i < t.numCatchTags; i++) tags.push(t.getCatchTagAt(i));
-		return { catches, tags };
-	};
-	/** the call statement of a site try, re-issued to the callee's variant (an import is called again) */
-	const redo = (t) => {
-		const stmt = siteStmt(t.body);
-		const call = callOf(stmt);
-		let again;
-		if (E.getExpressionId(call) === E.CallId) {
-			const c = new E.Call(call);
-			again = imports.has(c.target) && !foreign.has(c.target) ? module.copyExpression(call) : module.call(variant(c.target), [], E.getExpressionType(call));
-		} else {
-			const c = new E.CallIndirect(call);
-			again = module.call_indirect(`gmux.resume.${c.table}`, module.copyExpression(c.target), [], none, c.results);
-		}
-		const sid = E.getExpressionId(stmt);
-		const call2 = sid === E.LocalSetId ? module.local.set(new E.LocalSet(stmt).index, again) : sid === E.DropId ? module.drop(again) : again;
-		return stmt === t.body ? call2 : module.block(null, [call2, unwindCheck()], none);
-	};
-
-	/**
-	 * one variant per function, shared by all its sites. res(expr, sites) runs with $resuming set,
-	 * enters expr at the site $rid names and finishes expr as written; dual(expr, sites) is for a
-	 * position normal execution can also reach: res when resuming, the original otherwise. A block
-	 * dispatches once into the region holding the target child (the first region is reached only by
-	 * the dispatch); a loop runs the rest of the current iteration, then an unmodified copy of itself
-	 */
-	const makeBuilder = (frame, rid, resuming) => {
-		const n = frame.last - frame.first + 1;
-		// br_table on $rid over the function's sites, each to the label of its group
-		const dispatch = (groups) => {
-			const targets = new Array(n).fill(groups[0].label);
-			for (const g of groups) for (const s of g.sites) targets[s.id - frame.first] = g.label;
-			return module.switch(targets, groups[0].label, module.local.get(rid, i32));
-		};
-		const group = (sites) => {
-			const by = new Map();
-			for (const s of sites) {
-				const k = s.path[0];
-				if (!by.has(k)) by.set(k, []);
-				by.get(k).push({ id: s.id, path: s.path.slice(1) });
-			}
-			return by;
-		};
-		const res = (expr, sites) => {
-			const id = E.getExpressionId(expr);
-			if (sites.length === 1 && !sites[0].path.length) {
-				const t = new E.Try(expr);
-				const { catches, tags } = tryParts(t);
-				return module.block(null, [module.local.set(resuming, module.i32.const(0)), module.try(t.name, redo(t), tags, catches)], none);
-			}
-			const by = group(sites);
-			if (id === E.BlockId) {
-				const b = new E.Block(expr);
-				const idx = [...by.keys()].sort((x, y) => x - y);
-				const groups = idx.map((i) => ({ i, label: fresh('j'), sites: by.get(i) }));
-				let acc = [dispatch(groups)];
-				groups.forEach((g, j) => {
-					const end = j + 1 < groups.length ? groups[j + 1].i : b.numChildren;
-					const region = [(j === 0 ? res : dual)(b.getChildAt(g.i), g.sites)];
-					for (let c = g.i + 1; c < end; c++) region.push(module.copyExpression(b.getChildAt(c)));
-					acc = [module.block(g.label, acc, none), ...region];
-				});
-				return module.block(b.name, acc, b.type);
-			}
-			if (id === E.LoopId) {
-				const l = new E.Loop(expr);
-				const inner = res(l.body, by.get('body'));
-				if (!l.name) return inner;
-				// a branch to the loop's label inside the peel leaves a block of that name and enters the
-				// full loop; falling off the peel's end leaves the loop
-				const after = fresh('after');
-				return module.block(after, [module.block(l.name, [inner, module.br(after)], none), module.copyExpression(expr)], l.type);
-			}
-			if (id === E.IfId) {
-				const e = new E.If(expr);
-				const arms = [...by.keys()];
-				if (arms.length === 1) return res(arms[0] === 'true' ? e.ifTrue : e.ifFalse, by.get(arms[0]));
-				const out = fresh('if'), t = fresh('j'), f = fresh('j');
-				const d = dispatch([{ label: t, sites: by.get('true') }, { label: f, sites: by.get('false') }]);
-				return module.block(out, [
-					module.block(f, [module.block(t, [d], none), res(e.ifTrue, by.get('true')), module.br(out)], none),
-					res(e.ifFalse, by.get('false'))
-				], E.getExpressionType(expr));
-			}
-			if (id === E.TryId) {
-				const e = new E.Try(expr);
-				const { catches, tags } = tryParts(e);
-				return module.try(e.name, res(e.body, by.get('body')), tags, catches);
-			}
-			throw new Error(`unexpected expression ${id} on a resume path`);
-		};
-		const dual = (expr, sites) =>
-			module.if(module.local.get(resuming, i32), res(expr, sites), module.copyExpression(expr));
-		return res;
-	};
 
 	for (const [name, frame] of frames) {
 		const info = binaryen.getFunctionInfo(module.getFunction(name));
@@ -579,9 +595,166 @@ if (resume && handlers) {
 		module.addGlobalExport('gmux.unwinding', 'gmux_unwinding');
 	}
 }
+// Fold (--fold): the resume path runs through each function itself instead of a copy. A function's
+// prologue pops its frame when $gmux.resuming is set; every block on the way to a site starts with a
+// br_table, taken only while resuming, to just before the child holding it, and runs the rest as
+// written; an if on the way takes the site's arm; the site passes $gmux.resuming on to its callee (off
+// for a host import, which is called again) and clears its own. Normal execution pays a flag test at
+// entry, per block and if on a site path, and per site
+if (fold && handlers) {
+	// measurement arm, unsafe to resume: GMUX_FOLD_SKIP=prologue,blocks,ifs,sites leaves those parts
+	// out, to price each on the normal path
+	const skip = new Set((process.env.GMUX_FOLD_SKIP ?? '').split(','));
+	if (side) module.addGlobalImport('gmux.resuming', 'gmux', 'resuming', i32, true);
+	else {
+		module.addGlobal('gmux.resuming', i32, true, module.i32.const(0));
+		module.addGlobalExport('gmux.resuming', 'gmux_resuming');
+	}
+	for (const [name, frame] of frames) {
+		const fn = module.getFunction(name);
+		const info = binaryen.getFunctionInfo(fn);
+		const paths = pathsOf(info.body);
+		const base = binaryen._BinaryenFunctionAddVar(fn, i32);
+		const rid = binaryen._BinaryenFunctionAddVar(fn, i32);
+		const resuming = binaryen._BinaryenFunctionAddVar(fn, i32);
+		const flag = () => module.local.get(resuming, i32);
+		const load = (type, o) => {
+			const b = module.local.get(base, i32);
+			return type === i32 ? module.i32.load(o, 1, b) : type === i64 ? module.i64.load(o, 1, b) : type === f32 ? module.f32.load(o, 1, b) : type === f64 ? module.f64.load(o, 1, b) : module.v128.load(o, 1, b);
+		};
+		// the flag is on only from a resuming site to its callee's entry
+		const pop = [
+			module.global.set('gmux.resuming', module.i32.const(0)),
+			module.local.set(base, module.i32.sub(module.global.get('gmux.fp', i32), module.i32.const(frame.frameSize))),
+			module.global.set('gmux.fp', module.local.get(base, i32))
+		];
+		frame.types.forEach((type, index) => {
+			if (frame.offsets[index] >= 0) pop.push(module.local.set(index, load(type, frame.offsets[index])));
+		});
+		pop.push(module.local.set(rid, module.i32.sub(module.i32.load(frame.frameSize - 4, 1, module.local.get(base, i32)), module.i32.const(frame.first))));
+		const sites = [];
+		for (let k = frame.first; k <= frame.last; k++) {
+			const path = paths.get(k);
+			const t = new E.Try(tryAt(info.body, path));
+			const call = callOf(siteStmt(t.body));
+			const target = E.getExpressionId(call) === E.CallId ? new E.Call(call).target : null;
+			if (path.some((step) => String(step).startsWith('catch')) || (target && !imports.has(target) && !frames.has(target))) {
+				pop.push(module.if(module.i32.eq(module.local.get(rid, i32), module.i32.const(k - frame.first)), module.unreachable()));
+				stats.unresumableSites++;
+			} else {
+				sites.push({ id: k, path });
+				stats.resumableSites++;
+			}
+		}
+		// a group's ids relative to the frame's first: pre-order numbering keeps each child's in one
+		// range (an unresumable site's id in a gap traps in the prologue before any dispatch)
+		const first = (group) => Math.min(...group.map((s) => s.id)) - frame.first;
+		const last = (group) => Math.max(...group.map((s) => s.id)) - frame.first;
+		// a site: resuming, clear the flag and pass it on (off for a host import, called again)
+		const handOff = (t) => {
+			const call = callOf(siteStmt(t.body));
+			const host = E.getExpressionId(call) === E.CallId && imports.has(new E.Call(call).target) && !foreign.has(new E.Call(call).target);
+			return module.global.set('gmux.resuming', module.i32.const(host ? 0 : 1));
+		};
+		// inside a loop, the rest of the current iteration runs from a copy made for resuming (the
+		// variants' builder, handing off instead of calling a variant), so a hot loop keeps its shape
+		const peel = makeBuilder(frame, rid, resuming, (t) => module.block(null, [handOff(t), module.copyExpression(t.body)], none));
+		// returns expr threaded for resuming, or what takes its place
+		const thread = (expr, sites) => {
+			const id = E.getExpressionId(expr);
+			if (sites.length === 1 && !sites[0].path.length) {
+				if (skip.has('sites')) return expr;
+				const t = new E.Try(expr);
+				const pass = module.if(flag(), module.block(null, [module.local.set(resuming, module.i32.const(0)), handOff(t)], none));
+				if (E.getExpressionId(t.body) === E.BlockId) new E.Block(t.body).insertChildAt(0, pass);
+				else t.body = module.block(null, [pass, t.body], E.getExpressionType(t.body));
+				return expr;
+			}
+			const by = groupSites(sites);
+			if (id === E.BlockId) {
+				const b = new E.Block(expr);
+				const kids = [];
+				for (let i = 0; i < b.numChildren; i++) kids.push(b.getChildAt(i));
+				for (const [i, sub] of by) kids[i] = thread(kids[i], sub);
+				let cur = kids;
+				if (!skip.has('blocks')) {
+					const idx = [...by.keys()].sort((x, y) => x - y);
+					for (let j = 1; j < idx.length; j++)
+						if (last(by.get(idx[j - 1])) >= first(by.get(idx[j]))) throw new Error(`${name}: sites not in pre-order`);
+					const labels = idx.map(() => fresh('f'));
+					// sites are numbered in pre-order, so each child's sites are one ascending range of ids:
+					// a branch per child on its last id, taken only while resuming
+					const dispatch = idx.slice(0, -1).map((i, j) =>
+						module.br(labels[j], module.i32.le_u(module.local.get(rid, i32), module.i32.const(last(by.get(i)))))
+					);
+					dispatch.push(module.br(labels[idx.length - 1]));
+					cur = [module.if(flag(), module.block(null, dispatch, none)), ...kids.slice(0, idx[0])];
+					idx.forEach((i, j) => {
+						cur = [module.block(labels[j], cur, none), ...kids.slice(i, j + 1 < idx.length ? idx[j + 1] : kids.length)];
+					});
+				}
+				for (let k = b.numChildren - 1; k >= 0; k--) b.removeChildAt(k);
+				for (const c of cur) b.appendChild(c);
+				return expr;
+			}
+			if (id === E.LoopId) {
+				const l = new E.Loop(expr);
+				if (l.type !== none && l.type !== unreachable) throw new Error(`${name}: a loop with a value on a resume path`);
+				// a branch to the loop's label in the copy leaves a block of that name for the original
+				const after = fresh('after');
+				const rest = module.block(l.name || null, [peel(l.body, by.get('body')), module.br(after)], none);
+				return module.block(after, [module.if(flag(), rest), expr], none);
+			}
+			if (id === E.TryId) {
+				const t = new E.Try(expr);
+				t.body = thread(t.body, by.get('body'));
+				return expr;
+			}
+			if (id === E.IfId) {
+				const e = new E.If(expr);
+				if (by.has('true')) e.ifTrue = thread(e.ifTrue, by.get('true'));
+				if (by.has('false')) e.ifFalse = thread(e.ifFalse, by.get('false'));
+				if (skip.has('ifs')) return expr;
+				// the true arm's sites are one range of ids; the arm is picked from it only while resuming
+				const inTrue = by.get('true');
+				const member = inTrue
+					? module.i32.le_u(module.i32.sub(module.local.get(rid, i32), module.i32.const(first(inTrue))), module.i32.const(last(inTrue) - first(inTrue)))
+					: module.i32.const(0);
+				e.condition = module.if(flag(), member, e.condition);
+				return expr;
+			}
+			throw new Error(`unexpected expression ${id} on a resume path`);
+		};
+		const body = sites.length ? thread(info.body, sites) : info.body;
+		if (skip.has('prologue')) {
+			binaryen._BinaryenFunctionSetBody(fn, body);
+			continue;
+		}
+		const prologue = module.if(module.local.tee(resuming, module.global.get('gmux.resuming', i32), i32), module.block(null, pop, none));
+		binaryen._BinaryenFunctionSetBody(fn, module.block(null, [prologue, body], E.getExpressionType(body)));
+	}
+	// the host resumes an export through name$resume: the export itself, entered resuming
+	const zero = (type) => (type === i32 ? module.i32.const(0) : type === i64 ? module.i64.const(0n) : type === f32 ? module.f32.const(0) : type === f64 ? module.f64.const(0) : module.v128.const(new Array(16).fill(0)));
+	for (let e = 0; e < module.getNumExports(); e++) {
+		const x = binaryen.getExportInfo(module.getExportByIndex(e));
+		if (x.kind !== binaryen.ExternalFunction || !frames.has(x.value)) continue;
+		const info = binaryen.getFunctionInfo(module.getFunction(x.value));
+		// one entry per function, however many names export it
+		if (!module.getFunction(variant(x.value))) {
+			const call = module.call(x.value, binaryen.expandType(info.params).map(zero), info.results);
+			module.addFunction(variant(x.value), none, info.results, [], module.block(null, [module.global.set('gmux.resuming', module.i32.const(1)), call], info.results));
+		}
+		module.addFunctionExport(variant(x.value), variant(x.name));
+	}
+	if (!side) {
+		module.addTagExport('gmux.ckpt', 'gmux_ckpt');
+		module.addGlobalExport('gmux.fp', 'gmux_fp');
+		module.addGlobalExport('gmux.unwinding', 'gmux_unwinding');
+	}
+}
 // the peeled copies repeat label names in sibling scopes, which wasm allows and binaryen's IR does
 // not; the binary format resolves labels by depth and reading it back names them uniquely
-const final = resume || process.env.GMUX_ROUNDTRIP ? binaryen.readBinary(module.emitBinary()) : module;
+const final = resume || fold || process.env.GMUX_ROUNDTRIP ? binaryen.readBinary(module.emitBinary()) : module;
 final.setFeatures(features);
 binaryen.setOptimizeLevel(2);
 // measurement knob: the size up to which a function with several callers is inlined
@@ -589,4 +762,4 @@ if (process.env.GMUX_FLEX_INLINE) binaryen.setFlexibleInlineMaxSize(Number(proce
 if (!process.env.GMUX_NO_OPT) final.optimize();
 if (!final.validate()) throw new Error('invalid module');
 writeFileSync(output, final.emitBinary());
-console.log(JSON.stringify({ output, handlers, sites, functionsReachingASafepoint: reaches.size, functions: final.getNumFunctions(), ...(resume ? stats : {}) }));
+console.log(JSON.stringify({ output, handlers, sites, functionsReachingASafepoint: reaches.size, functions: final.getNumFunctions(), ...(resume || fold ? stats : {}) }));

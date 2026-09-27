@@ -1,11 +1,11 @@
-// resume check: build/resume-test.evac.wasm (evacuate.mjs --resume) checkpointed at tick k, restored
+// resume check: build/resume-test.evac.wasm (evacuate.ts --resume) checkpointed at tick k, restored
 // into a fresh instance and resumed, must print what the plain build prints; each case also takes a
-// second checkpoint inside the resumed run. `node resume-test.mjs [n]`
+// second checkpoint inside the resumed run. `node resume-test.ts [n] [evacuable.wasm]`
 import { readFileSync } from 'node:fs';
 
 const n = Number(process.argv[2] ?? 6);
 const plain = new WebAssembly.Module(readFileSync(new URL('../build/resume-test.wasm', import.meta.url)));
-const evac = new WebAssembly.Module(readFileSync(new URL('../build/resume-test.evac.wasm', import.meta.url)));
+const evac = new WebAssembly.Module(readFileSync(process.argv[3] ?? new URL('../build/resume-test.evac.wasm', import.meta.url)));
 
 function instance(module, out, onTick) {
 	const box = {};
