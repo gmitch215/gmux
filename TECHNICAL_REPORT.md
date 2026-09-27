@@ -37,7 +37,7 @@ frames for user programs, paid only when a machine leaves memory.
 | `vfork`, `$(...)`, pthreads, a signal handler that blocks, the POSIX surface | **all pass** (execve, `_exit`, failed execve; 4 threads x 10,000 locked increments; sockets, flock, epoll, eventfd, timerfd, inotify) | `experiments/vfork`, `posix`, Free |
 | Lua 5.4.7's own suite, file by file | **30 of 32** on Free, against **29 of 32** native musl; the two agree on 31 files | `tests/suites/lua.sh`, Alpine reference on paisley-park |
 | libc-test's pthread suite | **20 of 24** on Free | `tests/suites/`, Free |
-| A non-root process writing memory it does not own | `SIGSEGV` from the store, `EFAULT` from a syscall; the checked build costs **1.09-1.44x** on the census | `tests/c/isolation.c`, Node and Free |
+| A non-root process reaching memory it does not own | `SIGSEGV` from the load or store, `EFAULT` from a syscall; the checked build costs **1.26-2.86x** on the census in Node and **1.94-3.78x** on Free (stores alone 1.09-1.46x); a fork child in its own memory computes at **0.93-1.00x** | `tests/c/isolation.c` (Node and Free), `experiments/mmu` |
 | Checkpoint tax on user programs | resumable frames **0.977-1.023x** of the plain build on six census programs, against Asyncify's +63% | local wall clock, Node, interleaved |
 | Restore of an evicted machine | exact **6 of 6** into its predecessor's pooled memory, 0 of 6 into a fresh allocation | `experiments/evicted-memory`, Free |
 | Checkpoint of the whole booted machine, mid-pipeline | **18-53 ms**, 73 stacks in 17.3 KB; restore 19-52 ms; 11 of 11 exact | local wall clock, Node |
@@ -218,18 +218,32 @@ changes a byte of it. It then rewinds each task into the import it parked in, wh
 A machine that checkpointed cannot keep running; it continues from a restore.
 
 A program can carry resumable frames instead of Asyncify
-(`experiments/evacuation/scripts/evacuate.mjs --resume`). A call that can reach a syscall is
-wrapped so a checkpoint spills the frame's live locals, and each such function gets a variant
-that reloads them and continues from that call; only the kernel stays asyncified. A side module
-loaded with `dlopen` imports the program's unwind state and shares one resume table with it, so a
-stack that runs program, then library, then program again resumes too.
+(`experiments/evacuation/scripts/evacuate.ts --fold`). A call that can reach a syscall is
+wrapped so a checkpoint spills the frame's live locals; only the kernel stays asyncified. On
+resume a function reloads them at entry and branches through its own blocks to that call, and a
+loop on the way finishes its current iteration from a copy before running on as written. A side
+module loaded with `dlopen` imports the program's unwind state, so a stack that runs program, then
+library, then program again resumes too. (`--resume` builds a separate resume copy of each
+function instead: the same speed, a larger module.)
 `experiments/evacuation/scripts/control-flow.ts` checkpoints recursion, function pointers,
 `setjmp`/`longjmp`, a `qsort` callback, a signal handler, a side module calling back by pointer and
 by import, and Lua inside `pcall` inside a coroutine; the harness refuses a checkpoint that lands
 outside the phase it tests, and each restore is exact. Against the plain build, the wrapped calls
-cost 0.977-1.023x on six census programs. The cost is size: BusyBox grows from 1.45 MB to 3.38 MB
-with the spill handlers and to 18.0 MB with the resume variants, because the fuel pass puts a
-safepoint on every loop back-edge (26,958 sites).
+cost 0.977-1.023x on six census programs. The cost is size, since the fuel pass puts a safepoint on
+every loop back-edge (26,655 sites in BusyBox):
+
+| BusyBox, fueled | size |
+| --- | --- |
+| plain | 1.45 MB |
+| spill handlers only | 3.18 MB |
+| handlers and a resume copy of each function (`--resume`) | 17.2 MB |
+| handlers and resume folded into each function (`--fold`) | 11.5 MB |
+
+Folding every block, loops included, made BusyBox 3.4 MB but put a branch at each block inside hot
+loops: gawk ran 1.64x. Resuming loops from a copy keeps them as written. On the census under V8
+(`experiments/mmu/scripts/bench.ts`, 7 rounds for the last two), folded against separate copies:
+lua 0.96 / 0.96, gzip 0.99 / 1.01, sqlite 1.01 / 0.98, gawk 1.01 / 1.00, bzip2 1.02 / 1.02, sed
+1.08 / 1.06.
 
 Changed pages are found at checkpoint time by hashing each 64 KiB page, packed with a small page index
 into rows of up to 2 MB, and written only after `ctx.storage.sync()` succeeds. There is no store
@@ -286,13 +300,63 @@ full-file initramfs hands its 732 KiB back to the kernel after unpacking.
 
 ### Isolation
 
-Kernel patch 0014 keeps an owner for every page of the shared memory. A non-root process runs a
-build of its program that checks each store against that table (`scripts/wasm/guard-pass.ts`), and
-`access_ok` refuses a non-root task's syscall buffers outside its own pages. A non-root process that
-writes the kernel's memory or another process's gets `SIGSEGV` from the store and `EFAULT` from a
-syscall (`tests/c/isolation.c`), in Node and deployed on Free. The checked build costs 1.09-1.44x on
-the census; root processes run the plain build. Reads are not isolated, and a writable shared mapping
-is open to every non-root process (`SECURITY.md`).
+Kernel patch 0014 keeps an owner for every page of the shared memory: a process's tag for its
+private pages, and a region's tag for a shared mapping, with a set per process recording the regions
+it maps and whether it may write them. A non-root process runs a build of its program that checks
+each load and store against both (`scripts/wasm/guard-pass.ts`), and `access_ok` refuses a non-root
+task's syscall buffers outside its own pages and regions. A non-root process that reads or writes the
+kernel's memory, another process's, or a shared segment it never attached gets `SIGSEGV`, and
+`EFAULT` from a syscall (`tests/c/isolation.c`, 27 checks, in Node and on Free). Root processes run
+the plain build. Four of the checks take a page away while the reader is parked: a sibling thread
+unmaps it (the reader at a fuel yield, or in `sched_yield`) or detaches its segment, and the reader's
+next load of it must end with `SIGSEGV`. nommu refuses `MAP_FIXED`, so a page reaches another owner
+only through an unmap.
+
+Checking loads exposed a musl bug: `fcntl`, `ioctl`, `prctl` and `ptrace` read a variadic argument
+the caller never passed, and a call with none passes a null va_list on wasm, so `fcntl(fd,
+F_GETFD)` loaded address 0 (musl patch 0009). On the census under V8
+(`experiments/mmu/scripts/bench.ts`, a `guardsi` arm for stores alone):
+
+| | lua | gzip | bzip2 | sqlite | sed | gawk |
+| --- | --- | --- | --- | --- | --- | --- |
+| stores checked | 1.46 | 1.09 | 1.41 | 1.39 | 1.30 | 1.35 |
+| loads and stores checked | 2.37 | 1.26 | 2.19 | 2.86 | 2.78 | 2.36 |
+| loads and stores checked, deployed on Free (`cpuTime`) | 3.05 | 1.94 | 3.78 | 3.09 | 3.12 | 3.44 |
+
+The deployed row is the median of 4-5 runs per arm on `experiments/boot`, the program run as uid
+1000 through a launcher whose own cost (6 ms) is taken off; every output matched the root run.
+
+Few of these checks can move out of the access. `experiments/mmu/scripts/provable.ts` classes each
+access by its address (a local plus a constant, or computed) and counts each class as the census
+runs. Full checks left per 1,000:
+
+| | lua | gzip | bzip2 | sqlite | sed | gawk |
+| --- | --- | --- | --- | --- | --- | --- |
+| one check per base per straight run | 789 | 971 | 713 | 766 | 801 | 806 |
+| bases checked once at their loop or function entry | 761 | 987 | 669 | 718 | 693 | 763 |
+| and stack-pointer accesses free | 761 | 987 | 656 | 681 | 602 | 727 |
+| and a page cache per access site, per call | 27 | 345 | 108 | 322 | 390 | 439 |
+
+Pages repeat, so a cache covers what proof cannot. Ownership changes only while a process is parked
+(one thread runs every task), so a cache re-read after each call, wait, loop head and catch is sound,
+and the revocation checks above catch one that is not. Built with a kernel counter of revocations,
+it ran slower than the lookup it replaces: 2.02-4.16x on the census against 1.25-2.74x, and an
+unsafe cache that is never dropped was still 1.45-4.06x. The owner table is 64 KiB and stays in the
+L1 cache, so its lookup costs about what the compare does, and a cache per site adds thousands of
+locals. The code was removed.
+
+A process in its own `WebAssembly.Memory`, as a fork child is (kernel patch 0015), needs no check:
+V8 bounds every access. `experiments/mmu/src/own.c` runs one suite in the shared memory as root,
+in a fork child, and as uid 1000 under the checked build (`scripts/own-memory.ts`, Node):
+
+| against root in the shared memory | stream | chase | mix | sort | getpid | stat | 4 KiB pipe | 64 KiB pipe |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| fork child, own memory | 0.93 | 1.00 | 1.00 | 0.98 | 1.00 | 6.00 | 2.85 | 2.20 |
+| uid 1000, checked build | 3.59 | 1.01 | 1.02 | 1.38 | 0.92 | 1.16 | 1.06 | 1.06 |
+
+Compute runs at native speed in its own memory. A syscall that copies a user buffer crosses into the
+host for each copy (1.5 us more per `stat`, 0.6 us per 4 KiB write and read), and the memory is
+charged to the process's highest address (42 MB here).
 
 ### Foreign Executables
 
@@ -370,25 +434,31 @@ the kernel and the host together under 1%. curl moves bytes through syscalls (64
 runs near native speed. A faster Katybug is a faster dispatch loop: fused blocks, guest registers
 held in locals, or blocks translated to wasm.
 
-Four taxes in the dispatch loop can be switched off at build time, each keeping the corpus, the
-transcripts and the signal checks exact: the per-instruction `KB_PC` op (`-DKB_LEAN_PC` keeps each
-op's instruction offset in a side table, 4 bytes an op), the fault check after every op
-(`-DKB_LEAN_FAULT` checks only after ops that can fault), the zero register's reset after every op
-(`-DKB_LEAN_ZERO` sends its writes to a sink), and reading both operands ahead of the switch
-(`-DKB_LEAN_OPERANDS`). Six builds ran at once on paisley-park, one physical core each, 3 rounds, twice
-with the cores rotated; Katybug's time in the machine against the plain build
-(`experiments/katybug-profile/scripts/variants.sh`, `bench.ts` with `VARIANT`):
+Four taxes in the dispatch loop were measured behind build switches, each keeping the corpus, the
+transcripts and the signal checks exact, and are now gone from the only path: the per-instruction
+`KB_PC` op (each op's instruction offset lives in a side table, 4 bytes an op), the fault check after
+every op (only ops that can fault check), the zero register's reset after every op (its writes go
+to a sink), and reading both operands ahead of the switch. Each build ran alone on paisley-park,
+pinned to one core, 3 rounds, under two V8 versions; Katybug's time in the machine against the
+build with all four taxes (`experiments/katybug-profile/scripts/variants.sh`, `bench.ts` with
+`VARIANT`):
 
-| workload | plain | `KB_PC` | fault check | zero | operands | all four |
-| --- | --- | --- | --- | --- | --- | --- |
-| factor | 4,213-4,329 ms | -17.3% | -9.3% | -6.4% | -14.2% | -16.9% |
-| gzip | 11,621-12,966 ms | -15.6% | -9.8% | -6.9% | -16.0% | -18.8% |
-| bzip2 | 20,236-21,205 ms | -13.2% | -7.1% | -4.3% | -12.7% | -18.2% |
-| sqlite | 4,790-4,898 ms | -8.6% | -3.8% | -1.6% | -4.0% | -11.0% |
-| bash | 26,005-29,149 ms | -7.8% | -3.1% | -1.4% | -2.2% | -9.5% |
-| sha256 | 1,898-1,952 ms | +2.5% | +0.1% | +0.8% | +4.8% | -3.3% |
+| workload | V8 | plain | `KB_PC` | fault check | zero | operands | all four |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| factor | 14.6 | 3,682-3,697 ms | -17.4% | -7.6% | -6.3% | -12.7% | -15.7% |
+| sqlite | 14.6 | 4,128-4,151 ms | -11.0% | -4.8% | -2.4% | -5.9% | -13.4% |
+| sha256 | 14.6 | 1,895-1,928 ms | -10.9% | -5.6% | -1.5% | -6.2% | -14.5% |
+| factor | 13.6 | 3,663-3,677 ms | -14.3% | +3.9% | -0.4% | -11.7% | -26.8% |
+| gzip | 13.6 | 9,967-10,091 ms | -10.3% | -2.6% | -1.4% | -12.3% | -22.0% |
+| bzip2 | 13.6 | 16,592-16,609 ms | -12.2% | -0.2% | -1.5% | -12.0% | -25.9% |
+| sqlite | 13.6 | 4,092-4,132 ms | -9.6% | -0.5% | +0.1% | -7.1% | -18.8% |
+| bash | 13.6 | 24,119-24,180 ms | -9.8% | +0.2% | +0.6% | -7.5% | -18.3% |
+| sha256 | 13.6 | 1,901-1,917 ms | -10.2% | -1.5% | -1.9% | -10.4% | -24.8% |
 
-Those taxes are at most about a fifth of Katybug's time; the rest is interpretation itself.
+V8 14.6 is Node 26.10 and V8 13.6 is Node 24.21. The plain build runs at the same speed on both, but
+the lean builds do not: on V8 13.6 the fault check and zero-register switches are worth nothing and
+the other two add up, while on V8 14.6 all four together gain little more than `KB_PC` alone. Those
+taxes are 13-27% of Katybug's time, depending on V8; the rest is interpretation itself.
 
 What translation can reach was measured by lifting instead of interpreting. A `-DKB_HOT` build dumps
 every block it ran with its IR and run count; `experiments/aot-oracle/scripts/lift.ts` writes the
@@ -415,6 +485,57 @@ instead of inlining it, which put the flags in memory and cost 13-17% of the sam
 inline took factor, sqlite and sha256 from 11, 34 and 12 to 9, 29 and 9. katybug.wasm grows from
 239 KB to 1.35 MB with the 99% lifting. Peak RSS natively is 1.5 MiB for the binaries, 4.8-9.3 MiB
 under Katybug, and 0.1-1.2 MiB more with the lifted code.
+
+Hardware counters on the native lifted build (`experiments/aot-oracle/scripts/native-profile.sh`,
+`perf` on paisley-park, each workload ten times larger) show where the native 5-25x goes. The
+lifted regions hold 78-88% of the samples, dispatch 6-10%, translation up to 5%, and the
+out-of-line memory slow path under 1%. The lifted code does not stall: branch misses are at most
+1.1% of branches and cache misses under 0.1% of references. It executes too many instructions:
+
+| workload | instructions, lifted over native | cycles, lifted over native | IPC lifted | IPC native |
+| --- | --- | --- | --- | --- |
+| factor | 13.4x | 5.1x | 4.38 | 1.67 |
+| sqlite | 24.6x | 28.6x | 2.97 | 3.44 |
+| sha256 | 4.6x | 8.5x | 3.74 | 6.87 |
+
+Natively the 128-bit division stays under 0.5% of the samples, so its tenth of factor is a wasm
+cost. Without the signal check sha256 runs 9.8% fewer instructions and 8.8% fewer cycles; factor and
+sqlite move by under 3%.
+
+Guest state is not what the lifted code carries. A `-DKB_COUNT` build
+(`experiments/aot-oracle/scripts/counts.sh`) counts, per 1,000 guest instructions, the words of the
+cpu struct read and written and the mapping checks made:
+
+| workload | cpu words read, interpreted | read, lifted | written, interpreted | written, lifted | mapping checks | checks per lifted region entry | mappings per region |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| sha256 | 16,466 | 61 | 10,542 | 41 | 91 | 308 | 1 |
+| factor | 13,469 | 395 | 8,445 | 336 | 150 | 59 | 3 |
+| sqlite | 15,633 | 730 | 9,549 | 640 | 418 | 63 | 8 |
+
+A region's checks fall in a handful of mappings. The memory plan (`plan_mem` in `run.c`) follows
+each register through a block as an entry register plus a constant, and loads and stores off one
+root share a `KB_RESOLVE` at the block's start that resolves their whole span once; a span that is
+not one mapping leaves each access its own check, so faults stay where they were. Lifted checks
+fall to 28, 88 and 287 per 1,000 guest instructions, and the lifted code runs 8%, 3% and 13%
+faster. The interpreter skips the resolves: using them cost it 2-3%, since dispatch dominates it.
+Every IR op carries a semantic class (`kb_class` in `run.c`), and the flag and memory plans read
+the classes, not opcodes.
+
+Where the pending-signal check sits was measured with `-DKB_POLL`
+(`experiments/aot-oracle/scripts/poll.sh`), lifted time against checking at every block:
+
+| policy | signal corpus | sha256 | factor | sqlite | poll latency, mean / max |
+| --- | --- | --- | --- | --- | --- |
+| every block | exact | 0.043 s | 0.204 s | 0.401 s | 0.5 / 2.3 us |
+| back-edges | fails | -20.9% | -4.4% | -9.0% | 0.8 / 2.7 us |
+| back-edges and after each syscall | exact | -18.6% | -3.9% | -7.5% | 0.8 / 2.7 us |
+| every 64 transitions | fails | -11.6% | +1.5% | -19.0% | 13.8 / 41.7 us |
+
+Back-edges alone miss a signal a syscall makes pending (a `kill` of itself, a `sigprocmask` that
+unblocks one), which must run before the syscall returns. The interpreter gains 0-3% from any
+policy. The latency is from the host signal to the poll that sees it, under a `SIGUSR1` about every
+millisecond into a bash loop with a trap. Katybug now polls at back-edges and after each syscall by
+default; `-DKB_POLL=0` restores the check at every block.
 
 Katybug also decodes wasm (`src/gmux/katybug/wasm.c`, `katybug --wasm <module> <export> [args]`), so
 the IR has a third frontend and a planner over it sees native wasm programs too. Validated wasm has a
@@ -489,14 +610,14 @@ first replacement the object ran 5 s and ~10 s events without another.
 
 The threshold counts CPU across events, not within one. Five fresh objects each ran three burns of
 589-723 ms: every one kept its instance after the first and was replaced after the second, at ~1.3 s
-in total (`experiments/event-quanta/scripts/cumulative.mjs`). Keeping the first event short
+in total (`experiments/event-quanta/scripts/cumulative.ts`). Keeping the first event short
 therefore does not avoid the replacement; every object meets it once.
 
 The site spends it before a machine exists (`src/worker/placement.ts`). A fresh object's first
 request burns ~1.5 s of CPU, records which instance did so, and answers 503; the terminal retries.
 The next request arrives on the replacement instance, which sees that another instance did the
 burning and marks the object placed. Six fresh objects on Free went prime, then placed on the next
-request, then kept their instance through a 1.5 s burn (`placed.mjs`; priming cost 1,459-1,819 ms).
+request, then kept their instance through a 1.5 s burn (`placed.ts`; priming cost 1,459-1,819 ms).
 A large program's startup can then pass a second of CPU without taking the machine with it.
 
 A host that never replaces objects (workerd under `wrangler dev`, which the Docker image runs) keeps
@@ -640,9 +761,26 @@ memory with the lookups inlined, costs 2.06-2.66x on the census (lua 2.60, gzip 
 sqlite 2.06, sed 2.63, gawk 2.35); a 1,024-entry TLB was worse, 2.4-5.7x. Translating once per 4 KiB
 page ran at 0.98-0.99x of the same loop untranslated (`experiments/mmu/src/micro.wat`). So no code
 runs translated, and a restore uses the page owner table instead: it writes the pages no parked
-process owns and brings a process's pages in just before one of its tasks runs. A 127 MiB machine
-fetched 74-76 of its 86-88 MiB of data at restore, and two parked 6 MB processes came in only when
-they woke, intact (`experiments/mmu/scripts/lazy-restore.ts`).
+process owns and brings a process's pages in just before one of its tasks runs. The kernel can
+reach those pages for another task first: `/proc/<pid>/cmdline`, `environ` and `mem`, and ptrace, go
+through `access_remote_vm`, which kernel patch 0021 has ask the host for the range before it copies.
+A checkpoint of a lazily restored machine writes every page it still held back, and it zeroes the
+page allocator's free pages (patch 0020 hands the host a bitmap of them), whose bytes are dead. With
+two parked 6 MB processes in a 127 MiB machine (`experiments/mmu/scripts/lazy-restore.ts`), against
+the same run without patches 0020 and 0021:
+
+| | without | with |
+| --- | --- | --- |
+| stored image, non-zero pages | 73.6 MiB | 26.7 MiB |
+| fetched at restore | 61.2 MiB | 14.4 MiB |
+| free pages zeroed at checkpoint | 0 | 21,108 |
+| parked processes `ps` shows with their command line | 0 of 2 | 2 of 2 |
+
+Each parked process's 6 MB came in when it woke, intact in both runs. The restore itself made 21
+reads of the image. For a second after it, with no input, the machine read nothing more; each
+sleeper's wake then read its pages in whole owner runs, 21 reads at 607 KB each. Prefetching an
+early working set has nothing to win here, since only parked processes' pages are held back and
+each comes in at once.
 
 ### Dirty Tracking
 
@@ -756,18 +894,21 @@ native only once every function it calls has, which fixes the rungs:
 
 | promoted share | `r` against V8 | Amdahl | crossings per deflate |
 | --- | --- | --- | --- |
-| none | 13.48 | 13.48 | 0 |
-| 74.0% (`longest_match`) | 7.21 | 4.32 | 91,105 |
-| 77.0% | 6.41 | 3.95 | 91,108 |
-| 80.0% | 6.11 | 3.58 | 91,143 |
-| 81.5% | 5.97 | 3.39 | 91,161 |
-| 86.7% (`fill_window` and its callees) | 5.27 | 2.75 | 91,190 |
-| 100% (`deflate_slow` and its callees) | 1.10 | 1.10 | 14 |
+| none | 13.24 | 13.24 | 0 |
+| 74.0% (`longest_match`) | 7.10 | 4.25 | 91,105 |
+| 77.0% | 6.29 | 3.88 | 91,108 |
+| 80.0% | 5.97 | 3.52 | 91,143 |
+| 81.5% | 5.85 | 3.33 | 91,161 |
+| 86.7% (`fill_window` and its callees) | 5.18 | 2.71 | 91,190 |
+| 100% (`deflate_slow` and its callees) | 1.08 | 1.09 | 14 |
 
 Amdahl holds when the boundary is cold and misses by 1.6-1.9x when it is crossed 91,000 times a
 deflate, about 0.5 us per crossing through JavaScript. No rung lies between 86.7% and 100%:
-`deflate_slow` goes native only together with the functions it calls. On an Apple M-series laptop
-the same ladder runs at 7.40 interpreted and 0.97 promoted.
+`deflate_slow` goes native only together with the functions it calls. The ladder ran alone on one
+core under Node 26.10 (V8 14.6). Under Node 24.21 (V8 13.6) V8's own deflate is as fast, but the
+fully interpreted run takes 37% longer (`r` 18.36) and the 74.0% rung 16% longer (8.33), and a
+crossing still costs about 0.5 us. On an Apple M-series laptop the same ladder runs at 7.40 interpreted and
+0.97 promoted.
 
 ---
 
@@ -1137,7 +1278,7 @@ allocations now go through a `volatile` pointer.
 | `experiments/boot/` | the kernel host's Worker (it re-exports `src/worker/machine/`) and the Node boot script |
 | `experiments/quanta-job/` | the multi-event job and process-count drivers, run against the boot rig's Worker |
 | `experiments/network/`, `dirty-tracking/`, `codegen/`, `publication/` | sockets, dirty-page tracking, startup compile and packs, deploys against live machines |
-| `experiments/evacuation/`, `mmu/` | resumable frames (`evacuate.mjs`) and the control-flow checkpoint matrix; the software MMU bench and lazy restore |
+| `experiments/evacuation/`, `mmu/` | resumable frames (`evacuate.ts`) and the control-flow checkpoint matrix; the software MMU bench and lazy restore |
 | `experiments/console-interrupt/`, `syscall-cost/` | host calls and input latency of the console; host time per syscall |
 | `experiments/exec-stubs/` | guest memory, exec time and image size with full executables against stubs in the rootfs |
 | `scripts/tail.ts`, `scripts/probe.ts` | the `wrangler tail` parser and the gate drivers' shared client |
