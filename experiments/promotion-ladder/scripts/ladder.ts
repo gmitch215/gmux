@@ -1,0 +1,263 @@
+import { execFileSync } from 'node:child_process';
+import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { join } from 'node:path';
+
+/**
+ * The promotion-coverage ladder: a guest's hottest functions made native by hand while wasm3 interprets
+ * the rest, measured end to end against V8 and against Amdahl.
+ *
+ * `prepare <guest.wasm> <out dir>` (needs wasm-tools) counts each function's dynamic instructions by
+ * running an instrumented copy in V8 (burrow's law: interpreted cost per instruction is near flat, so
+ * the count stands in for interpreted CPU), picks the smallest set of functions reaching 0, 90, 95, 99,
+ * 99.5, 99.9 and 100% of it, closes each set under direct calls (native code never calls back into
+ * wasm3, which is not re-entrant), and writes two modules per rung: `interp` for wasm3, where each
+ * promoted function is a thunk to a host import, and `native`, which imports wasm3's memory and adds
+ * the guest's base to every load and store. The stack pointer crosses as the thunk's first argument.
+ *
+ * `run <out dir> <burrow dist> [rounds]` times `run(n)` and `run(2n)` per rung and keeps the difference.
+ */
+const [mode = '', a1 = '', a2 = '', a3 = ''] = process.argv.slice(2);
+
+interface Fn {
+	name: string;
+	header: string;
+	locals: string[];
+	body: string[];
+	params: number;
+	result: boolean;
+}
+
+function parse(wat: string) {
+	const lines = wat.split('\n');
+	const head: string[] = [];
+	const tail: string[] = [];
+	const fns: Fn[] = [];
+	for (let i = 0; i < lines.length; i++) {
+		const line = lines[i]!;
+		const m = line.match(/^ {2}\(func \$(\S+) \(;\d+;\) \(type \d+\)(.*)$/);
+		if (!m) {
+			(fns.length ? tail : head).push(line);
+			continue;
+		}
+		const sig = m[2]!;
+		const params = (sig.match(/\(param ([^)]*)\)/)?.[1] ?? '').split(/\s+/).filter(Boolean).length;
+		const result = /\(result/.test(sig);
+		const fn: Fn = { name: m[1]!, header: line, locals: [], body: [], params, result };
+		if ((line.match(/\(/g) ?? []).length === (line.match(/\)/g) ?? []).length) {
+			// an empty body printed on one line, e.g. (func $f (type 1) (param i32 i32))
+			fn.header = line.replace(/\)$/, '');
+			fns.push(fn);
+			continue;
+		}
+		for (i++; i < lines.length && lines[i] !== '  )'; i++) {
+			const l = lines[i]!;
+			if (/^\s*\(local /.test(l) && !fn.body.length) fn.locals.push(l);
+			else fn.body.push(l);
+		}
+		fns.push(fn);
+	}
+	return { head, tail, fns };
+}
+
+const sigOf = (fn: Fn) => fn.header.replace(/^ {2}\(func \$\S+ \(;\d+;\) \(type \d+\)/, '').trim();
+const paramList = (fn: Fn) => Array.from({ length: fn.params }, (_, i) => `    local.get ${i}`);
+const emit = (fn: Fn) => [fn.header, ...fn.locals, ...fn.body, '  )'];
+const wasmTools = (args: string[], input?: string) => execFileSync('wasm-tools', args, { input, maxBuffer: 1 << 28 });
+
+// #region prepare
+if (mode === 'prepare') {
+	const [guest, out] = [a1, a2];
+	mkdirSync(out, { recursive: true });
+	const wat = wasmTools(['print', guest]).toString();
+	const { head, tail, fns } = parse(wat);
+
+	// counting: a counter per function, bumped at every straight-line segment by its length
+	const boundary = /^\s*(block|loop|if|else|end|br_if|br_table|call|call_indirect)\b/;
+	const counted = fns.map((fn) => {
+		const body: string[] = [];
+		const bump = (k: number) => (k ? [`    global.get $cnt_${fn.name}`, `    i64.const ${k}`, '    i64.add', `    global.set $cnt_${fn.name}`] : []);
+		let segment: string[] = [];
+		const flush = () => {
+			body.push(...bump(segment.length), ...segment);
+			segment = [];
+		};
+		for (const l of fn.body) {
+			segment.push(l);
+			if (boundary.test(l)) {
+				// the boundary instruction ends its segment; what follows starts a new one
+				body.push(...bump(segment.length), ...segment);
+				segment = [];
+			}
+		}
+		flush();
+		return { ...fn, body };
+	});
+	const counters = fns.map((fn) => `  (global $cnt_${fn.name} (export "cnt_${fn.name}") (mut i64) i64.const 0)`);
+	const countWat = [...head, ...counted.flatMap(emit), ...counters, ...tail].join('\n');
+	const countBytes = wasmTools(['parse', '-o', '/dev/stdout'], countWat);
+	const inst = new WebAssembly.Instance(new WebAssembly.Module(countBytes)).exports as Record<string, WebAssembly.Global | ((n: number) => number)>;
+	// per deflate, as `run` times it: run(2) less run(1), so the input generation cancels here too
+	const read = () => fns.map((fn) => Number((inst[`cnt_${fn.name}`] as WebAssembly.Global).value));
+	(inst.run as (n: number) => number)(1);
+	const one = read();
+	for (const fn of fns) (inst[`cnt_${fn.name}`] as WebAssembly.Global).value = 0n;
+	(inst.run as (n: number) => number)(2);
+	const two = read();
+	const counts = Object.fromEntries(fns.map((fn, i) => [fn.name, two[i]! - one[i]!]));
+	const total = Object.values(counts).reduce((s, v) => s + v, 0);
+
+	// direct callees, for closing a set
+	const callees = new Map(fns.map((fn) => [fn.name, new Set(fn.body.map((l) => l.match(/^\s*call \$(\S+)/)?.[1]).filter(Boolean) as string[])]));
+	// bottom-up: a function can go native once every function it calls directly is native, so native
+	// code never calls back into wasm3; each step promotes the hottest eligible one
+	const shareOf = (set: Set<string>) => [...set].reduce((s, n) => s + counts[n]!, 0) / total;
+	const rungs = [{ target: 0, set: new Set<string>(), share: 0 }];
+	const done = new Set<string>();
+	for (;;) {
+		const eligible = fns.filter((fn) => !done.has(fn.name) && [...callees.get(fn.name)!].every((c) => done.has(c) || c === fn.name));
+		if (!eligible.length) break;
+		const next = eligible.sort((x, y) => counts[y.name]! - counts[x.name]!)[0]!;
+		done.add(next.name);
+		const share = shareOf(done);
+		// a rung per step that moves the share, and the last, which holds every function
+		if (share > rungs.at(-1)!.share + 1e-4 || done.size === fns.length) rungs.push({ target: share, set: new Set(done), share });
+	}
+
+	const byName = new Map(fns.map((fn) => [fn.name, fn]));
+	// imports go right after the types, ahead of the table, memory and globals wasm-tools prints next
+	const importAt = head.findLastIndex((l) => /^ {2}\(type/.test(l)) + 1;
+	const manifest = rungs.map((rung, k) => {
+		const promoted = [...rung.set].sort();
+		// wasm3's side: each promoted function becomes a thunk passing the stack pointer first
+		const interpHead = [...head];
+		interpHead.splice(
+			importAt,
+			0,
+			...promoted.map((n) => {
+				const fn = byName.get(n)!;
+				const params = ['i32', ...Array.from({ length: fn.params }, () => 'i32')].join(' ');
+				return `  (import "native" "${n}" (func $nat_${n} (param ${params})${fn.result ? ' (result i32)' : ''}))`;
+			})
+		);
+		const interpFns = fns.map((fn) =>
+			rung.set.has(fn.name) ? { ...fn, locals: [], body: ['    global.get $__stack_pointer', ...paramList(fn), `    call $nat_${fn.name}`] } : fn
+		);
+		writeFileSync(join(out, `rung${k}.interp.wasm`), wasmTools(['parse', '-o', '/dev/stdout'], [...interpHead, ...interpFns.flatMap(emit), ...tail].join('\n')));
+
+		// the native side: wasm3's memory, every access at base + address, entries that set the stack pointer
+		const own = (l: string) => !/^ {2}\((memory|export|data) /.test(l);
+		const nativeHead = [...head.slice(0, importAt), '  (import "env" "memory" (memory 1))', '  (import "env" "base" (global $gbase i32))', ...head.slice(importAt).filter(own)];
+		const rebased = fns.map((fn) => {
+			const body: string[] = [];
+			for (const l of fn.body) {
+				if (/^\s*memory\.(size|grow|copy|fill)/.test(l)) throw new Error(`${fn.name}: ${l.trim()} cannot be rebased`);
+				const load = l.match(/^\s*(i32|i64|f32|f64)\.load/);
+				const store = l.match(/^\s*(i32|i64|f32|f64)\.store/);
+				if (load) body.push('    global.get $gbase', '    i32.add', l);
+				else if (store) body.push(`    local.set $tv_${store[1]}`, '    global.get $gbase', '    i32.add', `    local.get $tv_${store[1]}`, l);
+				else body.push(l);
+			}
+			return { ...fn, locals: [...fn.locals, '    (local $tv_i32 i32) (local $tv_i64 i64) (local $tv_f32 f32) (local $tv_f64 f64)'], body };
+		});
+		const entries = promoted.map((n) => {
+			const fn = byName.get(n)!;
+			const params = ['i32', ...Array.from({ length: fn.params }, () => 'i32')].join(' ');
+			return [
+				`  (func $ent_${n} (export "f_${n}") (param ${params})${fn.result ? ' (result i32)' : ''}`,
+				'    local.get 0',
+				'    global.set $__stack_pointer',
+				...Array.from({ length: fn.params }, (_, i) => `    local.get ${i + 1}`),
+				`    call $${n}`,
+				'  )'
+			];
+		});
+		const nativeTail = tail.filter(own);
+		writeFileSync(
+			join(out, `rung${k}.native.wasm`),
+			wasmTools(['parse', '-o', '/dev/stdout'], [...nativeHead, ...rebased.flatMap(emit), ...entries.flat(), ...nativeTail].join('\n'))
+		);
+		return {
+			rung: k,
+			target: rung.target,
+			share: rung.share,
+			promoted,
+			imports: Object.fromEntries(promoted.map((n) => [n, `${byName.get(n)!.result ? 'i' : 'v'}(${'i'.repeat(byName.get(n)!.params + 1)})`]))
+		};
+	});
+	writeFileSync(join(out, 'rungs.json'), JSON.stringify({ total, counts, rungs: manifest }, null, '\t'));
+	writeFileSync(join(out, 'guest.wasm'), readFileSync(guest));
+	for (const r of manifest)
+		console.log(`rung ${r.rung}: target ${(100 * r.target).toFixed(1)}%, closed share ${(100 * r.share).toFixed(3)}%, ${r.promoted.length} functions: ${r.promoted.join(' ')}`);
+}
+// #endregion
+
+// #region run
+if (mode === 'run') {
+	const [out, burrowDist, roundsArg = '3'] = [a1, a2, a3];
+	const rounds = Number(roundsArg);
+	const { rungs } = JSON.parse(readFileSync(join(out, 'rungs.json'), 'utf8'));
+	const { createInterpreter } = await import(`${burrowDist}/interpret.js`);
+	const wasm3Module = new WebAssembly.Module(readFileSync(`${burrowDist}/vendor/wasm3.wasm`));
+	const n = Number(process.env.N ?? 2);
+	const median = (xs: number[]) => [...xs].sort((x, y) => x - y)[Math.floor(xs.length / 2)]!;
+	const time = (f: () => number) => {
+		const t = performance.now();
+		const v = f() >>> 0;
+		return { ms: performance.now() - t, v };
+	};
+
+	const v8 = new WebAssembly.Instance(new WebAssembly.Module(readFileSync(join(out, 'guest.wasm')))).exports as Record<string, (n: number) => number>;
+	const reference = v8.run!(2 * n) >>> 0;
+	const v8ms = median(Array.from({ length: rounds }, () => time(() => v8.run!(2 * n)).ms - time(() => v8.run!(n)).ms));
+
+	const rows: { rung: number; target: number; share: number; ms: number; crossings: number }[] = [];
+	for (const r of rungs) {
+		const vm = await createInterpreter({ module: wasm3Module });
+		let native: Record<string, (...a: number[]) => number> = {};
+		let crossings = 0;
+		const imports = Object.fromEntries(
+			Object.entries(r.imports as Record<string, string>).map(([name, signature]) => [
+				name,
+				{
+					signature,
+					fn: (...args: number[]) => {
+						crossings++;
+						return native[`f_${name}`]!(...args);
+					}
+				}
+			])
+		);
+		const guest = vm.load(new Uint8Array(readFileSync(join(out, `rung${r.rung}.interp.wasm`))), { imports: { native: imports } });
+		// burrow keeps the interpreter's memory private; the rig reaches it to share guest memory natively
+		const memory = (vm as unknown as { shim: { memory: WebAssembly.Memory } }).shim.memory;
+		const base = new WebAssembly.Global({ value: 'i32', mutable: false }, guest.memory().byteOffset);
+		native = new WebAssembly.Instance(new WebAssembly.Module(readFileSync(join(out, `rung${r.rung}.native.wasm`))), {
+			env: { memory, base }
+		}).exports as typeof native;
+		const diffs: number[] = [];
+		let perRun = 0;
+		for (let k = 0; k < rounds; k++) {
+			crossings = 0;
+			const one = time(() => guest.call('run', n));
+			const c1 = crossings;
+			const two = time(() => guest.call('run', 2 * n));
+			if (two.v !== reference) throw new Error(`rung ${r.rung}: ${two.v.toString(16)} against v8 ${reference.toString(16)}`);
+			diffs.push(two.ms - one.ms);
+			perRun = crossings - 2 * c1;
+		}
+		rows.push({ rung: r.rung, target: r.target, share: r.share, ms: median(diffs), crossings: Math.max(perRun, 0) });
+	}
+	const rI = rows[0]!.ms / v8ms;
+	const rN = rows.at(-1)!.ms / v8ms;
+	console.log(`V8: ${v8ms.toFixed(1)} ms per ${n} deflates; all interpreted r ${rI.toFixed(2)}, all native through one crossing r ${rN.toFixed(2)}`);
+	console.log('| rung | target | closed share | ms | r | Amdahl r | crossings per deflate |');
+	console.log('| --- | --- | --- | --- | --- | --- | --- |');
+	for (const row of rows) {
+		const r = row.ms / v8ms;
+		const amdahl = (1 - row.share) * rI + row.share * rN;
+		console.log(
+			`| ${row.rung} | ${(100 * row.target).toFixed(1)}% | ${(100 * row.share).toFixed(3)}% | ${row.ms.toFixed(1)} | ${r.toFixed(2)} | ${amdahl.toFixed(2)} | ${(row.crossings / n).toFixed(0)} |`
+		);
+	}
+}
+// #endregion
