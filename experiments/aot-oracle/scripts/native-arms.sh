@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 # the oracle's native attribution arms on a Linux x86-64 host: the same lifted C built natively, with
 # and without the per-transition signal check and the per-access range check, against Katybug's
-# interpreter and the binaries themselves; milliseconds per run (bash's time) and peak RSS (GNU time).
+# interpreter and the binaries themselves; seconds per run (bash's time) and peak RSS (GNU time).
 # usage: native-arms.sh <lifted.c> <bin dir with busybox-amd64, coreutils, sqlite3> [runs]; needs clang
-set -uo pipefail
+set -euo pipefail
 here=$(cd "$(dirname "$0")" && pwd)
 root=$(cd "$here/../../.." && pwd)
 aot=$1
@@ -28,7 +28,7 @@ cmd() {
 	esac
 }
 TIMEFORMAT=%3R
-echo "| workload | arm | ms per run | output | peak RSS KiB |"
+echo "| workload | arm | seconds per run | output | peak RSS KiB |"
 echo "| --- | --- | --- | --- | --- |"
 for w in sha256 factor sqlite; do
 	for arm in native plain aot aot-nosignal aot-norange aot-neither; do
@@ -36,8 +36,8 @@ for w in sha256 factor sqlite; do
 		[ "$arm" = native ] || p="$work/$arm"
 		c=$(cmd "$p" "$w")
 		out=$(sh -c "$c" 2> /dev/null | md5sum | cut -c1-8) || out=crash
-		times=$(for _ in $(seq "$runs"); do { time sh -c "$c > /dev/null"; } 2>&1; done | sort -n | tr '\n' ' ')
-		rss=$( { /usr/bin/time -f %M sh -c "$c > /dev/null"; } 2>&1 | tail -1)
+		times=$(for _ in $(seq "$runs"); do { time sh -c "$c > /dev/null"; } 2>&1 || true; done | sort -n | tr '\n' ' ')
+		rss=$({ /usr/bin/time -f %M sh -c "$c > /dev/null"; } 2>&1 | tail -1 || true)
 		echo "| $w | $arm | $times | $out | $rss |"
 	done
 done
