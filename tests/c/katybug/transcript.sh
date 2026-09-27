@@ -79,7 +79,9 @@ fail=0
 for s in $suites; do
 	on_host "docker run --rm --memory 1g --cpus 2 -v \"\$HOME/gmux-rig/t1/bbt/t:/t\" alpine:3.20 /t/run.sh $s" > "$out/$s.native.txt"
 	cp "$out/$s.native.txt" "$keep/"
-	TMPDIR=$out/tmp "$out/t/run.sh" "$s" "$out/katybug" > "$out/$s.katybug.txt"
+	# the native side starts in a fresh container; a CI runner starts steps with SIGPIPE ignored
+	TMPDIR=$out/tmp perl -e '$SIG{PIPE} = "DEFAULT"; exec @ARGV or die' \
+		"$out/t/run.sh" "$s" "$out/katybug" > "$out/$s.katybug.txt"
 	echo "# $s"
 	"$root/scripts/ts" "$here/transcript-diff.ts" "$out/$s.native.txt" "$out/$s.katybug.txt" || fail=1
 done
