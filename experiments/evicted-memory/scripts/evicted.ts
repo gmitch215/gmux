@@ -1,7 +1,7 @@
 // boot a machine, evict it, boot the same object again; does the new instance share the old
 // one's isolate, and is its boot reset for memory? Runs against experiments/boot deployed.
 // With reuse on, the successor boots into its predecessor's memory (worker.ts POOL).
-// `node evicted.mjs [reps] [pages]`
+// `node evicted.ts [reps] [pages]`
 const B = process.env.G08_URL ?? 'https://gmux-boot.gmitch215-free.workers.dev';
 const reps = Number(process.argv[2] ?? 5), pages = Number(process.argv[3] ?? 2400);
 const arms = [];

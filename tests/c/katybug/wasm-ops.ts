@@ -4,7 +4,7 @@ import { Random } from './random.ts';
 /**
  * Writes a wasm module (wasm-ops.wat) that exports every integer instruction form katybug's wasm
  * frontend decodes, and the calls to make on it (wasm-ops.calls, one "export arg..." per line, hex).
- * V8 (wasm-ops.mjs) and katybug --wasm run the same calls; the two outputs must be equal.
+ * V8 (wasm-ops-v8.ts) and katybug --wasm run the same calls; the two outputs must be equal.
  * `wasm-ops.ts <out dir>`
  */
 const random = new Random(215);

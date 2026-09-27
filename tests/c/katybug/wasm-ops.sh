@@ -8,7 +8,7 @@ out=$(mktemp -d)
 cc -std=c11 -D_DEFAULT_SOURCE -D_DARWIN_C_SOURCE -O2 ${KATYBUG_CFLAGS:-} -o "$out/katybug" "$root"/src/gmux/katybug/*.c -lm
 "$root/scripts/ts" "$here/wasm-ops.ts" "$out"
 wat2wasm "$out/wasm-ops.wat" -o "$out/wasm-ops.wasm"
-node "$here/wasm-ops.mjs" "$out" > "$out/v8.txt"
+node "$here/wasm-ops-v8.ts" "$out" > "$out/v8.txt"
 # V8 raises one message for an empty table slot and a signature mismatch; katybug names them apart
 "$out/katybug" --wasm "$out/wasm-ops.wasm" --calls "$out/wasm-ops.calls" \
 	| sed 's/ trap null$/ trap sig/' > "$out/katybug.txt"

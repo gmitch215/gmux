@@ -1,5 +1,5 @@
 // the reference side of the wasm corpus: V8 runs wasm-ops.calls on wasm-ops.wasm and prints each
-// result as katybug --wasm does. `node wasm-ops.mjs <dir>`
+// result as katybug --wasm does. `node wasm-ops-v8.ts <dir>`
 import { readFileSync } from 'node:fs';
 
 const dir = process.argv[2];
