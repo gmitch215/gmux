@@ -1,6 +1,7 @@
 import { execFileSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { mkdtempSync, readFileSync } from 'node:fs';
+import { Session } from 'node:inspector/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { appendCpio } from '../../../scripts/wasm/cpio-append.ts';
@@ -9,12 +10,15 @@ import { Machine } from '../../../src/worker/machine/machine.ts';
 /**
  * host nanoseconds per call for the syscalls src/cost.c loops over, timed between its markers as the
  * console delivers them, minus the empty loop. `cost.wasm` is src/cost.c built like a tests/c probe.
+ * PROFILE=getdents instead samples a run of only the directory loop and prints the functions with the
+ * most samples (VMLINUX names a kernel built with its name section, for kernel function names).
+ * GMUX_BUILD picks the build, as tests/c/run.ts does.
  * `node --experimental-strip-types experiments/syscall-cost/scripts/cost.ts <cost.wasm> [n] [rounds]`
  */
 const root = new URL('../../../', import.meta.url).pathname;
 const [plain, n = '20000', rounds = '3'] = process.argv.slice(2);
 if (!plain) throw new Error('usage: cost.ts <cost.wasm> [n] [rounds]');
-const kernel = join(root, 'build/kernel');
+const kernel = join(process.env.GMUX_BUILD ?? join(root, 'build'), 'kernel');
 const work = mkdtempSync(join(tmpdir(), 'gmux-syscall-cost-'));
 const sha256 = (bytes: Uint8Array) => createHash('sha256').update(bytes).digest('hex');
 const manifest = JSON.parse(readFileSync(join(kernel, 'manifest.json'), 'utf8'));
@@ -24,7 +28,7 @@ appendCpio(join(kernel, 'initramfs.bin'), join(work, 'initramfs.cpio'), [`/bin/c
 let output = '';
 const marks: [string, number, number][] = [];
 const machine = new Machine({
-	vmlinux: new WebAssembly.Module(readFileSync(join(kernel, 'vmlinux.wasm'))),
+	vmlinux: new WebAssembly.Module(readFileSync(process.env.VMLINUX ?? join(kernel, 'vmlinux.wasm'))),
 	initrd: new Uint8Array(readFileSync(join(work, 'initramfs.cpio'))),
 	cmdline:
 		'maxcpus=3 root=/dev/ram0 rootfstype=ramfs init=/init console=hvc console=ttyS0',
@@ -51,6 +55,32 @@ const run = async (until: () => boolean) => {
 };
 
 await run(() => output.includes('# '));
+if (process.env.PROFILE === 'getdents') {
+	const session = new Session();
+	session.connect();
+	await session.post('Profiler.enable');
+	await session.post('Profiler.setSamplingInterval', { interval: 100 });
+	const start = output.length;
+	const t0 = performance.now();
+	await session.post('Profiler.start');
+	machine.type(`cost ${n} getdents\n`);
+	await run(() => output.slice(start).includes('cost done'));
+	const { profile } = await session.post('Profiler.stop');
+	const ms = performance.now() - t0;
+	const byId = new Map(profile.nodes.map((node) => [node.id, node]));
+	const self = new Map<string, number>();
+	for (const id of profile.samples ?? []) {
+		const frame = byId.get(id)!.callFrame;
+		const name = frame.url.startsWith('wasm://') ? frame.functionName : `(host) ${frame.functionName || frame.url}`;
+		self.set(name, (self.get(name) ?? 0) + 1);
+	}
+	const total = [...self.values()].reduce((a, b) => a + b, 0);
+	const entries = Number(/cost done (\d+)/.exec(output.slice(start))?.[1] ?? 0) / Number(n);
+	console.log(JSON.stringify({ directories: Number(n), entriesPerDirectory: entries, usPerDirectory: +((ms * 1000) / Number(n)).toFixed(2), samples: total }));
+	for (const [name, count] of [...self].sort((a, b) => b[1] - a[1]).slice(0, 25))
+		console.log(`| ${name} | ${((100 * count) / total).toFixed(1)}% |`);
+	process.exit(0);
+}
 const perCall = new Map<string, number[]>();
 for (let r = 0; r < Number(rounds); r++) {
 	marks.length = 0;

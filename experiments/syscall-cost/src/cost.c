@@ -5,6 +5,7 @@
 #include <fcntl.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #include <sys/stat.h>
 #include <sys/syscall.h>
 #include <time.h>
@@ -15,8 +16,21 @@ static void mark(const char* what, long n) {
     fflush(stdout);
 }
 
+/* cost <n> getdents: only the directory loop, for a profile of it */
+static int dirs(long n) {
+    long sink = 0;
+    for (long i = 0; i < n; i++) {
+        DIR* d = opendir("/bin");
+        while (readdir(d)) sink++;
+        closedir(d);
+    }
+    printf("cost done %ld\n", sink);
+    return 0;
+}
+
 int main(int argc, char** argv) {
     long n = argc > 1 ? atol(argv[1]) : 20000;
+    if (argc > 2 && !strcmp(argv[2], "getdents")) return dirs(n);
     static char buf[65536];
     long sink = 0;
     struct stat st;
