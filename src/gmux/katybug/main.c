@@ -61,6 +61,7 @@ int main(int argc, char** argv) {
         fprintf(stderr, "katybug: cannot load %s (%d)\n", argv[1], rc);
         return 126;
     }
+    kb_sig_inherit(cpu);
     if (getenv("KATYBUG_TRACE"))
         cpu->trace = fopen(getenv("KATYBUG_TRACE"), "w");
     cpu->noplan =

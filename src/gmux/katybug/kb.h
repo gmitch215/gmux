@@ -290,6 +290,7 @@ int kb_fault(struct kb_cpu* cpu, int s, int code, uint64_t addr);
 int kb_host_sig(int s);
 int64_t kb_sigsuspend(struct kb_cpu* cpu, uint64_t mask);
 void kb_sig_reinstall(struct kb_cpu* cpu);
+void kb_sig_inherit(struct kb_cpu* cpu);
 int64_t kb_sigpending(struct kb_cpu* cpu, uint64_t set);
 int64_t kb_timer(struct kb_cpu* cpu, int64_t nr, const uint64_t* a);
 

@@ -87,6 +87,7 @@ struct ksigaction {
 #define SIGUSR1 10
 #define SIGSEGV 11
 #define SIGUSR2 12
+#define SIGPIPE 13
 #define SIGTERM 15
 #define MAP_FIXED_ANON 0x32 /* MAP_PRIVATE | MAP_FIXED | MAP_ANONYMOUS */
 
@@ -141,6 +142,11 @@ static void action(int s, void (*h)(int, void*, void*)) {
 }
 
 void sig_main(void) {
+    /* exec keeps an ignored signal ignored: 1 (SIG_IGN) when started so */
+    struct ksigaction inherited;
+    sys(NR_SIGACTION, SIGPIPE, 0, (long) &inherited, 8);
+    line("pipe at start", (long) inherited.handler);
+
     long pid = sys(NR_GETPID, 0, 0, 0, 0);
     action(SIGUSR1, on_usr1);
     sys(NR_KILL, pid, SIGUSR1, 0, 0);

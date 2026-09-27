@@ -121,6 +121,17 @@ int64_t kb_sigaction(struct kb_cpu* cpu, int s, uint64_t act, uint64_t old) {
     return 0;
 }
 
+/** at exec: a signal the host process inherited as ignored stays ignored for
+ * the guest, as execve keeps it */
+void kb_sig_inherit(struct kb_cpu* cpu) {
+    for (int s = 1; s <= 64; s++) {
+        int h = kb_host_sig(s);
+        struct sigaction hs;
+        if (h && sigaction(h, NULL, &hs) == 0 && hs.sa_handler == SIG_IGN)
+            cpu->sig[s].handler = 1;
+    }
+}
+
 /** after kb_resume: the host handlers for the guest's, which exec reset */
 void kb_sig_reinstall(struct kb_cpu* cpu) {
     for (int s = 1; s <= 64; s++)

@@ -44,7 +44,13 @@ check hello-x86 hello 0 "$out/katybug" "$out/hello-x86"
 check hello-a64 hello 0 "$out/katybug" "$out/hello-a64"
 check guest-x86 "$ref" "$ref_rc" "$out/katybug" "$out/guest-x86"
 check guest-a64 "$ref" "$ref_rc" "$out/katybug" "$out/guest-a64"
-# signals.expected is the x86-64 build's output on native Linux; SIGTERM's default action ends it
-check signals-x86 "$(cat "$here/signals.expected")" 143 "$out/katybug" "$out/signals-x86"
-check signals-a64 "$(cat "$here/signals.expected")" 143 "$out/katybug" "$out/signals-a64"
+# signals.expected is the x86-64 build's output on native Linux; SIGTERM's default action ends it.
+# a CI runner starts steps with SIGPIPE ignored, so the default case sets it back first
+dfl=(perl -e '$SIG{PIPE} = "DEFAULT"; exec @ARGV or die')
+check signals-x86 "$(cat "$here/signals.expected")" 143 "${dfl[@]}" "$out/katybug" "$out/signals-x86"
+check signals-a64 "$(cat "$here/signals.expected")" 143 "${dfl[@]}" "$out/katybug" "$out/signals-a64"
+# started with SIGPIPE ignored, which exec keeps (native Linux prints 1 on the first line)
+ignored=$(sed '1s/ 0$/ 1/' "$here/signals.expected")
+check signals-x86-ignored "$ignored" 143 bash -c "trap '' PIPE; exec \"\$@\"" - "$out/katybug" "$out/signals-x86"
+check signals-a64-ignored "$ignored" 143 bash -c "trap '' PIPE; exec \"\$@\"" - "$out/katybug" "$out/signals-a64"
 exit $failed
