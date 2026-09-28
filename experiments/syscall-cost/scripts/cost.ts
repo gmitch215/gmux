@@ -12,7 +12,8 @@ import { Machine } from '../../../src/worker/machine/machine.ts';
  * console delivers them, minus the empty loop. `cost.wasm` is src/cost.c built like a tests/c probe.
  * PROFILE=getdents instead samples a run of only the directory loop and prints the functions with the
  * most samples (VMLINUX names a kernel built with its name section, for kernel function names).
- * GMUX_BUILD picks the build, as tests/c/run.ts does.
+ * GMUX_BUILD picks the build, as tests/c/run.ts does. CACHE=1 answers repeated absolute statx from the
+ * host (MachineOptions.syscallCache, with a kernel that has patch 0022), CACHE=verify checks it.
  * `node --experimental-strip-types experiments/syscall-cost/scripts/cost.ts <cost.wasm> [n] [rounds]`
  */
 const root = new URL('../../../', import.meta.url).pathname;
@@ -39,6 +40,7 @@ const machine = new Machine({
 	maximumPages: 1024,
 	sha256,
 	sharedKernel: true,
+	syscallCache: process.env.CACHE === "verify" ? "verify" : process.env.CACHE === "1",
 	write: (text) => {
 		const at = performance.now();
 		output += text;
@@ -100,3 +102,5 @@ console.log(
 	JSON.stringify(Object.fromEntries([...perCall].map(([k, v]) => [k, Math.round(median(v))])))
 );
 console.log(JSON.stringify({ unit: 'host ns per call, median of rounds', crashed: String(machine.crashed) }));
+const { statxHits, statxMisses, statxFills, statxMismatches } = machine.stats;
+console.log(JSON.stringify({ statxHits, statxMisses, statxFills, statxMismatches }));
