@@ -10,3 +10,17 @@ mapped 7
 remapped 0
 unmapped 42
 segv 2
+cycled 3000
+sides kept 4
+middle gone 42
+protected 42
+readable again 5
+segv 4
+code 42
+code remapped 7
+flags in frame 1
+vector saved 1
+vector restored 1
+read restarted 1
+read interrupted -4
+alarms 2

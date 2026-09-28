@@ -115,6 +115,8 @@ jobs:
           key: userland-${{ hashFiles('tests/c/katybug/userland-build.sh') }}
       - name: Stage the amd64 Transcripts Against Native Runs
         run: NATIVE_HOST=local tests/c/katybug/transcript.sh
+      - name: Check Dynamic glibc and musl ELFs Against Native Runs
+        run: NATIVE_HOST=local tests/c/katybug/dynamic.sh
       - name: Pack the Payload
         run: |
           bun run release:payload

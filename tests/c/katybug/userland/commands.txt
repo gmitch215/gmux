@@ -62,7 +62,7 @@ sqlite3 :memory: 'begin; create table z(x); insert into z values(1); savepoint s
 curl -s "file://$PWD/input.txt" | head -2
 curl -s -o /dev/null -w '%{size_download}\n' "file://$PWD/numbers.txt"
 curl -sS "file:///nonexistent/x" 2>&1; echo $?
-{ printf 'HTTP/1.0 200 OK\r\nContent-Length: 6\r\n\r\nhello\n' | nc -l -p 18080 > "$TMPDIR/req"; } & p=$!; sleep 1; curl -s http://127.0.0.1:18080/x; wait $p; head -1 "$TMPDIR/req" | tr -d '\r'
-{ printf 'pong\n' | nc -l -p 18081 > "$TMPDIR/b"; } & p=$!; sleep 1; bash -c 'exec 3<>/dev/tcp/127.0.0.1/18081; echo ping >&3; cat <&3'; wait $p; cat "$TMPDIR/b"
-{ printf 'HTTP/1.0 200 OK\r\n\r\nbody\n' | nc -l -p 18083 > /dev/null; } & p=$!; sleep 1; wget -q -O - http://127.0.0.1:18083/; wait $p
-nc -l -p 18082 > "$TMPDIR/nc" & p=$!; sleep 1; curl -s -m 2 -T numbers.txt http://127.0.0.1:18082/up > /dev/null; wait $p; grep -c . "$TMPDIR/nc"; tail -6 "$TMPDIR/nc"
+nc -l -p 18080 -e sh -c 'while read -r l; do [ "$l" = "$(printf "\r")" ] && break; echo "$l"; done > "$TMPDIR/req"; printf "HTTP/1.0 200 OK\r\nContent-Length: 6\r\n\r\nhello\n"' & p=$!; for i in $(seq 300); do curl -s http://127.0.0.1:18080/x; [ $? = 7 ] || break; sleep 0.2; done; wait $p; head -1 "$TMPDIR/req" | tr -d '\r'
+nc -l -p 18081 -e sh -c 'read -r l; echo "$l" > "$TMPDIR/b"; echo pong' & p=$!; for i in $(seq 300); do bash -c 'exec 3<>/dev/tcp/127.0.0.1/18081 || exit 1; echo ping >&3; cat <&3' 2> /dev/null && break; sleep 0.2; done; wait $p; cat "$TMPDIR/b"
+nc -l -p 18083 -e sh -c 'while read -r l; do [ "$l" = "$(printf "\r")" ] && break; done; printf "HTTP/1.0 200 OK\r\n\r\nbody\n"' & p=$!; for i in $(seq 300); do wget -q -O - http://127.0.0.1:18083/ 2> /dev/null && break; sleep 0.2; done; wait $p
+nc -l -p 18082 -e sh -c 'cat > "$TMPDIR/nc"' & p=$!; for i in $(seq 300); do curl -s -m 5 -T numbers.txt http://127.0.0.1:18082/up > /dev/null; [ $? = 7 ] || break; sleep 0.2; done; wait $p; grep -c . "$TMPDIR/nc"; tail -6 "$TMPDIR/nc"

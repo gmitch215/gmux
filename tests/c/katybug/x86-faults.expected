@@ -1,0 +1,29 @@
+movsb rcx 104
+movsb rdi 4096
+movsb rsi 96
+movsb addr 4096
+movsb last 95
+stosq rcx 4
+stosq rdi 4092
+stosq kept 7
+movsq rcx 3
+movsq rsi 4096
+movsq kept 85
+faults 3
+aaaaaaaaaaaaaaaa
+stosb over a newer mapping 18
+copied sum 18677760
+filled 3
+walk rip at the load 1
+walk rcx 512
+walk rax 132304
+divq by zero 1 kept 1 code 1 q 0
+divq overflow 1 kept 1 code 1 q 0
+divq wide 0 q 2295594818061633090
+idivq min by -1 1 kept 1 code 1 q 0
+idivq 2^63 by 1 1 kept 1 code 1 q 0
+idivq -2^63 by 1 0 q -9223372036854775808
+idivq -2^63 by -2 0 q 4611686018427387904
+idivq wide 0 q -2295594818061633090
+idivl min by -1 1 kept 1 code 1 q 0
+divb overflow 1 kept 1 code 1 q 0

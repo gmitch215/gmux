@@ -1,0 +1,29 @@
+echo hello
+ls -1 /t | sort
+ls -la /nonexistent; echo $?
+cat /etc/os-release | head -2
+printf 'b\na\nc\n' | sort -r
+seq 1 5 | awk '{s+=$1} END {print s}'
+echo abc | sed 's/b/X/'
+grep -c root /etc/passwd
+sha256sum /t/commands.txt | cut -c1-16
+wc -l /t/commands.txt
+find /etc -maxdepth 1 -name 'host*' | sort
+tar -cf - /t/commands.txt 2>/dev/null | tar -tf -
+echo hi | gzip -c | gzip -dc
+id -u; id -g
+date -d @0 +%Y 2>/dev/null || date -u -r 0 +%Y
+env | sort | head -3
+x=$(printf '%s' abc | od -An -tx1); echo $x
+expr 6 \* 7
+test -d /etc && echo dir
+readlink -f /proc/self/exe >/dev/null && echo exe
+getent passwd root | cut -d: -f1,3
+perl -e 'print "perl ", 2**10, "\n"' 2>/dev/null || echo noperl
+perl -MPOSIX -e 'print POSIX::floor(2.5), "\n"' 2>/dev/null || echo noposix
+perl -e 'use Socket; print "socket ok\n"' 2>/dev/null || echo nosocket
+ldd /bin/ls 2>/dev/null | wc -l
+sh -c 'trap "echo usr1" USR1; kill -USR1 $$; echo after'
+awk 'BEGIN { printf "%.4f %.4f\n", sqrt(2), exp(1) }'
+if [ -f /etc/debian_version ]; then /t/threads-glibc; else /t/threads-musl; fi
+if [ -f /etc/debian_version ]; then KATYBUG_PLAN=0 /t/threads-glibc; else KATYBUG_PLAN=0 /t/threads-musl; fi
