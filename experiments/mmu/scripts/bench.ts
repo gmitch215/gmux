@@ -1,6 +1,6 @@
 import { execFileSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { appendCpio } from '../../../scripts/wasm/cpio-append.ts';
@@ -11,17 +11,20 @@ import { Machine } from '../../../src/worker/machine/machine.ts';
  * build/kernel in Node, arms interleaved and timed by the host between output markers. ARMS picks them:
  * plain, mmu and inline (the software MMU, the lookup as a call and inlined), flat, eh and ehr (evacuation:
  * binaryen's flatten and -O2, the same with a checkpoint handler around every call, and with resume
- * variants too), ehf (the handlers with resume folded into each function), guard and guardi (every load and store checked against a page owner table, the
+ * variants too), ehf (the handlers with resume folded into each function), eh1, ehn, eha and ehs (one try
+ * per function, handlers that save nothing, every local saved, no handlers at fuel yields), guard and guardi (every load and store checked against a page owner table, the
  * check called and inlined), guardsi (the guard pass at GUARD_STORES inlined, to price loads), count
  * (provable.ts: which checked accesses a check outside the access could cover, counts printed), nostack
  * (plain without the stack pointer check, to price it), simd (the program from SIMD_CENSUS, a census
  * built with EXTRA_CFLAGS=-msimd128).
- * `node --experimental-strip-types experiments/mmu/scripts/bench.ts <census dir> [rounds]`
+ * `node --experimental-strip-types experiments/mmu/scripts/bench.ts <census dir> [rounds]`; with
+ * WORK=<dir>, arms already built there are reused, so a machine without the toolchain can time them
  */
 const root = new URL('../../../', import.meta.url).pathname;
 const census = process.argv[2] ?? '';
 const rounds = Number(process.argv[3] ?? 3);
-const work = join(tmpdir(), `gmux-g1-${process.pid}`);
+const work = process.env.WORK ?? join(tmpdir(), `gmux-g1-${process.pid}`);
+const built = (file: string) => !!process.env.WORK && existsSync(file);
 mkdirSync(work, { recursive: true });
 const sha256 = (bytes: Uint8Array) => createHash('sha256').update(bytes).digest('hex');
 const sh = (cmd: string, args: string[]) => execFileSync(cmd, args, { stdio: ['ignore', 'ignore', 'inherit'] });
@@ -60,45 +63,52 @@ if (arms.includes('count'))
 	});
 for (const name of Object.keys(workloads)) {
 	const plain = join(census, `${name}.wasm`);
-	sh('wasm2wat', ['--enable-threads', '--enable-exceptions', '--generate-names', plain, '-o', join(work, `${name}.wat`)]);
+	if (!built(join(work, `${name}.wat`)))
+		sh('wasm2wat', ['--enable-threads', '--enable-exceptions', '--generate-names', plain, '-o', join(work, `${name}.wat`)]);
 	for (const arm of arms) {
 		const source = arm === 'simd' ? join(process.env.SIMD_CENSUS ?? '', `${name}.wasm`) : plain;
 		// the kernel loads the file in the image, which keeps dylink.0; the host runs the rewritten module
 		const image = join(work, `${name}.${arm}.image.wasm`);
 		writeFileSync(image, arm === 'plain' || arm === 'simd' ? readFileSync(source) : tagged(readFileSync(plain), arm));
 		const file = join(work, `${name}.${arm}.wasm`);
-		if (arm === 'plain' || arm === 'nostack' || arm === 'simd') writeFileSync(file, readFileSync(source));
-		else if (arm === 'flat' || arm === 'eh' || arm === 'ehr' || arm === 'ehf' || arm === 'eh1' || arm === 'ehn' || arm === 'eha') {
-			const flag = { flat: ['--no-handlers'], eh: [], ehr: ['--resume'], ehf: ['--fold'], eh1: ['--one-try'], ehn: ['--no-spill'], eha: ['--all-locals'] }[arm]!;
-			sh('node', [join(root, 'experiments/evacuation/scripts/evacuate.ts'), plain, file, ...flag]);
-		} else if (arm === 'count') {
-			sh('node', ['--no-warnings', '--experimental-strip-types', join(root, 'experiments/mmu/scripts/provable.ts'), plain, file]);
-		} else if (arm === 'guard' || arm === 'guardi' || arm === 'guardsi') {
-			const wat = join(work, `${name}.${arm}.wat`);
-			// guardsi: another guard pass (GUARD_STORES, e.g. a stores-only one) inlined, beside guardi
-			const pass = arm === 'guardsi' ? process.env.GUARD_STORES! : join(root, 'scripts/wasm/guard-pass.ts');
-			sh(join(root, 'scripts/ts'), [pass, join(work, `${name}.wat`), wat, ...(arm === 'guard' ? [] : ['--inline'])]);
-			sh('wat2wasm', ['--enable-threads', '--enable-exceptions', '--enable-multi-memory', wat, '-o', file]);
-		} else {
-			const wat = join(work, `${name}.${arm}.wat`);
-			sh(join(root, 'scripts/ts'), [join(root, 'scripts/wasm/mmu-pass.ts'), join(work, `${name}.wat`), wat, ...(arm === 'inline' ? ['--inline'] : [])]);
-			sh('wat2wasm', ['--enable-threads', '--enable-exceptions', '--enable-multi-memory', wat, '-o', file]);
-		}
 		const fueled = join(work, `${name}.${arm}.fuel.wasm`);
-		execFileSync(join(root, 'scripts/wasm/instrument.sh'), [file, fueled], {
-			stdio: ['ignore', 'ignore', 'inherit'],
-			env: {
-				...process.env,
-				GMUX_NO_STACK_CHECK: arm === 'nostack' ? '1' : '',
-				GMUX_KEEP_EXPORTS:
-					arm === 'count'
-						? WebAssembly.Module.exports(new WebAssembly.Module(readFileSync(file)))
-								.map((e) => e.name)
-								.filter((n) => n.startsWith('gmux_n_'))
-								.join(',')
-						: ''
+		const evacuation = { flat: ['--no-handlers'], eh: [], ehr: ['--resume'], ehf: ['--fold'], eh1: ['--one-try'], ehn: ['--no-spill'], eha: ['--all-locals'], ehs: ['--no-fuel-sites'] }[arm];
+		if (!built(fueled)) {
+			if (arm === 'plain' || arm === 'nostack' || arm === 'simd') writeFileSync(file, readFileSync(source));
+			else if (evacuation) {
+				// as the host builds an evacuable program: instrumented first, so the fuel yields at loop
+				// heads are safepoints too
+				sh(join(root, 'scripts/wasm/instrument.sh'), [plain, file]);
+				sh(join(root, 'scripts/ts'), [join(root, 'scripts/wasm/export-globals.ts'), file, `${file}.g`, '--all-mutable']);
+				sh('node', [join(root, 'experiments/evacuation/scripts/evacuate.ts'), `${file}.g`, fueled, ...evacuation]);
+			} else if (arm === 'count') {
+				sh('node', ['--no-warnings', '--experimental-strip-types', join(root, 'experiments/mmu/scripts/provable.ts'), plain, file]);
+			} else if (arm === 'guard' || arm === 'guardi' || arm === 'guardsi') {
+				const wat = join(work, `${name}.${arm}.wat`);
+				// guardsi: another guard pass (GUARD_STORES, e.g. a stores-only one) inlined, beside guardi
+				const pass = arm === 'guardsi' ? process.env.GUARD_STORES! : join(root, 'scripts/wasm/guard-pass.ts');
+				sh(join(root, 'scripts/ts'), [pass, join(work, `${name}.wat`), wat, ...(arm === 'guard' ? [] : ['--inline'])]);
+				sh('wat2wasm', ['--enable-threads', '--enable-exceptions', '--enable-multi-memory', wat, '-o', file]);
+			} else {
+				const wat = join(work, `${name}.${arm}.wat`);
+				sh(join(root, 'scripts/ts'), [join(root, 'scripts/wasm/mmu-pass.ts'), join(work, `${name}.wat`), wat, ...(arm === 'inline' ? ['--inline'] : [])]);
+				sh('wat2wasm', ['--enable-threads', '--enable-exceptions', '--enable-multi-memory', wat, '-o', file]);
 			}
-		});
+			if (!evacuation) execFileSync(join(root, 'scripts/wasm/instrument.sh'), [file, fueled], {
+				stdio: ['ignore', 'ignore', 'inherit'],
+				env: {
+					...process.env,
+					GMUX_NO_STACK_CHECK: arm === 'nostack' ? '1' : '',
+					GMUX_KEEP_EXPORTS:
+						arm === 'count'
+							? WebAssembly.Module.exports(new WebAssembly.Module(readFileSync(file)))
+									.map((e) => e.name)
+									.filter((n) => n.startsWith('gmux_n_'))
+									.join(',')
+							: ''
+				}
+			});
+		}
 		const compiled = new WebAssembly.Module(readFileSync(fueled));
 		if (arm === 'count') counted.add(compiled);
 		registry.set(sha256(readFileSync(image)), compiled);
