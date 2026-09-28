@@ -16,3 +16,5 @@ experiments/**/*.wasm
 experiments/**/*.bin
 experiments/lane-simd/src/native
 __pycache__/
+.DS_Store
+Icon*
