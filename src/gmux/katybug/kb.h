@@ -22,6 +22,10 @@ enum kb_arch
     KB_WASM = 2
 };
 
+/* AArch64 handlers without SA_RESTORER return here (the kernel's vDSO
+ * sigreturn: mov x8, #139; svc #0), a page elf.c maps above the stack */
+#define KB_A64_SIGTRAMP 0x7ffffff00000ull
+
 /* registers: guest 0..31 (x86 rax..r15 at 0..15, AArch64 x0..x30 and sp at 31),
  * temps from 32 */
 enum
@@ -92,12 +96,25 @@ enum kb_op
                     cld, 6 std */
     KB_X87, /* x87: imm = opcode << 8 | modrm, b = memory address, c = 0x80 for
               memory; x87.c */
-    KB_POPCNT, /* a = the set bits of b's low w bytes */
-    KB_WTRAP,  /* a wasm trap: imm indexes kb_wasm_traps */
-    KB_WEXIT,  /* the wasm entry function returned */
-    KB_RESOLVE /* the memory plan: group a resolves [b + imm, + 16w) once, and
-                  lifted loads and stores with c = a + 1 skip their own check;
-                  the interpreter skips these (run.c, step) */
+    KB_POPCNT,  /* a = the set bits of b's low w bytes */
+    KB_WTRAP,   /* a wasm trap: imm indexes kb_wasm_traps */
+    KB_WEXIT,   /* the wasm entry function returned */
+    KB_RESOLVE, /* the memory plan: group a resolves [b + imm, + 16w) once, and
+                   lifted loads and stores with c = a + 1 skip their own check;
+                   the interpreter skips these (run.c, step) */
+    KB_NZCV,    /* a = the flags as AArch64 NZCV, bits 31..28 (mrs nzcv) */
+    KB_CRC32, /* a = the crc b updated by the low w bytes of c; imm 1 is crc32c
+               */
+    KB_CLOCK, /* a = the host's monotonic clock in ns (x86 rdtsc) */
+    KB_CPUID, /* x86 cpuid of leaf eax into eax ebx ecx edx */
+    KB_EXCL,  /* AArch64 exclusives: imm 0 arms the monitor (ldxr); 1 stores c
+                 at b, w bytes, if it holds, a = 0 then else 1 (stxr); 2 also
+                 stores register imm >> 8 at b + w (stxp); 3 clears (clrex) */
+    KB_EXIT,  /* a trace's side exit: leave, to the block's pc plus the int32 at
+                 imm >> 16, if cond imm & 0xff holds (bit 8 clear), or if a is
+                 zero (bit 8 set, bit 0 clear) or nonzero (both set) */
+    KB_A64V   /* AArch64 floating point, Advanced SIMD, FPCR/FPSR: imm is the
+                 instruction word, b a load or store's address; a64v.c */
 };
 
 /* semantic classes (run.c, kb_class): the plans read these, not opcodes */
@@ -182,7 +199,14 @@ struct kb_block {
     uint32_t* pcs;    /* each op's guest instruction, as an offset from pc, in
                          place of KB_PC ops (NULL in a trace, which keeps them) */
     int flag_writes,
-        dropped;  /* flag writes decoded, and those the plan took out */
+        dropped;      /* flag writes decoded, and those the plan took out */
+    int pruned;       /* pure ops the demand plan took out */
+    uint32_t codegen; /* kb_cpu's when decoded; an older one decodes again */
+    struct kb_block *to_target, *to_next; /* the successors last seen */
+    uint32_t taken, fall; /* runs that left to target, and to next */
+    int traced;           /* decoded as a trace (or found not to be one) */
+    int nseg;             /* the guest code decoded: seg[2i] to seg[2i + 1] */
+    uint64_t* seg;
     int resolves; /* the memory plan's KB_RESOLVE ops, which lead the block */
     struct kb_block* chain; /* the next block in its hash bucket */
 #if defined(KB_HOT) || defined(KB_COUNT)
@@ -201,9 +225,8 @@ struct kb_block {
 
 struct kb_mapping {
     uint64_t start, end;
-    uint8_t* host; /* NULL for a hole left by a partial munmap */
+    uint8_t* host; /* mappings never overlap; each owns its block */
     int prot;
-    int brk; /* the heap brk grows */
 };
 
 struct kb_sigaction {
@@ -223,14 +246,20 @@ struct kb_cpu {
     /* flags, kept as bits: N (sign), Z, C (the producing architecture's carry),
      * V, P (x86 parity) */
     int n, z, c, v, p;
+    /* K17: 1 + the kind of a flag write not yet made into the bits above,
+     * with its operands (run.c kb_flags_sync makes it) */
+    int lz, lz_w;
+    uint64_t lz_b, lz_c, lz_r;
     int df; /* x86 direction flag: string ops go down when set */
     int arch;
     int exited, status;
     struct kb_mapping
         maps[1024]; /* later ones cover earlier ones where they overlap */
     int nmaps;
-    uint32_t mapgen; /* bumped by every change to maps, which makes older kb_ic
-                        entries stale */
+    uint32_t mapgen;  /* bumped by every change to maps, which makes older kb_ic
+                         entries stale */
+    uint32_t codegen; /* bumped when executable code is unmapped or changes
+                         protection, which makes older blocks stale */
     uint64_t brk_start, brk_end, mmap_next;
     struct kb_block* cache[4096];
     const char* fault;
@@ -243,9 +272,22 @@ struct kb_cpu {
         plan_flags_ran; /* of those, as executed: dropped, and all */
     uint64_t plan_mem,
         plan_mem_grouped; /* accesses decoded, and those a KB_RESOLVE covers */
-    uint64_t ipc;         /* the current guest instruction */
-    uint64_t x[16][2];    /* x86 xmm registers */
-    f80 st[8];            /* the x87 stack, st(i) = st[(top + i) & 7] */
+    uint64_t plan_ops, plan_ops_removed; /* pure ops decoded, and dropped */
+    int tracing;                         /* the decoders build a trace */
+    int segments; /* a trace's most segments (KB_TRACE, KATYBUG_SEGMENTS) */
+    uint64_t decoded, loaded;     /* blocks decoded, and taken from the cache */
+    uint64_t lookups;             /* blocks found through the block cache */
+    void* persist;                /* persist.c's records, when loaded */
+    uint64_t traces, trace_exits; /* traces built, side exits taken */
+    uint64_t plan_ops_run, plan_ops_ran; /* as executed: dropped, and all run */
+    uint64_t ipc;                        /* the current guest instruction */
+    uint64_t x[32][2];                   /* x86 xmm0-15; AArch64 v0-31 */
+    uint32_t fpcr, fpsr;                 /* AArch64 */
+    uint32_t mxcsr; /* x86, kept for stmxcsr and fxsave; SSE rounds to
+                       nearest whatever it holds */
+    uint64_t excl;  /* AArch64's exclusive monitor: kb_switches at the
+                       last ldxr, ~0 when clear */
+    f80 st[8];      /* the x87 stack, st(i) = st[(top + i) & 7] */
     int top;
     uint8_t ftag; /* the x87 registers holding a value */
     uint16_t fcw,
@@ -270,7 +312,8 @@ struct kb_mapping* kb_map(
     struct kb_cpu* cpu, uint64_t start, uint64_t len, int prot
 );
 int kb_unmap(struct kb_cpu* cpu, uint64_t start, uint64_t len);
-void kb_protect(struct kb_cpu* cpu, uint64_t start, uint64_t len, int prot);
+int kb_protect(struct kb_cpu* cpu, uint64_t start, uint64_t len, int prot);
+uint64_t kb_free_at(struct kb_cpu* cpu, uint64_t at, uint64_t len);
 uint64_t kb_load(struct kb_cpu* cpu, uint64_t va, int w);
 void kb_store(struct kb_cpu* cpu, uint64_t va, uint64_t v, int w);
 uint64_t kb_load_ic(struct kb_cpu* cpu, struct kb_ic* ic, uint64_t va, int w);
@@ -291,6 +334,17 @@ extern const char* kb_wasm_traps[];
 
 /* run.c */
 int kb_cond(struct kb_cpu* cpu, int cond);
+/* the flag bits made current before anything reads or writes them directly */
+void kb_flags_sync(struct kb_cpu* cpu);
+#define KB_SYNC(cpu)                                                           \
+    do {                                                                       \
+        if ((cpu)->lz) kb_flags_sync(cpu);                                     \
+    } while (0)
+/* -DKB_LAZY: 0 eager flags, 1 recorded and made when read, 2 conditions from
+ * the record */
+#ifndef KB_LAZY
+    #define KB_LAZY 2
+#endif
 int kb_run(struct kb_cpu* cpu);
 /* -DKB_POLL picks where pending signals are looked for: 2 (default) back-edges
  * and after a syscall; 0 every block, 1 back-edges only, 3 every KB_POLL_FUEL
@@ -359,12 +413,17 @@ int64_t kb_net(struct kb_cpu* cpu, int64_t nr, const uint64_t* a);
    address, w = REX.W, imm as in KB_SSE */
 int kb_sse(struct kb_cpu* cpu, const struct kb_ins* x);
 int kb_x87(struct kb_cpu* cpu, const struct kb_ins* x);
+/* a64v.c: one AArch64 FP/SIMD instruction, as KB_A64V; nonzero when unknown */
+int kb_a64v(struct kb_cpu* cpu, const struct kb_ins* x);
 
 /* sig.c */
 int64_t kb_sigaction(struct kb_cpu* cpu, int s, uint64_t act, uint64_t old);
 int64_t kb_sigprocmask(struct kb_cpu* cpu, int how, uint64_t set, uint64_t old);
 void kb_raise(struct kb_cpu* cpu, int s, int code);
 void kb_sigreturn(struct kb_cpu* cpu);
+int kb_restart(struct kb_cpu* cpu, int restartable);
+void kb_fxsave(struct kb_cpu* cpu, uint64_t at);
+void kb_fxrstor(struct kb_cpu* cpu, uint64_t at);
 void kb_signals(struct kb_cpu* cpu);
 int kb_fault(struct kb_cpu* cpu, int s, int code, uint64_t addr);
 int kb_host_sig(int s);
@@ -374,11 +433,70 @@ void kb_sig_inherit(struct kb_cpu* cpu);
 int64_t kb_sigpending(struct kb_cpu* cpu, uint64_t set);
 int64_t kb_timer(struct kb_cpu* cpu, int64_t nr, const uint64_t* a);
 
+/* thread.c: guest threads, green, inside this one process; kb_cpu holds the
+ * running one's state */
+extern int kb_nthreads;
+extern uint64_t kb_switches;
+extern volatile int* kb_pending_flag; /* sig.c: a signal waits */
+/* a call's result when another thread now runs */
+#define KB_SWITCHED INT64_MIN
+#define KB_SLICE 16384 /* back edges one thread runs before the next's turn */
+int64_t kb_thread_clone(struct kb_cpu* cpu, const uint64_t* a);
+int kb_thread_exit(struct kb_cpu* cpu);
+int64_t kb_gettid(void);
+int64_t kb_futex(struct kb_cpu* cpu, const uint64_t* a);
+void kb_yield(struct kb_cpu* cpu);
+int kb_thread_gate(
+    struct kb_cpu* cpu, int64_t nr, const uint64_t* a, int64_t* v
+);
+void kb_thread_forked(void);
+void kb_thread_called(void);
+
 /* a growing op list for decoders */
 struct kb_emit {
     struct kb_ins* ins;
     int n, cap;
 };
 void kb_put(struct kb_emit* e, int op, int w, int a, int b, int c, int64_t imm);
+
+/* block fusion (run.c): a block runs on through up to KB_FUSE_MAX direct
+ * jumps; -DKB_FUSE=0 ends every block at its first */
+#ifndef KB_FUSE
+    #define KB_FUSE 1
+#endif
+#define KB_FUSE_MAX 4
+/* -DKB_CHAIN=0: every block looked up in the cache instead of through its
+ * predecessor's link (run.c next_block) */
+#ifndef KB_CHAIN
+    #define KB_CHAIN 1
+#endif
+/* traces: a block run KB_TRACE_AT times is decoded again on through the hot
+ * side of its biased branches, up to KB_TRACE segments by default
+ * (KATYBUG_SEGMENTS=n sets 1 to KB_SEGS - 1); -DKB_TRACE=1 compiles them out */
+#ifndef KB_TRACE
+    #define KB_TRACE 32
+#endif
+#define KB_TRACE_AT 64
+#define KB_SEGS 65
+struct kb_fuse {
+    struct kb_cpu* cpu;
+    int trace;     /* decoding a trace */
+    int n, jumps;  /* segments after the first; jumps fused */
+    uint64_t head; /* where the block ending here alone starts */
+    uint64_t lo[KB_SEGS], hi[KB_SEGS]; /* code the block holds */
+};
+int kb_fuse(
+    struct kb_emit* e, const struct kb_block* b, struct kb_fuse* f,
+    uint64_t end, uint64_t* at
+);
+/* the block keeps the code ranges f saw, the last ending at end */
+void kb_fuse_done(struct kb_block* b, struct kb_fuse* f, uint64_t end);
+
+/* persist.c: decoded blocks kept across processes under KATYBUG_CACHE */
+void kb_persist_load(struct kb_cpu* cpu, const char* elf);
+int kb_persist_take(struct kb_cpu* cpu, struct kb_block* b);
+void kb_persist_save(struct kb_cpu* cpu);
+uint64_t kb_code_hash(struct kb_cpu* cpu, const struct kb_block* b, int* ok);
+int kb_block_ready(struct kb_cpu* cpu, struct kb_block* b);
 
 #endif

@@ -139,6 +139,7 @@ static int x86_to_generic(uint64_t n) {
         case 108: return 177; /* getegid */
         case 110: return 173; /* getppid */
         case 186: return 178; /* gettid */
+        case 202: return 98;  /* futex */
         case 218: return 96;  /* set_tid_address */
         case 228: return 113; /* clock_gettime */
         case 231: return 94;  /* exit_group */
@@ -433,9 +434,10 @@ static int64_t mmap_anon(
     struct kb_cpu* cpu, uint64_t addr, uint64_t len, uint64_t prot,
     uint64_t flags, int64_t fd, uint64_t off
 ) {
-    uint64_t at = (flags & 0x10)
-                      ? addr
-                      : cpu->mmap_next; /* MAP_FIXED lays over what is there */
+    uint64_t at = (flags & 0x10) ? addr
+                                 : kb_free_at(
+                                       cpu, cpu->mmap_next, len
+                                   ); /* MAP_FIXED replaces what is there */
     struct kb_mapping* m = kb_map(cpu, at, len, prot ? (int) prot : 0);
     if (!m) return -12;
     if (!(flags & 0x10)) cpu->mmap_next = m->end + 4096;
@@ -449,25 +451,31 @@ static int64_t mmap_anon(
 
 static int64_t brk_to(struct kb_cpu* cpu, uint64_t want) {
     if (want <= cpu->brk_start) return (int64_t) cpu->brk_end;
+    uint64_t top = (cpu->brk_end + 0xfffull) & ~0xfffull;
     uint64_t end = (want + 0xfffull) & ~0xfffull;
-    for (int i = 0; i < cpu->nmaps; i++) {
-        struct kb_mapping* m = &cpu->maps[i];
-        if (m->brk) {
-            /* guest pointers are guest addresses, so the host block may move */
+    if (end < top && kb_unmap(cpu, end, top - end))
+        return (int64_t) cpu->brk_end;
+    if (end > top) {
+        if (kb_free_at(cpu, top, end - top) != top)
+            return (int64_t) cpu->brk_end;
+        /* the heap mapping below grows in place, or new pages start one; guest
+         * pointers are guest addresses, so the host block may move */
+        struct kb_mapping* m = NULL;
+        for (int i = 0; i < cpu->nmaps && !m; i++)
+            if (cpu->maps[i].end == top && cpu->maps[i].prot == 3 &&
+                top > cpu->brk_start)
+                m = &cpu->maps[i];
+        if (m) {
             uint8_t* h = realloc(m->host, end - m->start);
             if (!h) return (int64_t) cpu->brk_end;
-            if (end > m->end) memset(h + (m->end - m->start), 0, end - m->end);
+            memset(h + (top - m->start), 0, end - top);
             m->host = h;
             m->end = end;
             cpu->mapgen++;
-            cpu->brk_end = want;
-            return (int64_t) want;
         }
+        else if (!kb_map(cpu, top, end - top, 3))
+            return (int64_t) cpu->brk_end;
     }
-    struct kb_mapping* heap =
-        kb_map(cpu, cpu->brk_start, end - cpu->brk_start, 3);
-    if (!heap) return (int64_t) cpu->brk_end;
-    heap->brk = 1;
     cpu->brk_end = want;
     return (int64_t) want;
 }
@@ -653,7 +661,7 @@ void kb_syscall(struct kb_cpu* cpu) {
 #endif
     uint64_t* r = cpu->r;
     int x86 = cpu->arch == KB_X86;
-    uint64_t guest = x86 ? r[0] : r[8];
+    uint64_t guest = x86 ? r[0] : r[8], r0 = r[0];
     int64_t nr = x86 ? x86_to_generic(r[0]) : (int64_t) r[8];
 #ifdef KB_COUNT
     if (guest < 512) kb_count.sys[guest]++;
@@ -744,9 +752,25 @@ void kb_syscall(struct kb_cpu* cpu) {
         memcpy(a, x, sizeof a);
     }
     int64_t v;
+    if (kb_nthreads > 1) {
+        int g = kb_thread_gate(cpu, nr, a, &v);
+        if (g == 2) {
+            cpu->sigreturned = 1; /* another thread runs */
+            return;
+        }
+        if (g == 1) goto done;
+    }
     switch (nr) {
         case -2: v = (int64_t) a[0]; break; /* dup2 of an fd to itself */
-        case -3:                            /* arch_prctl */
+        case 98:
+            v = kb_futex(cpu, a);
+            if (v == KB_SWITCHED) {
+                cpu->sigreturned = 1;
+                return;
+            }
+            break;
+        case 178: v = kb_gettid(); break;
+        case -3: /* arch_prctl */
             if (a[0] == 0x1002)
                 cpu->fs = a[1], v = 0;
             else if (a[0] == 0x1003) {
@@ -944,18 +968,46 @@ void kb_syscall(struct kb_cpu* cpu) {
             v = 0;
             break;
         }
-        case 93:
+        case 93: /* exit: of the thread, the process with its last one */
+            if (kb_thread_exit(cpu)) {
+                cpu->sigreturned = 1;
+                return;
+            }
+            /* fall through */
         case 94:
             cpu->exited = 1;
             cpu->status = (int) (a[0] & 0xff);
             return;
-        case -4: v = kb_fork_by_exec() ? kb_fork(cpu) : ret(fork()); break;
-        case 220: /* clone: only the fork-like form (a signal to the parent, no
-                     shared memory) */
-            v = (a[0] & ~0xffull)   ? -38
-                : kb_fork_by_exec() ? kb_fork(cpu)
-                                    : ret(fork());
+        case -4:
+            v = kb_fork_by_exec() ? kb_fork(cpu) : ret(fork());
+            if (v == 0) kb_thread_forked();
             break;
+        case 220: {
+            /* clone: a thread (CLONE_VM without CLONE_VFORK), or the fork-like
+             * forms: tid stores (glibc's fork), and CLONE_VM | CLONE_VFORK on a
+             * new stack (posix_spawn) as a fork whose parent does not wait for
+             * the exec */
+            uint64_t f = a[0], ctid = x86 ? a[3] : a[4];
+            uint64_t tids = 0x01000000 | 0x00200000 | 0x00100000;
+            if ((f & 0x4100) == 0x100) {
+                v = kb_thread_clone(cpu, a);
+                break;
+            }
+            if ((f & ~(0xffull | tids | 0x4100)) ||
+                ((f & 0x4100) && (f & 0x4100) != 0x4100)) {
+                v = -38;
+                break;
+            }
+            v = kb_fork_by_exec() ? kb_fork(cpu) : ret(fork());
+            if (v == 0) {
+                kb_thread_forked();
+                if (a[1]) r[x86 ? 4 : 31] = a[1];
+                if (f & 0x01000000) kb_store(cpu, ctid, (uint64_t) getpid(), 4);
+            }
+            else if (v > 0 && (f & 0x00100000))
+                kb_store(cpu, a[2], (uint64_t) v, 4);
+            break;
+        }
         case 221: v = execve_guest(cpu, a[0], a[1], a[2]); break;
         case 260: {
             int st = 0;
@@ -973,14 +1025,13 @@ void kb_syscall(struct kb_cpu* cpu) {
         case -5: v = getpgrp(); break;
         case 157: v = ret(setsid()); break;
         case 156: v = ret(getsid((pid_t) a[0])); break;
-        case 96: v = getpid(); break;
+        case 96: v = kb_gettid(); break; /* set_tid_address */
         case 172: v = getpid(); break;
         case 173: v = getppid(); break;
         case 174: v = getuid(); break;
         case 175: v = geteuid(); break;
         case 176: v = getgid(); break;
         case 177: v = getegid(); break;
-        case 178: v = getpid(); break;
         case 134: v = kb_sigaction(cpu, (int) a[0], a[1], a[2]); break;
         case 135: v = kb_sigprocmask(cpu, (int) a[0], a[1], a[2]); break;
         case 139: kb_sigreturn(cpu); return;
@@ -1006,10 +1057,7 @@ void kb_syscall(struct kb_cpu* cpu) {
             v = mmap_anon(cpu, a[0], a[1], a[2], a[3], (int64_t) a[4], a[5]);
             break;
         case 215: v = kb_unmap(cpu, a[0], a[1]) ? -12 : 0; break;
-        case 226:
-            kb_protect(cpu, a[0], a[1], (int) a[2]);
-            v = 0;
-            break;
+        case 226: v = kb_protect(cpu, a[0], a[1], (int) a[2]) ? -12 : 0; break;
         case 233: v = 0; break;
         case 160: {
             uint8_t* p = kb_host(cpu, a[0], 6 * 65);
@@ -1199,7 +1247,15 @@ void kb_syscall(struct kb_cpu* cpu) {
             v = 8;
             break;
         }
-        case 124: v = 0; break;
+        case 124: /* sched_yield */
+            if (kb_nthreads > 1) {
+                r[0] = 0;
+                kb_yield(cpu);
+                cpu->sigreturned = 1;
+                return;
+            }
+            v = 0;
+            break;
         case 153: {
             struct tms t;
             clock_t now = times(&t);
@@ -1322,6 +1378,8 @@ void kb_syscall(struct kb_cpu* cpu) {
         }
         default: v = kb_net(cpu, nr, a); break;
     }
+done:
+    kb_thread_called();
     r[0] = (uint64_t) v;
     if (getenv("KATYBUG_STRACE"))
         fprintf(
@@ -1332,4 +1390,13 @@ void kb_syscall(struct kb_cpu* cpu) {
             (unsigned long long) a[0], (unsigned long long) a[1],
             (unsigned long long) a[2], (unsigned long long) a[3], (long long) v
         );
+    /* sleeps and waits for events return EINTR to a handler even under
+     * SA_RESTART; everything else re-runs from its syscall instruction */
+    int once = nr == -7 || nr == -8 || nr == -9 || nr == 22 || nr == 72 ||
+               nr == 73 || nr == 101 || nr == 115 || nr == 133 || nr == 137;
+    if (v == -4 && kb_restart(cpu, !once)) {
+        r[0] = r0;
+        cpu->pc -= x86 ? 2 : 4;
+        cpu->sigreturned = 1;
+    }
 }

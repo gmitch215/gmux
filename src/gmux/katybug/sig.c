@@ -53,9 +53,7 @@ static volatile sig_atomic_t pending_bits[65];
 static int pending_code[65]; /* si_code: SI_USER 0 from kill and other
                                 processes, SI_TKILL -6 */
 static volatile sig_atomic_t any_pending;
-#ifdef KB_AOT
 volatile int* kb_pending_flag = &any_pending;
-#endif
 
 static int timer_sig; /* the guest's one POSIX timer, on the host's ITIMER_REAL;
                          0 for none */
@@ -166,8 +164,9 @@ static void host_install(struct kb_cpu* cpu, int s) {
     else if (a->handler == 1)
         hs.sa_handler = SIG_IGN;
     else {
+        /* never SA_RESTART: a blocked host call must return for the guest
+         * handler to run; kb_restart re-issues it as Linux would */
         hs.sa_handler = on_host_signal;
-        if (a->flags & 0x10000000) hs.sa_flags |= SA_RESTART;
     }
     sigfillset(&hs.sa_mask);
     sigaction(h, &hs, NULL);
@@ -222,7 +221,54 @@ static void set_rflags(struct kb_cpu* cpu, uint64_t f) {
 static const int x86_order[17] = {8, 9, 10, 11, 12, 13, 14, 15, 7,
                                   6, 5, 3,  2,  0,  1,  4,  -1};
 
+/** x86 fxsave, for a signal frame and the instruction: fcw, fsw, abridged
+ * tags, mxcsr at 24, st(i) at 32 in 16-byte slots, xmm at 160 */
+void kb_fxsave(struct kb_cpu* cpu, uint64_t fp) {
+    for (uint64_t i = 0; i < 512; i += 8) kb_store(cpu, fp + i, 0, 8);
+    kb_store(cpu, fp, cpu->fcw, 2);
+    kb_store(cpu, fp + 2, (uint64_t) (cpu->fcc | (cpu->top << 11)), 2);
+    kb_store(cpu, fp + 4, cpu->ftag, 1);
+    kb_store(cpu, fp + 24, cpu->mxcsr, 4);
+    kb_store(cpu, fp + 28, 0xffff, 4);
+    for (int i = 0; i < 8; i++) {
+        f80 v = cpu->st[(cpu->top + i) & 7];
+        kb_store(cpu, fp + 32 + 16 * (uint64_t) i, v.sig, 8);
+        kb_store(cpu, fp + 40 + 16 * (uint64_t) i, v.se, 2);
+    }
+    for (int i = 0; i < 16; i++)
+        for (int h = 0; h < 2; h++)
+            kb_store(
+                cpu, fp + 160 + 16 * (uint64_t) i + 8 * (uint64_t) h,
+                cpu->x[i][h], 8
+            );
+}
+
+void kb_fxrstor(struct kb_cpu* cpu, uint64_t fp) {
+    cpu->fcw = (uint16_t) kb_load(cpu, fp, 2);
+    cpu->mxcsr = (uint32_t) kb_load(cpu, fp + 24, 4) & 0xffff;
+    uint16_t sw = (uint16_t) kb_load(cpu, fp + 2, 2);
+    cpu->fcc = sw & 0x4700;
+    cpu->top = (sw >> 11) & 7;
+    cpu->ftag = (uint8_t) kb_load(cpu, fp + 4, 1);
+    for (int i = 0; i < 8; i++) {
+        f80* v = &cpu->st[(cpu->top + i) & 7];
+        v->sig = kb_load(cpu, fp + 32 + 16 * (uint64_t) i, 8);
+        v->se = (uint16_t) kb_load(cpu, fp + 40 + 16 * (uint64_t) i, 2);
+    }
+    for (int i = 0; i < 16; i++)
+        for (int h = 0; h < 2; h++)
+            cpu->x[i][h] = kb_load(
+                cpu, fp + 160 + 16 * (uint64_t) i + 8 * (uint64_t) h, 8
+            );
+}
+
+/* AArch64: sigcontext's __reserved (after pstate, 16-aligned) holds records;
+ * the first is fpsimd_context: magic, size 528, fpsr, fpcr, v0-v31 at 16 */
+#define A64_RESERVED (8 + 8 * 34 + 8)
+#define A64_FPSIMD 0x46508001u
+
 static void deliver(struct kb_cpu* cpu, int s, int code, uint64_t addr) {
+    KB_SYNC(cpu); /* the frame carries the flag bits */
     struct kb_sigaction* a = &cpu->sig[s];
     uint64_t* r = cpu->r;
     uint64_t frame;
@@ -230,12 +276,15 @@ static void deliver(struct kb_cpu* cpu, int s, int code, uint64_t addr) {
         /* pretcode, then ucontext (uc_flags, uc_link, uc_stack[3],
          * mcontext[32], sigmask), then siginfo */
         uint64_t sp = (r[4] - 128) & ~15ull; /* the red zone */
+        uint64_t fp = (sp - 512) & ~63ull;   /* fpstate, above the frame */
         uint64_t uc_size = 8 * (5 + 32 + 1);
-        frame = ((sp - 128 - uc_size - 8) & ~15ull) - 8;
+        frame = ((fp - 128 - uc_size - 8) & ~15ull) - 8;
         uint64_t uc = frame + 8, info = uc + uc_size;
         kb_store(cpu, frame, a->restorer, 8);
         for (uint64_t i = 0; i < uc_size; i += 8) kb_store(cpu, uc + i, 0, 8);
         uint64_t mc = uc + 40;
+        kb_fxsave(cpu, fp);
+        kb_store(cpu, mc + 8 * 23, fp, 8);
         for (int i = 0; i < 16; i++)
             kb_store(cpu, mc + 8 * (uint64_t) i, r[x86_order[i]], 8);
         kb_store(cpu, mc + 8 * 16, cpu->pc, 8);
@@ -260,7 +309,7 @@ static void deliver(struct kb_cpu* cpu, int s, int code, uint64_t addr) {
         uint64_t sp = r[31] & ~15ull;
         uint64_t mc_off = 8 * 5 + 128; /* 168, aligned below */
         mc_off = (mc_off + 15) & ~15ull;
-        uint64_t uc_size = mc_off + 8 + 8 * 31 + 8 * 3 + 16;
+        uint64_t uc_size = mc_off + A64_RESERVED + 4096;
         frame = (sp - 128 - uc_size) & ~15ull;
         uint64_t info = frame, uc = frame + 128;
         for (uint64_t i = 0; i < 128 + uc_size; i += 8)
@@ -280,13 +329,25 @@ static void deliver(struct kb_cpu* cpu, int s, int code, uint64_t addr) {
         uint64_t nzcv = ((uint64_t) cpu->n << 31) | ((uint64_t) cpu->z << 30) |
                         ((uint64_t) cpu->c << 29) | ((uint64_t) cpu->v << 28);
         kb_store(cpu, mc + 8 + 8 * 33, nzcv, 8);
+        uint64_t fs = mc + A64_RESERVED;
+        kb_store(cpu, fs, A64_FPSIMD, 4);
+        kb_store(cpu, fs + 4, 528, 4);
+        kb_store(cpu, fs + 8, cpu->fpsr, 4);
+        kb_store(cpu, fs + 12, cpu->fpcr, 4);
+        for (int i = 0; i < 32; i++)
+            for (int h = 0; h < 2; h++)
+                kb_store(
+                    cpu, fs + 16 + 16 * (uint64_t) i + 8 * (uint64_t) h,
+                    cpu->x[i][h], 8
+                );
         r[0] = (uint64_t) s;
         r[1] = info;
         r[2] = uc;
-        r[30] = a->restorer;
+        r[30] = (a->flags & 0x04000000) ? a->restorer : KB_A64_SIGTRAMP;
         r[31] = frame;
     }
     cpu->restore_mask = 0;
+    cpu->excl = ~0ull; /* an exception return clears the exclusive monitor */
     cpu->sigmask |= a->mask;
     if (!(a->flags & 0x40000000))
         cpu->sigmask |= 1ull << (s - 1);       /* SA_NODEFER */
@@ -298,6 +359,7 @@ static void deliver(struct kb_cpu* cpu, int s, int code, uint64_t addr) {
  * popped pretcode) */
 void kb_sigreturn(struct kb_cpu* cpu) {
     uint64_t* r = cpu->r;
+    cpu->lz = 0; /* the frame's flags replace them all */
     if (cpu->arch == KB_X86) {
         uint64_t uc = r[4], mc = uc + 40;
         uint64_t regs[18];
@@ -306,6 +368,8 @@ void kb_sigreturn(struct kb_cpu* cpu) {
         for (int i = 0; i < 16; i++) r[x86_order[i]] = regs[i];
         cpu->pc = regs[16];
         set_rflags(cpu, regs[17]);
+        uint64_t fp = kb_load(cpu, mc + 8 * 23, 8);
+        if (fp) kb_fxrstor(cpu, fp);
         cpu->sigmask = kb_load(cpu, uc + 40 + 8 * 32, 8);
     }
     else {
@@ -320,6 +384,16 @@ void kb_sigreturn(struct kb_cpu* cpu) {
         cpu->z = (int) ((nzcv >> 30) & 1);
         cpu->c = (int) ((nzcv >> 29) & 1);
         cpu->v = (int) ((nzcv >> 28) & 1);
+        uint64_t fs = mc + A64_RESERVED;
+        if ((uint32_t) kb_load(cpu, fs, 4) == A64_FPSIMD) {
+            cpu->fpsr = (uint32_t) kb_load(cpu, fs + 8, 4) & 0x0800009f;
+            cpu->fpcr = (uint32_t) kb_load(cpu, fs + 12, 4) & 0x07ff9f00;
+            for (int i = 0; i < 32; i++)
+                for (int h = 0; h < 2; h++)
+                    cpu->x[i][h] = kb_load(
+                        cpu, fs + 16 + 16 * (uint64_t) i + 8 * (uint64_t) h, 8
+                    );
+        }
         cpu->sigmask = kb_load(cpu, uc + 40, 8);
     }
     cpu->sigreturned = 1;
@@ -345,6 +419,18 @@ static int deliverable(struct kb_cpu* cpu) {
         if (h > 1 || (h == 0 && !ignored_by_default(s))) return 1;
     }
     return 0;
+}
+
+/** a host call ended with EINTR: 1 when the guest sees it restarted, because
+   no handler will run (the signal is masked or ignored) or the one that runs
+   asked for SA_RESTART on a call Linux restarts */
+int kb_restart(struct kb_cpu* cpu, int restartable) {
+    for (int s = 1; s <= 64; s++) {
+        if (!pending_bits[s] || (cpu->sigmask & (1ull << (s - 1)))) continue;
+        if (cpu->sig[s].handler <= 1) continue;
+        return restartable && (cpu->sig[s].flags & 0x10000000);
+    }
+    return 1;
 }
 
 /** rt_sigsuspend: waits under the given mask for a signal to act on, then
@@ -422,7 +508,6 @@ int64_t kb_timer(struct kb_cpu* cpu, int64_t nr, const uint64_t* a) {
             struct sigaction hs;
             memset(&hs, 0, sizeof hs);
             hs.sa_handler = on_host_signal;
-            hs.sa_flags = SA_RESTART;
             sigfillset(&hs.sa_mask);
             sigaction(SIGALRM, &hs, NULL);
             kb_store(cpu, a[2], 0, 4);

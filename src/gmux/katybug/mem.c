@@ -7,23 +7,16 @@
 
 static int last = -1;
 
-/* the newest mapping holding va: a MAP_FIXED mapping or a hole covers what is
- * under it */
+/* the mapping holding va; mappings never overlap */
 static struct kb_mapping* find(struct kb_cpu* cpu, uint64_t va) {
     if (last >= 0 && last < cpu->nmaps && va >= cpu->maps[last].start &&
         va < cpu->maps[last].end)
         return &cpu->maps[last];
-    for (int i = cpu->nmaps - 1; i >= 0; i--) {
+    for (int i = 0; i < cpu->nmaps; i++)
         if (va >= cpu->maps[i].start && va < cpu->maps[i].end) {
-            /* only a mapping nothing newer overlaps may be cached */
-            int covered = 0;
-            for (int j = i + 1; j < cpu->nmaps && !covered; j++)
-                covered = cpu->maps[j].start < cpu->maps[i].end &&
-                          cpu->maps[j].end > cpu->maps[i].start;
-            if (!covered) last = i;
+            last = i;
             return &cpu->maps[i];
         }
-    }
     return NULL;
 }
 
@@ -32,17 +25,31 @@ static void changed(struct kb_cpu* cpu) {
     cpu->mapgen++;
 }
 
-/* kb_host, and when ic is given and the mapping has nothing newer over it, ic
- * keeps it */
+/* kb_host, and when ic is given, ic keeps the mapping */
 static uint8_t* translate(
     struct kb_cpu* cpu, struct kb_ic* ic, uint64_t va, uint64_t len
 ) {
     struct kb_mapping* m = find(cpu, va);
-    if (!m || !m->host || !m->prot || va + len > m->end || va + len < va)
-        return NULL;
-    if (ic && last >= 0 && m == &cpu->maps[last])
+    if (!m || !m->prot || va + len > m->end || va + len < va) return NULL;
+    if (ic)
         *ic = (struct kb_ic){m->start, m->end - m->start, m->host, cpu->mapgen};
     return m->host + (va - m->start);
+}
+
+/* a mapping across a becomes two at a, the upper part in its own block */
+static int split(struct kb_cpu* cpu, uint64_t a) {
+    struct kb_mapping* m = find(cpu, a);
+    if (!m || m->start == a) return 0;
+    if (cpu->nmaps == (int) (sizeof cpu->maps / sizeof cpu->maps[0])) return -1;
+    uint8_t* up = malloc(m->end - a);
+    if (!up) return -1;
+    memcpy(up, m->host + (a - m->start), m->end - a);
+    uint8_t* low = realloc(m->host, a - m->start);
+    if (low) m->host = low;
+    cpu->maps[cpu->nmaps++] = (struct kb_mapping){a, m->end, up, m->prot};
+    m->end = a;
+    changed(cpu);
+    return 0;
 }
 
 /** the host bytes behind [va, va + len), or NULL when they are not one
@@ -67,16 +74,19 @@ static struct kb_mapping* add(
     if (cpu->nmaps == (int) (sizeof cpu->maps / sizeof cpu->maps[0]))
         return NULL;
     struct kb_mapping* m = &cpu->maps[cpu->nmaps++];
-    *m = (struct kb_mapping){s, e, host, prot, 0};
+    *m = (struct kb_mapping){s, e, host, prot};
     changed(cpu);
     return m;
 }
 
+/** a new mapping over [start, start + len), zeroed; what was there goes, as
+ * MAP_FIXED does */
 struct kb_mapping* kb_map(
     struct kb_cpu* cpu, uint64_t start, uint64_t len, int prot
 ) {
     uint64_t s = start & ~(PAGE - 1);
     uint64_t e = (start + len + PAGE - 1) & ~(PAGE - 1);
+    if (kb_unmap(cpu, s, e - s)) return NULL;
     uint8_t* host = calloc(1, e - s);
     if (!host) return NULL;
     struct kb_mapping* m = add(cpu, s, e, host, prot);
@@ -84,30 +94,47 @@ struct kb_mapping* kb_map(
     return m;
 }
 
-/* an exact newest mapping goes away; what is left under the range is covered by
- * a hole */
+/** the lowest address from at up where len bytes touch no mapping */
+uint64_t kb_free_at(struct kb_cpu* cpu, uint64_t at, uint64_t len) {
+    for (int i = 0; i < cpu->nmaps; i++)
+        if (cpu->maps[i].start < at + len && cpu->maps[i].end > at) {
+            at = cpu->maps[i].end + PAGE;
+            i = -1;
+        }
+    return at;
+}
+
+/** munmap: the pages of [start, start + len) go, splitting mappings across its
+ * ends */
 int kb_unmap(struct kb_cpu* cpu, uint64_t start, uint64_t len) {
     uint64_t e = (start + len + PAGE - 1) & ~(PAGE - 1);
-    int i = cpu->nmaps - 1;
-    if (i >= 0 && cpu->maps[i].start == start && cpu->maps[i].end == e) {
-        free(cpu->maps[i].host);
-        cpu->nmaps--;
-        changed(cpu);
+    if (split(cpu, start) || split(cpu, e)) return -1;
+    for (int i = 0; i < cpu->nmaps; i++) {
+        struct kb_mapping* m = &cpu->maps[i];
+        if (m->start >= start && m->end <= e) {
+            if (m->prot & 4) cpu->codegen++; /* blocks decoded from it go */
+            free(m->host);
+            *m = cpu->maps[--cpu->nmaps];
+            i--;
+        }
     }
-    for (int j = 0; j < cpu->nmaps; j++)
-        if (cpu->maps[j].start < e && cpu->maps[j].end > start)
-            return add(cpu, start, e, NULL, 0) ? 0 : -1;
+    changed(cpu);
     return 0;
 }
 
-/* mprotect: whole newest mappings change; a part of one is left as it is */
-void kb_protect(struct kb_cpu* cpu, uint64_t start, uint64_t len, int prot) {
+/** mprotect, splitting mappings across the range's ends */
+int kb_protect(struct kb_cpu* cpu, uint64_t start, uint64_t len, int prot) {
     uint64_t e = (start + len + PAGE - 1) & ~(PAGE - 1);
-    for (int i = cpu->nmaps - 1; i >= 0; i--) {
+    if (split(cpu, start) || split(cpu, e)) return -1;
+    for (int i = 0; i < cpu->nmaps; i++) {
         struct kb_mapping* m = &cpu->maps[i];
-        if (m->start >= start && m->end <= e && m->host) m->prot = prot;
+        if (m->start >= start && m->end <= e) {
+            if ((m->prot ^ prot) & 4) cpu->codegen++;
+            m->prot = prot;
+        }
     }
     changed(cpu);
+    return 0;
 }
 
 uint64_t kb_load(struct kb_cpu* cpu, uint64_t va, int w) {

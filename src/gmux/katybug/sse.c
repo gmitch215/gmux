@@ -242,6 +242,24 @@ int kb_sse(struct kb_cpu* cpu, const struct kb_ins* x) {
     v128 dv;
     memcpy(&dv, dst, 16);
 #define PUT(v) memcpy(dst, &(v), 16)
+    if (op == 0xae) {
+        /* fxsave fxrstor ldmxcsr stmxcsr clflush; lfence mfence sfence (one
+         * thread: nothing to order) */
+        int reg = x->a & 7;
+        uint64_t at = cpu->r[x->b];
+        if (pre) return -1;
+        if (!(x->c & 0x80)) return reg >= 5 ? 0 : -1;
+        switch (reg) {
+            case 0: kb_fxsave(cpu, at); return 0;
+            case 1: kb_fxrstor(cpu, at); return 0;
+            case 2:
+                cpu->mxcsr = (uint32_t) kb_load(cpu, at, 4) & 0xffff;
+                return 0;
+            case 3: kb_store(cpu, at, cpu->mxcsr, 4); return 0;
+            case 7: return 0;
+        }
+        return -1;
+    }
     switch (op) {
         case 0x10:
         case 0x28:

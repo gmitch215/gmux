@@ -113,6 +113,36 @@ static void ldst(struct dec* d, unsigned size, unsigned opc, unsigned rt) {
     }
 }
 
+/* a load or store's access, log2 bytes: a q register is size 0 with opc bit 1
+ */
+static unsigned vscale(uint32_t i) {
+    unsigned size = i >> 30;
+    return ((i >> 26) & 1) && ((i >> 23) & 1) && size == 0 ? 4 : size;
+}
+
+/* floating point and SIMD go to a64v.c whole, a load or store's address in TA
+ */
+static int vec(struct dec* d, uint32_t i) {
+    put(d, KB_A64V, 8, 0, TA, 0, (int64_t) i);
+    return 0;
+}
+
+/* the bytes an ld1-ld4/st1-st4 moves, for its post-index writeback */
+static int structure_bytes(uint32_t i) {
+    unsigned q = (i >> 30) & 1;
+    if (!((i >> 24) & 1)) {
+        static const int regs[16] = {4, 0, 4, 0, 3, 0, 3, 1, 2, 0, 2};
+        return regs[(i >> 12) & 15] * (q ? 16 : 8);
+    }
+    unsigned opc = (i >> 13) & 7, r = (i >> 21) & 1, size = (i >> 10) & 3,
+             scale = opc >> 1;
+    int selem = (int) ((opc & 1) << 1 | r) + 1;
+    int eb = scale == 3   ? 1 << size
+             : scale == 2 ? (size & 1 ? 8 : 4)
+                          : 1 << scale;
+    return selem * eb;
+}
+
 static int one(struct dec* d, struct kb_block* blk) {
     uint32_t* p = (uint32_t*) kb_host(d->cpu, d->pc, 4);
     if (!p) return -1;
@@ -122,11 +152,28 @@ static int one(struct dec* d, struct kb_block* blk) {
     put(d, KB_PC, 8, 0, 0, 0, (int64_t) pc);
     unsigned sf = i >> 31, rd = i & 31, rn = (i >> 5) & 31, rm = (i >> 16) & 31;
 
+    if ((i & 0x0e000000) == 0x0e000000) /* floating point and SIMD */
+        return vec(d, i);
+    if ((i & 0xbe000000) == 0x0c000000) /* ld1-ld4, st1-st4 */
+    {
+        put(d, KB_MOV, 8, TA, rs(rn), 0, 0);
+        vec(d, i);
+        if ((i >> 23) & 1) { /* post index: by the bytes moved, or by xm */
+            if (rm == 31) {
+                movi(d, T5, structure_bytes(i));
+                put(d, KB_ADD, 8, rs(rn), rs(rn), T5, 0);
+            }
+            else
+                put(d, KB_ADD, 8, rs(rn), rs(rn), rz(rm), 0);
+        }
+        return 0;
+    }
+
     /* data processing, immediate */
     if ((i & 0x1f000000) == 0x10000000) /* adr, adrp */
     {
         int64_t imm = sx(((i >> 3) & 0x1ffffc) | ((i >> 29) & 3), 21);
-        uint64_t v = (i >> 31) ? (pc & ~0xfffull) + (uint64_t) (imm << 12)
+        uint64_t v = (i >> 31) ? (pc & ~0xfffull) + ((uint64_t) imm << 12)
                                : pc + (uint64_t) imm;
         movi(d, T1, (int64_t) v);
         wr(d, rz(rd), 1, T1);
@@ -322,6 +369,11 @@ static int one(struct dec* d, struct kb_block* blk) {
     if ((i & 0xfffff0ff) == 0xd503309f || (i & 0xfffff0ff) == 0xd50330bf ||
         (i & 0xfffff0ff) == 0xd50330df)
         return 0;                       /* dsb, dmb, isb */
+    if ((i & 0xfffff0ff) == 0xd503305f) /* clrex */
+    {
+        put(d, KB_EXCL, 8, T3, 0, 0, 3);
+        return 0;
+    }
     if ((i & 0xffffffe0) == 0xd53bd040) /* mrs xt, tpidr_el0 */
     {
         put(d, KB_TPIDR, 8, T1, 0, 0, 0);
@@ -333,15 +385,37 @@ static int one(struct dec* d, struct kb_block* blk) {
         put(d, KB_SETTP, 8, 0, rz(rd), 0, 0);
         return 0;
     }
+    if ((i & 0xffdfffc0) == 0xd51b4400) /* mrs/msr fpcr, fpsr */
+        return vec(d, i);
+    if ((i & 0xffffffe0) == 0xd53b00e0 || (i & 0xffffffe0) == 0xd53b0020) {
+        /* dczid_el0: dc zva prohibited, so guests zero with stores; ctr_el0:
+         * 64-byte cache lines */
+        movi(d, T1, (i & 0xe0) == 0xe0 ? 0x10 : 0x8444c004);
+        wr(d, rz(rd), 1, T1);
+        return 0;
+    }
+    if ((i & 0xfff8f000) == 0xd5087000 && (i & 0xffffffe0) != 0xd50b7420)
+        return 0; /* cache maintenance (not dc zva): nothing to flush */
+    if ((i & 0xffffffe0) == 0xd53b4200) /* mrs xt, nzcv */
+    {
+        put(d, KB_NZCV, 8, T1, 0, 0, 0);
+        wr(d, rz(rd), 1, T1);
+        return 0;
+    }
+    if ((i & 0xffffffe0) == 0xd51b4200) /* msr nzcv, xt */
+    {
+        flags(d, KB_F_NZCV, 1, T1, rz(rd), rz(rd));
+        return 0;
+    }
 
     /* loads and stores */
     if ((i & 0x3b000000) == 0x39000000) /* ldr/str unsigned offset */
     {
-        unsigned size = i >> 30, opc = (i >> 22) & 3;
-        if ((i >> 26) & 1) goto bad; /* simd */
-        uint64_t off = ((i >> 10) & 0xfff) << size;
+        unsigned size = i >> 30, opc = (i >> 22) & 3, v = (i >> 26) & 1;
+        uint64_t off = ((i >> 10) & 0xfff) << vscale(i);
         movi(d, T5, (int64_t) off);
         put(d, KB_ADD, 8, TA, rs(rn), T5, 0);
+        if (v) return vec(d, i);
         if (size == 3 && opc >= 2) return 0; /* prfm */
         if (size == 2 && opc == 3) goto bad;
         ldst(d, size, opc, rd);
@@ -349,14 +423,17 @@ static int one(struct dec* d, struct kb_block* blk) {
     }
     if ((i & 0x3b200000) == 0x38000000) /* unscaled, pre and post index */
     {
-        unsigned size = i >> 30, opc = (i >> 22) & 3, mode = (i >> 10) & 3;
-        if ((i >> 26) & 1) goto bad;
+        unsigned size = i >> 30, opc = (i >> 22) & 3, mode = (i >> 10) & 3,
+                 v = (i >> 26) & 1;
         int64_t off = sx((i >> 12) & 0x1ff, 9);
-        if (mode == 2) goto bad;             /* unprivileged */
-        if (size == 3 && opc >= 2) return 0; /* prfum */
+        if (mode == 2) goto bad;                   /* unprivileged */
+        if (!v && size == 3 && opc >= 2) return 0; /* prfum */
         movi(d, T5, mode == 1 ? 0 : off);
         put(d, KB_ADD, 8, TA, rs(rn), T5, 0);
-        ldst(d, size, opc, rd);
+        if (v)
+            vec(d, i);
+        else
+            ldst(d, size, opc, rd);
         if (mode != 0) {
             movi(d, T5, off);
             put(d, KB_ADD, 8, rs(rn), rs(rn), T5, 0);
@@ -366,24 +443,26 @@ static int one(struct dec* d, struct kb_block* blk) {
     if ((i & 0x3b200c00) == 0x38200800) /* register offset */
     {
         unsigned size = i >> 30, opc = (i >> 22) & 3, option = (i >> 13) & 7,
-                 s = (i >> 12) & 1;
-        if ((i >> 26) & 1) goto bad;
-        if (size == 3 && opc >= 2) return 0;
-        extended(d, rz(rm), option, s ? (int) size : 0, T2);
+                 s = (i >> 12) & 1, v = (i >> 26) & 1;
+        if (!v && size == 3 && opc >= 2) return 0;
+        extended(d, rz(rm), option, s ? (int) vscale(i) : 0, T2);
         put(d, KB_ADD, 8, TA, rs(rn), T2, 0);
+        if (v) return vec(d, i);
         ldst(d, size, opc, rd);
         return 0;
     }
     if ((i & 0x3a000000) == 0x28000000) /* ldp/stp, ldpsw */
     {
-        unsigned opc = i >> 30, l = (i >> 22) & 1, mode = (i >> 23) & 3;
-        if ((i >> 26) & 1) goto bad;
-        int w = opc == 2 ? 8 : 4;
+        unsigned opc = i >> 30, l = (i >> 22) & 1, mode = (i >> 23) & 3,
+                 v = (i >> 26) & 1;
+        int w = v ? 4 << opc : opc == 2 ? 8 : 4;
         int64_t off = sx((i >> 15) & 0x7f, 7) * w;
         unsigned rt2 = (i >> 10) & 31;
         movi(d, T5, mode == 1 ? 0 : off);
         put(d, KB_ADD, 8, TA, rs(rn), T5, 0);
-        if (l) {
+        if (v)
+            vec(d, i);
+        else if (l) {
             put(d, opc == 1 ? KB_LDS : KB_LD, w, T1, TA, 0, 0);
             put(d, opc == 1 ? KB_LDS : KB_LD, w, T2, TA, 0, w);
             wr(d, rz(rd), 1, T1);
@@ -402,10 +481,10 @@ static int one(struct dec* d, struct kb_block* blk) {
     if ((i & 0x3b000000) == 0x18000000) /* ldr literal */
     {
         unsigned opc = i >> 30;
-        if ((i >> 26) & 1) goto bad;
         movi(
             d, TA, (int64_t) (pc + (uint64_t) (sx((i >> 5) & 0x7ffff, 19) * 4))
         );
+        if ((i >> 26) & 1) return vec(d, i);
         if (opc == 3) return 0; /* prfm literal */
         put(d, opc == 2 ? KB_LDS : KB_LD,
             opc == 0   ? 4
@@ -415,22 +494,25 @@ static int one(struct dec* d, struct kb_block* blk) {
         wr(d, rz(rd), 1, T1);
         return 0;
     }
-    if ((i & 0x3f000000) ==
-        0x08000000) /* exclusives and acquire/release: one thread, so plain */
+    if ((i & 0x3f000000) == 0x08000000) /* exclusives, acquire/release */
     {
-        unsigned size = i >> 30, l = (i >> 22) & 1, o0 = (i >> 15) & 1,
-                 o2 = (i >> 23) & 1;
-        int w = 1 << size;
-        (void) o0;
+        unsigned size = i >> 30, l = (i >> 22) & 1, o1 = (i >> 21) & 1,
+                 o2 = (i >> 23) & 1, rt2 = (i >> 10) & 31;
+        int pair = !o2 && o1, w = pair ? 4 << (size & 1) : 1 << size;
         put(d, KB_MOV, 8, TA, rs(rn), 0, 0);
         if (l) {
             put(d, KB_LD, w, T1, TA, 0, 0);
+            if (pair) put(d, KB_LD, w, T2, TA, 0, w);
             wr(d, rz(rd), 1, T1);
+            if (pair) wr(d, rz(rt2), 1, T2);
+            if (!o2) put(d, KB_EXCL, w, T3, 0, 0, 0); /* a names a scratch */
         }
-        else {
+        else if (o2) /* stlr */
             put(d, KB_ST, w, rz(rd), TA, 0, 0);
-            if (!o2)
-                wr(d, rz(rm), 1, KB_ZERO); /* stxr status: always succeeds */
+        else {
+            put(d, KB_EXCL, w, T1, TA, rz(rd),
+                pair ? 2 | (int64_t) rz(rt2) << 8 : 1);
+            wr(d, rz(rm), 1, T1);
         }
         return 0;
     }
@@ -472,6 +554,22 @@ static int one(struct dec* d, struct kb_block* blk) {
         wr(d, s ? rz(rd) : rs(rd), sf, T3);
         return 0;
     }
+    if ((i & 0x1fe0fc00) == 0x1a000000) /* adc adcs sbc sbcs */
+    {
+        unsigned op = (i >> 30) & 1, s = (i >> 29) & 1;
+        int b = rz(rm);
+        if (op) { /* sbc is add with carry of the complement */
+            movi(d, T5, -1);
+            put(d, KB_XOR, 8, T2, b, T5, 0);
+            b = T2;
+        }
+        put(d, KB_CARRY, 8, T1, 0, 0, 0);
+        put(d, KB_ADD, 8, T3, rz(rn), b, 0);
+        put(d, KB_ADD, 8, T3, T3, T1, 0);
+        if (s) flags(d, KB_F_ADC, sf, T3, rz(rn), b);
+        wr(d, rz(rd), sf, T3);
+        return 0;
+    }
     if ((i & 0x1fe00000) == 0x1a400000) /* ccmp, ccmn */
     {
         unsigned op = (i >> 30) & 1, cond = (i >> 12) & 15, nzcv = i & 15;
@@ -480,8 +578,9 @@ static int one(struct dec* d, struct kb_block* blk) {
             movi(d, T2, (int64_t) rm);
             b = T2;
         }
+        /* op 1 is ccmp (a subtract), 0 ccmn */
         put(d, KB_CCMP, sf ? 8 : 4, rz(rn), b, 0,
-            (int64_t) (cond | (nzcv << 4) | (op << 8)));
+            (int64_t) (cond | (nzcv << 4) | ((op ^ 1) << 8)));
         return 0;
     }
     if ((i & 0x1fe00000) == 0x1a800000) /* csel csinc csinv csneg */
@@ -510,6 +609,12 @@ static int one(struct dec* d, struct kb_block* blk) {
     {
         unsigned op = (i >> 10) & 0x3f;
         int a = rz(rn), b = rz(rm);
+        if ((op & 0x38) == 0x10) /* crc32 and crc32c of 1, 2, 4 or 8 bytes */
+        {
+            put(d, KB_CRC32, 1 << (op & 3), T3, a, b, (op >> 2) & 1);
+            wr(d, rz(rd), 0, T3);
+            return 0;
+        }
         if (!sf) {
             put(d, (op == 3 || op == 10) ? KB_SEXT : KB_ZEXT, 4, T1, a, 0, 0);
             put(d, op == 3 ? KB_SEXT : KB_ZEXT, 4, T2, b, 0, 0);
@@ -541,6 +646,45 @@ static int one(struct dec* d, struct kb_block* blk) {
         unsigned op = (i >> 10) & 0x3f;
         int a = rz(rn);
         switch (op) {
+            case 0: /* rbit: bits swapped in pairs, nibble halves, nibbles, then
+                       the bytes reversed */
+            {
+                static const uint64_t m[3] = {
+                    0x5555555555555555ull, 0x3333333333333333ull,
+                    0x0f0f0f0f0f0f0f0full
+                };
+                put(d, KB_MOV, 8, T3, a, 0, 0);
+                for (int k = 0; k < 3; k++) {
+                    movi(d, T5, 1 << k);
+                    put(d, KB_SHR, 8, T1, T3, T5, 0);
+                    put(d, KB_SHL, 8, T2, T3, T5, 0);
+                    movi(d, T4, (int64_t) m[k]);
+                    put(d, KB_AND, 8, T1, T1, T4, 0);
+                    movi(d, T4, (int64_t) ~m[k]);
+                    put(d, KB_AND, 8, T2, T2, T4, 0);
+                    put(d, KB_OR, 8, T3, T1, T2, 0);
+                }
+                put(d, KB_BSWAP, sf ? 8 : 4, T3, T3, 0, 0);
+                break;
+            }
+            case 1: /* rev16: the bytes of each halfword swapped */
+                movi(d, T5, 8);
+                put(d, KB_SHR, 8, T1, a, T5, 0);
+                put(d, KB_SHL, 8, T2, a, T5, 0);
+                movi(d, T4, 0x00ff00ff00ff00ffll);
+                put(d, KB_AND, 8, T1, T1, T4, 0);
+                movi(d, T4, (int64_t) 0xff00ff00ff00ff00ull);
+                put(d, KB_AND, 8, T2, T2, T4, 0);
+                put(d, KB_OR, 8, T3, T1, T2, 0);
+                break;
+            case 5: /* cls: leading zeros of x ^ (x >> 1, arithmetic), less 1 */
+                put(d, sf ? KB_MOV : KB_SEXT, sf ? 8 : 4, T1, a, 0, 0);
+                movi(d, T5, 1);
+                put(d, KB_SAR, 8, T2, T1, T5, 0);
+                put(d, KB_XOR, 8, T1, T1, T2, 0);
+                put(d, KB_CLZ, sf ? 8 : 4, T3, T1, 0, 0);
+                put(d, KB_SUB, 8, T3, T3, T5, 0);
+                break;
             case 4: put(d, KB_CLZ, sf ? 8 : 4, T3, a, 0, 0); break;
             case 2:
             case 3:
@@ -593,11 +737,16 @@ bad:
 int kb_a64_block(struct kb_cpu* cpu, struct kb_block* b) {
     struct kb_emit e = {0};
     struct dec d = {.cpu = cpu, .e = &e, .pc = b->pc};
-    int end = 0;
-    for (int n = 0; n < 64 && !end; n++) {
+    struct kb_fuse f = {
+        .cpu = cpu, .trace = cpu->tracing, .head = b->pc, .lo = {b->pc}
+    };
+    int end = 0, cap = f.trace ? 1024 : 64;
+    for (int n = 0; n < cap && !end; n++) {
         end = one(&d, b);
         if (end < 0) return -1;
+        if (end && n < cap - 1 && kb_fuse(&e, b, &f, d.pc, &d.pc)) end = 0;
     }
+    kb_fuse_done(b, &f, d.pc);
     b->next = d.pc;
     if (!end) b->target = d.pc;
     b->ins = e.ins;

@@ -201,8 +201,8 @@ static int sse_op(uint8_t op) {
     if (op >= 0x10 && op <= 0x17) return 1;
     if (op >= 0x28 && op <= 0x2f && op != 0x2b) return 1;
     if (op >= 0x50 && op <= 0x76) return 1;
-    if (op == 0x7e || op == 0x7f || op == 0xc2 || op == 0xc4 || op == 0xc5 ||
-        op == 0xc6)
+    if (op == 0x7e || op == 0x7f || op == 0xae || op == 0xc2 || op == 0xc4 ||
+        op == 0xc5 || op == 0xc6)
         return 1;
     if (op >= 0xd1 && op <= 0xfe && op != 0xd0 && op != 0xe0 && op != 0xf0 &&
         op != 0xf7)
@@ -684,12 +684,13 @@ static int one(struct dec* d, struct kb_block* blk) {
                     /* hint nops, endbr64 among them */
                     modrm(d);
                     return 0;
-                case 0xa2: /* cpuid: nothing beyond the baseline */
-                    put(d, KB_MOVI, 8, 0, 0, 0, 0);
-                    put(d, KB_MOVI, 8, 3, 0, 0, 0);
-                    put(d, KB_MOVI, 8, 1, 0, 0, 0);
-                    put(d, KB_MOVI, 8, 2, 0, 0, 0);
+                case 0x31: /* rdtsc: the host clock in ns as edx:eax */
+                    put(d, KB_CLOCK, 8, T1, 0, 0, 0);
+                    put(d, KB_ZEXT, 4, 0, T1, 0, 0);
+                    put(d, KB_MOVI, 8, T2, 0, 0, 32);
+                    put(d, KB_SHR, 8, 2, T1, T2, 0);
                     return 0;
+                case 0xa2: put(d, KB_CPUID, 8, 0, 0, 0, 0); return 0;
                 case 0xa3:
                 case 0xab:
                 case 0xb3:
@@ -814,6 +815,30 @@ static int one(struct dec* d, struct kb_block* blk) {
                     put(d, KB_SEL, 8, 0, T0_SAVE, 0, 4);
                     return 0;
                 }
+                case 0xc7: /* cmpxchg8b m64: edx:eax against it, ZF alone */
+                {
+                    modrm(d);
+                    if (!d->mem || (d->reg & 7) != 1 || (d->rex & 8)) break;
+                    address(d);
+                    put(d, KB_LD, 8, T1, TA, 0, 0);
+                    put(d, KB_MOVI, 8, T5, 0, 0, 32);
+                    put(d, KB_ZEXT, 4, T2, 0, 0, 0);
+                    put(d, KB_SHL, 8, T3, 2, T5, 0);
+                    put(d, KB_OR, 8, T2, T2, T3, 0);
+                    put(d, KB_XOR, 8, T3, T1, T2, 0);
+                    put(d, KB_FLAGS, 8, T3, 0, T3, KB_F_ZERO);
+                    put(d, KB_ZEXT, 4, T2, 3, 0, 0);
+                    put(d, KB_SHL, 8, T4, 1, T5, 0);
+                    put(d, KB_OR, 8, T2, T2, T4, 0);
+                    put(d, KB_SEL, 8, T2, T2, T1, 4);
+                    put(d, KB_ST, 8, T2, TA, 0, 0);
+                    /* a mismatch loads edx:eax, zero-extended */
+                    put(d, KB_ZEXT, 4, T3, T1, 0, 0);
+                    put(d, KB_SEL, 8, 0, 0, T3, 4);
+                    put(d, KB_SHR, 8, T3, T1, T5, 0);
+                    put(d, KB_SEL, 8, 2, 2, T3, 4);
+                    return 0;
+                }
                 case 0xc0:
                 case 0xc1: /* xadd r/m, r */
                 {
@@ -890,11 +915,16 @@ static int one(struct dec* d, struct kb_block* blk) {
 int kb_x86_block(struct kb_cpu* cpu, struct kb_block* b) {
     struct kb_emit e = {0};
     struct dec d = {.cpu = cpu, .e = &e, .at = b->pc};
-    int end = 0;
-    for (int i = 0; i < 64 && !end; i++) {
+    struct kb_fuse f = {
+        .cpu = cpu, .trace = cpu->tracing, .head = b->pc, .lo = {b->pc}
+    };
+    int end = 0, cap = f.trace ? 1024 : 64;
+    for (int i = 0; i < cap && !end; i++) {
         end = one(&d, b);
         if (d.bad) return -1;
+        if (end && i < cap - 1 && kb_fuse(&e, b, &f, d.at, &d.at)) end = 0;
     }
+    kb_fuse_done(b, &f, d.at);
     b->next = d.at;
     if (!end) b->target = d.at;
     b->ins = e.ins;

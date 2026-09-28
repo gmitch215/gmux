@@ -1,8 +1,10 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 #include "kb.h"
+#include "wide.h"
 
 #ifdef KB_HOT
     #include <unistd.h>
@@ -129,8 +131,32 @@ KB_NOINLINE static void flags(
     }
 }
 
-int kb_cond(struct kb_cpu* cpu, int cond) {
-    int n = cpu->n, z = cpu->z, c = cpu->c, v = cpu->v;
+/*
+ * K17, lazy flags: a KB_FLAGS op of a kind that sets every flag records its
+ * kind and operands instead (cpu->lz); a condition reads the record directly
+ * (KB_LAZY 2) and anything else that reads or writes the flags materializes
+ * it first (KB_SYNC). KB_LAZY 1 materializes for conditions too; 0 is eager
+ */
+static int lazy_kind(int kind) {
+    switch (kind) {
+        case KB_F_ADD:
+        case KB_F_A_ADD:
+        case KB_F_SUB:
+        case KB_F_A_SUB:
+        case KB_F_LOGIC:
+        case KB_F_A_LOGIC:
+        case KB_F_NEG: return 1;
+    }
+    return 0;
+}
+
+void kb_flags_sync(struct kb_cpu* cpu) {
+    int kind = cpu->lz - 1;
+    cpu->lz = 0;
+    flags(cpu, kind, cpu->lz_b, cpu->lz_c, cpu->lz_r, cpu->lz_w);
+}
+
+static int eval_cond(int cond, int n, int z, int c, int v, int p) {
     if (cond < KB_C_A64) {
         int r;
         switch (cond >> 1) {
@@ -139,7 +165,7 @@ int kb_cond(struct kb_cpu* cpu, int cond) {
             case 2: r = z; break;
             case 3: r = c || z; break;
             case 4: r = n; break;
-            case 5: r = cpu->p; break;
+            case 5: r = p; break;
             case 6: r = n != v; break;
             default: r = z || n != v; break;
         }
@@ -159,98 +185,117 @@ int kb_cond(struct kb_cpu* cpu, int cond) {
     return (k & 1) ? !r : r;
 }
 
+int kb_cond(struct kb_cpu* cpu, int cond) {
+#if KB_LAZY >= 2
+    /* n z c v straight from the record; parity materializes */
+    if (cpu->lz && !(cond < KB_C_A64 && cond >> 1 == 5)) {
+        int kind = cpu->lz - 1, w = cpu->lz_w;
+        uint64_t m = mask(w), sign = 1ull << (8 * w - 1);
+        uint64_t a = cpu->lz_b & m, b = cpu->lz_c & m, r = cpu->lz_r & m;
+        int n = !!(r & sign), z = r == 0, c = 0, v = 0;
+        switch (kind) {
+            case KB_F_ADD:
+            case KB_F_A_ADD:
+                c = r < a;
+                v = !!(~(a ^ b) & (a ^ r) & sign);
+                break;
+            case KB_F_SUB:
+            case KB_F_A_SUB:
+                c = kind == KB_F_SUB ? a < b : a >= b;
+                v = !!((a ^ b) & (a ^ r) & sign);
+                break;
+            case KB_F_NEG:
+                c = b != 0;
+                v = b == sign;
+                break;
+        }
+        return eval_cond(cond, n, z, c, v, 0);
+    }
+#endif
+    if (cpu->lz) kb_flags_sync(cpu);
+    return eval_cond(cond, cpu->n, cpu->z, cpu->c, cpu->v, cpu->p);
+}
+
 /* x86 mul, imul, div and idiv of rdx:rax (ax for bytes) by v; 1 on a divide
  * error */
 static int muldiv(struct kb_cpu* cpu, int kind, int w, uint64_t v) {
     uint64_t* r = cpu->r;
-    int bits = 8 * w;
-    uint64_t m = mask(w);
     if (kind == 4 || kind == 5) {
-        unsigned __int128 p;
-        int ov;
-        if (kind == 4) {
-            p = (unsigned __int128) (r[0] & m) * (v & m);
-            ov = (p >> bits) != 0;
-        }
-        else {
-            __int128 q = (__int128) sext(r[0], w) * sext(v, w);
-            p = (unsigned __int128) q;
-            ov = q != (__int128) sext((uint64_t) q, w);
-        }
-        uint64_t lo = (uint64_t) p & m, hi = (uint64_t) (p >> bits) & m;
-        if (w == 1)
-            r[0] = (r[0] & ~0xffffull) | ((hi << 8) | lo);
-        else if (w == 2) {
-            r[0] = (r[0] & ~0xffffull) | lo;
-            r[2] = (r[2] & ~0xffffull) | hi;
-        }
-        else {
-            r[0] = lo;
-            r[2] = hi;
-        }
-        cpu->c = cpu->v = ov;
+        cpu->c = cpu->v = kb_mul(kind == 5, w, &r[0], &r[2], v);
         return 0;
     }
-    if ((v & m) == 0) {
+    if (kb_divide(kind == 7, w, &r[0], &r[2], v)) {
         cpu->fault = "divide error";
         cpu->fault_sig = 8;
         return 1;
-    }
-    unsigned __int128 n;
-    if (w == 1)
-        n = r[0] & 0xffff;
-    else
-        n = ((unsigned __int128) (r[2] & m) << bits) | (r[0] & m);
-    uint64_t q, rem;
-    if (kind == 6) {
-        unsigned __int128 qq = n / (v & m);
-        if (qq > m) {
-            cpu->fault = "divide error";
-            cpu->fault_sig = 8;
-            return 1;
-        }
-        q = (uint64_t) qq;
-        rem = (uint64_t) (n % (v & m));
-    }
-    else {
-        __int128 sn =
-            w == 1 ? (__int128) (int16_t) n
-                   : (__int128) (n << (128 - 2 * bits)) >> (128 - 2 * bits);
-        __int128 d = sext(v, w), qq = sn / d;
-        if (qq != (__int128) sext((uint64_t) qq, w)) {
-            cpu->fault = "divide error";
-            cpu->fault_sig = 8;
-            return 1;
-        }
-        q = (uint64_t) qq & m;
-        rem = (uint64_t) (sn % d) & m;
-    }
-    if (w == 1)
-        r[0] = (r[0] & ~0xffffull) | (rem << 8) | q;
-    else if (w == 2) {
-        r[0] = (r[0] & ~0xffffull) | q;
-        r[2] = (r[2] & ~0xffffull) | rem;
-    }
-    else {
-        r[0] = q;
-        r[2] = rem;
     }
     return 0;
 }
 
 /* x86 movs and stos, down when the direction flag is set (memmove copies
  * backward that way) */
+/* a forward rep in one go over host memory: up to 1 MiB whose ranges are
+ * each one mapping, or 0 when they are not; an overlapping movs keeps the
+ * element order */
+static uint64_t string_bulk(struct kb_cpu* cpu, int stos, int w, uint64_t n) {
+    uint64_t* r = cpu->r;
+    if (n > (1u << 20) / (unsigned) w) n = (1u << 20) / (unsigned) w;
+    uint64_t len = n * (uint64_t) w;
+    uint8_t* d = kb_host(cpu, r[7], len);
+    uint8_t* s = stos ? NULL : kb_host(cpu, r[6], len);
+    if (!d || (!stos && !s)) return 0;
+    if (stos && w == 1)
+        memset(d, (int) (uint8_t) r[0], len);
+    else if (stos)
+        for (uint64_t i = 0; i < len; i += (uint64_t) w)
+            memcpy(d + i, &r[0], (size_t) w);
+    else if (r[7] > r[6] && r[7] - r[6] < len)
+        for (uint64_t i = 0; i < len; i += (uint64_t) w) {
+            uint64_t v;
+            memcpy(&v, s + i, (size_t) w);
+            memcpy(d + i, &v, (size_t) w);
+        }
+    else
+        memmove(d, s, len);
+    r[7] += len;
+    if (!stos) r[6] += len;
+    r[1] -= n;
+    return n;
+}
+
+/* one element; 0 on a fault, which leaves the registers at that element */
+static int string_one(struct kb_cpu* cpu, int stos, int w, int rep) {
+    uint64_t* r = cpu->r;
+    uint64_t v = stos ? r[0] : kb_load(cpu, r[6], w);
+    if (!cpu->fault) kb_store(cpu, r[7], v, w);
+    if (cpu->fault) return 0;
+    uint64_t step = cpu->df ? (uint64_t) -(int64_t) w : (uint64_t) w;
+    r[7] += step;
+    if (!stos) r[6] += step;
+    if (rep) r[1]--;
+    return 1;
+}
+
 static void string(struct kb_cpu* cpu, int stos, int w, int rep) {
     uint64_t* r = cpu->r;
     uint64_t n = rep ? r[1] : 1;
-    for (; n; n--) {
-        uint64_t v = stos ? r[0] : kb_load(cpu, r[6], w);
-        kb_store(cpu, r[7], v, w);
-        if (cpu->fault) return;
-        uint64_t step = cpu->df ? (uint64_t) -(int64_t) w : (uint64_t) w;
-        r[7] += step;
-        if (!stos) r[6] += step;
-        if (rep) r[1]--;
+    while (n) {
+        uint64_t k = n;
+        if (rep && !cpu->df) {
+            uint64_t done = string_bulk(cpu, stos, w, n);
+            if (done) {
+                n -= done;
+                continue;
+            }
+            /* element by element to the next page, where a fault is exact */
+            k = (4096 - (r[7] & 4095) + (uint64_t) w - 1) / (uint64_t) w;
+            uint64_t ks =
+                (4096 - (r[6] & 4095) + (uint64_t) w - 1) / (uint64_t) w;
+            if (!stos && ks < k) k = ks;
+            if (k > n) k = n;
+        }
+        for (n -= k; k; k--)
+            if (!string_one(cpu, stos, w, rep)) return;
     }
 }
 
@@ -363,6 +408,14 @@ const uint16_t kb_class[] = {
     [KB_WTRAP] = KB_K_CONTROL | KB_K_FAULT,
     [KB_WEXIT] = KB_K_CONTROL | KB_K_HOST,
     [KB_RESOLVE] = KB_K_ADDRESS,
+    [KB_NZCV] = KB_K_DEF | KB_K_FLAGS_R,
+    [KB_CRC32] = PURE_DEF,
+    [KB_CLOCK] = KB_K_DEF | KB_K_HOST,
+    [KB_CPUID] = OPAQUE,
+    [KB_EXCL] = KB_K_DEF | KB_K_WRITE | KB_K_FAULT | KB_K_HOST | KB_K_CLOBBER,
+    [KB_EXIT] = KB_K_CONTROL | KB_K_FLAGS_R,
+    /* fcmp writes flags, fcsel reads them: read-all keeps earlier writes */
+    [KB_A64V] = KB_K_VECTOR | OPAQUE | KB_K_FLAGS_R,
 };
 
 /*
@@ -397,6 +450,47 @@ static void plan_flags(struct kb_cpu* cpu, struct kb_block* b) {
             live |= FC;
         else if (!(kb_class[x->op] & KB_K_PURE))
             live = FALL;
+    }
+    for (int i = 0; i < b->n; i++)
+        if (b->ins[i].op != DROPPED) b->ins[n++] = b->ins[i];
+    b->n = n;
+}
+
+/*
+ * backward demand, after the flag plan: a pure op whose result nothing reads
+ * is dropped. Guest registers are read at the block's end and at every op that
+ * is not pure or a known flag or select op (a fault shows a handler them all);
+ * temps only where an op names them. A write to KB_ZERO is never read
+ */
+static void plan_demand(struct kb_cpu* cpu, struct kb_block* b) {
+    enum
+    {
+        DROPPED = 0xff
+    };
+    uint64_t live = 0xffffffffull; /* bit r: register r is read later */
+    int n = 0;
+    for (int i = b->n - 1; i >= 0; i--) {
+        struct kb_ins* x = &b->ins[i];
+        uint64_t a = 1ull << x->a, reads = 1ull << x->b | 1ull << x->c;
+        if ((kb_class[x->op] & PURE_DEF) == PURE_DEF) {
+            cpu->plan_ops++;
+            if (!(live & a) || x->a == KB_ZERO) {
+                x->op = DROPPED;
+                cpu->plan_ops_removed++;
+                b->pruned++;
+                continue;
+            }
+            live = (live & ~a) | reads | (x->op == KB_INS ? a : 0);
+        }
+        else if (x->op == KB_FLAGS)
+            live |= a | reads;
+        else if (
+            x->op == KB_SETCC || x->op == KB_SEL || x->op == KB_CARRY ||
+            x->op == KB_NZCV
+        )
+            live = (live & ~a) | reads;
+        else if (x->op != KB_PC)
+            live = ~0ull;
     }
     for (int i = 0; i < b->n; i++)
         if (b->ins[i].op != DROPPED) b->ins[n++] = b->ins[i];
@@ -513,6 +607,79 @@ static void plan_mem(struct kb_cpu* cpu, struct kb_block* b) {
 
 /* KB_PC ops out of the stream, each op's instruction kept beside it for a fault
  * to report (a trace keeps them: it prints each instruction as it runs) */
+static struct kb_block* peek(struct kb_cpu* cpu, uint64_t pc) {
+    unsigned h = (unsigned) ((pc >> 2) ^ (pc >> 14)) & 4095u;
+    for (struct kb_block* b = cpu->cache[h]; b; b = b->chain)
+        if (b->pc == pc) return b;
+    return NULL;
+}
+
+/** block fusion: ops that end in a direct jump (a constant into a temp, then
+ * a jump to it) lose it, and decoding goes on at the target, when that is not
+ * code the block holds (a loop stays a block transition, where polls happen)
+ * and is within the pcs' 31 bits; 1 when it fused */
+int kb_fuse(
+    struct kb_emit* e, const struct kb_block* b, struct kb_fuse* f,
+    uint64_t end, uint64_t* at
+) {
+    if (e->n < 1 || f->n + 1 >= KB_SEGS) return 0;
+    struct kb_ins* j = &e->ins[e->n - 1];
+    int jump = KB_FUSE && e->n >= 2 && j->op == KB_JMP && j[-1].op == KB_MOVI &&
+               j[-1].a == j->b && f->jumps < (f->trace ? KB_SEGS : KB_FUSE_MAX);
+    int branch = f->trace && (j->op == KB_BR || j->op == KB_BRZ) &&
+                 f->n + 1 < f->cpu->segments &&
+                 !(j->op == KB_BR && j->imm >= KB_C_A64 + 14);
+    uint64_t t = 0, cold = 0;
+    int taken = 0;
+    if (jump)
+        t = (uint64_t) j[-1].imm;
+    else if (branch) {
+        /* the hot side, from the profile of the block this branch ended alone
+         */
+        const struct kb_block* s = peek(f->cpu, f->head);
+        uint32_t tot = s ? s->taken + s->fall : 0;
+        if (tot < 16) return 0;
+        taken = (uint64_t) s->taken * 10 >= (uint64_t) tot * 9;
+        if (!taken && (uint64_t) s->fall * 10 < (uint64_t) tot * 9) return 0;
+        t = taken ? b->target : end;
+        cold = taken ? end : b->target;
+    }
+    else
+        return 0;
+    if (t - b->pc + 0x80000000ull >= 0x100000000ull) return 0;
+    if (branch && cold - b->pc + 0x80000000ull >= 0x100000000ull) return 0;
+    f->hi[f->n] = end;
+    for (int i = 0; i <= f->n; i++)
+        if (t >= f->lo[i] && t < f->hi[i]) return 0;
+    f->lo[++f->n] = t;
+    if (jump) {
+        e->n -= 2;
+        f->jumps++;
+    }
+    else {
+        /* the branch becomes an exit to its cold side, carried as an offset
+         * from the block's pc */
+        int zero = j->op == KB_BRZ;
+        int64_t c = j->imm,
+                flip = c >= KB_C_A64 ? KB_C_A64 + ((c - KB_C_A64) ^ 1) : c ^ 1;
+        int64_t cond = zero ? 0x100 | (taken ? c ^ 1 : c) : taken ? flip : c;
+        j->op = KB_EXIT;
+        j->imm = cond | (int64_t) (uint32_t) (cold - b->pc) << 16;
+        f->head = t;
+    }
+    *at = t;
+    return 1;
+}
+
+void kb_fuse_done(struct kb_block* b, struct kb_fuse* f, uint64_t end) {
+    f->hi[f->n] = end;
+    free(b->seg);
+    b->nseg = f->n + 1;
+    b->seg = malloc(2 * sizeof *b->seg * (size_t) b->nseg);
+    for (int i = 0; b->seg && i < b->nseg; i++)
+        b->seg[2 * i] = f->lo[i], b->seg[2 * i + 1] = f->hi[i];
+}
+
 static int lean_pcs(struct kb_cpu* cpu, struct kb_block* b) {
     if (cpu->trace) return 0;
     if (!(b->pcs = malloc((size_t) (b->n ? b->n : 1) * sizeof *b->pcs)))
@@ -638,16 +805,14 @@ static void traffic(const struct kb_block* b, int* rd, int* wr) {
 }
 #endif
 
-KB_NOINLINE static struct kb_block* block(struct kb_cpu* cpu, uint64_t pc) {
-    unsigned h = (unsigned) ((pc >> 2) ^ (pc >> 14)) & 4095u;
-    for (struct kb_block* b = cpu->cache[h]; b; b = b->chain)
-        if (b->pc == pc) return b;
-    struct kb_block* b = calloc(1, sizeof *b);
-    b->pc = pc;
+/* decodes and plans the code at b->pc into b; nonzero when there is none */
+static int translate(struct kb_cpu* cpu, struct kb_block* b) {
+    b->codegen = cpu->codegen;
     int bad = cpu->arch == KB_X86   ? kb_x86_block(cpu, b)
               : cpu->arch == KB_A64 ? kb_a64_block(cpu, b)
                                     : kb_wasm_block(cpu, b);
     if (!bad && !cpu->noplan) plan_flags(cpu, b);
+    if (!bad && !cpu->noplan) plan_demand(cpu, b);
     if (!bad && !cpu->noplan) plan_mem(cpu, b);
     for (int i = 0; !bad && i < b->n; i++)
         if (b->ins[i].a == KB_ZERO && writes_a(&b->ins[i]))
@@ -656,25 +821,114 @@ KB_NOINLINE static struct kb_block* block(struct kb_cpu* cpu, uint64_t pc) {
     for (int i = 0; !bad && i < b->n; i++) b->insns += b->ins[i].op == KB_PC;
 #endif
     if (!bad) bad = lean_pcs(cpu, b);
-#ifdef KB_COUNT
-    if (!bad) traffic(b, &b->rd, &b->wr);
-#endif
-    int mem = 0;
-    for (int i = 0; !bad && i < b->n; i++)
-        mem += is_access(b->ins[i].op) || b->ins[i].op == KB_RESOLVE;
-    if (mem && !bad && !(b->ic = calloc((size_t) mem, sizeof *b->ic))) bad = 1;
+    if (!bad) bad = kb_block_ready(cpu, b);
     if (bad) {
         free(b->ins);
         free(b->pcs);
+        b->ins = NULL;
+        b->pcs = NULL;
+        return 1;
+    }
+    cpu->decoded++;
+    return 0;
+}
+
+/** a block's run-time parts from its ops: the inline caches (one per access
+ * and KB_RESOLVE) and a lifted region; nonzero when out of memory */
+int kb_block_ready(struct kb_cpu* cpu, struct kb_block* b) {
+#ifdef KB_COUNT
+    traffic(b, &b->rd, &b->wr);
+#endif
+    int mem = 0;
+    for (int i = 0; i < b->n; i++)
+        mem += is_access(b->ins[i].op) || b->ins[i].op == KB_RESOLVE;
+    if (mem && !(b->ic = calloc((size_t) mem, sizeof *b->ic))) return 1;
+#ifdef KB_AOT
+    if (!cpu->trace) kb_aot_attach(cpu, b);
+#else
+    (void) cpu;
+#endif
+    return 0;
+}
+
+/* b emptied for its code to be decoded again: pc and its place in the cache
+ * stay, so blocks linked to it stay linked */
+static void reset(struct kb_block* b) {
+    free(b->ins);
+    free(b->pcs);
+    free(b->ic);
+    free(b->seg);
+    struct kb_block keep = {.pc = b->pc, .chain = b->chain};
+    *b = keep;
+}
+
+KB_NOINLINE static struct kb_block* block(struct kb_cpu* cpu, uint64_t pc) {
+    cpu->lookups++;
+    unsigned h = (unsigned) ((pc >> 2) ^ (pc >> 14)) & 4095u;
+    for (struct kb_block* b = cpu->cache[h]; b; b = b->chain) {
+        if (b->pc != pc) continue;
+        if (b->codegen == cpu->codegen) return b;
+        /* the code under it was unmapped or changed protection since */
+        reset(b);
+        if (translate(cpu, b)) {
+            b->codegen = cpu->codegen - 1;
+            return NULL;
+        }
+        return b;
+    }
+    struct kb_block* b = calloc(1, sizeof *b);
+    b->pc = pc;
+    if (!kb_persist_take(cpu, b) && translate(cpu, b)) {
+        free(b->seg);
         free(b);
         return NULL;
     }
     b->chain = cpu->cache[h];
     cpu->cache[h] = b;
-#ifdef KB_AOT
-    if (!cpu->trace) kb_aot_attach(cpu, b);
-#endif
     return b;
+}
+
+#if KB_TRACE > 1
+/* K6f: a hot block decoded again in place as a trace; one with no biased
+ * branch to follow stays as it was */
+static void retrace(struct kb_cpu* cpu, struct kb_block* b) {
+    b->traced = 1;
+    if (cpu->arch == KB_WASM || cpu->trace) return;
+    struct kb_block t = {.pc = b->pc};
+    cpu->tracing = 1;
+    int bad = translate(cpu, &t), exits = 0;
+    cpu->tracing = 0;
+    for (int i = 0; !bad && i < t.n; i++) exits += t.ins[i].op == KB_EXIT;
+    if (bad || !exits) {
+        free(t.ins);
+        free(t.pcs);
+        free(t.ic);
+        free(t.seg);
+        return;
+    }
+    struct kb_block* chain = b->chain;
+    reset(b);
+    *b = t;
+    b->chain = chain;
+    b->traced = 1;
+    cpu->traces++;
+}
+#endif
+
+/* K16: the block cpu->pc names, through prev's cached successor when prev
+ * ended there; a successor of an older code generation is looked up again */
+static struct kb_block* next_block(struct kb_cpu* cpu, struct kb_block* prev) {
+#if !KB_CHAIN
+    (void) prev;
+    return block(cpu, cpu->pc);
+#endif
+    struct kb_block** link = !prev                     ? NULL
+                             : cpu->pc == prev->target ? &prev->to_target
+                             : cpu->pc == prev->next   ? &prev->to_next
+                                                       : NULL;
+    if (!link) return block(cpu, cpu->pc);
+    if (!*link || (*link)->codegen != cpu->codegen) *link = block(cpu, cpu->pc);
+    return *link;
 }
 
 #ifdef KB_HOT
@@ -731,7 +985,11 @@ KB_NOINLINE static inline void store(
 /* a fault in op i leaves the block at its start, and names the instruction from
  * the side table (a trace's KB_PC ops name it as they run) */
 #define FAULTED()                                                              \
-    ((blk->pcs ? (void) (cpu->ipc = blk->pc + blk->pcs[i]) : (void) 0), blk->pc)
+    ((blk->pcs                                                                 \
+          ? (void) (cpu->ipc =                                                 \
+                        blk->pc + (uint64_t) (int64_t) (int32_t) blk->pcs[i])  \
+          : (void) 0),                                                         \
+     blk->pc)
 /* only the ops that can raise a fault check for one after them */
 #define CHECK()                                                                \
     if (cpu->fault) return FAULTED()
@@ -765,13 +1023,8 @@ static uint64_t step(struct kb_cpu* cpu, struct kb_block* blk) {
                 break;
             }
             case KB_MUL: r[x->a] = B * C; break;
-            case KB_UMULH:
-                r[x->a] = (uint64_t) (((unsigned __int128) B * C) >> 64);
-                break;
-            case KB_SMULH:
-                r[x->a] =
-                    (uint64_t) (((__int128) (int64_t) B * (int64_t) C) >> 64);
-                break;
+            case KB_UMULH: r[x->a] = kb_umulh(B, C); break;
+            case KB_SMULH: r[x->a] = kb_smulh(B, C); break;
             case KB_UDIV: r[x->a] = C ? B / C : 0; break;
             case KB_SDIV:
                 r[x->a] = C ? ((int64_t) B == INT64_MIN && (int64_t) C == -1
@@ -807,13 +1060,34 @@ static uint64_t step(struct kb_cpu* cpu, struct kb_block* blk) {
                 store(cpu, ic++, B + (uint64_t) x->imm, r[x->a], x->w);
                 CHECK();
                 break;
-            case KB_FLAGS: flags(cpu, (int) x->imm, B, C, r[x->a], x->w); break;
+            case KB_FLAGS:
+#if KB_LAZY
+                if (lazy_kind((int) x->imm)) {
+                    cpu->lz = (int) x->imm + 1;
+                    cpu->lz_w = x->w;
+                    cpu->lz_b = B, cpu->lz_c = C, cpu->lz_r = r[x->a];
+                    break;
+                }
+                KB_SYNC(cpu);
+#endif
+                flags(cpu, (int) x->imm, B, C, r[x->a], x->w);
+                break;
             case KB_SETCC:
                 r[x->a] = (uint64_t) kb_cond(cpu, (int) x->imm);
                 break;
             case KB_SEL: r[x->a] = kb_cond(cpu, (int) x->imm) ? B : C; break;
             case KB_BR:
                 if (kb_cond(cpu, (int) x->imm)) return blk->target;
+                break;
+            case KB_EXIT:
+                if (x->imm & 0x100 ? (r[x->a] == 0) == !(x->imm & 1)
+                                   : kb_cond(cpu, (int) (x->imm & 0xff))) {
+                    cpu->trace_exits++;
+                    cpu->plan_ops_ran -=
+                        (uint64_t) (blk->n - 1 - i); /* not run */
+                    return blk->pc +
+                           (uint64_t) (int64_t) (int32_t) (x->imm >> 16);
+                }
                 break;
             case KB_JMP: return B;
             case KB_SYSCALL:
@@ -838,6 +1112,7 @@ static uint64_t step(struct kb_cpu* cpu, struct kb_block* blk) {
                     );
                 break;
             case KB_X86FLAGS:
+                KB_SYNC(cpu);
                 switch (x->imm) {
                     case 0:
                         r[x->a] = 0x202 | (uint64_t) cpu->c |
@@ -865,6 +1140,7 @@ static uint64_t step(struct kb_cpu* cpu, struct kb_block* blk) {
                 }
                 break;
             case KB_X86SHD: {
+                KB_SYNC(cpu);
                 int bits = 8 * x->w;
                 uint64_t m = mask(x->w), v = r[x->a] & m, in = B & m, n = C;
                 if (!n) break;
@@ -885,6 +1161,7 @@ static uint64_t step(struct kb_cpu* cpu, struct kb_block* blk) {
                 break;
             }
             case KB_X87:
+                KB_SYNC(cpu);
                 if (kb_x87(cpu, x) && !cpu->fault) {
                     cpu->fault = "unknown x87 instruction";
                     cpu->fault_sig = 4;
@@ -892,13 +1169,25 @@ static uint64_t step(struct kb_cpu* cpu, struct kb_block* blk) {
                 CHECK();
                 break;
             case KB_SSE:
+                KB_SYNC(cpu);
                 if (kb_sse(cpu, x) && !cpu->fault) {
                     cpu->fault = "unknown sse instruction";
                     cpu->fault_sig = 4;
                 }
                 CHECK();
                 break;
-            case KB_CARRY: r[x->a] = (uint64_t) cpu->c; break;
+            case KB_A64V:
+                KB_SYNC(cpu);
+                if (kb_a64v(cpu, x) && !cpu->fault) {
+                    cpu->fault = "unknown instruction";
+                    cpu->fault_sig = 4;
+                }
+                CHECK();
+                break;
+            case KB_CARRY:
+                KB_SYNC(cpu);
+                r[x->a] = (uint64_t) cpu->c;
+                break;
             case KB_BSWAP: {
                 uint64_t v = __builtin_bswap64(B);
                 r[x->a] = v >> (64 - 8 * x->w);
@@ -925,12 +1214,84 @@ static uint64_t step(struct kb_cpu* cpu, struct kb_block* blk) {
                 return FAULTED();
             case KB_WEXIT: cpu->exited = 1; return 0;
             case KB_TPIDR: r[x->a] = cpu->tpidr; break;
+            case KB_NZCV:
+                KB_SYNC(cpu);
+                r[x->a] = (uint64_t) (cpu->n << 31 | cpu->z << 30 |
+                                      cpu->c << 29 | cpu->v << 28) &
+                          0xf0000000u;
+                break;
+            case KB_CLOCK: {
+                struct timespec ts;
+                clock_gettime(CLOCK_MONOTONIC, &ts);
+                r[x->a] = (uint64_t) ts.tv_sec * 1000000000ull +
+                          (uint64_t) ts.tv_nsec;
+                break;
+            }
+            case KB_EXCL:
+                if (!x->imm || x->imm == 3) {
+                    cpu->excl = x->imm ? ~0ull : kb_switches;
+                    break;
+                }
+                {
+                    /* a switch or a signal since the ldxr clears the monitor */
+                    int held = cpu->excl == kb_switches;
+                    cpu->excl = ~0ull;
+                    if (held) {
+                        kb_store(cpu, B, C, x->w);
+                        if ((x->imm & 0xff) == 2)
+                            kb_store(
+                                cpu, B + (uint64_t) x->w, r[x->imm >> 8], x->w
+                            );
+                        CHECK();
+                    }
+                    r[x->a] = !held;
+                }
+                break;
+            case KB_CPUID: {
+                /* the x86-64 baseline as qemu64 reports it (glibc reads leaf 1
+                 * only for a vendor it knows); mmx is claimed but faults if run
+                 */
+                uint32_t leaf = (uint32_t) r[0], v[4] = {0, 0, 0, 0};
+                if (leaf == 0) {
+                    v[0] = 1;
+                    memcpy(&v[1], "Auth", 4);
+                    memcpy(&v[3], "enti", 4);
+                    memcpy(&v[2], "cAMD", 4);
+                }
+                else if (leaf == 1) {
+                    v[0] = 0x00060fb1; /* family 15, model 107, stepping 1 */
+                    v[1] = 0x00010800; /* one logical cpu, 64-byte clflush */
+                    v[3] = 1u | 1u << 4 | 1u << 8 | 1u << 15 | 1u << 23 |
+                           1u << 24 | 1u << 25 | 1u << 26;
+                }
+                else if (leaf == 0x80000000)
+                    v[0] = 0x80000001;
+                else if (leaf == 0x80000001)
+                    v[3] = 1u << 11 | 1u << 29;
+                r[0] = v[0];
+                r[3] = v[1];
+                r[1] = v[2];
+                r[2] = v[3];
+                break;
+            }
+            case KB_CRC32: {
+                /* the reflected polynomials, bit by bit */
+                uint32_t crc = (uint32_t) B,
+                         poly = x->imm ? 0x82f63b78u : 0xedb88320u;
+                uint64_t v = C;
+                for (int k = 0; k < 8 * x->w; k++, v >>= 1)
+                    crc = ((crc ^ (uint32_t) (v & 1)) & 1) ? (crc >> 1) ^ poly
+                                                           : crc >> 1;
+                r[x->a] = crc;
+                break;
+            }
             case KB_FSBASE: r[x->a] = cpu->fs; break;
             case KB_SETTP: cpu->tpidr = B; break;
             case KB_BRZ:
                 if ((r[x->a] != 0) == (x->imm != 0)) return blk->target;
                 break;
             case KB_CCMP: {
+                KB_SYNC(cpu);
                 int cond = (int) (x->imm & 15),
                     nzcv = (int) ((x->imm >> 4) & 15);
                 uint64_t a = r[x->a];
@@ -947,6 +1308,7 @@ static uint64_t step(struct kb_cpu* cpu, struct kb_block* blk) {
                 break;
             }
             case KB_X86MD:
+                KB_SYNC(cpu);
                 if (muldiv(cpu, (int) x->imm, x->w, B)) return FAULTED();
                 break;
             case KB_X86STR:
@@ -1063,8 +1425,11 @@ int kb_run(struct kb_cpu* cpu) {
 #if KB_POLL == 3
     int fuel = 0;
 #endif
+    int slice = 0;
+    struct kb_block* prev = NULL;
     while (!cpu->exited) {
-        struct kb_block* b = block(cpu, cpu->pc);
+        struct kb_block* b = next_block(cpu, prev);
+        prev = b;
         if (!b) {
             /* no instruction here at all: the jump itself faulted */
             cpu->fault = "jump outside the address space";
@@ -1088,6 +1453,7 @@ int kb_run(struct kb_cpu* cpu) {
         }
 #endif
 #ifdef KB_AOT
+        if (b->aot) KB_SYNC(cpu); /* lifted code keeps the flag bits itself */
         uint64_t next = b->aot ? b->aot(cpu, b->pc) : step(cpu, b);
 #else
         uint64_t next = step(cpu, b);
@@ -1095,6 +1461,8 @@ int kb_run(struct kb_cpu* cpu) {
         cpu->steps++;
         cpu->plan_flags_run += b->dropped;
         cpu->plan_flags_ran += b->flag_writes;
+        cpu->plan_ops_run += b->pruned;
+        cpu->plan_ops_ran += (uint64_t) (b->n + b->pruned);
         if (cpu->exited) break;
         /* a wasm trap ends the call; there is no guest signal to deliver */
         if (cpu->fault && cpu->arch == KB_WASM) break;
@@ -1116,6 +1484,13 @@ int kb_run(struct kb_cpu* cpu) {
             continue;
         }
         cpu->pc = next;
+#if KB_TRACE > 1
+        if (next == b->target)
+            b->taken++;
+        else if (next == b->next)
+            b->fall++;
+        if (!b->traced && b->taken + b->fall >= KB_TRACE_AT) retrace(cpu, b);
+#endif
 #if KB_POLL == 1
         if (next <= b->pc) kb_signals(cpu);
 #elif KB_POLL == 2
@@ -1131,6 +1506,10 @@ int kb_run(struct kb_cpu* cpu) {
 #else
         kb_signals(cpu);
 #endif
+        if (kb_nthreads > 1 && next <= b->pc && ++slice >= KB_SLICE) {
+            slice = 0;
+            kb_yield(cpu);
+        }
     }
     return cpu->status;
 }

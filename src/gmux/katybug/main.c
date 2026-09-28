@@ -66,7 +66,14 @@ int main(int argc, char** argv) {
         cpu->trace = fopen(getenv("KATYBUG_TRACE"), "w");
     cpu->noplan =
         getenv("KATYBUG_PLAN") && !strcmp(getenv("KATYBUG_PLAN"), "0");
+    cpu->segments = KB_TRACE;
+    if (getenv("KATYBUG_SEGMENTS")) {
+        int s = atoi(getenv("KATYBUG_SEGMENTS"));
+        cpu->segments = s < 1 ? 1 : s > KB_SEGS - 1 ? KB_SEGS - 1 : s;
+    }
+    kb_persist_load(cpu, path);
     int status = kb_run(cpu);
+    kb_persist_save(cpu);
     if (cpu->trace) fclose(cpu->trace);
     if (cpu->fault && !cpu->exited) {
         uint8_t* p = kb_host(cpu, cpu->pc, 4);
@@ -80,19 +87,34 @@ int main(int argc, char** argv) {
             stderr, " after %llu blocks\n", (unsigned long long) cpu->steps
         );
     }
+    /* the decoded code held at the end: blocks and their ops */
+    uint64_t held = 0, held_ops = 0;
+    for (int h = 0; getenv("KATYBUG_STATS") && h < 4096; h++)
+        for (struct kb_block* b = cpu->cache[h]; b; b = b->chain)
+            held++, held_ops += (uint64_t) b->n;
     if (getenv("KATYBUG_STATS"))
         fprintf(
             stderr,
             "katybug: %llu blocks; plan dropped %llu of %llu flag writes "
             "decoded, %llu of %llu run; grouped %llu of %llu accesses "
-            "decoded\n",
+            "decoded; dropped %llu of %llu pure ops decoded, %llu of %llu "
+            "ops run; %llu traces, %llu side exits; %llu blocks and %llu "
+            "ops held; %llu decoded, %llu from the cache; %llu lookups\n",
             (unsigned long long) cpu->steps,
             (unsigned long long) cpu->plan_flags_removed,
             (unsigned long long) cpu->plan_flags,
             (unsigned long long) cpu->plan_flags_run,
             (unsigned long long) cpu->plan_flags_ran,
             (unsigned long long) cpu->plan_mem_grouped,
-            (unsigned long long) cpu->plan_mem
+            (unsigned long long) cpu->plan_mem,
+            (unsigned long long) cpu->plan_ops_removed,
+            (unsigned long long) cpu->plan_ops,
+            (unsigned long long) cpu->plan_ops_run,
+            (unsigned long long) cpu->plan_ops_ran,
+            (unsigned long long) cpu->traces,
+            (unsigned long long) cpu->trace_exits, (unsigned long long) held,
+            (unsigned long long) held_ops, (unsigned long long) cpu->decoded,
+            (unsigned long long) cpu->loaded, (unsigned long long) cpu->lookups
         );
 #ifdef KB_HOT
     kb_hot_dump(cpu);
