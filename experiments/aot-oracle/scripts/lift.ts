@@ -58,7 +58,7 @@ function parse(path: string): Block[] {
 }
 
 // ops a region cannot run: AArch64-only state and traps stay with the interpreter
-const unliftable = new Set(['TRAP', 'WTRAP', 'WEXIT', 'CCMP', 'TPIDR', 'SETTP'].map((n) => op[n]!));
+const unliftable = new Set(['TRAP', 'WTRAP', 'WEXIT', 'CCMP', 'TPIDR', 'SETTP', 'CLOCK', 'CPUID', 'EXCL'].map((n) => op[n]!));
 const liftable = (b: Block) => b.ins.every((x) => !unliftable.has(x.op));
 const hex = (v: bigint) => `0x${BigInt.asUintN(64, v).toString(16)}ull`;
 const imm64 = (v: bigint) => `(uint64_t) ${hex(v)}`;
@@ -159,8 +159,8 @@ dumps.forEach((dump, region) => {
 					body.push(`\t{ uint64_t v = ${B} & aot_mask(${W}), n = ${C} % ${8 * W}u; ${D} = n ? ((v >> n) | (v << (${8 * W} - n))) & aot_mask(${W}) : v; }`);
 					break;
 				case 'MUL': body.push(`\t${D} = ${B} * ${C};`); break;
-				case 'UMULH': body.push(`\t${D} = (uint64_t) (((unsigned __int128) ${B} * ${C}) >> 64);`); break;
-				case 'SMULH': body.push(`\t${D} = (uint64_t) (((__int128) (int64_t) ${B} * (int64_t) ${C}) >> 64);`); break;
+				case 'UMULH': body.push(`\t${D} = kb_umulh(${B}, ${C});`); break;
+				case 'SMULH': body.push(`\t${D} = kb_smulh(${B}, ${C});`); break;
 				case 'UDIV': body.push(`\t${D} = ${C} ? ${B} / ${C} : 0;`); break;
 				case 'SDIV':
 					body.push(`\t${D} = ${C} ? ((int64_t) ${B} == INT64_MIN && (int64_t) ${C} == -1 ? ${B} : (uint64_t) ((int64_t) ${B} / (int64_t) ${C})) : 0;`);

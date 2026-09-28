@@ -2,7 +2,7 @@
 # builds katybug.wasm once per flag set, the way scripts/build-linux.sh builds the shipped one, in the
 # pipeline's image against a finished run's linux-wasm tree (tools and musl) and an LLVM install.
 # usage: variants.sh <linux-wasm dir> <llvm install> <out dir> <name>=<flags>... (CPUSET pins the build)
-# e.g. variants.sh ~/w/linux-wasm ~/w/linux-wasm/workspace/install/llvm out base= pc=-DKB_LEAN_PC
+# e.g. variants.sh ~/w/linux-wasm ~/w/linux-wasm/workspace/install/llvm out base= every=-DKB_POLL=0
 set -euo pipefail
 here=$(cd "$(dirname "$0")" && pwd)
 root=$(cd "$here/../../.." && pwd)

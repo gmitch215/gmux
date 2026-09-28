@@ -5,6 +5,7 @@
 #include <string.h>
 
 #include "kb.h"
+#include "wide.h"
 
 /* the interpreter's flags, conditions and x86 mul/div (src/gmux/katybug/run.c)
    over locals instead of the cpu, so lifted code keeps them in registers; keep
@@ -159,67 +160,11 @@ static inline __attribute__((always_inline)) int aot_cond(
 static inline __attribute__((always_inline)) int aot_muldiv(
     uint64_t* rax, uint64_t* rdx, struct aot_fl* f, int kind, int w, uint64_t v
 ) {
-    int bits = 8 * w;
-    uint64_t m = aot_mask(w);
     if (kind == 4 || kind == 5) {
-        unsigned __int128 p;
-        int ov;
-        if (kind == 4) {
-            p = (unsigned __int128) (*rax & m) * (v & m);
-            ov = (p >> bits) != 0;
-        }
-        else {
-            __int128 q = (__int128) aot_sext(*rax, w) * aot_sext(v, w);
-            p = (unsigned __int128) q;
-            ov = q != (__int128) aot_sext((uint64_t) q, w);
-        }
-        uint64_t lo = (uint64_t) p & m, hi = (uint64_t) (p >> bits) & m;
-        if (w == 1)
-            *rax = (*rax & ~0xffffull) | ((hi << 8) | lo);
-        else if (w == 2) {
-            *rax = (*rax & ~0xffffull) | lo;
-            *rdx = (*rdx & ~0xffffull) | hi;
-        }
-        else {
-            *rax = lo;
-            *rdx = hi;
-        }
-        f->c = f->v = ov;
+        f->c = f->v = kb_mul(kind == 5, w, rax, rdx, v);
         return 0;
     }
-    if ((v & m) == 0) return 1;
-    unsigned __int128 n;
-    if (w == 1)
-        n = *rax & 0xffff;
-    else
-        n = ((unsigned __int128) (*rdx & m) << bits) | (*rax & m);
-    uint64_t q, rem;
-    if (kind == 6) {
-        unsigned __int128 qq = n / (v & m);
-        if (qq > m) return 1;
-        q = (uint64_t) qq;
-        rem = (uint64_t) (n % (v & m));
-    }
-    else {
-        __int128 sn =
-            w == 1 ? (__int128) (int16_t) n
-                   : (__int128) (n << (128 - 2 * bits)) >> (128 - 2 * bits);
-        __int128 d = aot_sext(v, w), qq = sn / d;
-        if (qq != (__int128) aot_sext((uint64_t) qq, w)) return 1;
-        q = (uint64_t) qq & m;
-        rem = (uint64_t) (sn % d) & m;
-    }
-    if (w == 1)
-        *rax = (*rax & ~0xffffull) | (rem << 8) | q;
-    else if (w == 2) {
-        *rax = (*rax & ~0xffffull) | q;
-        *rdx = (*rdx & ~0xffffull) | rem;
-    }
-    else {
-        *rax = q;
-        *rdx = rem;
-    }
-    return 0;
+    return kb_divide(kind == 7, w, rax, rdx, v);
 }
 
 /* attribution arms, unsafe outside a measurement: -DAOT_NO_SIGNAL_CHECK moves
