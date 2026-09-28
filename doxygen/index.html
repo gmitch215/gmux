@@ -164,7 +164,7 @@ $(function() {
 <div class="fragment"><div class="line">scripts/build-linux.sh ~/gmux-build      # the toolchain, kernel, libc, userland and probes</div>
 <div class="line">scripts/build-kernel.sh ~/gmux-build/out # staged into build/</div>
 <div class="line">bun run test:probes                      # C probes booted in a machine</div>
-</div><!-- fragment --><p>Two clean builds produce the same bytes in every artifact.</p>
+</div><!-- fragment --><p>Two clean builds produce the same bytes in every artifact. The probes refuse a <code>build/kernel</code> staged from other pins or patches than the tree's.</p>
 <div class="fragment"><div class="line">bun run typecheck</div>
 <div class="line">bun run test</div>
 <div class="line">bun run format:check</div>
