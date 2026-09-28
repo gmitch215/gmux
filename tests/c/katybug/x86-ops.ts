@@ -142,6 +142,28 @@ add(
 	0,
 	safe.map(([a, b, f]) => [a & 0xffffffffn, b & 0x7fffffffn || 1n, f])
 );
+// a high half below the divisor: every bit of the dividend, never a divide error
+// (a quarter of the divisor as the signed high half needs |divisor| > 4)
+const wide = pairs();
+const divisor = (b: bigint, bits: bigint, signed: boolean) => {
+	const m = (1n << bits) - 1n;
+	const s = BigInt.asIntN(Number(bits), b);
+	if (!signed) return b & m || 1n;
+	return (s >= -8n && s <= 8n ? (s < 0n ? s - 8n : s + 8n) : s) & m;
+};
+for (const [s, [, b, , d], bits] of [
+	['q', W.q!, 64n],
+	['l', W.l!, 32n],
+	['w', W.w!, 16n],
+	['b', ['al', 'bl', '', 'ah'], 8n]
+] as const) {
+	for (const signed of [false, true]) {
+		const op = `${signed ? 'i' : ''}div${s}`;
+		const code = `mov %${b}, %${d}\n\t${signed ? 'sar $2' : 'shr $1'}, %${d}\n\t${op} %${b}`;
+		const inputs: Input[] = wide.map(([x, y, f]) => [x, divisor(y, bits, signed), f]);
+		add(`${op} wide`, code, 0, inputs);
+	}
+}
 for (const ins of [
 	'movzbl %bl, %eax',
 	'movzwl %bx, %eax',

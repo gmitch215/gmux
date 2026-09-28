@@ -1,23 +1,28 @@
 import { readFileSync } from 'node:fs';
 
 /**
- * Compares two outputs of x86-ops: per instruction form, how many cases differ, and the first one.
- * `x86-ops-diff.ts x86-ops.S native.bin katybug.bin`
+ * Compares two outputs of x86-ops (or a64-ops, with --a64): per instruction form, how many cases
+ * differ, and the first one. `x86-ops-diff.ts x86-ops.S native.bin katybug.bin [--a64]`
  */
-const [asm, first, second] = process.argv.slice(2);
+const [asm, first, second, arch] = process.argv.slice(2);
 const labels = [...readFileSync(asm!, 'utf8').matchAll(/^\t# (.*)$/gm)].map((m) => m[1]!);
 const a = readFileSync(first!);
 const b = readFileSync(second!);
-const names = ['rax', 'rbx', 'rcx', 'rdx', 'flags', 'mem'];
+const names =
+	arch === '--a64'
+		? ['x0', 'x1', 'x2', 'x3', 'nzcv', 'mem0', 'mem8']
+		: ['rax', 'rbx', 'rcx', 'rdx', 'flags', 'mem'];
+const size = 8 * names.length;
+// a run that died early leaves the rest of its cases as zeros
 const words = (buf: Buffer, i: number) => {
-	const block = Buffer.alloc(48);
-	buf.copy(block, 0, 48 * i, 48 * i + 48);
+	const block = Buffer.alloc(size);
+	if (size * i < buf.length) buf.copy(block, 0, size * i, size * i + size);
 	return names.map((_, k) => block.readBigUInt64LE(8 * k));
 };
 const bad = new Map<string, string[]>();
 labels.forEach((label, i) => {
-	const x = a.subarray(48 * i, 48 * i + 48);
-	const y = b.subarray(48 * i, 48 * i + 48);
+	const x = a.subarray(size * i, size * i + size);
+	const y = b.subarray(size * i, size * i + size);
 	if (x.equals(y)) return;
 	const xs = words(a, i);
 	const ys = words(b, i);
