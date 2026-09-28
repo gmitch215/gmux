@@ -6,20 +6,18 @@ import initrd from '../build/kernel/initramfs.bin';
 import katybug from '../build/kernel/katybug.wasm';
 import manifest from '../build/kernel/manifest.json';
 import vmlinux from '../build/kernel/vmlinux.async.wasm';
+import { bootstrapOf, fits, type BootstrapIndex } from './worker/bootstrap';
 import type { Sql } from './worker/durable';
 import { Keeper } from './worker/keeper';
 import { claim, verify, type OwnerStore } from './worker/owner';
 import { placement, prime, type PlacementStore } from './worker/placement';
+import { CMDLINE, MAXIMUM_PAGES, siteOptions } from './worker/site-machine';
 
 export interface Env {
 	MACHINE: DurableObjectNamespace<MachineDO>;
 	ASSETS: Fetcher;
 }
 
-// no nohz_full: its timekeeping cpu never stops ticking, and its context tracking reads the host
-// clock on every syscall
-const CMDLINE = 'maxcpus=3 root=/dev/ram0 rootfstype=ramfs init=/init console=hvc console=ttyS0';
-const MAXIMUM_PAGES = 800;
 // a keystroke runs the machine briefly; a tick or an alarm gives it a full quantum
 const INPUT_MS = 250;
 const QUANTUM_MS = 5000;
@@ -64,28 +62,44 @@ export class MachineDO extends DurableObject<Env> {
 			sql: sqlOf(ctx.storage.sql),
 			alarms: ctx.storage,
 			sync: () => ctx.storage.sync(),
-			options: () => ({
-				vmlinux,
-				initrd: new Uint8Array(initrd),
-				cmdline: CMDLINE,
-				registry: new Map([
-					[manifest.busybox, busybox],
-					[manifest.katybug, katybug]
-				]),
-				// a non-root task's BusyBox checks every store against the kernel's page owner table
-				guarded: new Map([[manifest.busybox, busyboxGuard]]),
-				maximumPages: MAXIMUM_PAGES,
-				sharedKernel: true,
-				asyncify: true,
-				memory: MEMORIES.get(id)?.deref(),
-				// the rootfs's own executables carry their hash (exec stubs); anything else is hashed
-				sha256: (bytes) => createHash('sha256').update(bytes).digest('hex'),
-				write: (text) => {
-					this.keeper.activity();
-					this.pending += text;
-					queueMicrotask(() => this.flush());
-				}
-			})
+			options: () =>
+				siteOptions(
+					{
+						vmlinux,
+						busybox,
+						busyboxGuard,
+						katybug,
+						initrd: new Uint8Array(initrd),
+						manifest
+					},
+					{
+						memory: MEMORIES.get(id)?.deref(),
+						// the rootfs's own executables carry their hash (exec stubs); anything else is hashed
+						sha256: (bytes) => createHash('sha256').update(bytes).digest('hex'),
+						write: (text) => {
+							this.keeper.activity();
+							this.pending += text;
+							queueMicrotask(() => this.flush());
+						}
+					}
+				),
+			bootstrap: () => this.bootstrap()
+		});
+	}
+
+	/** scripts/bootstrap.ts's image in the static assets, when it was taken from this build */
+	private async bootstrap() {
+		const asset = (path: string) =>
+			this.env.ASSETS.fetch(new URL(`/_gmux/bootstrap/${path}`, 'https://assets.invalid'));
+		const res = await asset('index.json');
+		if (!res.ok) return null;
+		const index = (await res.json()) as BootstrapIndex;
+		if (!fits(index, (manifest as { image?: string }).image, CMDLINE, MAXIMUM_PAGES))
+			return null;
+		return bootstrapOf(index, async (n) => {
+			const chunk = await asset(`c${n}.bin`);
+			if (!chunk.ok) throw new Error(`bootstrap chunk ${n}: ${chunk.status}`);
+			return new Uint8Array(await chunk.arrayBuffer());
 		});
 	}
 
@@ -137,7 +151,10 @@ export class MachineDO extends DurableObject<Env> {
 		try {
 			const { machine, from } = await this.keeper.open();
 			if (from !== 'running') {
-				this.send({ t: 'status', d: from === 'booted' ? 'booting' : 'restored' });
+				this.send({
+					t: 'status',
+					d: { booted: 'booting', bootstrapped: 'started', restored: 'restored' }[from]
+				});
 				console.log(JSON.stringify({ gmux: from, ...this.keeper.counts }));
 			}
 			MEMORIES.set(this.ctx.id.toString(), new WeakRef(machine.memory));

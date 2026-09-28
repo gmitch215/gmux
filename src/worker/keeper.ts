@@ -1,5 +1,5 @@
 import { decodeSnapshot, DurableStore, encodeSnapshot, type Sql, type Written } from './durable.ts';
-import { Machine, type MachineOptions } from './machine/machine.ts';
+import { Machine, type MachineOptions, type Snapshot } from './machine/machine.ts';
 import { Alarm, Cadence, type AlarmStorage, type IntervalOptions } from './schedule.ts';
 
 /** what the keeper needs from its Durable Object */
@@ -12,6 +12,14 @@ export interface KeeperHost {
 	options(): MachineOptions;
 	/** wall time, ms since the epoch */
 	now?(): number;
+	/**
+	 * a machine checkpointed after boot (src/worker/bootstrap.ts), when the host has one taken from
+	 * this build: a machine with nothing stored restores it instead of booting
+	 */
+	bootstrap?(): Promise<{
+		snapshot: Snapshot;
+		lazy: { byteLength: number; read(start: number, end: number): Promise<Uint8Array> };
+	} | null>;
 }
 
 /**
@@ -64,8 +72,8 @@ export class Keeper {
 	machine: Machine | null = null;
 	readonly store: DurableStore;
 	readonly alarm: Alarm;
-	/** checkpoints taken, restores from storage, and checkpoints the machine refused */
-	counts = { checkpoints: 0, restores: 0, refused: 0 };
+	/** checkpoints taken, restores from storage, bootstrap images restored, checkpoints refused */
+	counts = { checkpoints: 0, restores: 0, bootstraps: 0, refused: 0 };
 	/** what the last checkpoint wrote, and why the last refused one was refused */
 	last: { written: Written | null; refused: string | null } = { written: null, refused: null };
 	/** how long an unattended idle machine is left before its next wake, ms */
@@ -143,9 +151,13 @@ export class Keeper {
 
 	/**
 	 * the machine: the running one, else the last checkpoint restored (the object lost its machine,
-	 * which the cadence learns from), else a new one that boots when first run
+	 * which the cadence learns from), else the host's bootstrap image restored, else a new one that
+	 * boots when first run
 	 */
-	async open(): Promise<{ machine: Machine; from: 'running' | 'restored' | 'booted' }> {
+	async open(): Promise<{
+		machine: Machine;
+		from: 'running' | 'restored' | 'bootstrapped' | 'booted';
+	}> {
 		if (this.machine) return { machine: this.machine, from: 'running' };
 		const restored = await this.restore(this.host.options().memory);
 		if (restored) {
@@ -155,8 +167,20 @@ export class Keeper {
 			this.saveCadence();
 			return { machine: restored, from: 'restored' };
 		}
-		this.machine = new Machine(this.options());
 		this.dirty = true;
+		const image = await this.host.bootstrap?.();
+		if (image) {
+			this.machine = await Machine.restore(
+				this.options(),
+				image.snapshot,
+				undefined,
+				image.lazy
+			);
+			this.counts.bootstraps++;
+			this.restoredNow = true;
+			return { machine: this.machine, from: 'bootstrapped' };
+		}
+		this.machine = new Machine(this.options());
 		return { machine: this.machine, from: 'booted' };
 	}
 
@@ -170,7 +194,10 @@ export class Keeper {
 	turn(budgetMs: number): () => boolean {
 		const start = this.now();
 		const last = this.lastTurn;
-		if (last?.stopped === 'steps') this.stepMs = (start - last.start) / last.steps;
+		// a deployed clock can stand still from one event to the next, and a step then looks free
+		// (one event ran 18 s of CPU on a cap learned at 0 ms): a turn the clock never saw teaches nothing
+		if (last?.stopped === 'steps' && start > last.start)
+			this.stepMs = (start - last.start) / last.steps;
 		const fit = Math.floor(budgetMs / this.stepMs);
 		let cap = Math.min(STEPS_MAX, fit, this.stepCap ? 2 * this.stepCap : fit);
 		if (this.restoredNow) cap *= RESTORE_SHARE;

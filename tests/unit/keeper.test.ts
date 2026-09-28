@@ -2,6 +2,8 @@ import binaryen from 'binaryen';
 import { readFileSync } from 'node:fs';
 import { describe, expect, it } from 'vitest';
 import { sqlite } from '../../experiments/write-back/scripts/sqlite.ts';
+import { bootstrapOf, CHUNK, packImage, type BootstrapIndex } from '../../src/worker/bootstrap.ts';
+import { encodeSnapshot } from '../../src/worker/durable.ts';
 import {
 	checkpointCost,
 	Keeper,
@@ -11,7 +13,7 @@ import {
 	STEPS_MIN,
 	type KeeperHost
 } from '../../src/worker/keeper.ts';
-import type { Machine } from '../../src/worker/machine/machine.ts';
+import { Machine } from '../../src/worker/machine/machine.ts';
 
 const PARK_IMPORTS = [
 	'wasm_serialize_tasks',
@@ -111,6 +113,41 @@ describe('Keeper', () => {
 		expect(r.output()).toContain('parent back ok');
 		const learned = r.sql.exec("SELECT v FROM gmux_meta WHERE k = 'cadence'").toArray()[0]!.v;
 		expect(JSON.parse(String(learned)).losses).toBe(1);
+	});
+
+	it("starts a machine from the host's bootstrap image with nothing stored, and prefers its own checkpoint after", async () => {
+		const built = rig();
+		const booted = new Machine(built.host.options());
+		await built.run(booted, () => built.output().includes('parent ok'));
+		const snapshot = await booted.checkpoint();
+		const { blocks, chunks } = packImage(snapshot.memory);
+		const index: BootstrapIndex = {
+			version: 1,
+			image: 'toy',
+			cmdline: 'toy',
+			maximumPages: 64,
+			byteLength: snapshot.memory.byteLength,
+			chunkBytes: CHUNK,
+			blocks,
+			snapshot: encodeSnapshot(snapshot)
+		};
+		const r = rig();
+		let asked = 0;
+		r.host.bootstrap = async () => (asked++, bootstrapOf(index, async (n) => chunks[n]!));
+		const keeper = new Keeper(r.host, { minMs: 1 });
+		const { machine, from } = await keeper.open();
+		expect(from).toBe('bootstrapped');
+		expect(keeper.counts.bootstraps).toBe(1);
+		expect(machine.stats.restoreHooks).toBe(1);
+		machine.type('s');
+		await r.run(machine, () => r.output().includes('parent back ok'));
+		expect(r.output()).toContain('echo:schild ok\nparent back ok\n');
+		// a bootstrapped machine is unsaved work: its own checkpoint comes due and wins from then on
+		await keeper.ran(10);
+		expect(keeper.counts.checkpoints).toBe(1);
+		const next = new Keeper(r.host, { minMs: 1 });
+		expect((await next.open()).from).toBe('restored');
+		expect(asked).toBe(1);
 	});
 
 	it('takes one checkpoint at a time, and none for an alarm while the machine runs', async () => {
@@ -218,6 +255,16 @@ describe('Keeper', () => {
 			expect(drive(r, keeper.turn(5000), 0.25)).toBe(STEPS_MAX);
 			expect(drive(r, keeper.turn(5000), 0.25) * 0.25).toBeLessThanOrEqual(5000);
 			expect(keeper.stepMs).toBeCloseTo(0.25);
+		});
+
+		it('learns nothing from turns the clock never saw, so the cap does not run away', () => {
+			const r = rig();
+			const keeper = new Keeper(r.host);
+			expect(drive(r, keeper.turn(5000), 1)).toBe(5000);
+			// the next events start on a clock that stood still: each turn looks free
+			for (let i = 0; i < 4; i++) drive(r, keeper.turn(5000), 0);
+			expect(keeper.stepMs).toBe(1);
+			expect(keeper.stepCap).toBe(5000);
 		});
 
 		it('keeps every turn within its budget of real time when a step gets dearer', () => {
