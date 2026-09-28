@@ -15,17 +15,40 @@ gmux enforces isolation itself:
 
 - **Root is trusted with the machine.** A process with effective uid 0 can read and write the
   kernel's memory and every other process's.
-- **A non-root process can write only its own memory and shared mappings.** The kernel keeps an owner
-  for every page. A non-root process runs a build of its program that checks every store against
-  that table and ends the process with `SIGSEGV` on a refused one, and the kernel refuses its syscall
-  buffers outside its own pages with `EFAULT`. A non-root process cannot run a program that has no
-  such build.
-- **Reads are not isolated.** Any process can read the kernel's memory and every other process's.
-- **Shared memory is shared with every non-root process.** A page a process maps shared and writable
-  (`MAP_SHARED`, System V shared memory) can be written by any non-root process in the machine.
+- **A non-root process can reach only its own memory and the shared mappings it maps.** The kernel
+  keeps an owner for every page: a process's tag for its private pages, a region's tag for a shared
+  mapping (`MAP_SHARED`, System V shared memory, a file mapped read-only), and for each process the
+  regions it maps and whether it may write them. A non-root process runs a build of its program that
+  checks every load and store against that table and ends the process with `SIGSEGV` on a refused
+  one, and the kernel refuses its syscall buffers outside its own pages and its regions with
+  `EFAULT`. A non-root process cannot run a program that has no such build.
+- **Past 4,095 shared regions at once**, a new shared mapping is open to every process.
 
 Run only software you trust with the whole machine as root, and do not keep secrets in a machine
 that runs code you do not trust.
+
+## Authority Domains
+
+Root in a machine is root of that machine and of nothing outside it. A deployment has four holders
+of authority, and none of the other three is reachable from guest root:
+
+| domain                  | holds                                                                                                                    | what guest root reaches                                                                                             |
+| ----------------------- | ------------------------------------------------------------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------- |
+| Linux root in a machine | the machine's kernel, processes and memory                                                                               | all of it                                                                                                           |
+| the Worker host         | the isolate running the machine's Durable Object: its `env` (`MACHINE`, `ASSETS`), its SQLite storage and its WebSockets | only the imports below, which act on the machine's own memory and host state                                        |
+| the deployment owner    | the owner token, which opens the terminal and types into the console                                                     | nothing: the token goes once over HTTP to whoever claims the machine, and the object keeps only its SHA-256 hash    |
+| the Cloudflare account  | API tokens, deploys, routes, secrets and the storage of every Worker in the account                                      | nothing: the Worker binds only `MACHINE` and `ASSETS`, holds no variable or secret, and the machine has no link out |
+
+`tests/c/authority.c` runs as root in a machine and looks for each of them: it scans the machine's
+whole memory for values only the host holds (finding the kernel's command line, which the host did
+put there), checks its environment and init's, and finds no `/dev/mem`, block device, TUN device or
+network device other than loopback and tunnels over it; connecting to the Cloudflare API and
+resolving its name both fail. `tests/c/run.ts` plants those values (a Worker-style secret, a
+secret in the host process's environment, and a claimed owner token and its hash), scans every
+memory the guest was given after the run, and checks every import the guest was instantiated with
+against the surface below. `tests/unit/authority.test.ts` holds the same checks on the toy kernel,
+the deployment's bindings, and the Worker's routing, where every path outside `/_gmux/` is answered
+with 503 whatever the guest does.
 
 Between a machine and everything outside it:
 
@@ -40,11 +63,13 @@ Between a machine and everything outside it:
 
 User programs may import only the kernel's syscall entry points (`__wasm_syscall_0` to
 `__wasm_syscall_6`), their memory and table, `__gmux_fuel` (a scheduling yield), `__gmux_vfork`,
-`__gmux_vfork_exec` and `__gmux_vfork_exit`, `__gmux_dlprep`, `__gmux_dlopen`, `__gmux_dlsym`,
+`__gmux_vfork_exec` and `__gmux_vfork_exit`, `__gmux_fork` (fork of a program with resumable frames),
+`__gmux_stack_move` (a new stack segment for a frame that outgrows its own), `__gmux_dlprep`, `__gmux_dlopen`, `__gmux_dlsym`,
 `__gmux_dlclose` and `__gmux_dlerror` (`dlopen` of side modules the build registered), and
 `__wasm_abort`. `scripts/cc-strict` refuses to link a program that imports anything else, and the
 host refuses to instantiate one. The builds non-root processes run also import the page owner table's
-address and the process's tag, both read-only, and `__gmux_denied`, which ends the process.
+address, the process's tag and the address of its region set, all read-only, and `__gmux_denied`,
+which ends the process.
 
 `dlopen` loads only side modules whose bytes hash to a module compiled with the build; other files
 are refused, since a Worker cannot compile code at run time.
@@ -58,11 +83,17 @@ act only on that memory and that machine's host state.
 | threat                                                                        | status                                                                                                         |
 | ----------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------- |
 | a non-root process alters the kernel or another process in the same machine   | refused: every store and syscall buffer is checked against the kernel's page owner table                       |
-| a non-root process writes memory another process maps shared                  | possible                                                                                                       |
-| a process reads the kernel or another process in the same machine             | possible; reads are not isolated                                                                               |
+| a non-root process reads the kernel or another process in the same machine    | refused: every load is checked against the same table                                                          |
+| a non-root process reaches memory another process maps shared                 | refused unless it maps the same segment or file itself                                                         |
+| a non-root process keeps reaching a page after it is unmapped or detached     | refused: the next load or store faults, whether it was parked in a syscall or at a fuel yield                  |
+| a non-root process writes a region it mapped read-only, through a syscall     | possible: syscall buffers are checked for access to the region, not for its write permission                   |
 | a root process alters the kernel or another process                           | possible; root is trusted with the machine                                                                     |
 | a process loads code the build did not compile                                | refused: `dlopen` and `exec` take only registered modules; a refused `exec` ends the process with `SIGSEGV`    |
 | a process reaches a Worker binding, secret or Durable Object storage directly | refused: no import exposes them                                                                                |
+| guest root reads a Worker secret, the host's environment or the owner token   | refused: none of them is ever in the machine's memory, which root can read whole                               |
+| guest root writes the Durable Object's storage                                | refused: the machine holds no storage handle; the object stores only the owner hash and placement records      |
+| guest root publishes a site or deploys a Worker                               | refused: paths outside `/_gmux/` answer 503, and the machine has no route to the Cloudflare API                |
+| guest root opens a connection outside the machine                             | refused: its only network devices are loopback and IP tunnels over it                                          |
 | a process reads another machine's memory                                      | refused: separate memories, no shared host state                                                               |
 | a process instantiates a module with an unlisted import                       | refused at link time and at instantiation                                                                      |
 | a visitor opens the terminal without the owner token                          | refused                                                                                                        |

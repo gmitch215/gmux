@@ -119,7 +119,8 @@ threat matrix.</p>
 <pre><code class="sh"><span class="hl-0">scripts/build-linux.sh</span><span class="hl-1"> </span><span class="hl-2">~/gmux-build</span><span class="hl-1">      </span><span class="hl-4"># the toolchain, kernel, libc, userland and probes</span><br/><span class="hl-0">scripts/build-kernel.sh</span><span class="hl-1"> </span><span class="hl-2">~/gmux-build/out</span><span class="hl-1"> </span><span class="hl-4"># staged into build/</span><br/><span class="hl-0">bun</span><span class="hl-1"> </span><span class="hl-2">run</span><span class="hl-1"> </span><span class="hl-2">test:probes</span><span class="hl-1">                      </span><span class="hl-4"># C probes booted in a machine</span>
 </code><button type="button">Copy</button></pre>
 
-<p>Two clean builds produce the same bytes in every artifact.</p>
+<p>Two clean builds produce the same bytes in every artifact. The probes refuse a <code>build/kernel</code>
+staged from other pins or patches than the tree's.</p>
 <pre><code class="sh"><span class="hl-0">bun</span><span class="hl-1"> </span><span class="hl-2">run</span><span class="hl-1"> </span><span class="hl-2">typecheck</span><br/><span class="hl-0">bun</span><span class="hl-1"> </span><span class="hl-2">run</span><span class="hl-1"> </span><span class="hl-2">test</span><br/><span class="hl-0">bun</span><span class="hl-1"> </span><span class="hl-2">run</span><span class="hl-1"> </span><span class="hl-2">format:check</span>
 </code><button type="button">Copy</button></pre>
 
