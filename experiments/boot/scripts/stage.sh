@@ -37,7 +37,7 @@ args=()
 		# a forking program runs with resumable frames
 		if [ "$name" = fork ]; then
 			"$root/scripts/ts" "$root/scripts/wasm/export-globals.ts" "$vendor/programs/$name.wasm" "$tmp/$name.g.wasm" --all-mutable > /dev/null
-			node "$root/experiments/evacuation/scripts/evacuate.ts" "$tmp/$name.g.wasm" "$vendor/programs/$name.wasm" "${GMUX_EVACUATE:---fold}" > /dev/null
+			node "$root/experiments/evacuation/scripts/evacuate.ts" "$tmp/$name.g.wasm" "$vendor/programs/$name.wasm" "${GMUX_EVACUATE:---resume}" > /dev/null
 		fi
 		echo "import program$n from '../vendor/programs/$name.wasm';"
 		case $p in *.so) args+=("/lib/$name=$p") ;; *) args+=("/bin/$name=$p") ;; esac
