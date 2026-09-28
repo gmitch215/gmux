@@ -677,8 +677,10 @@ AArch64 floating point and Advanced SIMD (`a64v.c`) are computed in software on 
 significands, because wasm has no rounding-mode control: every FPCR rounding mode, flush-to-zero,
 default NaN, and FPSR's cumulative flags, with add, subtract, multiply and divide taking the host's
 result when the mode is the default and the operands are ordinary. The AArch64 corpus
-(`tests/c/katybug/a64-ops.sh`, native on Apple silicon through Docker) is 14,739 cases, FPSR
-included, all equal. Signal frames carry the FP and vector registers on both architectures. The cost
+(`tests/c/katybug/a64-ops.sh`, native on Apple silicon through Docker) is 14,747 cases, FPSR
+included, all equal. GCC's `-Wtautological-compare` found that an FP or vector load from a literal
+(`ldr q0, label`) never decoded, since its match masked out the bit it compared; it had no case in
+the corpus, and now has two. Signal frames carry the FP and vector registers on both architectures. The cost
 is about 5 ns per scalar FP operation, and a vector fused multiply-add loop runs 45% slower than it
 did before exactness.
 
@@ -863,6 +865,53 @@ TLS`, upgraded with `startTls()`, and answered EHLO over TLS, in 133-206 ms. DNS
 
 Module scope cannot do I/O, so the bytes must be in the deployment already; Static Assets arrive only
 through an asynchronous fetch.
+
+### WebAssembly Features
+
+`experiments/wasm-features` compiles one module per feature at startup on Free, each in its own
+`try`, so a feature the runtime lacked would fail alone. All of them compile: tail calls, branch
+hints (the `metadata.code.branch_hint` section), memory64, multiple memories, relaxed SIMD and typed
+function references; JSPI is present. The platform does not say which V8 it runs:
+`process.versions.v8` is empty and the Node version it reports (22.19.0) is emulated.
+
+Each feature's kernel ran against its plain form, deployed (CPU per request from `wrangler tail`, the
+difference between two sizes, 13 rounds with the first dropped, medians) and under Node on a Ryzen 9
+9900X core, with V8's optimizing tier and with Liftoff only. A JavaScript loop with no wasm gives
+the host's speed:
+
+| kernel, ns an op | Free | Zen 5, optimized | Zen 5, Liftoff only |
+| --- | --- | --- | --- |
+| JavaScript loop (no wasm) | 2.08 | 0.28 | |
+| dispatch: handlers tail-call the next | 4.46 | 0.77 | 4.21 |
+| dispatch: a loop over `call_indirect` | 4.92 | 0.59 | 5.35 |
+| dispatch: a loop over `br_table` | 3.00 | 0.42 | 1.23 |
+| hot loop, no hints | 1.39 | 0.23 | 0.55 |
+| hot loop, hinted as it runs | 0.91 | 0.21 | 0.55 |
+| hot loop, hinted backwards | 2.01 | 0.26 | 0.55 |
+| scattered loads, wasm32 | 2.27 | 0.31 | 0.61 |
+| scattered loads, memory64 | 2.08 | 0.32 | 0.64 |
+| loads and page counters, one memory | 2.79 | 0.44 | 0.82 |
+| loads and page counters, two memories | 3.84 | 0.43 | 0.87 |
+| dot product, `mul` then `add` | 3.26 | 1.11 | 2.81 |
+| dot product, relaxed `madd` | 3.41 | 1.29 | 2.99 |
+| dispatch, `call_indirect` | 4.81 | 0.59 | 5.34 |
+| dispatch, `call_ref` | 5.09 | 0.66 | 6.02 |
+
+The Free host runs JavaScript 7.4 times slower than the Zen 5 core, and the wasm kernels track the
+optimized column times about that factor (scattered loads 2.27 against 2.27, `br_table` 3.1 against
+3.0), so deployed wasm runs optimized code. Per feature, on Free:
+
+- A `br_table` loop dispatches fastest; threaded tail calls beat a `call_indirect` loop by 9% and run
+  49% slower than `br_table`. On an Apple M-series host tail calls were fastest, so the order depends on
+  the machine.
+- V8 reads branch hints: with `--no-experimental-wasm-branch-hinting` the three hot loops run equal.
+  Hints that match the branches ran 34% faster than none on Free and 9% on Zen 5, and the backwards
+  hints 45% and 13% slower; on the Apple host the backwards hints were the fastest by 17%. A hint is a
+  measured choice per host.
+- memory64 costs nothing measurable, with bounds checks on trap handling.
+- A second memory for interpreter metadata cost 38% on Free (26% in an earlier run), while it cost
+  nothing on Zen 5 and was 12% faster on the Apple host.
+- Relaxed `madd` and `call_ref` bought nothing on these kernels.
 
 ---
 
@@ -1064,6 +1113,46 @@ the second, an alarm could start a checkpoint while the pump's own checkpoint wa
 same machine; the object stopped answering after 205 s. `Machine.checkpoint` now refuses a
 concurrent or repeated checkpoint, and an alarm does not checkpoint while a pump runs.
 
+### A Machine Started From an Image
+
+`scripts/bootstrap.ts`, which `scripts/build-assets.sh` runs, boots the site's machine under Node,
+runs it to its prompt (and, with `--run <line> --until <text>`, through a port's own startup),
+checkpoints it, and writes the image into the Static Assets: an index, and a file for each 1 MiB of
+memory that holds a nonzero byte (226 of 790 blocks of 64 KiB, 14.1 MiB in 22 files). The index
+names the manifest's `image` hash, taken over the asyncified kernel, both BusyBox builds, Katybug
+and the initramfs, and a site uses it only when that hash, its command line and its size all match;
+otherwise it boots. A machine with nothing stored restores the image lazily, as any restore does, and
+takes its own checkpoints from then on.
+
+Every copy of an image starts with the same kernel state, so kernel patch 0023 adds `wasm_restored`,
+which the host calls after every restore. It mixes 32 fresh host bytes into the entropy pool and
+reseeds the crng at once, since every copy would otherwise draw the same random numbers until the
+next scheduled reseed. It also resets the RCU stall and soft-lockup detectors: the host clock runs on
+while a machine is stored, and a restore more than the 21 s stall timeout after its checkpoint
+printed an RCU stall and a dump of every cpu (none at a 4 s gap, a stall at 36 s and at 597 s under
+Node), which hung the site when it happened there. With the hook, restores 35 s, 10 minutes and 2
+hours after their checkpoints ran clean.
+
+On Free, each run against a fresh deployment:
+
+| start | prompt, from connecting | CPU of the start |
+| --- | --- | --- |
+| boot | 3.2 s | about 380 ms over its first events |
+| the shipped image | 1.4-1.6 s | 133 ms in one event |
+| a port image: a shell whose 3,000,000-iteration startup ran at build time, parked in `read` | answered 2.2 s after the line was typed | 146 ms to restore, then turns of 2-6 ms |
+
+The same startup run live costs about 74 s of CPU over 32 events. Started from the shipped image, it
+was replaced partway by a redeploy after the machine's first checkpoint; the object came back
+restored and the loop ended with its exact count. An earlier attempt was reset by the platform
+itself ("Durable Object storage operation exceeded timeout") around the first checkpoint after the
+image, which writes the image's pages once more (18 MB). CPython 3.8 starts in 14-35 ms of wall time
+and 21-62 ms of host CPU in a machine under Node, well under the second at which a staged start
+matters.
+
+Not settled: one of five local survival runs of an image-started machine panicked ("Syscall called
+when in kernel mode") right after its restore. Four more runs and every run under Node restored
+cleanly, including one with the image's chunks delayed as an asset fetch delays them.
+
 ### CPU per Event
 
 The durable site's worst event ran 23.0 s of CPU against the 30 s limit (23.3 s in a later run).
@@ -1085,6 +1174,11 @@ way. Deployed with both fixes, 91 events of the same drive peaked at 1.5 s of CP
 The cap has a ceiling: a turn whose steps get k times dearer within one event runs k times its budget
 before the next turn learns the new cost. The clock catches up at most such turns anyway, whenever
 the job syncs a file.
+
+It also learned from turns the clock never saw. Events that follow each other can start on the same
+frozen `Date.now()`, so a step looked free and the cap doubled every turn to 12,000 steps: a shell
+loop's events on Free then ran 18.4, 10.3 and 16.6 s of CPU. A turn with no elapsed time now
+teaches nothing.
 
 ### Fuel
 
@@ -1279,6 +1373,7 @@ compressed bytes once, and its cpio is the same.
 | the console takes an interrupt the host raises on input | khvcd polled the host every 10 ms, backing off to 2 s, so an idle machine kept calling out and a keystroke waited up to a second of machine time; now 0 polls per idle minute and the echo arrives in the same wake |
 | `sched_clock()` reads the host clock | the arch had none, so the scheduler counted jiffies: task runtime and `CLOCK_PROCESS_CPUTIME_ID` moved in 10 ms steps, charged to whichever task was current when one passed |
 | the host can refuse an executable, and the exec fails | the host could only throw for a program it holds no build of, which stopped the whole machine; now that process ends with `SIGSEGV` |
+| after a restore the host calls `wasm_restored`: fresh host bytes reseed the crng, and the RCU stall and soft-lockup detectors reset | every copy of one checkpoint drew the same random numbers, and a restore more than 21 s after its checkpoint printed an RCU stall |
 | `mlock` and its family, `mincore`, `msync`, `madvise`; `memfd_create` | MMU-only in `mm/`, so they returned `ENOSYS`; without an MMU every page is resident, so each checks its range and succeeds, `msync` writes a shared file mapping back, and `MADV_DONTNEED` zeroes or rereads its range as an MMU kernel's next fault would. `MEMFD_CREATE` had come only with `TMPFS`, which needs an MMU |
 
 The host boots the kernel without `nohz_full`. With it, the timekeeping cpu never stops its tick,
@@ -1617,6 +1712,7 @@ allocations now go through a `volatile` pointer.
 | `src/llvm/patches/` | toolchain fixes the pipeline applies before building LLVM (wasm-ld's lazy archive symbols) |
 | `src/worker/placement.ts` | spending a new object's first-placement replacement before a machine exists |
 | `src/worker/durable.ts`, `src/worker/schedule.ts`, `src/worker/keeper.ts`, `src/worker/machine/router.ts` | write-back checkpoints and exact file syncs in SQLite; the adaptive interval and the one alarm; the site's restore, checkpoint and wake policy; the syscall router that hands the sync calls to the host |
+| `src/worker/site-machine.ts`, `src/worker/bootstrap.ts`, `scripts/bootstrap.ts` | the site's machine options, shared by the site and the image builder; the bootstrap image's format and lazy reader; the build step that takes the image |
 | `src/rootfs/` | files the pipeline lays over linux-wasm's initramfs (`/init`, the `binfmt_misc` registrations) |
 | `scripts/build-linux.sh`, `scripts/build-kernel.sh` | the reproducible pipeline (in Docker on a Linux host), and the step that stages its output into `build/` |
 | `scripts/cc-strict`, `scripts/wasm-imports.c` | the strict CC for user programs, and its module reader |
