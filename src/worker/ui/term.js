@@ -25,11 +25,17 @@ const saveToken = (token) => {
 let warm = null;
 let ticker = null;
 
-function openWarm(token) {
+// the warm socket holds the machine resident; the ticks that run it go on the control socket, so
+// each quantum is an event of its own
+function openWarm(token, control) {
 	if (warm) return;
 	warm = new WebSocket(socketUrl('warm', token));
+	const tick = JSON.stringify({ t: 'tick' });
 	warm.onopen = () =>
-		(ticker = setInterval(() => warm.readyState === 1 && warm.send('tick'), 1000));
+		(ticker = setInterval(
+			() => warm?.readyState === 1 && control.readyState === 1 && control.send(tick),
+			1000
+		));
 	warm.onclose = () => {
 		clearInterval(ticker);
 		warm = null;
@@ -48,7 +54,7 @@ function connect(token) {
 		status.textContent = 'Connected';
 		tokenInput.hidden = connectButton.hidden = true;
 		control.send(JSON.stringify({ t: 'in', d: '\n' }));
-		openWarm(token);
+		openWarm(token, control);
 	};
 	control.onmessage = (event) => {
 		const msg = JSON.parse(event.data);
@@ -64,7 +70,7 @@ function connect(token) {
 	);
 	// a hidden page stops holding the machine resident
 	document.addEventListener('visibilitychange', () =>
-		document.hidden ? closeWarm() : openWarm(token)
+		document.hidden ? closeWarm() : openWarm(token, control)
 	);
 }
 

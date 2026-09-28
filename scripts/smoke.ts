@@ -28,7 +28,10 @@ function socket(kind: 'control' | 'warm', owner: string): Promise<WebSocket> {
 const owner = await token();
 const control = await socket('control', owner);
 const warm = await socket('warm', owner);
-const ticker = setInterval(() => warm.readyState === 1 && warm.send('tick'), 1000);
+const ticker = setInterval(
+	() => warm.readyState === 1 && control.send(JSON.stringify({ t: 'tick' })),
+	1000
+);
 let output = '';
 control.addEventListener('message', (event) => {
 	const msg = JSON.parse(String(event.data)) as { t: string; d: string };
