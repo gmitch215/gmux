@@ -86,9 +86,9 @@ plain build. Only the kernel stays asyncified.
 
 Root processes share one trust domain, and non-root processes are isolated for writes only: they
 can still read the kernel's and other processes' memory (`SECURITY.md`). A forked child copies its
-parent's memory eagerly and cannot share memory with other processes. The terminal site does not
-checkpoint its machine yet, so a machine evicted there boots again, and checkpoints do not save
-shared instances. Also unmeasured: any serving workload, execution memoization, publication of
+parent's memory eagerly and cannot share memory with other processes. Checkpoints do not save
+shared instances or a fork child's own memory, and the terminal site's rows and CPU per idle day
+are not read. Also unmeasured: any serving workload, execution memoization, publication of
 proven responses, energy, and a deployed run of the latest kernel (console interrupt, scheduler
 clock, exec stubs). None of it has a number, and no figure here stands in for one.
 
@@ -218,36 +218,130 @@ changes a byte of it. It then rewinds each task into the import it parked in, wh
 A machine that checkpointed cannot keep running; it continues from a restore.
 
 A program can carry resumable frames instead of Asyncify
-(`experiments/evacuation/scripts/evacuate.ts --fold`). A call that can reach a syscall is
-wrapped so a checkpoint spills the frame's live locals; only the kernel stays asyncified. On
-resume a function reloads them at entry and branches through its own blocks to that call, and a
-loop on the way finishes its current iteration from a copy before running on as written. A side
-module loaded with `dlopen` imports the program's unwind state, so a stack that runs program, then
-library, then program again resumes too. (`--resume` builds a separate resume copy of each
-function instead: the same speed, a larger module.)
+(`experiments/evacuation/scripts/evacuate.ts --resume`). A call that can reach a syscall or a fuel
+yield is wrapped so a checkpoint spills the frame's live locals; only the kernel stays asyncified.
+Each such function gets a resume copy that reloads its frame and runs on from the recorded call: a
+block resumes inside the child holding it, a loop finishes its current iteration from a copy and
+then runs as written, and a loop resumed at its own fuel yield is entered at its head instead. A
+saved value that is a cheap expression of other saved values at that call (`p = n + 16`) is not
+saved; the resume recomputes it. The program is optimized before it is flattened, since each copy
+adds a caller to every call it repeats and a later `-O2` would no longer inline a function that had
+one. A side module loaded with `dlopen` imports the program's unwind state, so a stack that runs
+program, then library, then program again resumes too. (`--fold` resumes inside each function
+instead of a copy: a smaller module, and slower on the census, below.)
 `experiments/evacuation/scripts/control-flow.ts` checkpoints recursion, function pointers,
 `setjmp`/`longjmp`, a `qsort` callback, a signal handler, a side module calling back by pointer and
 by import, and Lua inside `pcall` inside a coroutine; the harness refuses a checkpoint that lands
-outside the phase it tests, and each restore is exact. Against the plain build, the wrapped calls
-cost 0.977-1.023x on six census programs. The cost is size, since the fuel pass puts a safepoint on
-every loop back-edge (26,655 sites in BusyBox):
+outside the phase it tests, and each restore is exact.
+
+The census bench (`experiments/mmu/scripts/bench.ts`) builds each arm as the host does:
+instrumented first, so every loop's fuel yield is a safepoint, then evacuated. Ratios against the
+plain instrumented build, on V8. The x86 columns are a Ryzen 9 9900X core pinned in a container
+(Node 26.10, three runs of 25 rounds, lowest to highest); the arm64 column is a laptop (Node 26.8,
+7 rounds, about 3% noise):
+
+| program | `-O2` only, x86 | handlers only, x86 | `--resume`, x86 | `--fold`, x86 | `--resume`, arm64 |
+| --- | --- | --- | --- | --- | --- |
+| lua | 1.02-1.05 | 1.03-1.08 | 1.04-1.07 | 1.04-1.08 | 1.00 |
+| gzip | 1.01-1.02 | 1.02 | 1.03 | 1.04-1.05 | 0.99 |
+| bzip2 | 0.98-1.00 | 0.98-1.00 | 0.98-0.99 | 1.00-1.01 | 1.01 |
+| sqlite | 1.05-1.06 | 1.02-1.04 | 0.99-1.05 | 1.63-1.69 | 1.00 |
+| sed | 0.96-1.02 | 1.01-1.06 | 1.01-1.06 | 1.39-1.44 | 1.06 |
+| gawk | 0.97-1.15 | 1.02-1.11 | 1.04-1.09 | 1.55-1.60 | 1.05 |
+
+The resume copies cost what the handlers cost; what is left is binaryen's `-O2` over the
+flattened program and the try regions themselves. With every function compiled optimized up front,
+sed's copies run at 1.01 and its folded build at 1.20, so the fold's cost is its dispatch tests on
+the normal path, not tier-up. Size, since the fuel pass puts a safepoint on every loop back-edge
+(26,655 sites in BusyBox):
 
 | BusyBox, fueled | size |
 | --- | --- |
 | plain | 1.45 MB |
-| spill handlers only | 3.18 MB |
-| handlers and a resume copy of each function (`--resume`) | 17.2 MB |
-| handlers and resume folded into each function (`--fold`) | 11.5 MB |
+| a resume copy of each function (`--resume`) | 16.2 MB |
+| resume folded into each function (`--fold`) | 8.8 MB |
 
-Folding every block, loops included, made BusyBox 3.4 MB but put a branch at each block inside hot
-loops: gawk ran 1.64x. Resuming loops from a copy keeps them as written. On the census under V8
-(`experiments/mmu/scripts/bench.ts`, 7 rounds for the last two), folded against separate copies:
-lua 0.96 / 0.96, gzip 0.99 / 1.01, sqlite 1.01 / 0.98, gawk 1.01 / 1.00, bzip2 1.02 / 1.02, sed
-1.08 / 1.06.
+Entering loops at their fuel yield took the copies from 17.2 MB to 15.0 MB, recomputing values
+(164,455 saved values down to 144,958) to 14.3 MB, and optimizing before flattening back to
+16.2 MB. At about 13 ms of startup per MiB of native code, BusyBox's copies cost about 200 ms.
+
+After a restore (`experiments/evacuation/scripts/restore-bench.ts`: checkpoint at 30% of the
+run's fuel yields, restore, time to the end, every run's output checked), the copies run as they
+did before it when their modules are already compiled: on two pinned x86 cores lua 0.99-1.00, gzip
+1.05, bzip2 1.01, sed 1.01-1.06, gawk 1.05-1.17 against plain from the same yield. Restored into
+freshly compiled modules, as a new isolate would be, they run 1.13-1.22 (lua), 1.14-1.15 (gzip),
+1.79-1.85 (bzip2), 1.24-1.25 (sed) and 1.45-1.55 (gawk) against a freshly compiled plain run, which
+had warmed up over the part before the yield. sqlite's rest is too short to separate from its
+compile. `reenterAfterRestore` spills the restored frames once more at a later fuel yield and
+resumes them in the same instance, so frames rebuilt in unoptimized code re-enter what V8 has
+optimized since; at 10 ms it moved none of these, so the cold cost is compiling and tiering the
+new module, not frames held in old code. On one pinned core V8's background compiles of each
+fresh module land on whatever run comes next, and the restore rig does not measure there.
 
 Changed pages are found at checkpoint time by hashing each 64 KiB page, packed with a small page index
 into rows of up to 2 MB, and written only after `ctx.storage.sync()` succeeds. There is no store
 barrier (Dirty Tracking, below).
+
+### Write-Back and fsync
+
+`src/worker/durable.ts` keeps a machine in SQLite as write-back rather than rewrite. A checkpoint
+stores only the 64 KiB pages whose hash changed since the last one, 30 to a 2 MB extent row, plus
+one page-map row and one row for the snapshot's host state; zero pages cost nothing. An extent row
+is never rewritten, and one whose every page was replaced is deleted. A restore streams the extents
+into the machine's memory one row at a time.
+
+`fsync` and `fdatasync` are a per-file flush. When a host passes `fileSync`, each user program calls
+a small router module (`src/worker/machine/router.ts`) instead of the kernel's `wasm_syscall_N`. It
+sends the sync calls to a host hook and tail-calls the kernel for everything else, so a
+checkpoint's unwind and rewind never see a router frame. The hook reads the file through the kernel
+in the calling task's context (the path from `/proc/self/fd/N`, `statx`, then a fresh descriptor
+read into the process's spill mapping), hands the bytes to the store, and lets the kernel's own
+sync run only after the rows are durable. A file up to 1.9 MB goes whole into its record row, one
+row a sync; a larger one writes its changed 4 KiB blocks into extent rows. Other dirty state waits
+for the next checkpoint.
+
+The other durability calls take the same flush:
+
+| call | what the hook flushes |
+| --- | --- |
+| `fsync`, `fdatasync`, `sync_file_range` | the file behind the descriptor |
+| a write to a descriptor opened `O_SYNC` or `O_DSYNC` (`write`, `writev`, `pwrite64`, `pwritev`, `sendfile`, `splice`, `copy_file_range`), or `pwritev2` with `RWF_SYNC`/`RWF_DSYNC` | that file, after the kernel's write returns |
+| `msync` with `MS_SYNC` | every file mapped over the range, by `/proc/self/maps` |
+| `sync`, `syncfs` on the root filesystem | every regular file on it whose ctime is newer than the checkpoint the machine continues from, then a removal record for each file synced since that checkpoint that is gone |
+
+The router hands the hook the write family only after a program has opened a file with `O_DSYNC`
+(the flag is saved in the snapshot), and the hook checks the descriptor's flags with `F_GETFL`, so a
+machine that never opens a synchronous file pays nothing on its writes. `sync` walks the filesystem
+instead of taking a checkpoint: a checkpoint needs every task parked in the kernel, and the caller is
+inside the hook until its call returns. The walk reads only files changed since the checkpoint, and
+`syncfs` of proc or devtmpfs has nothing to keep. `close` flushes nothing, as on Linux: a closed file
+stays in the kernel's page cache and reaches storage with the next checkpoint or sync.
+
+A lost machine restores from its last checkpoint, and every file synced after it is written back
+through the kernel at the first syscall any program makes, before that syscall runs. A checkpoint is
+refused while a sync is in flight or before the files are back. The machine resumes at the
+checkpoint while those files hold their synced contents, so a program that appends after a restore
+can repeat its last appends; a checkpoint soon after the sync narrows that window.
+
+`src/worker/schedule.ts` sets the checkpoint interval by Young's optimum `sqrt(2 C M)`: `C` is the
+smoothed checkpoint cost, `M` the mean machine time between losses, 30 minutes until one is seen and
+then the observed rate. It is counted in time the machine ran, it is never shorter than the
+machine's share of the daily rows budget allows, and it never exceeds half the mean time between
+losses. `Alarm` keeps one Durable Object alarm for the earliest of any named deadlines (a Linux
+timer from `Machine.deadline`, a checkpoint coming due) and moves it only when that deadline comes
+sooner, since every `setAlarm` writes a row.
+
+`src/worker/keeper.ts` joins the three for the site. It restores the last checkpoint and the files
+synced after it when the object lost its machine, and boots one when nothing is stored. It
+checkpoints when the interval comes due and continues the machine in place (`Machine.resume`: the
+memory already is the image, so nothing is read back or copied). It points the alarm at the
+machine's next Linux deadline and at unsaved work one interval ahead. An idle kernel always has a
+timer within 0.5-4 s (its own housekeeping, measured under Node), so taken literally the earliest
+deadline would wake an idle object about once a second. An unattended machine is therefore not
+woken sooner than a quiet period that doubles from 1 s to an hour while it runs without output,
+input or a file sync, and drops back to 1 s when it does something. A user's timer fires late by
+about as long as the machine had been quiet. With a warm socket attached, the socket drives the
+machine and only unsaved work wants the alarm.
 
 ### Two Sockets per Terminal
 
@@ -262,12 +356,14 @@ the control socket survives eviction, and its next message wakes a new instance 
 the machine's Durable Object, `src/site-do.ts`. The first visitor claims the machine with `POST
 /_gmux/claim` and receives an owner token once; the object stores only its SHA-256
 (`src/worker/owner.ts`). Both sockets require the token. The control socket is hibernatable and
-carries console bytes. The warm socket is standard, keeps the object resident, and sends a tick
-each second that gives the machine a 5 s quantum; a keystroke gives it 250 ms. A hidden page closes
-its warm socket. The site does not checkpoint its machine yet, so a machine evicted after its last warm socket
-closes boots again on the next keystroke; on Free, a control socket idle for 70 s saw the object
-evicted, and the next keystroke booted a fresh machine and got an answer. All sessions share the one
-console.
+carries console bytes. The warm socket is standard and keeps the object resident; while it is open
+the page sends a tick each second on the control socket, which gives the machine a 5 s quantum in an
+event of its own (CPU per Event); a keystroke gives it 250 ms. A hidden page closes its warm socket. The object keeps its machine through the keeper (Write-Back and fsync), so a
+machine evicted after its last socket closes comes back from its last checkpoint on the next
+keystroke or alarm, with every file synced since then. The site runs the asyncified kernel and
+BusyBox that `scripts/wasm/asyncify.sh` builds into `build/kernel`; the guarded BusyBox and
+katybug are not asyncified, and a checkpoint is refused, and tried again later, while either is on a
+stack. All sessions share the one console.
 
 ### Executables
 
@@ -369,8 +465,8 @@ stays wasm32.
 
 Each load and store in a decoded block keeps an inline cache of the last mapping it hit: its range,
 its host block and a generation. Every change to the mappings (`mmap`, `munmap`, `mprotect`, `brk`)
-bumps the generation, which stales every cache at once. Only a mapping that nothing newer overlaps
-is cached, so a `MAP_FIXED` mapping or a hole always wins. On an amd64 `sqlite3` workload,
+bumps the generation, which stales every cache at once. Mappings never overlap: `munmap`,
+`mprotect` and `MAP_FIXED` split the ones across a range's ends, each piece in its own block. On an amd64 `sqlite3` workload,
 translation had been 29% of native samples, and the mapping search 22%; the cache cut the search to
 about 2%.
 
@@ -553,6 +649,97 @@ A foreign program can be checkpointed through Katybug. With Katybug built with r
 the control-flow matrix runs amd64 bash parked in `read` inside Katybug's interpreter, checkpoints
 the machine, restores it into a fresh one and finishes the transcript unchanged, beside the seven
 C phases and Lua (`experiments/evacuation/scripts/control-flow.ts` with `KATYBUG` and `BASH`).
+
+Dynamically linked programs run with the guest's own loader: `elf.c` maps the `PT_INTERP` loader
+beside the program and passes `AT_BASE` and `AT_ENTRY`, and ld-linux or ld-musl does the rest.
+`tests/c/katybug/dynamic.sh` runs 29 lines in `debian:bookworm-slim` (glibc) and `alpine:3.20`
+(musl) natively and under a static Katybug in the same container, on x86-64 and AArch64: coreutils,
+awk, sed, tar, gzip, `getent`, perl loading XS modules with `dlopen`, `ldd`, a trapped signal, libm
+and a pthread suite. All match. glibc needed a `cpuid` that reports the x86-64 baseline under a
+vendor it knows (qemu64's AuthenticAMD, family 15, model 107; glibc reads the feature leaf only for
+known vendors), `fxsave` for its lazy PLT resolver, and on AArch64 a sigreturn trampoline, since
+glibc there installs handlers without `SA_RESTORER` and expects the vDSO's.
+
+Guest threads run green inside one Katybug process, one at a time (`thread.c`), the way one isolate
+runs one thread. A thread is a saved register set; memory, mappings and decoded blocks are shared. A
+thread switches every 16,384 back edges, on a futex wait, or when a call would block: `read`,
+`accept`, `poll`, `select`, sleeps and `wait4` first look at their descriptors with a zero-timeout
+host `poll`, and if nothing is ready the thread parks with the call rewound and a deadline from its
+first attempt. When every thread is parked, one host `poll` waits on all their descriptors. Futexes
+live in the process. Since switches happen only between blocks, x86 locked instructions are atomic
+as decoded, and the AArch64 exclusive monitor is cleared at every switch and signal so an
+interleaved `stxr` fails and its loop retries. `tests/c/katybug/threads.c` (joins, a mutex counter,
+atomics and CAS, condvars, TLS, `pthread_once`, semaphores, barriers, a pipe between threads,
+overlapping sleeps, a preempted spin, rwlocks, `pthread_exit`, detached threads) matches native with
+glibc and musl on both architectures. A process with one thread pays one compare per back edge.
+
+AArch64 floating point and Advanced SIMD (`a64v.c`) are computed in software on exact
+significands, because wasm has no rounding-mode control: every FPCR rounding mode, flush-to-zero,
+default NaN, and FPSR's cumulative flags, with add, subtract, multiply and divide taking the host's
+result when the mode is the default and the operands are ordinary. The AArch64 corpus
+(`tests/c/katybug/a64-ops.sh`, native on Apple silicon through Docker) is 14,739 cases, FPSR
+included, all equal. Signal frames carry the FP and vector registers on both architectures. The cost
+is about 5 ns per scalar FP operation, and a vector fused multiply-add loop runs 45% slower than it
+did before exactness.
+
+x86 `rep movs` and `rep stos` copy and fill forward in 1 MiB chunks of host memory, and element by
+element up to the next page when a range is not one mapping, so a fault stops at the exact element
+with `rcx`, `rsi` and `rdi` as native leaves them (`tests/c/katybug/x86-faults.c`). musl's `memcpy`
+and `memset` are `rep` instructions, so this moves ordinary programs: sqlite with 80 MB of blobs
+went from 24.95 to 17.32 s. A handler with `SA_RESTART` now runs while its thread is blocked in a
+host call, which is then restarted as Linux restarts it; before, the host restarted the call itself
+and the handler waited for the call to return. 128-bit multiplies and divides are 64-bit halves under
+wasm (`wide.h`), so wasm32 code no longer calls compiler-rt's `__multi3`, `__udivti3` or `__divti3`;
+lifted factor gained 3%.
+
+Three changes cut dispatch. Block fusion decodes through direct jumps into one block; each block
+links the two successors it last saw, so most transitions skip the block hash; and a block run 64
+times is decoded again as a trace through the hot side (90% of at least 16 runs) of each branch, the
+cold side a side exit. Executable memory that is unmapped or re-protected makes decoded blocks stale,
+which the block cache had never checked before (code replaced at one address ran the old code). A
+fault inside a trace reports the `rip` of the faulting instruction, with every register as it stood.
+
+Link order alone moves a Katybug build by 1-4%, as much as some of the differences measured here, so
+`experiments/trace-length/scripts/sweep.sh` links every build in three source orders and reports the
+mean. Trace lengths share one build through `KATYBUG_SEGMENTS=n`. CPU seconds on a Ryzen 9 9900X,
+one pinned core, x86-64 guests:
+
+| arm | sqlite blocks | sqlite time | bash blocks | bash time |
+| --- | --- | --- | --- | --- |
+| no fusion, no links | 96.7 M | 5.68 s | 295.8 M | 18.10 s |
+| links | 96.7 M | 5.37 s | 295.8 M | 16.97 s |
+| fusion and links | 76.5 M | 5.20 s | 239.7 M | 16.14 s |
+| traces of up to 2 blocks | 49.7 M | 5.41 s | 155.2 M | 16.83 s |
+| traces of up to 8 blocks | 26.7 M | 5.23 s | 104.5 M | 16.61 s |
+| traces of up to 32 blocks | 24.1 M | 5.05 s | 100.7 M | 16.39 s |
+
+Over eight programs (sqlite, bash, awk and sort on both architectures), links save 1.4-6.8% and
+fusion 3.3-5.6%. Traces cut blocks dispatched by a further 54-70%, and within the traced build time
+falls with trace length and stops falling at 16 to 32 blocks, so 32 is the default. Against the
+untraced build the result depends on the program: from 5.3% faster (AArch64 sort) to 2.2% slower
+(x86-64 awk), 0.5% faster on average. On an Apple M-series host traces are 3.1% faster on average
+and sqlite 7-8% faster. The traced build pays for its branch profile, which short traces do not win
+back. Traces hold 19-80% more decoded ops.
+
+Dispatch count does not predict time. Going from 2- to 32-block traces removes 25.6 M dispatches
+and 8.8 M ops from sqlite and saves 0.36 s, 14 ns per dispatch removed, while links remove 83.7 M
+block-cache lookups for 0.31 s, 3.7 ns each. The best fit of time to ops, blocks, lookups and side
+exits predicts every arm within 4.2%, but only by giving blocks and side exits negative costs: the
+arms differ too little for crossing costs to be read from them. Each op's own work is most of the
+time: 3.2-3.8 ns an op.
+
+Deferred flags do not pay consistently. Four settings were measured: computing every flag
+(`KATYBUG_PLAN=0`), dropping the flag writes nothing reads, recording flags as an expression, and
+evaluating the branch straight from the record (the default). On the Ryzen all four are within 2.4%
+of each other and the default is fastest on seven of eight programs; on the Apple host dropping dead
+writes alone is fastest on five of six, and the spread reaches 8.5%. Flags stay exact in signal
+frames under every setting.
+
+With `KATYBUG_CACHE=<dir>`, a process writes its decoded blocks, with their profile and trace
+shape, to a file named by the hash of its ELF, and the next process of that ELF takes them instead of
+decoding (`persist.c`). A file is used only when Katybug's own executable, the IR's layout and the
+plan settings match the ones that wrote it, and a block only while the guest bytes it was decoded
+from hash the same. sqlite decodes 4,754 blocks on its first run and 104 on its second.
 
 ---
 
@@ -795,6 +982,110 @@ each comes in at once.
 Hashing at the checkpoint costs nothing between checkpoints. A barrier taxes every store of every
 workload to save that work. The default is hashing.
 
+### Write-Back Against Per-Quantum Checkpoints
+
+`experiments/write-back/` runs an 800-page machine in 5 s quanta, one job per arm. The per-quantum
+arm is what the rigs did before: every image row deleted and the whole memory written again at the
+end of each quantum, then restored from those rows. The write-back arm checkpoints at the adaptive
+interval, writes changed pages only, and makes every fsync durable. The write-heavy job has the
+shell rewrite 16 files of about 40 KB in turn and fsync every 256th write; the CPU-heavy job is
+shell arithmetic in one process. On Free, `cpuTime` from `wrangler tail`, rows counted from each
+cursor's `rowsWritten`, one deploy per arm:
+
+| job, arm | window | rows per hour | CPU per hour | per quantum | notes |
+| --- | --- | --- | --- | --- | --- |
+| write, write-back | 245 s, 33 quanta | 44,984 | 3,022 s | 5.6 s | 1,268 fsyncs, 30 checkpoints, 29 replaced instances restored |
+| write, per quantum | 3 quanta | 40,320 | | 6.4-8.3 s | then `exceededMemory` and `exceededCpu` |
+| CPU, write-back | 182 s, 14 quanta | 969 | 3,434 s | 12.4 s | 3 checkpoints, no losses |
+| CPU, per quantum | 2 quanta | 40,320 | | 11.1 s | then a request that never answered |
+
+The per-quantum arm did not survive on Free in any of four attempts: two to four quanta, then the
+isolate ran out of memory or an event passed 30 s of CPU. Its rows per hour are its measured 56 rows
+a quantum at 12 quanta a minute. CPU per quantum is not comparable across jobs, because a deployed
+Worker's clock stands still while code runs, so a CPU-bound quantum outlasts its 5 s wall budget.
+
+The same arms under Node, 24 quanta each with no losses, host time spent checkpointing:
+
+| job | write-back rows per hour | per-quantum rows per hour | write-back checkpoint time | per-quantum checkpoint time |
+| --- | --- | --- | --- | --- |
+| write | 53,310 (1,767 fsyncs, 10 checkpoint rows) | 38,790 | 15 s an hour | 82 s an hour |
+| CPU | 1,140 | 37,980 | 11 s an hour | 47 s an hour |
+
+Checkpoint rows fall 33-130x and checkpoint time 4.5-5.4x. Exact fsync is what the write-heavy job's
+rows are made of: one row per fsync of a small file, about 5 a second deployed, so it spends Free's
+100,000 daily rows in about 2.2 hours. A per-quantum checkpoint makes no fsync durable at all.
+
+On Free the write-back arm's object was replaced after nearly every event past its fourth, 29
+times in 33 quanta, four of them after `exceededMemory`. Each replacement restored from the store,
+wrote back the files synced since the checkpoint, and the job continued. The learned loss rate then
+held the interval at one checkpoint a quantum.
+
+Durability is exact (`experiments/write-back/scripts/fsync-exact.ts`, the asyncified kernel under
+Node). The machine checkpoints; a job writes a 228,894-byte file and fsyncs it twice with a rewrite
+between, writes a file it never syncs, runs a program that writes two lines to a file opened
+`O_SYNC` and one that stores into a `MAP_SHARED` mapping and calls `msync(MS_SYNC)` (both
+hand-written wasm in `programs/`), and writes and closes a file it never syncs. The machine is
+dropped. After the restore the fsynced file has the right SHA-256, the `O_SYNC` and msynced files
+hold what was written, the unsynced and the closed files are absent, the store never received the
+closed file, and a file from before the checkpoint is kept. A second job writes a file, fsyncs and
+removes another, and calls `sync`; after a second loss the first is there and the removed one is
+not. Each control fails its own check: withholding the synced files from the restore, opening
+without `O_SYNC`, or msyncing with `MS_ASYNC`. 20 of 20 runs passed after the first fix below and
+8 of 8 after both.
+
+The check found two restore defects, both older than write-back:
+
+| defect | seen | fix | after |
+| --- | --- | --- | --- |
+| a task the kernel released while it still had a turn in the ready queue was left out of the snapshot, so the cpu that would have switched back to it waited forever (an RCU stall) | 4 of 15 and 4 of 20 fresh-boot restores; 2 of 20 durability runs | the snapshot keeps such a task and the ready queue by index | 0 of 260 restores, 8 of 60 had the state |
+| every exited process left its parked JSPI stack, and the program instance on it, retained: V8 keeps a suspended stack as a root | JS heap +5.4 MiB every 3 s under the write job (its fsync applet forks about 15 times a second), flat for the CPU job and idle | a released task's parked stack is unwound, at the release or at its last switch | heap flat at 6-8 MiB |
+
+The second is what reset the first deployed site with `exceededMemory` 43 s into the write job.
+
+### The Terminal Site, Durable
+
+`experiments/write-back/scripts/site-drive.ts` against the shipped site on Free: claim, run the
+write job for 40 s on a warm socket, stop it, fsync one marker file and `sync` another, close both
+sockets, leave the object to its alarms for 240 s, then reconnect and read the markers.
+
+| phase | measured |
+| --- | --- |
+| attended job, 40 s | 61,184 writes, 261 file syncs, 1 `sync` walk, 2 checkpoints (16 rows for 342 changed pages, then 10 rows for 168) |
+| unattended, 240 s | replaced 4 times, each restored from storage by an alarm; 10 checkpoints, 79 rows |
+| whole run | 54 events, 30 of them alarms, 154.6 s CPU; no `exceededMemory` or `exceededCpu` |
+| reconnect | both marker files read back |
+
+The job ran again after the first replacement: its last checkpoint predated the stop, and a
+process's state is only as durable as the last checkpoint. One alarm event early in the attended
+job took 23.0 s of CPU, against the 30 s per-event limit, in this run and the one before.
+
+Two earlier deploys failed. The first reset with `exceededMemory` (the stack retention above). In
+the second, an alarm could start a checkpoint while the pump's own checkpoint was still unwinding the
+same machine; the object stopped answering after 205 s. `Machine.checkpoint` now refuses a
+concurrent or repeated checkpoint, and an alarm does not checkpoint while a pump runs.
+
+### CPU per Event
+
+The durable site's worst event ran 23.0 s of CPU against the 30 s limit (23.3 s in a later run).
+Two causes, both found on Free:
+
+| cause | how it was found | fix |
+| --- | --- | --- |
+| a pump's wall budget never ended: `Date.now()` moves only at some I/O | a probe Durable Object burned 1.2 s of CPU between awaits: a storage sync that wrote caught the clock up 3 of 3 times; `setTimeout(0)`, a microtask and a sync with nothing written never did; `scheduler.wait(0..10)` did only sometimes | `Keeper.turn` caps a pump's steps as well as its wall time |
+| a pump started by a warm-socket tick runs outside any awaited handler, and its CPU is charged to whichever event is open | a diagnostic deploy logged each pump's steps with the real time read after a written sync: every pump stayed within its 5 s, while one alarm event carried two pumps and 9.2 s | ticks go on the hibernatable control socket, one awaited pump per event; the warm socket only holds the object resident |
+
+A step is one task's turn. Its cost comes from the real time the previous turn took, read at the
+start of the next event, and only from a turn its step cap stopped: a turn the clock stopped may have
+slept. It starts at 1 ms and moves by at most a factor of two a turn, within 500 to 12,000 steps;
+the turn after a restore gets half. Under Node with the deployed clock modeled (it moves at a timer
+by the timer's delay and catches up at a written sync), a shell CPU loop ran each event to the 60 s
+cutoff with the wall budget alone, and 5.1 s at most with the step cap; the write job 5.2 s either
+way. Deployed with both fixes, 91 events of the same drive peaked at 1.5 s of CPU.
+
+The cap has a ceiling: a turn whose steps get k times dearer within one event runs k times its budget
+before the next turn learns the new cost. The clock catches up at most such turns anyway, whenever
+the job syncs a file.
+
 ### Fuel
 
 1e8 loop-head iterations per shape, deployed:
@@ -860,6 +1151,31 @@ TLS connection to dns.google for 901 s and answered 19 DoH queries exact while i
 aborted or idle-evicted four times (`experiments/socket`). The request that opened the socket keeps
 it, since I/O objects belong to the request that created them. Without a 60 s keepalive the
 connection dropped within 300 s idle while its object stayed resident.
+
+### Lane Placement
+
+`experiments/lane-pods/scripts/placement.ts` places one seeded workload on 48 lanes over 40 isolates
+three ways, under Node: by CPU load alone (the lane with the least recent CPU), by expected latency
+and effect class, and by the same score with a prefetch plan for cold reads. The latencies are the
+ones measured on Free above: a warm lane answers in ~70 ms and a cold one in ~800, a first 1 MiB
+asset fetch takes 95-195 ms and a repeat ~0, and lanes in one isolate share its thread. The workload
+is synthetic: 3,000 jobs, a quarter builds reading 8 chunks of one of six package sets, a quarter
+authoritative writes on one of four keys, 15% external fetches that wait 150 ms without the CPU, and
+small jobs reading one library chunk. The latency score adds the isolate's queue, the lane's restore
+cost, the job's reads the lane does not hold, and a forward for a write off its key's owner. The
+prefetch plan fetches every cold chunk of the job's trace at dispatch, up to the 50 subrequests an
+event allows. Three seeds:
+
+| scorer | job latency p50 / p99 / mean | cold-read stall mean / p99 | cold starts | writes forwarded |
+| --- | --- | --- | --- | --- |
+| CPU load | 230 / 2,855-2,904 / 626-637 ms | 197-201 / 1,144-1,176 ms | 48 | 713-765 |
+| latency and effects | 216-230 / 2,245-2,441 / 487-512 ms | 20-21 / 450-509 ms | 6-7 | 0 |
+| latency, effects and prefetch | 193-230 / 2,075-2,310 / 480-519 ms | 6-7 / 98-114 ms | 5-7 | 0 |
+
+The CPU scorer spreads work over every lane, so each one starts cold once and loses what the last
+lane read; the latency score keeps jobs where their data and their key live. The prefetch plan cuts
+cold-read stalls by another factor of three and moves the mean by up to 1.5%, since a build's CPU
+already overlaps most of its reads.
 
 ### The Interpreted Tier
 
@@ -1093,6 +1409,47 @@ unbuilt syscall is `sys_ni_syscall`, and wasm32's `rt_sigreturn` takes no argume
 `sys_*` symbol, so rebuilding with them changes no handler's type; `scripts/kernel/adapters-check.sh`
 regenerates after a config change until the file is a fixed point.
 
+### Path-Query Cache
+
+With `MachineOptions.syscallCache`, a statx of an absolute path can be answered by the host without
+entering the kernel. The syscall router asks a plain host import first, which hashes the path in
+place and returns the stored answer when the kernel's path-query generation and the task's view are
+what they were; otherwise the call goes through the hook to the kernel, and the answer is kept.
+Kernel patch 0022 gives both. `wasm_fs_gen` counts every mtime and ctime store, every atime that
+changes and every size change of a file, directory or symlink on the root filesystem, every change
+to the mount tree and every chroot. `wasm_fs_view` is the task's root dentry when its lookups depend
+on nothing but the path: it may search every directory, resolves in the first mount namespace and
+has its root on that filesystem. The host keeps success, ENOENT and ENOTDIR only, never an answer
+about a device, fifo or socket, and never one whose lookup ended off the root mount (a proc or sysfs
+answer changes with no timestamp moving). A hit skips the kernel's syscall entry, so a signal pending
+for the task waits for its next real syscall or fuel yield.
+
+Each rule answers a case the check below caught:
+
+| generation first counted | what it missed or cost |
+| --- | --- |
+| every timestamp store, any filesystem | a shell loop kept 0 answers: the console and `/dev/null` move their times at every write |
+| root filesystem only | device nodes live on the root filesystem here, with the same effect |
+| file, directory and symlink stores only | 651 invalidations in 200 `ls -l`: relatime stores an unchanged atime while it is not newer than the ctime |
+| atime only when it changes | a write in the same clock tick as the last grows a file with no time stored: a stale size (the check failed, 1 mismatch) |
+| plus every size change | exact |
+
+`experiments/syscall-cost/scripts/cache.ts` runs a mutation script with the cache off, on, and in
+verify mode, which asks the kernel every time and compares with what the cache holds: create, write
+in one tick, chmod twice in one tick, rename, remove, symlink, mkdir over a removed file, a tmpfs
+mounted over a directory and removed, and `/proc` paths. The transcripts are byte for byte equal, and
+94,030 verified answers had 0 mismatches.
+
+| measure (this Mac, Node) | kernel | cache |
+| --- | --- | --- |
+| `stat` of one path in a loop (`cost.ts`) | 166 ns | 110 ns, 59,997 hits in 60,022 calls |
+| `ls -l /bin`, 1,000 times | 484-497 µs each | 499-530 µs each, 87,000-88,000 hits and 6,200-6,800 refills |
+
+A hit saves ~56 ns; a miss goes through the Suspending hook and costs several microseconds, so the
+cache pays only above roughly 50 hits a miss. The kernel's own statx of a cached dentry is already
+cheap, and `ls -l` still invalidates everything about 70 times in 1,000 runs for a reason not yet
+found. The option stays off.
+
 ### Threads
 
 Pthreads never worked on linux-wasm. Its variadic `__clone` read the TLS and clear-tid arguments only
@@ -1259,6 +1616,7 @@ allocations now go through a `volatile` pointer.
 | `src/gmux/katybug/` | the x86-64, AArch64 and wasm frontends to the IR, its interpreter and plan, Linux syscalls and signals |
 | `src/llvm/patches/` | toolchain fixes the pipeline applies before building LLVM (wasm-ld's lazy archive symbols) |
 | `src/worker/placement.ts` | spending a new object's first-placement replacement before a machine exists |
+| `src/worker/durable.ts`, `src/worker/schedule.ts`, `src/worker/keeper.ts`, `src/worker/machine/router.ts` | write-back checkpoints and exact file syncs in SQLite; the adaptive interval and the one alarm; the site's restore, checkpoint and wake policy; the syscall router that hands the sync calls to the host |
 | `src/rootfs/` | files the pipeline lays over linux-wasm's initramfs (`/init`, the `binfmt_misc` registrations) |
 | `scripts/build-linux.sh`, `scripts/build-kernel.sh` | the reproducible pipeline (in Docker on a Linux host), and the step that stages its output into `build/` |
 | `scripts/cc-strict`, `scripts/wasm-imports.c` | the strict CC for user programs, and its module reader |
@@ -1281,6 +1639,7 @@ allocations now go through a `volatile` pointer.
 | `experiments/evacuation/`, `mmu/` | resumable frames (`evacuate.ts`) and the control-flow checkpoint matrix; the software MMU bench and lazy restore |
 | `experiments/console-interrupt/`, `syscall-cost/` | host calls and input latency of the console; host time per syscall |
 | `experiments/exec-stubs/` | guest memory, exec time and image size with full executables against stubs in the rootfs |
+| `experiments/write-back/` | per-quantum checkpoints against write-back on Free and under Node, the durability check (fsync, `O_SYNC`, `msync`, close, `sync`), the keeper under Node, and the deployed site's restore drive |
 | `scripts/tail.ts`, `scripts/probe.ts` | the `wrangler tail` parser and the gate drivers' shared client |
 | `scripts/census.sh`, `docker/census.Dockerfile` | the package census, and its image (the toolchain with node, wabt, pkg-config and unzip) |
 | `scripts/wasm/config.site`, `toolchain.cmake`, `target-run.ts`, `target/` | autoconf answers for the target, a CMake toolchain file, and running a configure's test programs on gmux (`GMUX_TARGET_RUN`, ssh and scp for perl) |
