@@ -142,7 +142,8 @@ scripts/build-kernel.sh ~/gmux-build/out # staged into build/
 bun run test:probes                      # C probes booted in a machine
 ```
 
-Two clean builds produce the same bytes in every artifact.
+Two clean builds produce the same bytes in every artifact. The probes refuse a `build/kernel`
+staged from other pins or patches than the tree's.
 
 ```sh
 bun run typecheck

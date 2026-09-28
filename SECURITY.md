@@ -27,6 +27,29 @@ gmux enforces isolation itself:
 Run only software you trust with the whole machine as root, and do not keep secrets in a machine
 that runs code you do not trust.
 
+## Authority Domains
+
+Root in a machine is root of that machine and of nothing outside it. A deployment has four holders
+of authority, and none of the other three is reachable from guest root:
+
+| domain                  | holds                                                                                                                    | what guest root reaches                                                                                             |
+| ----------------------- | ------------------------------------------------------------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------- |
+| Linux root in a machine | the machine's kernel, processes and memory                                                                               | all of it                                                                                                           |
+| the Worker host         | the isolate running the machine's Durable Object: its `env` (`MACHINE`, `ASSETS`), its SQLite storage and its WebSockets | only the imports below, which act on the machine's own memory and host state                                        |
+| the deployment owner    | the owner token, which opens the terminal and types into the console                                                     | nothing: the token goes once over HTTP to whoever claims the machine, and the object keeps only its SHA-256 hash    |
+| the Cloudflare account  | API tokens, deploys, routes, secrets and the storage of every Worker in the account                                      | nothing: the Worker binds only `MACHINE` and `ASSETS`, holds no variable or secret, and the machine has no link out |
+
+`tests/c/authority.c` runs as root in a machine and looks for each of them: it scans the machine's
+whole memory for values only the host holds (finding the kernel's command line, which the host did
+put there), checks its environment and init's, and finds no `/dev/mem`, block device, TUN device or
+network device other than loopback and tunnels over it; connecting to the Cloudflare API and
+resolving its name both fail. `tests/c/run.ts` plants those values (a Worker-style secret, a
+secret in the host process's environment, and a claimed owner token and its hash), scans every
+memory the guest was given after the run, and checks every import the guest was instantiated with
+against the surface below. `tests/unit/authority.test.ts` holds the same checks on the toy kernel,
+the deployment's bindings, and the Worker's routing, where every path outside `/_gmux/` is answered
+with 503 whatever the guest does.
+
 Between a machine and everything outside it:
 
 | boundary                        | what enforces it                                                                                                                      |
@@ -40,7 +63,8 @@ Between a machine and everything outside it:
 
 User programs may import only the kernel's syscall entry points (`__wasm_syscall_0` to
 `__wasm_syscall_6`), their memory and table, `__gmux_fuel` (a scheduling yield), `__gmux_vfork`,
-`__gmux_vfork_exec` and `__gmux_vfork_exit`, `__gmux_dlprep`, `__gmux_dlopen`, `__gmux_dlsym`,
+`__gmux_vfork_exec` and `__gmux_vfork_exit`, `__gmux_fork` (fork of a program with resumable frames),
+`__gmux_stack_move` (a new stack segment for a frame that outgrows its own), `__gmux_dlprep`, `__gmux_dlopen`, `__gmux_dlsym`,
 `__gmux_dlclose` and `__gmux_dlerror` (`dlopen` of side modules the build registered), and
 `__wasm_abort`. `scripts/cc-strict` refuses to link a program that imports anything else, and the
 host refuses to instantiate one. The builds non-root processes run also import the page owner table's
@@ -66,6 +90,10 @@ act only on that memory and that machine's host state.
 | a root process alters the kernel or another process                           | possible; root is trusted with the machine                                                                     |
 | a process loads code the build did not compile                                | refused: `dlopen` and `exec` take only registered modules; a refused `exec` ends the process with `SIGSEGV`    |
 | a process reaches a Worker binding, secret or Durable Object storage directly | refused: no import exposes them                                                                                |
+| guest root reads a Worker secret, the host's environment or the owner token   | refused: none of them is ever in the machine's memory, which root can read whole                               |
+| guest root writes the Durable Object's storage                                | refused: the machine holds no storage handle; the object stores only the owner hash and placement records      |
+| guest root publishes a site or deploys a Worker                               | refused: paths outside `/_gmux/` answer 503, and the machine has no route to the Cloudflare API                |
+| guest root opens a connection outside the machine                             | refused: its only network devices are loopback and IP tunnels over it                                          |
 | a process reads another machine's memory                                      | refused: separate memories, no shared host state                                                               |
 | a process instantiates a module with an unlisted import                       | refused at link time and at instantiation                                                                      |
 | a visitor opens the terminal without the owner token                          | refused                                                                                                        |

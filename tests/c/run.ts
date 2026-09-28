@@ -4,7 +4,9 @@ import { mkdtempSync, readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { appendCpio } from '../../scripts/wasm/cpio-append.ts';
+import { inputs } from '../../scripts/wasm/inputs.ts';
 import { Machine } from '../../src/worker/machine/machine.ts';
+import { hostOnly, leaks, SURFACE, watch } from './authority.ts';
 
 /**
  * Boots build/kernel with the tests/c probes from build/probes and checks each one's output;
@@ -33,6 +35,13 @@ const probes: Record<string, Probe> = {
 	isolation: {
 		lines: ['TRUST kernel-address write accepted'],
 		passes: 27
+	},
+	// SECURITY.md's authority domains: root looks through all of the machine's memory for what the
+	// host holds (a Worker env's secret, a host secret, the owner token), and for a device or a
+	// network path to storage or the Cloudflare API; the host scans every guest memory after
+	authority: {
+		lines: ['kernel command line', 'Network unreachable'],
+		passes: 10
 	},
 	vf: { lines: ['from-exec', 'child 1 exited 0', 'second exited 7', 'third exited 9'] },
 	sig: { lines: ['handler slept', 'after pause'] },
@@ -160,6 +169,16 @@ const read = (path: string) => new Uint8Array(readFileSync(join(build, path)));
 const share = !!process.env.SHARE;
 const busybox = read(share ? 'kernel/busybox.share.wasm' : 'kernel/busybox.wasm');
 const manifest = JSON.parse(readFileSync(join(build, 'kernel/manifest.json'), 'utf8'));
+// a kernel staged from other patches than this tree's fails probes for reasons the tree does not have
+if (!manifest.inputs)
+	console.log('note: build/kernel does not record the patches it was built from; not checked');
+else if (manifest.inputs !== inputs(root)) {
+	console.log(
+		'build/kernel was built from other patches than this tree (src/sources.json, src/*/patches): ' +
+			'rebuild it with scripts/build-linux.sh and scripts/build-kernel.sh'
+	);
+	process.exit(1);
+}
 const registry = new Map([[manifest.busybox as string, new WebAssembly.Module(busybox)]]);
 // the build's own katybug, which binfmt_misc runs for foreign executables (src/rootfs/etc/init.d/rcS)
 if (manifest.katybug)
@@ -187,7 +206,7 @@ for (const name of added) {
 				join(root, 'experiments/evacuation/scripts/evacuate.ts'),
 				`${fueled}.g`,
 				`${fueled}.evac`,
-				process.env.GMUX_EVACUATE ?? '--fold'
+				process.env.GMUX_EVACUATE ?? '--resume'
 			],
 			{ stdio: 'ignore' }
 		);
@@ -270,6 +289,9 @@ const script = names
 let output = '';
 const hostLog: string[] = [];
 let typed = false;
+const authority = names.includes('authority');
+const planted = authority ? await hostOnly() : [];
+const seen = authority ? watch() : null;
 const machine = new Machine({
 	vmlinux: new WebAssembly.Module(read('kernel/vmlinux.wasm')),
 	initrd: new Uint8Array(readFileSync(initrd)),
@@ -297,12 +319,31 @@ await machine.run(
 	(ms) => new Promise((r) => setTimeout(r, Math.min(ms, 50)))
 );
 
+seen?.stop();
+const hostSide: string[] = [];
+if (seen) {
+	const buffers = [...new Set([machine.memory, ...seen.memories])].map((m) => m.buffer);
+	const bytes = buffers.reduce((n, b) => n + b.byteLength, 0);
+	const off = [...seen.imports].filter((i) => !SURFACE.test(i));
+	hostSide.push(...leaks(planted, buffers).map((l) => `host-only ${l}`));
+	// the host did put the command line there, so a scan that misses it is broken
+	if (!leaks(['rootfstype=ramfs'], buffers).length)
+		hostSide.push('the host scan misses the command line');
+	hostSide.push(...off.map((i) => `import ${i} is off the surface`));
+	console.log(
+		`host: ${planted.length} host-only values searched in ${buffers.length} guest memories ` +
+			`(${bytes} bytes): ${hostSide.length ? 'found' : 'absent'}; ${seen.imports.size} imports, ` +
+			`${off.length} off the surface`
+	);
+}
+
 let failed = 0;
 for (const name of names) {
 	const at = output.lastIndexOf(`\n== ${name}`);
 	const section = at < 0 ? '' : output.slice(at, output.indexOf('== end', at));
 	const { lines, passes = 0, host } = probes[name]!;
 	const problems = [
+		...(name === 'authority' ? hostSide : []),
 		...(host && !hostLog.some((line) => line.includes(host))
 			? [`host never logged "${host}"`]
 			: []),
