@@ -20,21 +20,23 @@ flag_management:
   default_rules:
     carryforward: true
   individual_flags:
-    - name: coverage
+    - name: unittests
       paths:
         - src/
-    - name: pack
+    - name: c
       paths:
-        - src/
-    - name: workers
+        - src/gmux/
+    - name: wat
       paths:
-        - src/
-    - name: node
+        - tests/fixtures/
+        - scripts/wasm/
+    - name: patch
       paths:
-        - src/
+        - src/kernel/patches/
 
 ignore:
-  - 'tests/**/*'
+  - '^tests/(?!fixtures/[^/]+\.wat$).*'
+  - '^scripts/(?!wasm/[a-z]+-pass\.ts$).*'
   - 'coverage/**/*'
   - '.coverage/**/*'
   - '**/*.test.ts'
@@ -43,6 +45,5 @@ ignore:
   - 'dist/**/*'
   - 'src/worker/probes/**/*'
   - 'experiments/**/*'
-  - 'scripts/**/*'
   - 'build/**/*'
   - 'assets/**/*'
