@@ -1,4 +1,25 @@
 import { DlProcess, type DlSaved, type DlView } from './dl.ts';
+import {
+	MISS,
+	ROUTE_HOOK,
+	ROUTE_KERNEL,
+	ROUTE_WATCH,
+	ROUTE_WRITES,
+	ROUTER,
+	WRITE_CALLS
+} from './router.ts';
+
+/** a regular file as a program's fsync left it, or as a restore writes it back */
+export interface SyncedFile {
+	/** its absolute path in the machine */
+	path: string;
+	/** its permission bits */
+	mode: number;
+	/** its whole contents */
+	bytes: Uint8Array;
+	/** a sync(2) found it gone: a restore removes it */
+	removed?: boolean;
+}
 
 /**
  * what a machine is built from: the kernel, its initramfs and command line, the programs it may run
@@ -52,6 +73,13 @@ export interface MachineOptions {
 	memory?: WebAssembly.Memory;
 	/** loop iterations a user program runs between host yields */
 	fuelBudget?: number;
+	/**
+	 * milliseconds after `Machine.restore` at which each restored evacuable program, at its next fuel
+	 * yield, spills its frames and resumes them in its own instance. A running wasm frame keeps the
+	 * code it was entered with, so frames a restore rebuilt in freshly compiled code continue in what
+	 * V8 has optimized since. Once per program; nothing is copied
+	 */
+	reenterAfterRestore?: number;
 	/** pump steps between macrotask yields, so a frozen host clock can advance */
 	yieldEvery?: number;
 	/** how far the kernel's clock moves per scheduling decision when the host clock does not */
@@ -66,6 +94,23 @@ export interface MachineOptions {
 	 * `checkpoint()` can turn every parked stack into bytes and `Machine.restore()` can rewind it
 	 */
 	asyncify?: boolean;
+	/**
+	 * called when a program fsyncs or fdatasyncs a regular file, with the file as the kernel reads
+	 * it; the program's call returns once this resolves, so resolve once the bytes are durable.
+	 * Without it (and without `restoreFiles`) programs call the kernel directly
+	 */
+	fileSync?: (file: SyncedFile) => Promise<void>;
+	/**
+	 * for `Machine.restore`: files synced after the snapshot was taken, written into the machine at
+	 * the first syscall any program makes, before that syscall runs
+	 */
+	restoreFiles?: SyncedFile[];
+	/**
+	 * answers a repeated statx of an absolute path from the host while the kernel's path-query
+	 * generation (kernel patch 0022) and the task's view are what they were, without entering the
+	 * kernel. 'verify' asks the kernel every time and counts answers the cache would have got wrong
+	 */
+	syscallCache?: boolean | 'verify';
 }
 
 /**
@@ -111,6 +156,8 @@ export interface SavedRunner {
 	tag?: number;
 	/** a signal handler parked on a stack of its own, unwound before the frames it interrupted */
 	signal?: HandlerStacks | null;
+	/** the kernel released it while it still had a turn in the ready queue to take */
+	released?: boolean;
 }
 
 /** a signal handler parked on its own stack, in a snapshot */
@@ -144,6 +191,8 @@ export interface Snapshot {
 	input: number[];
 	/** tasks ready to run, in order, by id */
 	ready: number[];
+	/** the same, by index into `runners`: a released task's id may name a newer task */
+	readyAt?: number[];
 	/** the boot cpu's id */
 	cpuZero: number;
 	/** every task, parked */
@@ -154,6 +203,8 @@ export interface Snapshot {
 	dl?: DlSaved[];
 	/** the kernel's page owner tags at checkpoint, which a lazy restore defers pages by */
 	owners?: Uint16Array;
+	/** a program had opened a file with O_DSYNC */
+	syncWrites?: boolean;
 }
 
 // asyncify buffers live in linear memory only while a stack unwinds or rewinds
@@ -176,6 +227,42 @@ const SYS_EXECVE = 221;
 const SYS_MUNMAP = 215;
 const SYS_MMAP = 222;
 const SYS_PRLIMIT64 = 261;
+const SYS_MKDIRAT = 34;
+const SYS_OPENAT = 56;
+const SYS_CLOSE = 57;
+const SYS_READ = 63;
+const SYS_WRITE = 64;
+const SYS_READLINKAT = 78;
+const SYS_FSYNC = 82;
+const SYS_FDATASYNC = 83;
+const SYS_STATX = 291;
+const STATX_MNT_ID = 0x1000;
+const SYS_FCNTL = 25;
+const SYS_UNLINKAT = 35;
+const SYS_GETDENTS64 = 61;
+const SYS_SPLICE = 76;
+const SYS_SYNC = 81;
+const SYS_SYNC_FILE_RANGE = 84;
+const SYS_MSYNC = 227;
+const SYS_SYNCFS = 267;
+const SYS_COPY_FILE_RANGE = 285;
+const SYS_PWRITEV2 = 287;
+const F_GETFL = 3;
+const O_DSYNC = 0o10000;
+const O_DIRECTORY = 0o200000;
+const AT_SYMLINK_NOFOLLOW = 0x100;
+const MS_SYNC = 4;
+const RWF_DSYNC = 2;
+const RWF_SYNC = 4;
+const DT_DIR = 4;
+const DT_REG = 8;
+const AT_FDCWD = -100;
+const AT_EMPTY_PATH = 0x1000;
+const O_RDONLY = 0;
+const O_WRONLY = 1;
+const O_CREAT = 0o100;
+const O_TRUNC = 0o1000;
+const O_CLOEXEC = 0o2000000;
 const RLIMIT_STACK = 3;
 // a split stack grows by this much at a time (scripts/wasm/stack-pass.ts)
 const STACK_SEGMENT = 1 << 20;
@@ -276,6 +363,8 @@ interface Runner {
 	vforkOf: Vfork | null;
 	/** its process's page owner tag, when a lazy restore has its pages to bring in */
 	tag?: number;
+	/** inside the syscall router's host hook, whose JS frame a checkpoint cannot carry */
+	syncing?: boolean;
 	/** its frames are spilling for a fork */
 	forking?: boolean;
 	/** what the re-issued __gmux_fork of its resumed frames returns: the child's pid, or 0 in the child */
@@ -284,6 +373,14 @@ interface Runner {
 	forkSp?: number;
 	/** the fork this runner is the child of, until its frames resume */
 	forkOf?: Fork | null;
+	/** with `reenterAfterRestore`: the host time from which its next fuel yield re-enters its frames */
+	reenterAt?: bigint;
+	/** its frames are spilling to resume in their own instance */
+	reentering?: boolean;
+	/** the stack pointer of the fuel yield it re-enters at */
+	reenterSp?: number;
+	/** what the re-issued __gmux_fuel of its re-entered frames returns */
+	reentered?: number;
 	/** signal handlers running on stacks of their own */
 	handlers: number;
 	/** inside a kernel entry of userInterrupt's, whose JS frame a checkpoint cannot carry */
@@ -354,6 +451,38 @@ function isFault(error: unknown): boolean {
 	return error instanceof RangeError && /call stack size/.test(error.message);
 }
 
+/** a statx the kernel answered, and the generation the answer holds for */
+interface StatxAnswer {
+	view: number;
+	flags: number;
+	mask: number;
+	path: Uint8Array;
+	gen: number;
+	ret: number;
+	bytes: Uint8Array | null;
+}
+
+/**
+ * FNV-1a over an absolute path's bytes in `mem` from `at`, with the view, flags and mask folded in;
+ * null for a relative or unterminated path
+ */
+function statxHash(mem: Uint8Array, at: number, view: number, flags: number, mask: number) {
+	if (mem[at] !== 0x2f) return null;
+	let h = (0x811c9dc5 ^ view ^ Math.imul(flags, 0x9e3779b1) ^ Math.imul(mask, 0x85ebca6b)) >>> 0;
+	for (let i = at; i < at + 4096 && i < mem.length; i++) {
+		const b = mem[i]!;
+		if (!b) return h;
+		h = Math.imul(h ^ b, 16777619) >>> 0;
+	}
+	return null;
+}
+
+/** whether the NUL-terminated path at `at` is `path` */
+function samePath(mem: Uint8Array, at: number, path: Uint8Array) {
+	for (let i = 0; i < path.length; i++) if (mem[at + i] !== path[i]) return false;
+	return mem[at + path.length] === 0;
+}
+
 class Trap extends Error {
 	readonly kind: string;
 	constructor(kind: string) {
@@ -361,6 +490,13 @@ class Trap extends Error {
 		this.kind = kind;
 	}
 }
+
+/**
+ * thrown into the parked stack of a task the kernel released, which nothing will resume: V8 keeps a
+ * suspended stack and every instance on it, so a stack left parked is memory an exited process never
+ * gives back
+ */
+class Abandoned extends Error {}
 
 /** counters the host keeps while a machine runs */
 export interface MachineStats {
@@ -388,6 +524,8 @@ export interface MachineStats {
 	stackSegments: number;
 	/** forks through __gmux_fork */
 	forks: number;
+	/** restored programs whose frames resumed again in their own instance (`reenterAfterRestore`) */
+	reentries: number;
 	/** pages a lazy restore left out */
 	deferredPages: number;
 	/** deferred pages brought in since */
@@ -404,6 +542,28 @@ export interface MachineStats {
 	consoleRaises: number;
 	/** executables the registry did not hold, by hash and size */
 	unknownExecutables: string[];
+	/** regular files handed to `fileSync` by an fsync, a synchronous write, an msync or a sync */
+	fileSyncs: number;
+	/** sync and syncfs calls, each a walk of the root filesystem */
+	syncWalks: number;
+	/** parked stacks of released tasks, unwound so they can be collected */
+	abandonedStacks: number;
+	/** statx answered from the host's cache, asked of the kernel for want of an answer, and stored */
+	statxHits: number;
+	statxMisses: number;
+	statxFills: number;
+	/** with `syscallCache: 'verify'`: answers the cache held that the kernel then contradicted */
+	statxMismatches: number;
+	/** files a sync found gone since they were synced, handed to `fileSync` as removed */
+	fileRemovals: number;
+	/** the bytes those handed over */
+	fileSyncBytes: number;
+	/** syncs of a file with no path to name it by (deleted, or not a regular file), passed through */
+	fileSyncsSkipped: number;
+	/** `restoreFiles` written back */
+	filesRestored: number;
+	/** `restoreFiles` the kernel refused, with its error */
+	fileRestoreErrors: string[];
 }
 
 /**
@@ -438,6 +598,7 @@ export class Machine {
 		pageFaults: 0,
 		stackSegments: 0,
 		forks: 0,
+		reentries: 0,
 		deferredPages: 0,
 		filledPages: 0,
 		touchedPages: 0,
@@ -445,7 +606,19 @@ export class Machine {
 		sharedEntries: 0,
 		consoleReads: 0,
 		consoleRaises: 0,
-		unknownExecutables: []
+		unknownExecutables: [],
+		fileSyncs: 0,
+		syncWalks: 0,
+		abandonedStacks: 0,
+		statxHits: 0,
+		statxMisses: 0,
+		statxFills: 0,
+		statxMismatches: 0,
+		fileRemovals: 0,
+		fileSyncBytes: 0,
+		fileSyncsSkipped: 0,
+		filesRestored: 0,
+		fileRestoreErrors: []
 	};
 	/** whether the kernel halted (`reboot`, `poweroff`) */
 	halted = false;
@@ -456,15 +629,29 @@ export class Machine {
 	private running = false;
 	// its stacks are bytes in a snapshot; only Machine.restore continues it
 	private spent = false;
+	private checkpointing = false;
 	private clockOffset = 0n;
 	private scratch = 0;
 	private unwound: (() => void) | null = null;
+	/** where the syscall router sends a call (router.ts), when the host watches file syncs */
+	private route: WebAssembly.Global | null = null;
+	/** files a restore still has to write back, and the task writing them */
+	private pendingFiles: SyncedFile[] | null = null;
+	private applying: Runner | null = null;
+	/** a program opened a file with O_DSYNC, so the router hands the hook every write */
+	private syncWrites = false;
+	/** the kernel clock at the checkpoint this machine continues from: older files are in its image */
+	private syncMark = 0n;
+	/** files handed to `fileSync` since that checkpoint, which a sync reports gone if they are */
+	private readonly syncedPaths = new Set<string>();
+	/** statx answers by a hash of view, flags, mask and path, each with the generation it holds for */
+	private fsCache: Map<number, StatxAnswer> | null = null;
 
 	/**
 	 * a machine that has not booted; `run` boots it. Its memory starts at `initialPages` 64 KiB
 	 * pages
 	 */
-	constructor(options: MachineOptions, initialPages = 15) {
+	constructor(options: MachineOptions, initialPages = 15, keep = false) {
 		this.options = options;
 		// the kernel's static memory, recorded at build time (scripts/wasm/memory-note.ts)
 		const note = WebAssembly.Module.customSections(options.vmlinux, 'gmux.memory')[0];
@@ -474,7 +661,8 @@ export class Machine {
 			this.memory = options.memory;
 			const pages = this.memory.buffer.byteLength / 0x10000;
 			if (pages < initial) this.memory.grow(initial - pages);
-			new Uint8Array(this.memory.buffer).fill(0);
+			// Machine.resume: the memory already holds the snapshot's image
+			if (!keep) new Uint8Array(this.memory.buffer).fill(0);
 		} else
 			this.memory = new WebAssembly.Memory({
 				initial,
@@ -482,6 +670,19 @@ export class Machine {
 				shared: true
 			});
 		this.cpuZero = this.runner('cpu0', { kind: 'boot' });
+		if (options.fileSync || options.restoreFiles?.length || options.syscallCache)
+			this.route = new WebAssembly.Global({ value: 'i32', mutable: true }, ROUTE_WATCH);
+		if (options.syscallCache) this.fsCache = new Map();
+	}
+
+	/** the earliest Linux timer an idle task waits for, in kernel-clock nanoseconds, or null */
+	get deadline(): bigint | null {
+		return this.nextDeadline();
+	}
+
+	/** the kernel clock, in nanoseconds; `deadline` is on it */
+	get clockNs(): bigint {
+		return this.now();
 	}
 
 	private log(line: string) {
@@ -600,7 +801,13 @@ export class Machine {
 				self.stats.switches++;
 				target.value = prev;
 				self.ready.unshift(target);
-				if (me.kill) self.release(prev);
+				// released while it ran, or before its last turn: this switch was its last
+				if (me.kill && !me.vfork && !me.vforkOf) {
+					if (self.runners.get(prev) === me) self.runners.delete(prev);
+					const parked = self.park(me);
+					queueMicrotask(() => self.abandon(me));
+					return parked;
+				}
 				return self.park(me);
 			}),
 			wasm_create_and_run_task: new WebAssembly.Suspending(
@@ -833,7 +1040,22 @@ export class Machine {
 		const runner = this.runners.get(dead);
 		if (!runner) return;
 		if (runner === this.current) runner.kill = true;
-		else this.runners.delete(dead);
+		else {
+			this.runners.delete(dead);
+			// one still in the ready queue has a turn to take (its final switch); it goes after that
+			if (this.ready.includes(runner)) runner.kill = true;
+			else this.abandon(runner);
+		}
+	}
+
+	/** unwinds a released task's parked stack, so its frames and instances can be collected */
+	private abandon(runner: Runner) {
+		const fail = runner.fail;
+		runner.resume = null;
+		runner.fail = null;
+		if (!fail) return;
+		this.stats.abandonedStacks++;
+		fail(new Abandoned());
 	}
 
 	private shared: WebAssembly.Instance | null = null;
@@ -872,6 +1094,8 @@ export class Machine {
 	}
 
 	private finished(runner: Runner, error?: unknown) {
+		// an abandoned stack was not running: the pump waits on another task
+		if (error instanceof Abandoned) return;
 		if (error && !(error instanceof Trap && error.kind === 'panic')) {
 			this.crashed = error;
 			this.log(`${runner.name} crashed: ${String((error as Error)?.stack ?? error)}`);
@@ -1110,10 +1334,17 @@ export class Machine {
 				// a vfork child runs this instance as another task
 				const me = this.shared ? this.current! : runner;
 				if (me.rewinding) return this.rewound(me);
+				if (me.reentered !== undefined) {
+					const value = me.reentered;
+					me.reentered = undefined;
+					return value;
+				}
 				this.stats.fuelYields++;
 				me.value = this.options.fuelBudget ?? 200000;
 				this.ready.push(me);
-				return this.park(me, 'user').then((value) => this.userInterrupt(me, value));
+				return this.park(me, 'user')
+					.then((value) => this.userInterrupt(me, value))
+					.then((value) => this.reenter(me, value));
 			}),
 			__gmux_vfork: new WebAssembly.Suspending((env: number) => this.vforkStart(env)),
 			// musl's _Fork (musl patch 0008)
@@ -1126,8 +1357,503 @@ export class Machine {
 				this.vforkTerminal(SYS_EXIT_GROUP, [status])
 			)
 		};
-		for (let n = 0; n <= 6; n++) env[`__wasm_syscall_${n}`] = kernel[`wasm_syscall_${n}`];
+		if (!this.route) {
+			for (let n = 0; n <= 6; n++) env[`__wasm_syscall_${n}`] = kernel[`wasm_syscall_${n}`];
+			return env;
+		}
+		const k: Record<string, unknown> = {};
+		const h: Record<string, unknown> = {};
+		for (let n = 0; n <= 6; n++) {
+			// a kernel without an arity (the unit tests' toy one) never gets a call at it
+			k[n] =
+				kernel[`wasm_syscall_${n}`] ??
+				(() => {
+					throw new Error(`the kernel has no wasm_syscall_${n}`);
+				});
+			h[n] = new WebAssembly.Suspending(
+				(sp: number, tls: number, nr: number, ...args: number[]) =>
+					this.syscallHook(this.shared ? this.current! : runner, sp, tls, nr, args)
+			);
+		}
+		const router = new WebAssembly.Instance(ROUTER, {
+			k: k as WebAssembly.ModuleImports,
+			h: h as WebAssembly.ModuleImports,
+			c: {
+				5: (
+					_sp: number,
+					_tls: number,
+					_nr: number,
+					_dirfd: number,
+					path: number,
+					flags: number,
+					mask: number,
+					buf: number
+				) => this.statxCached(this.shared ? this.current! : runner, path, flags, mask, buf)
+			},
+			m: {
+				route: this.route,
+				cache: new WebAssembly.Global(
+					{ value: 'i32', mutable: false },
+					this.fsCache ? 1 : 0
+				)
+			}
+		}).exports;
+		for (let n = 0; n <= 6; n++) env[`__wasm_syscall_${n}`] = router[`s${n}`];
 		return env;
+	}
+
+	/**
+	 * the router's hook: a restore's files go back in first, then an fsync or fdatasync of a regular
+	 * file hands the file to `fileSync` before the kernel's own sync runs, and the call returns after
+	 * both. Its kernel calls are the task's own, as userInterrupt's are
+	 */
+	private async syscallHook(
+		me: Runner,
+		sp: number,
+		tls: number,
+		nr: number,
+		args: number[]
+	): Promise<number> {
+		const kernel = this.exp(me);
+		me.syncing = true;
+		try {
+			// one task writes a restore's files back; any other waits its turn in the ready queue
+			while (this.pendingFiles || (this.applying && this.applying !== me)) {
+				if (this.pendingFiles && !this.applying) {
+					this.applying = me;
+					try {
+						await this.applyFiles(me, sp, tls, this.pendingFiles);
+					} finally {
+						this.pendingFiles = null;
+						this.applying = null;
+						this.route!.value = this.syncWrites ? ROUTE_WRITES : ROUTE_WATCH;
+					}
+					break;
+				}
+				this.ready.push(me);
+				await this.park(me, 'user');
+			}
+			// -1 without fileSync: every call goes straight on
+			const sync = this.options.fileSync ? nr : -1;
+			if (sync === SYS_FSYNC || sync === SYS_FDATASYNC || sync === SYS_SYNC_FILE_RANGE)
+				await this.syncFile(me, sp, tls, args[0]!);
+			else if (sync === SYS_MSYNC && args[2]! & MS_SYNC)
+				await this.syncMapped(me, sp, tls, args[0]! >>> 0, args[1]! >>> 0);
+			else if (sync === SYS_SYNC) await this.syncAll(me, sp, tls);
+			else if (sync === SYS_SYNCFS) await this.syncAll(me, sp, tls, args[0]!);
+			const query = this.fsCache && nr === SYS_STATX ? this.statxQuery(me, args) : null;
+			const result =
+				Number(
+					await WebAssembly.promising(kernel[`wasm_syscall_${args.length}`])(
+						sp,
+						tls,
+						nr,
+						...args
+					)
+				) | 0;
+			if (query) await this.statxFill(me, sp, tls, query, result, args[4]! >>> 0);
+			if (result < 0) return result;
+			if (sync === SYS_OPENAT && args[2]! & O_DSYNC) {
+				// ponytail: once set, every write on the machine passes the hook; a per-fd table in
+				// the kernel would narrow it to the synchronous files
+				this.syncWrites = true;
+				this.route!.value = ROUTE_WRITES;
+			} else if (WRITE_CALLS.includes(sync) || sync === SYS_PWRITEV2) {
+				// a synchronous write returns once its file is durable, as fsync after it would
+				const fd =
+					sync === SYS_SPLICE || sync === SYS_COPY_FILE_RANGE ? args[2]! : args[0]!;
+				const flags =
+					sync === SYS_PWRITEV2 && args[5]! & (RWF_DSYNC | RWF_SYNC)
+						? O_DSYNC
+						: await this.sys(me, sp, tls, SYS_FCNTL, fd, F_GETFL);
+				if (flags >= 0 && flags & O_DSYNC) await this.syncFile(me, sp, tls, fd);
+			}
+			return result;
+		} finally {
+			me.syncing = false;
+		}
+	}
+
+	/**
+	 * the cache key of a statx at `args` (dirfd, path, flags, mask, buf) and the generation it is asked
+	 * at, or null when its answer may depend on more than the path: a relative path (the cwd, the
+	 * dirfd), or a task that could be refused a directory or sees other mounts (kernel patch 0022)
+	 */
+	private statxQuery(me: Runner, args: number[]) {
+		const kernel = this.exp(me);
+		const view = Number(kernel.wasm_fs_view?.() ?? 0) >>> 0;
+		if (!view) return null;
+		const mem = new Uint8Array(this.userMemory(me).buffer);
+		const at = args[1]! >>> 0;
+		const hash = statxHash(mem, at, view, args[2]!, args[3]!);
+		if (hash === null) return null;
+		const path = mem.slice(at, mem.indexOf(0, at));
+		return {
+			hash,
+			path,
+			// one char per byte, for the ancestor walk
+			name: String.fromCharCode(...path),
+			view,
+			flags: args[2]!,
+			mask: args[3]!,
+			gen: Number(kernel.wasm_fs_gen()) >>> 0
+		};
+	}
+
+	/**
+	 * the router's plain import for statx: the cached answer, or MISS. It runs on every statx, so it
+	 * hashes the path in place and allocates nothing
+	 */
+	private statxCached(
+		me: Runner,
+		path: number,
+		flags: number,
+		mask: number,
+		buf: number
+	): number {
+		const kernel = this.exp(me);
+		const view = kernel.wasm_fs_view() >>> 0;
+		const mem = this.userBytes(me);
+		const at = path >>> 0;
+		const hash = view ? statxHash(mem, at, view, flags, mask) : null;
+		const held = hash === null ? undefined : this.fsCache!.get(hash);
+		if (
+			!held ||
+			held.gen !== kernel.wasm_fs_gen() >>> 0 ||
+			held.view !== view ||
+			held.flags !== flags ||
+			held.mask !== mask ||
+			!samePath(mem, at, held.path) ||
+			this.options.syscallCache === 'verify'
+		) {
+			this.stats.statxMisses++;
+			return MISS;
+		}
+		if (held.bytes) mem.set(held.bytes, buf >>> 0);
+		this.stats.statxHits++;
+		return held.ret;
+	}
+
+	private userBytesCache: Uint8Array | null = null;
+	/** the mount id of each view's "/" */
+	private readonly rootMounts = new Map<number, number | null>();
+
+	/** the task's memory as bytes, the view kept until the memory grows or differs */
+	private userBytes(me: Runner): Uint8Array {
+		const buffer = this.userMemory(me).buffer;
+		const held = this.userBytesCache;
+		if (held && held.buffer === buffer) return held;
+		return (this.userBytesCache = new Uint8Array(buffer));
+	}
+
+	/**
+	 * keeps the kernel's answer to a statx when nothing changed while it was asked and the lookup
+	 * ended on the root mount (a proc or sysfs answer changes with no timestamp moving). Only answers
+	 * that follow from the path are kept: success, ENOENT and ENOTDIR, never EFAULT
+	 */
+	private async statxFill(
+		me: Runner,
+		sp: number,
+		tls: number,
+		q: NonNullable<ReturnType<Machine['statxQuery']>>,
+		result: number,
+		buf: number
+	) {
+		const kernel = this.exp(me);
+		const gen = () => Number(kernel.wasm_fs_gen()) >>> 0;
+		if ((result !== 0 && result !== -2 && result !== -20) || gen() !== q.gen) return;
+		const bytes =
+			result === 0 ? new Uint8Array(this.userMemory(me).buffer).slice(buf, buf + 256) : null;
+		// a device, fifo or socket's times move without the generation (kernel patch 0022)
+		const type = bytes ? new DataView(bytes.buffer).getUint16(28, true) & 0o170000 : 0;
+		if (bytes && !(bytes[0]! & 1 && [0o100000, 0o040000, 0o120000].includes(type))) return;
+		const held = this.fsCache!.get(q.hash);
+		if (
+			held?.gen === q.gen &&
+			held.view === q.view &&
+			held.flags === q.flags &&
+			held.mask === q.mask &&
+			held.path.length === q.path.length &&
+			held.path.every((b, i) => b === q.path[i]) &&
+			(held.ret !== result || (bytes && !bytes.every((b, i) => b === held.bytes?.[i])))
+		)
+			this.stats.statxMismatches++;
+		// a task's "/" is its root dentry, the view, whatever is mounted over it later
+		let root = this.rootMounts.get(q.view);
+		if (root === undefined) {
+			root = await this.statxMount(me, sp, tls, '/', 0);
+			if (typeof root === 'number') this.rootMounts.set(q.view, root);
+		}
+		let mount: number | null | undefined =
+			bytes && new DataView(bytes.buffer).getUint32(0, true) & STATX_MNT_ID
+				? Number(new DataView(bytes.buffer).getBigUint64(144, true))
+				: undefined;
+		if (bytes && mount === undefined)
+			mount = await this.statxMount(me, sp, tls, q.name, q.flags);
+		// a missing path: the nearest ancestor that exists holds the lookup's last mount
+		for (let p = q.name; mount === undefined && p !== '/';) {
+			p = p.slice(0, p.lastIndexOf('/')) || '/';
+			mount = await this.statxMount(me, sp, tls, p, 0);
+		}
+		if (root == null || mount !== root || gen() !== q.gen) return;
+		const { view, flags, mask, path, gen: at } = q;
+		this.fsCache!.set(q.hash, { view, flags, mask, path, gen: at, ret: result, bytes });
+		this.stats.statxFills++;
+	}
+
+	/**
+	 * the mount id of `path` by a statx the hook makes below the task's stack pointer; undefined when
+	 * the path does not resolve, null when the answer cannot be had
+	 */
+	private async statxMount(me: Runner, sp: number, tls: number, path: string, flags: number) {
+		const at = (sp - 8192) & ~15;
+		const low = Number(this.exp(me).wasm_user_stack_low?.(sp) ?? 0) >>> 0;
+		if (at < low) return null;
+		const mem = new Uint8Array(this.userMemory(me).buffer);
+		for (let i = 0; i < path.length; i++) mem[at + i] = path.charCodeAt(i);
+		mem[at + path.length] = 0;
+		const statx = at + 4608;
+		// the region is free stack; a signal frame the call might push goes below it
+		const r = await this.sys(me, at, tls, SYS_STATX, AT_FDCWD, at, flags, STATX_MNT_ID, statx);
+		if (r === -2 || r === -20) return undefined;
+		const view = new DataView(this.userMemory(me).buffer);
+		if (r < 0 || !(view.getUint32(statx, true) & STATX_MNT_ID)) return null;
+		return Number(view.getBigUint64(statx + 144, true));
+	}
+
+	/** a synchronous-looking kernel call in the task's context, which may park it */
+	private async sys(me: Runner, sp: number, tls: number, nr: number, ...args: number[]) {
+		const call = this.exp(me)[`wasm_syscall_${args.length}`];
+		return Number(await WebAssembly.promising(call)(sp, tls, nr, ...args)) | 0;
+	}
+
+	/**
+	 * the hook's view of the task's scratch mapping: a path at 0, statx at 4608, reads from 8192.
+	 * Null when the task has no mapping to lend
+	 */
+	private hookScratch(me: Runner, sp: number, tls: number) {
+		const scratch = this.forkSpill(me);
+		if (!scratch) return null;
+		const mem = () => new Uint8Array(this.userMemory(me).buffer);
+		const buffer = scratch + 8192;
+		const chunk = FORK_SPILL - 8192;
+		const put = (s: string) => mem().set(new TextEncoder().encode(`${s}\0`), scratch);
+		const sys = (nr: number, ...args: number[]) => this.sys(me, sp, tls, nr, ...args);
+		return {
+			scratch,
+			put,
+			sys,
+			/** statx of a path, or of fd `at` itself when `path` is empty */
+			stat: async (path: string, flags = 0, at = AT_FDCWD) => {
+				put(path);
+				const statx = scratch + 4608;
+				if ((await sys(SYS_STATX, at, scratch, flags, 0x7ff, statx)) < 0) return null;
+				const view = new DataView(this.userMemory(me).buffer);
+				return {
+					mode: view.getUint16(statx + 28, true),
+					size: Number(view.getBigUint64(statx + 40, true)),
+					ctime:
+						view.getBigInt64(statx + 96, true) * 1_000_000_000n +
+						BigInt(view.getUint32(statx + 104, true)),
+					dev: `${view.getUint32(statx + 136, true)}:${view.getUint32(statx + 140, true)}`
+				};
+			},
+			/** a file's whole contents, read through a descriptor of its own */
+			read: async (path: string, size = 0) => {
+				put(path);
+				const fd = await sys(SYS_OPENAT, AT_FDCWD, scratch, O_RDONLY | O_CLOEXEC, 0);
+				if (fd < 0) return null;
+				let bytes = new Uint8Array(size);
+				let at = 0;
+				for (;;) {
+					const got = await sys(SYS_READ, fd, buffer, chunk);
+					if (got <= 0) break;
+					if (at + got > bytes.length) {
+						const grown = new Uint8Array(Math.max(bytes.length * 2, at + got));
+						grown.set(bytes);
+						bytes = grown;
+					}
+					bytes.set(mem().subarray(buffer, buffer + got), at);
+					at += got;
+				}
+				await sys(SYS_CLOSE, fd);
+				return bytes.slice(0, at);
+			},
+			/** a directory's entries as [name, d_type] */
+			list: async (path: string) => {
+				put(path);
+				const fd = await sys(
+					SYS_OPENAT,
+					AT_FDCWD,
+					scratch,
+					O_RDONLY | O_DIRECTORY | O_CLOEXEC,
+					0
+				);
+				if (fd < 0) return [];
+				const out: [string, number][] = [];
+				for (;;) {
+					const got = await sys(SYS_GETDENTS64, fd, buffer, 65536);
+					if (got <= 0) break;
+					const bytes = mem();
+					const view = new DataView(bytes.buffer);
+					// linux_dirent64: ino, off, reclen at 16, type at 18, name at 19
+					for (let at = buffer; at < buffer + got;) {
+						const length = view.getUint16(at + 16, true);
+						const end = bytes.indexOf(0, at + 19);
+						out.push([this.decoder.decode(bytes.slice(at + 19, end)), bytes[at + 18]!]);
+						at += length || got;
+					}
+				}
+				await sys(SYS_CLOSE, fd);
+				return out;
+			}
+		};
+	}
+
+	/** reads the file behind `fd` through the kernel and hands it to `fileSync` */
+	private async syncFile(me: Runner, sp: number, tls: number, fd: number) {
+		const s = this.hookScratch(me, sp, tls);
+		if (!s) return void this.stats.fileSyncsSkipped++;
+		// /proc/self/fd/N names the open file; reopening it reads without moving the program's offset
+		const link = `/proc/self/fd/${fd}`;
+		s.put(link);
+		const n = await s.sys(SYS_READLINKAT, AT_FDCWD, s.scratch, s.scratch + 256, 3840);
+		const bytes = new Uint8Array(this.userMemory(me).buffer);
+		const path =
+			n > 0 ? this.decoder.decode(bytes.slice(s.scratch + 256, s.scratch + 256 + n)) : '';
+		if (!path.startsWith('/') || path.endsWith(' (deleted)'))
+			return void this.stats.fileSyncsSkipped++;
+		await this.flushPath(s, link, path);
+	}
+
+	/** hands the regular file at `open` to `fileSync` under the name `path` */
+	private async flushPath(
+		s: NonNullable<ReturnType<Machine['hookScratch']>>,
+		open: string,
+		path: string
+	) {
+		const st = await s.stat(open);
+		if (!st || (st.mode & 0o170000) !== 0o100000) return void this.stats.fileSyncsSkipped++;
+		const bytes = await s.read(open, st.size);
+		if (!bytes) return void this.stats.fileSyncsSkipped++;
+		this.stats.fileSyncs++;
+		this.stats.fileSyncBytes += bytes.byteLength;
+		this.syncedPaths.add(path);
+		await this.options.fileSync!({ path, mode: st.mode & 0o7777, bytes });
+	}
+
+	/** msync(MS_SYNC): every file mapped over [addr, addr + length), by /proc/self/maps */
+	private async syncMapped(me: Runner, sp: number, tls: number, addr: number, length: number) {
+		const s = this.hookScratch(me, sp, tls);
+		if (!s) return void this.stats.fileSyncsSkipped++;
+		const maps = await s.read('/proc/self/maps');
+		const paths = new Set<string>();
+		for (const line of this.decoder.decode(maps ?? new Uint8Array(0)).split('\n')) {
+			const m = /^([0-9a-f]+)-([0-9a-f]+) \S+ \S+ \S+ \S+\s+(\/.*)$/.exec(line);
+			if (!m || m[3]!.endsWith(' (deleted)')) continue;
+			if (parseInt(m[1]!, 16) < addr + Math.max(length, 1) && parseInt(m[2]!, 16) > addr)
+				paths.add(m[3]!);
+		}
+		for (const path of paths) await this.flushPath(s, path, path);
+	}
+
+	/**
+	 * sync and syncfs: every regular file on the root filesystem changed since the checkpoint this
+	 * machine continues from, then every file synced since then that is gone, as removed. A walk and
+	 * not a checkpoint: a checkpoint needs every task parked in the kernel, and this one is in the
+	 * hook until the call returns. syncfs of another filesystem (proc, devtmpfs) has nothing to keep
+	 */
+	private async syncAll(me: Runner, sp: number, tls: number, fd?: number) {
+		const s = this.hookScratch(me, sp, tls);
+		if (!s) return void this.stats.fileSyncsSkipped++;
+		const root = await s.stat('/');
+		if (!root) return;
+		if (fd !== undefined && (await s.stat('', AT_EMPTY_PATH, fd))?.dev !== root.dev) return;
+		this.stats.syncWalks++;
+		// file times come from the kernel's coarse clock, a tick behind; two seconds covers it
+		const since = this.syncMark - 2_000_000_000n;
+		const seen = new Set<string>();
+		const dirs = ['/'];
+		while (dirs.length) {
+			const dir = dirs.pop()!;
+			for (const [name, type] of await s.list(dir)) {
+				if (name === '.' || name === '..' || (type !== DT_DIR && type !== DT_REG)) continue;
+				const path = `${dir === '/' ? '' : dir}/${name}`;
+				const st = await s.stat(path, AT_SYMLINK_NOFOLLOW);
+				if (!st || st.dev !== root.dev) continue;
+				if (type === DT_DIR) dirs.push(path);
+				else {
+					seen.add(path);
+					if (st.ctime >= since) await this.flushPath(s, path, path);
+				}
+			}
+		}
+		for (const path of [...this.syncedPaths]) {
+			if (seen.has(path)) continue;
+			this.syncedPaths.delete(path);
+			this.stats.fileRemovals++;
+			await this.options.fileSync!({
+				path,
+				mode: 0,
+				bytes: new Uint8Array(0),
+				removed: true
+			});
+		}
+	}
+
+	/** writes a restore's files back through the kernel, making any directory they need */
+	private async applyFiles(me: Runner, sp: number, tls: number, files: SyncedFile[]) {
+		const scratch = this.forkSpill(me);
+		if (!scratch) {
+			this.stats.fileRestoreErrors.push('no scratch mapping');
+			return;
+		}
+		const mem = () => new Uint8Array(this.userMemory(me).buffer);
+		const put = (s: string) => mem().set(new TextEncoder().encode(`${s}\0`), scratch);
+		const buffer = scratch + 4096;
+		const chunk = FORK_SPILL - 4096;
+		for (const file of files) {
+			if (file.removed) {
+				put(file.path);
+				const gone = await this.sys(me, sp, tls, SYS_UNLINKAT, AT_FDCWD, scratch, 0);
+				// ENOENT: the checkpoint never had it
+				if (gone < 0 && gone !== -2)
+					this.stats.fileRestoreErrors.push(`${file.path}: ${gone}`);
+				else this.stats.filesRestored++;
+				continue;
+			}
+			const parts = file.path.split('/').filter(Boolean);
+			for (let i = 1; i < parts.length; i++) {
+				put(`/${parts.slice(0, i).join('/')}`);
+				await this.sys(me, sp, tls, SYS_MKDIRAT, AT_FDCWD, scratch, 0o755);
+			}
+			put(file.path);
+			const fd = await this.sys(
+				me,
+				sp,
+				tls,
+				SYS_OPENAT,
+				AT_FDCWD,
+				scratch,
+				O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC,
+				file.mode
+			);
+			if (fd < 0) {
+				this.stats.fileRestoreErrors.push(`${file.path}: ${fd}`);
+				continue;
+			}
+			let failed = 0;
+			for (let at = 0; at < file.bytes.length && !failed;) {
+				const part = file.bytes.subarray(at, at + chunk);
+				mem().set(part, buffer);
+				const wrote = await this.sys(me, sp, tls, SYS_WRITE, fd, buffer, part.length);
+				if (wrote <= 0) failed = wrote || -5;
+				else at += wrote;
+			}
+			await this.sys(me, sp, tls, SYS_CLOSE, fd);
+			if (failed) this.stats.fileRestoreErrors.push(`${file.path}: ${failed}`);
+			else this.stats.filesRestored++;
+		}
 	}
 
 	/**
@@ -1173,6 +1899,19 @@ export class Machine {
 					(error as { is(tag: unknown): boolean }).is(ux.gmux_ckpt)
 				) {
 					await this.forkUnwound(runner);
+					restoring = true;
+					continue;
+				}
+				if (
+					runner.reentering &&
+					evacuable(ux) &&
+					error instanceof WebAssembly.Exception &&
+					(error as { is(tag: unknown): boolean }).is(ux.gmux_ckpt)
+				) {
+					runner.reentering = false;
+					ux.gmux_unwinding.value = 0;
+					runner.program!.stackPointer.value = runner.reenterSp!;
+					this.stats.reentries++;
 					restoring = true;
 					continue;
 				}
@@ -1329,8 +2068,12 @@ export class Machine {
 	private enterProgram(runner: Runner, clone: boolean): NonNullable<Runner['program']> {
 		const kernel = this.exp(runner);
 		const tlsBase = kernel.get_user_tls_base();
-		// a new process image: nothing loaded at this data start belongs to it
-		if (!clone) this.dls.delete(runner.user!.dataStart);
+		// a new process image: nothing loaded at this data start belongs to it, nor a scratch
+		// mapping cached for an earlier mm at its mm's address
+		if (!clone) {
+			this.dls.delete(runner.user!.dataStart);
+			this.forkSpills.delete(Number(kernel.wasm_current_mm?.() ?? 0) >>> 0);
+		}
 		const made = this.program(runner, kernel.get_user_stack_pointer());
 		const ux = made.ux;
 		runner.program = {
@@ -1539,12 +2282,49 @@ export class Machine {
 		return 0;
 	}
 
+	/**
+	 * `reenterAfterRestore`: once its time has come, a fuel yield returns with the program unwinding,
+	 * so its frames spill as for a fork and userChain resumes them in the same instance, where the
+	 * re-issued yield returns `value`
+	 */
+	private reenter(me: Runner, value: number): number {
+		if (me.reenterAt === undefined || me.unwinding || me.rewinding || this.now() < me.reenterAt)
+			return value;
+		const program = me.program;
+		// a handler's frames are not userChain's, and a vfork child runs its parent's instance
+		if (
+			!program ||
+			me.handlers ||
+			me.vfork ||
+			me.vforkOf ||
+			me.shared ||
+			!evacuable(program.exports)
+		)
+			return value;
+		me.reenterAt = undefined;
+		const spill = this.forkSpill(me);
+		if (!spill) return value;
+		me.reenterSp = program.stackPointer.value;
+		program.exports.gmux_fp.value = spill;
+		program.exports.gmux_unwinding.value = 1;
+		me.reentering = true;
+		me.reentered = value;
+		return value;
+	}
+
 	/** a mapping of the process's own for its spilled frames, made once and reused while it lasts */
 	private forkSpill(me: Runner): number {
 		const kernel = this.exp(me);
 		const mm = Number(kernel.wasm_current_mm()) >>> 0;
 		const known = this.forkSpills.get(mm);
-		if (known && kernel.wasm_user_stack_low(known) >>> 0 === known) return known;
+		// a dead process's mm and mapping addresses come back; a smaller mapping there is not ours
+		if (
+			known &&
+			kernel.wasm_user_stack_low(known) >>> 0 === known &&
+			(!kernel.wasm_user_stack_high ||
+				kernel.wasm_user_stack_high(known) >>> 0 >= known + FORK_SPILL)
+		)
+			return known;
 		const [sp, tls] = this.userRegs(me);
 		// synchronous: the program is in its fork call, and an anonymous mapping does not sleep
 		const low =
@@ -1877,6 +2657,12 @@ export class Machine {
 	 * machine's memory, not a copy, so a caller persists it before dropping the machine
 	 */
 	async checkpoint(): Promise<Snapshot> {
+		// a task the kernel released can still hold a turn in the ready queue, which a live machine
+		// gives it; dropped from the snapshot, a cpu waits forever for the switch it would make
+		const all = [
+			...this.runners.values(),
+			...this.ready.filter((r) => this.runners.get(r.id) !== r)
+		];
 		// ponytail: a fork child's own memory is not in the snapshot yet
 		if (this.privateMemories.size)
 			throw new Error('checkpoint: fork children with their own memory are not saved yet');
@@ -1887,11 +2673,17 @@ export class Machine {
 		if (!this.options.asyncify || !this.shared)
 			throw new Error('checkpoint needs asyncify and a shared kernel');
 		if (this.running) throw new Error('checkpoint while the pump runs');
-		if ([...this.runners.values()].some((r) => r.vfork || r.vforkOf))
-			throw new Error('checkpoint during vfork');
+		// its stacks are already bytes, or are being made so: a second snapshot would hold none of them
+		if (this.spent || this.checkpointing)
+			throw new Error('checkpoint: this machine has checkpointed already');
+		if (all.some((r) => r.vfork || r.vforkOf)) throw new Error('checkpoint during vfork');
+		if (all.some((r) => r.syncing) || this.pendingFiles)
+			throw new Error(
+				'checkpoint during a file sync or before a restore wrote its files back'
+			);
 		// ponytail: one handler per task, from a syscall's return; nested handlers would stack HandlerStacks
 		if (
-			[...this.runners.values()].some(
+			all.some(
 				(r) =>
 					r.handlers > 1 ||
 					(r.handlers && (r.interrupting || !r.program || !evacuable(r.program.exports)))
@@ -1900,6 +2692,18 @@ export class Machine {
 			throw new Error(
 				'checkpoint during a nested, interrupt-time or asyncified signal handler'
 			);
+		// the guarded BusyBox and katybug are not asyncified: nothing could unwind their frames
+		if (
+			all.some(
+				(r) =>
+					r.program &&
+					!r.halted &&
+					!evacuable(r.program.exports) &&
+					!r.program.exports.asyncify_start_unwind
+			)
+		)
+			throw new Error('checkpoint while a program without asyncify runs');
+		this.checkpointing = true;
 		this.ensureScratch();
 		// a machine restored lazily saves every page: what its parked processes never brought in too
 		for (const tag of [...this.deferred.keys()]) await this.fillDeferred(tag);
@@ -1916,7 +2720,7 @@ export class Machine {
 				)
 			: undefined;
 		const programs = new Map<Runner, SavedRunner['program']>();
-		for (const runner of this.runners.values()) {
+		for (const runner of all) {
 			if (!runner.program) continue;
 			const globals = Object.entries(runner.program.exports)
 				.filter(([name]) => name.startsWith('gmux_g'))
@@ -1927,7 +2731,7 @@ export class Machine {
 				globals
 			});
 		}
-		for (const runner of this.runners.values()) {
+		for (const runner of all) {
 			if (!runner.started || runner.halted || !runner.resume) continue;
 			const resume = runner.resume;
 			runner.resume = null;
@@ -1942,7 +2746,7 @@ export class Machine {
 			if (runner.unwinding) this.endUnwind(runner);
 			this.current = null;
 		}
-		const runners: SavedRunner[] = [...this.runners.values()].map((r) => ({
+		const runners: SavedRunner[] = all.map((r) => ({
 			id: r.id,
 			name: r.name,
 			entry: r.entry,
@@ -1968,7 +2772,8 @@ export class Machine {
 			kernelStack: this.stacks.get(r)?.kernel ?? null,
 			userStack: this.stacks.get(r)?.user ?? null,
 			tag: r.user && owners ? owners[r.user.dataStart >>> 12] : undefined,
-			signal: r.signal ?? null
+			signal: r.signal ?? null,
+			released: this.runners.get(r.id) !== r || undefined
 		}));
 		this.spent = true;
 		// the page allocator's free pages hold dead bytes (kernel patch 0020); zeroed, they save as nothing
@@ -1998,13 +2803,15 @@ export class Machine {
 			now: String(now),
 			input: [...this.input],
 			ready: this.ready.map((r) => r.id),
+			readyAt: this.ready.map((r) => all.indexOf(r)),
 			cpuZero: this.cpuZero.id,
 			runners,
 			stats: { ...this.stats, unknownExecutables: [...this.stats.unknownExecutables] },
 			dl: [...this.dls.values()]
 				.filter((d) => d.libs.length || d.slots.length)
 				.map((d) => d.save()),
-			owners
+			owners,
+			syncWrites: this.syncWrites || undefined
 		};
 	}
 
@@ -2013,7 +2820,7 @@ export class Machine {
 	 * `image`, when given, writes the memory straight into the machine instead of snapshot.memory, so
 	 * a large machine never needs a second full copy of itself to restore
 	 */
-	static async restore(
+	static restore(
 		options: MachineOptions,
 		snapshot: Snapshot,
 		image?: { byteLength: number; write(into: Uint8Array): void },
@@ -2022,10 +2829,41 @@ export class Machine {
 			read(start: number, end: number): Uint8Array | Promise<Uint8Array>;
 		}
 	): Promise<Machine> {
+		return Machine.rebuild(options, snapshot, image, lazy, false);
+	}
+
+	/**
+	 * continues a machine that has just checkpointed, in the memory it checkpointed from, which
+	 * `options.memory` must be: that memory already is the snapshot's image, so nothing is copied or
+	 * read back
+	 */
+	static resume(options: MachineOptions, snapshot: Snapshot): Promise<Machine> {
+		if (options.memory?.buffer.byteLength !== snapshot.memory.byteLength)
+			throw new Error('resume: options.memory must be the memory the snapshot was taken in');
+		return Machine.rebuild(options, snapshot, undefined, undefined, true);
+	}
+
+	private static async rebuild(
+		options: MachineOptions,
+		snapshot: Snapshot,
+		image: { byteLength: number; write(into: Uint8Array): void } | undefined,
+		lazy:
+			| {
+					byteLength: number;
+					read(start: number, end: number): Uint8Array | Promise<Uint8Array>;
+			  }
+			| undefined,
+		inPlace: boolean
+	): Promise<Machine> {
 		const machine = new Machine(
 			options,
-			(image ?? lazy ?? snapshot.memory).byteLength / 0x10000
+			(image ?? lazy ?? snapshot.memory).byteLength / 0x10000,
+			inPlace
 		);
+		if (options.restoreFiles?.length) machine.pendingFiles = [...options.restoreFiles];
+		for (const f of options.restoreFiles ?? []) if (!f.removed) machine.syncedPaths.add(f.path);
+		machine.syncWrites = !!snapshot.syncWrites;
+		machine.syncMark = BigInt(snapshot.now);
 		const into = new Uint8Array(machine.memory.buffer);
 		// a lazy restore writes the kernel's, free and shared pages now, and each parked process's
 		// own pages when one of its tasks is about to run
@@ -2056,7 +2894,7 @@ export class Machine {
 			}
 			machine.deferredSource = (start, end) => lazy.read(start, end);
 		} else if (image) image.write(into);
-		else into.set(snapshot.memory);
+		else if (!inPlace) into.set(snapshot.memory);
 		const behind = BigInt(snapshot.now) - machine.now();
 		if (behind > 0n) machine.clockOffset = behind;
 		Object.assign(machine.stats, snapshot.stats);
@@ -2070,11 +2908,13 @@ export class Machine {
 		machine.instantiate(machine.cpuZero);
 		for (const saved of snapshot.dl ?? []) machine.dlProcess(saved.dataStart).load(saved);
 		const now = machine.now();
+		const made: Runner[] = [];
 		for (const saved of snapshot.runners) {
 			const runner =
-				saved.id === snapshot.cpuZero
+				saved.id === snapshot.cpuZero && !saved.released
 					? machine.cpuZero
 					: machine.runner(saved.name, saved.entry);
+			made.push(runner);
 			machine.stats.runners = snapshot.stats.runners;
 			Object.assign(runner, {
 				id: saved.id,
@@ -2104,10 +2944,10 @@ export class Machine {
 			}
 			runner.tag = saved.tag;
 			runner.signal = saved.signal ?? null;
-			machine.runners.set(saved.id, runner);
+			if (!saved.released) machine.runners.set(saved.id, runner);
 		}
-		for (const saved of snapshot.runners) {
-			const runner = machine.runners.get(saved.id)!;
+		for (const [i, saved] of snapshot.runners.entries()) {
+			const runner = made[i]!;
 			const entry = saved.entry;
 			if (!saved.started) {
 				if (entry.kind === 'fork')
@@ -2144,6 +2984,9 @@ export class Machine {
 					made.ux.gmux_fp.value =
 						snapshot.scratch + STACK_BYTES + 8 + saved.userStack!.byteLength;
 					made.ux.gmux_unwinding.value = 0;
+					if (options.reenterAfterRestore !== undefined)
+						runner.reenterAt =
+							machine.now() + BigInt(Math.round(options.reenterAfterRestore * 1e6));
 				} else made.ux.asyncify_start_rewind(snapshot.scratch + STACK_BYTES);
 			}
 			runner.rewinding = true;
@@ -2160,7 +3003,11 @@ export class Machine {
 			await reached;
 			machine.current = null;
 		}
-		machine.ready.push(...snapshot.ready.map((id) => machine.runners.get(id)!).filter(Boolean));
+		machine.ready.push(
+			...(snapshot.readyAt
+				? snapshot.readyAt.map((i) => made[i]!)
+				: snapshot.ready.map((id) => machine.runners.get(id)!).filter(Boolean))
+		);
 		return machine;
 	}
 
@@ -2273,6 +3120,15 @@ export class Machine {
 			next.resume = null;
 			next.fail = null;
 			this.current = next;
+			// a rewinding stack re-enters the kernel exactly where it parked; nothing may come between
+			if (this.route)
+				this.route.value = next.rewinding
+					? ROUTE_KERNEL
+					: this.pendingFiles || this.applying
+						? ROUTE_HOOK
+						: this.syncWrites
+							? ROUTE_WRITES
+							: ROUTE_WATCH;
 			if (next.saved) {
 				this.taskGlobals.forEach((g, i) => (g.value = next.saved![i]));
 				next.saved = null;

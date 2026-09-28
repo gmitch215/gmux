@@ -4,7 +4,15 @@ import { mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
-import { Machine, type MachineOptions } from '../../src/worker/machine/machine.ts';
+import { Machine, type MachineOptions, type SyncedFile } from '../../src/worker/machine/machine.ts';
+import {
+	MISS,
+	ROUTE_HOOK,
+	ROUTE_KERNEL,
+	ROUTE_WATCH,
+	ROUTE_WRITES,
+	ROUTER
+} from '../../src/worker/machine/router.ts';
 
 const PARK_IMPORTS = [
 	'wasm_serialize_tasks',
@@ -23,7 +31,10 @@ const PARK_IMPORTS = [
 function toyKernel(asyncify: boolean): WebAssembly.Module {
 	const module = parse('toy-kernel.wat');
 	module.setFeatures(
-		binaryen.Features.Atomics | binaryen.Features.MutableGlobals | binaryen.Features.BulkMemory
+		binaryen.Features.Atomics |
+			binaryen.Features.MutableGlobals |
+			binaryen.Features.BulkMemory |
+			binaryen.Features.BulkMemoryOpt
 	);
 	if (asyncify) {
 		binaryen.setPassArgument(
@@ -47,11 +58,15 @@ function parse(name: string) {
  * tests/fixtures/toy-user.wat ("u" on the toy kernel's console), toy-vfork.wat ("v"),
  * toy-fault.wat ("f"), toy-spin.wat ("i"), toy-overflow.wat ("o") or toy-mmu.wat ("m")
  */
-function toyUser(name = 'toy-user.wat'): WebAssembly.Module {
+function toyUser(name = 'toy-user.wat', asyncify = false): WebAssembly.Module {
 	const module = parse(name);
 	module.setFeatures(
 		binaryen.Features.Atomics | binaryen.Features.MutableGlobals | binaryen.Features.MultiMemory
 	);
+	if (asyncify) {
+		binaryen.setPassArgument('asyncify-imports', 'env.__wasm_syscall_*');
+		module.runPasses(['asyncify']);
+	}
 	const bytes = module.emitBinary();
 	module.dispose();
 	return new WebAssembly.Module(bytes);
@@ -83,7 +98,8 @@ function evacuated(name: string): WebAssembly.Module {
 		script.pathname,
 		join(dir, 'in.wasm'),
 		join(dir, 'out.wasm'),
-		'--resume'
+		'--resume',
+		'--as-written'
 	]);
 	return new WebAssembly.Module(readFileSync(join(dir, 'out.wasm')));
 }
@@ -531,6 +547,37 @@ describe('Machine', () => {
 			expect(restored.crashed).toBeFalsy();
 		});
 
+		it('re-enters restored frames in their own instance at a fuel yield', async () => {
+			const r = rig({
+				asyncify: true,
+				sharedKernel: true,
+				registry: new Map([['I', evacuated('toy-evac.wat')]])
+			});
+			const machine = new Machine(r.machineOptions);
+			await r.run(machine, () => r.output().includes('parent ok'));
+			machine.type('i');
+			await r.run(machine, () => machine.stats.fuelYields >= 10);
+			const snapshot = await machine.checkpoint();
+			expect(snapshot.runners.find((s) => s.program)?.where).toBe('user');
+			const saved = { ...snapshot, memory: snapshot.memory.slice() };
+			const restored = await Machine.restore(
+				{ ...r.machineOptions, reenterAfterRestore: 0 },
+				saved
+			);
+			await r.run(restored, () => restored.stats.reentries > 0);
+			// the count's local survived the second spill: the loop still ends at 40
+			await r.run(restored, () => false);
+			expect(restored.stats.fuelYields - snapshot.stats.fuelYields).toBe(
+				40 - snapshot.stats.fuelYields
+			);
+			const before = r.output().length;
+			restored.type('r');
+			await r.run(restored, () => r.output().includes('user back'));
+			expect(r.output().slice(before)).toContain('handled\nvfork child\nuser back\n');
+			expect(restored.stats.reentries).toBe(1);
+			expect(restored.crashed).toBeFalsy();
+		});
+
 		it('checkpoints a signal handler parked on its own stack, and the frames it interrupted', async () => {
 			const r = rig({
 				asyncify: true,
@@ -614,11 +661,308 @@ describe('Machine', () => {
 			expect(r.output()).not.toContain('bad');
 		});
 
+		it('refuses a second checkpoint while one unwinds, and after one', async () => {
+			const r = rig({ asyncify: true });
+			const machine = new Machine(r.machineOptions);
+			await r.run(machine, () => r.output().includes('parent ok'));
+			const first = machine.checkpoint();
+			await expect(machine.checkpoint()).rejects.toThrow('checkpointed already');
+			const snapshot = await first;
+			expect(snapshot.runners.some((s) => s.kernelStack)).toBe(true);
+			await expect(machine.checkpoint()).rejects.toThrow('checkpointed already');
+		});
+
 		it('refuses while the pump runs or without asyncify', async () => {
 			const plain = rig();
 			const machine = new Machine(plain.machineOptions);
 			await plain.run(machine, () => plain.output().includes('parent ok'));
 			await expect(machine.checkpoint()).rejects.toThrow('checkpoint needs asyncify');
+		});
+
+		it('keeps a task the kernel released while its turn in the ready queue was still to come', async () => {
+			const r = rig({ asyncify: true });
+			const machine = new Machine(r.machineOptions);
+			await r.run(machine, () => r.output().includes('parent ok'));
+			machine.type('s');
+			await r.run(machine, () => r.output().includes('echo:s'));
+			// task 1 switched to task 2, which waits for its turn; the kernel releases it before then
+			new DataView(machine.memory.buffer).setUint32(0x854, 2, true);
+			machine.type(' ');
+			const snapshot = await machine.checkpoint();
+			expect(snapshot.runners.find((s) => s.id === 2)?.released).toBe(true);
+			const restored = await Machine.restore(r.machineOptions, snapshot);
+			await r.run(restored, () => r.output().includes('parent back ok'));
+			expect(r.output()).toContain('child ok\nparent back ok');
+			// that turn's switch was its last: its stack is unwound, not left parked
+			expect(restored.stats.abandonedStacks).toBe(1);
+		});
+
+		it('unwinds the parked stack of a task the kernel released, and runs on', async () => {
+			const r = rig({ asyncify: true });
+			const machine = new Machine(r.machineOptions);
+			await r.run(machine, () => r.output().includes('parent ok'));
+			// task 2 parked in its switch back to task 1; releasing it leaves nothing to resume it
+			new DataView(machine.memory.buffer).setUint32(0x854, 2, true);
+			machine.type(' ');
+			await r.run(machine, () => r.output().includes('echo: '));
+			expect(machine.stats.abandonedStacks).toBe(1);
+			expect(machine.crashed).toBeNull();
+			const snapshot = await machine.checkpoint();
+			expect(snapshot.runners.some((s) => s.id === 2)).toBe(false);
+		});
+
+		it('refuses, and can still run, while a program without asyncify is parked', async () => {
+			const r = rig({
+				asyncify: true,
+				registry: new Map([['Z', toyUser('toy-sync-writes.wat')]])
+			});
+			const machine = new Machine(r.machineOptions);
+			await r.run(machine, () => r.output().includes('parent ok'));
+			machine.type('n');
+			await r.run(machine, () => r.output().includes('user back'));
+			await expect(machine.checkpoint()).rejects.toThrow('a program without asyncify');
+			machine.type('s');
+			await r.run(machine, () => r.output().includes('parent back ok'));
+			expect(r.output()).toContain('parent back ok');
+		});
+	});
+
+	describe('file syncs', () => {
+		const word = (m: Machine, at: number) => new DataView(m.memory.buffer).getUint32(at, true);
+
+		it('hands an fsynced file to fileSync before the kernel syncs it, and routes everything else past', async () => {
+			const synced: SyncedFile[] = [];
+			const kernelSyncsSeen: number[] = [];
+			let machine: Machine;
+			const r = rig({
+				sharedKernel: true,
+				registry: new Map([['Y', toyUser('toy-sync.wat')]]),
+				fileSync: async (file) => {
+					await Promise.resolve();
+					kernelSyncsSeen.push(word(machine, 0x830));
+					synced.push(file);
+				}
+			});
+			machine = new Machine(r.machineOptions);
+			await r.run(machine, () => r.output().includes('parent ok'));
+			machine.type('y');
+			await r.run(machine, () => r.output().includes('user back'));
+			expect(synced.map((f) => [f.path, f.mode, new TextDecoder().decode(f.bytes)])).toEqual([
+				['/toy/file', 0o644, 'hello']
+			]);
+			// the kernel's own sync had not run when fileSync did; both reached it after
+			expect(kernelSyncsSeen).toEqual([0]);
+			expect(word(machine, 0x830)).toBe(2);
+			expect(r.output()).toContain('handled\nuser back');
+			expect(machine.stats).toMatchObject({
+				fileSyncs: 1,
+				fileSyncBytes: 5,
+				fileSyncsSkipped: 1
+			});
+			// both syncs used one scratch mapping
+			expect(word(machine, 0x84c)).toBe(1);
+		});
+
+		it('maps a new scratch region when the cached address now starts a smaller mapping', async () => {
+			const r = rig({
+				sharedKernel: true,
+				registry: new Map([['Y', toyUser('toy-sync.wat')]]),
+				fileSync: async () => {}
+			});
+			const machine = new Machine(r.machineOptions);
+			await r.run(machine, () => r.output().includes('parent ok'));
+			// as when a dead process's mm and mapping addresses come back for a new one
+			new DataView(machine.memory.buffer).setUint32(0x850, 0x1000, true);
+			machine.type('y');
+			await r.run(machine, () => r.output().includes('user back'));
+			expect(word(machine, 0x84c)).toBe(2);
+		});
+
+		it("writes a restore's files back at the first syscall, before it runs, and checkpoints only after", async () => {
+			const r = rig({ asyncify: true, registry: new Map([['Y', toyUser('toy-sync.wat')]]) });
+			const machine = new Machine(r.machineOptions);
+			await r.run(machine, () => r.output().includes('parent ok'));
+			const snapshot = await machine.checkpoint();
+			const file = { path: '/a/b', mode: 0o600, bytes: new TextEncoder().encode('xyz') };
+			const gone = { path: '/gone', mode: 0, bytes: new Uint8Array(0), removed: true };
+			const restored = await Machine.restore(
+				{ ...r.machineOptions, restoreFiles: [file, gone] },
+				snapshot
+			);
+			await expect(restored.checkpoint()).rejects.toThrow(/wrote its files back/);
+			restored.type('y');
+			await r.run(restored, () => r.output().includes('user back'));
+			const bytes = new Uint8Array(restored.memory.buffer);
+			expect(new TextDecoder().decode(bytes.subarray(0x2800, 0x2803))).toBe('xyz');
+			// one directory made on the way, then O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC
+			expect(word(restored, 0x838)).toBe(1);
+			expect(word(restored, 0x834)).toBe(0o2001101);
+			// the removed one unlinked
+			expect(word(restored, 0x848)).toBe(1);
+			expect(restored.stats).toMatchObject({ filesRestored: 2, fileRestoreErrors: [] });
+			// without fileSync the program's fsyncs go straight to the kernel
+			expect(word(restored, 0x830)).toBe(2);
+		});
+
+		it('flushes a synchronous write, an MS_SYNC msync and a sync walk, and reports what a sync found gone', async () => {
+			const synced: [string, string, boolean][] = [];
+			const r = rig({
+				asyncify: true,
+				registry: new Map([['Z', toyUser('toy-sync-writes.wat', true)]]),
+				fileSync: async (file) => {
+					synced.push([file.path, new TextDecoder().decode(file.bytes), !!file.removed]);
+				}
+			});
+			const machine = new Machine(r.machineOptions);
+			await r.run(machine, () => r.output().includes('parent ok'));
+			machine.type('n');
+			await r.run(machine, () => r.output().includes('user back'));
+			expect(synced).toEqual([
+				// the O_SYNC write to fd 5; the write to fd 6 and the MS_ASYNC msync flush nothing
+				['/toy/file', 'hello', false],
+				// the MS_SYNC msync, by the mapping's file in /proc/self/maps
+				['/toy/file', 'hello', false],
+				// sync walks / and finds /file, and /toy/file no longer there
+				['/file', 'hello', false],
+				['/toy/file', '', true]
+			]);
+			// both writes reached the kernel, and the program's openat kept O_SYNC
+			expect(word(machine, 0x840)).toBe(6);
+			expect(machine.stats).toMatchObject({ fileSyncs: 3, syncWalks: 1, fileRemovals: 1 });
+			const snapshot = await machine.checkpoint();
+			expect(snapshot.syncWrites).toBe(true);
+		});
+
+		describe('statx cache', () => {
+			const statxRig = (syscallCache: true | 'verify') => {
+				const r = rig({
+					sharedKernel: true,
+					syscallCache,
+					registry: new Map([['T', toyUser('toy-statx.wat')]])
+				});
+				const machine = new Machine(r.machineOptions);
+				const set = (at: number, v: number) =>
+					new DataView(machine.memory.buffer).setUint32(at, v, true);
+				return { r, machine, set };
+			};
+
+			it('answers a repeated absolute statx from the host until the generation moves', async () => {
+				const { r, machine, set } = statxRig(true);
+				await r.run(machine, () => r.output().includes('parent ok'));
+				machine.type('t');
+				await r.run(machine, () => r.output().includes('handled'));
+				// the first asks the kernel, and the fill asks where / is; the second is a hit; the
+				// relative path goes to the kernel
+				expect(word(machine, 0x860)).toBe(3);
+				expect(new DataView(machine.memory.buffer).getBigUint64(0x3000 + 40, true)).toBe(
+					5n
+				);
+				set(0x858, 7);
+				machine.type('r');
+				await r.run(machine, () => r.output().includes('user back'));
+				// the refill asks the kernel once: where / is was kept
+				expect(word(machine, 0x860)).toBe(4);
+				expect(machine.stats).toMatchObject({
+					statxHits: 2,
+					statxMisses: 3,
+					statxFills: 2,
+					statxMismatches: 0
+				});
+			});
+
+			it('asks the kernel for a task whose view is not cacheable', async () => {
+				const { r, machine, set } = statxRig(true);
+				await r.run(machine, () => r.output().includes('parent ok'));
+				set(0x85c, 0);
+				machine.type('t');
+				await r.run(machine, () => r.output().includes('handled'));
+				expect(word(machine, 0x860)).toBe(3);
+				expect(machine.stats).toMatchObject({ statxHits: 0, statxFills: 0 });
+			});
+
+			it('verifies every answer it would give against the kernel', async () => {
+				const { r, machine, set } = statxRig('verify');
+				await r.run(machine, () => r.output().includes('parent ok'));
+				machine.type('t');
+				await r.run(machine, () => r.output().includes('handled'));
+				// the size changes with no generation step: a stale answer the kernel contradicts
+				set(0x864, 9);
+				machine.type('r');
+				await r.run(machine, () => r.output().includes('user back'));
+				expect(machine.stats.statxHits).toBe(0);
+				expect(machine.stats.statxMismatches).toBe(1);
+			});
+		});
+
+		it('routes each syscall by the route global', () => {
+			const seen: string[] = [];
+			const route = new WebAssembly.Global({ value: 'i32', mutable: true }, ROUTE_WATCH);
+			const k: Record<string, unknown> = {};
+			const h: Record<string, unknown> = {};
+			for (let n = 0; n <= 6; n++) {
+				k[n] = (_sp: number, _tls: number, nr: number) => (seen.push(`k${nr}`), 0);
+				h[n] = (_sp: number, _tls: number, nr: number) => (seen.push(`h${nr}`), 0);
+			}
+			const router = (cache: boolean, answer: number) =>
+				new WebAssembly.Instance(ROUTER, {
+					k: k as WebAssembly.ModuleImports,
+					h: h as WebAssembly.ModuleImports,
+					c: {
+						5: (_sp: number, _tls: number, nr: number) => (seen.push(`c${nr}`), answer)
+					},
+					m: {
+						route,
+						cache: new WebAssembly.Global(
+							{ value: 'i32', mutable: false },
+							cache ? 1 : 0
+						)
+					}
+				}).exports as Record<string, (...a: number[]) => number>;
+			let s = router(false, MISS);
+			const calls = () => {
+				s.s0!(0, 0, 81);
+				s.s1!(0, 0, 82, 3);
+				s.s3!(0, 0, 64, 5, 0, 1);
+				s.s4!(0, 0, 56, -100, 0, 1, 0);
+				s.s4!(0, 0, 56, -100, 0, 0o4010001, 0);
+				s.s3!(0, 0, 63, 5, 0, 1);
+				s.s5!(0, 0, 291, -100, 0, 0, 0, 0);
+			};
+			calls();
+			route.value = ROUTE_WRITES;
+			calls();
+			route.value = ROUTE_KERNEL;
+			calls();
+			route.value = ROUTE_HOOK;
+			calls();
+			expect(seen).toEqual([
+				...['h81', 'h82', 'k64', 'k56', 'h56', 'k63', 'k291'],
+				...['h81', 'h82', 'h64', 'k56', 'h56', 'k63', 'k291'],
+				...['k81', 'k82', 'k64', 'k56', 'k56', 'k63', 'k291'],
+				...['h81', 'h82', 'h64', 'h56', 'h56', 'h63', 'h291']
+			]);
+			// with the cache: a miss fills through the hook, a hit answers alone
+			seen.length = 0;
+			route.value = ROUTE_WATCH;
+			s = router(true, MISS);
+			expect(s.s5!(0, 0, 291, -100, 0, 0, 0, 0)).toBe(0);
+			s = router(true, -2);
+			expect(s.s5!(0, 0, 291, -100, 0, 0, 0, 0)).toBe(-2);
+			route.value = ROUTE_KERNEL;
+			s.s5!(0, 0, 291, -100, 0, 0, 0, 0);
+			route.value = ROUTE_HOOK;
+			s.s5!(0, 0, 291, -100, 0, 0, 0, 0);
+			expect(seen).toEqual(['c291', 'h291', 'c291', 'k291', 'h291']);
+		});
+
+		it('reports the earliest Linux deadline an idle task waits for, on the kernel clock', async () => {
+			const r = rig();
+			const machine = new Machine(r.machineOptions);
+			expect(machine.deadline).toBeNull();
+			await r.run(machine, () => r.output().includes('parent ok'));
+			// init idles on a 1 ms deadline
+			expect(machine.deadline! - machine.clockNs).toBeLessThanOrEqual(1_000_000n);
+			expect(machine.deadline).not.toBeNull();
 		});
 	});
 });

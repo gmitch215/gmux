@@ -10,6 +10,7 @@
 	(import "env" "wasm_load_executable" (func $load (param i32 i32 i32 i32) (result i32)))
 	(import "env" "wasm_cpu_clock_get_monotonic" (func $clock (param i64) (result i64)))
 	(import "env" "wasm_start_cpu" (func $startCpu (param i32 i32)))
+	(import "env" "wasm_release_task" (func $release (param i32)))
 
 	(global $init_task (export "init_task") i32 (i32.const 1))
 	(global $boot_command_line (export "boot_command_line") i32 (i32.const 0x100))
@@ -45,6 +46,19 @@
 	(data (i32.const 0x728) "M")
 	(data (i32.const 0x730) "S")
 	(data (i32.const 0x738) "X")
+	(data (i32.const 0x740) "Y")
+	;; what readlinkat answers for /proc/self/fd/3, and the bytes read from the file behind it
+	(data (i32.const 0x750) "/toy/file")
+	(data (i32.const 0x760) "hello")
+	(data (i32.const 0x748) "Z")
+	(data (i32.const 0x768) "T")
+	;; /proc/self/maps: the toy file shared at 0xa0000
+	(data (i32.const 0x880) "000a0000-000a1000 rw-s 00000000 00:01 7 /toy/file\n")
+	;; getdents64 of /: ".", ".." and the regular file "file"
+	(data (i32.const 0x900)
+		"\01\00\00\00\00\00\00\00\01\00\00\00\00\00\00\00\18\00\04.\00\00\00\00"
+		"\02\00\00\00\00\00\00\00\02\00\00\00\00\00\00\00\18\00\04..\00\00\00"
+		"\03\00\00\00\00\00\00\00\03\00\00\00\00\00\00\00\18\00\08file\00")
 	(data (i32.const 0x560) "exec refused\n")
 	(data (i32.const 0x570) "exec taken\n")
 	(data (i32.const 0x530) "shared ok\n")
@@ -112,6 +126,15 @@
 							(drop (call $create (i32.const 1) (i32.const 5) (i32.const 0x490) (i32.const 0x730) (i32.const 0x734) (i32.const 0x20000) (i32.const 0)))
 							(drop (call $switch (i32.const 1) (i32.const 3)))
 							(drop (call $switch (i32.const 1) (i32.const 5)))))
+					;; "y" runs program "Y", which fsyncs
+					(if (i32.eq (i32.load8_u (i32.const 0x600)) (i32.const 121))
+						(then (drop (call $create (i32.const 1) (i32.const 3) (i32.const 0x490) (i32.const 0x740) (i32.const 0x744) (i32.const 0x10000) (i32.const 0)))))
+					;; "t" runs program "T", which statxes one path over and over
+					(if (i32.eq (i32.load8_u (i32.const 0x600)) (i32.const 116))
+						(then (drop (call $create (i32.const 1) (i32.const 3) (i32.const 0x490) (i32.const 0x768) (i32.const 0x76c) (i32.const 0x10000) (i32.const 0)))))
+					;; "n" runs program "Z", which writes synchronously, msyncs and syncs
+					(if (i32.eq (i32.load8_u (i32.const 0x600)) (i32.const 110))
+						(then (drop (call $create (i32.const 1) (i32.const 3) (i32.const 0x490) (i32.const 0x748) (i32.const 0x74c) (i32.const 0x10000) (i32.const 0)))))
 					(if (i32.eq (i32.load8_u (i32.const 0x600)) (i32.const 117))
 						(then (drop (call $create (i32.const 1) (i32.const 3) (i32.const 0x490) (i32.const 0x700) (i32.const 0x704) (i32.const 0x10000) (i32.const 0)))))
 					(if (i32.eq (i32.load8_u (i32.const 0x600)) (i32.const 115))
@@ -166,15 +189,68 @@
 				(call $say (i32.const 0x520) (i32.const 15))))
 		(i32.const 0))
 
-	;; rt_sigaction (134) and rt_sigprocmask (135) record the signal set they were given at 0x804
+	;; rt_sigaction (134) and rt_sigprocmask (135) record the signal set they were given at 0x804.
+	;; A toy file for the host's fsync hook: readlinkat (78) names fd 3 /toy/file and refuses fd 4;
+	;; openat (56) keeps its flags at 0x834, what it opened at 0x844 (1 /proc/self/maps, 2 /, 0 a file)
+	;; and answers fd 5
 	(func (export "wasm_syscall_4") (param $sp i32) (param $tp i32) (param $nr i32)
 		(param $a i32) (param $b i32) (param $c i32) (param $d i32) (result i32)
 		(if (i32.eq (local.get $nr) (i32.const 135)) (then (i32.store (i32.const 0x804) (i32.load (local.get $b)))))
+		(if (i32.eq (local.get $nr) (i32.const 78))
+			(then
+				(if (i32.eq (i32.load8_u (i32.add (local.get $b) (i32.const 14))) (i32.const 0x34))
+					(then (return (i32.const -9))))
+				(memory.copy (local.get $c) (i32.const 0x750) (i32.const 9))
+				(return (i32.const 9))))
+		(if (i32.eq (local.get $nr) (i32.const 56))
+			(then
+				(i32.store (i32.const 0x834) (local.get $c))
+				(i32.store (i32.const 0x844)
+					(select
+						(i32.const 2)
+						(i32.and
+							(i32.eq (i32.load8_u (i32.add (local.get $b) (i32.const 1))) (i32.const 0x70))
+							(i32.eq (i32.load8_u (i32.add (local.get $b) (i32.const 11))) (i32.const 0x6d)))
+						(i32.eqz (i32.load8_u (i32.add (local.get $b) (i32.const 1))))))
+				(return (i32.const 5))))
 		(i32.const 0))
+
+	;; fsync (82) and fdatasync (83) count at 0x830; close (57) lets the next open read again
+	(func (export "wasm_syscall_1") (param $sp i32) (param $tp i32) (param $nr i32) (param $a i32) (result i32)
+		(if (i32.or (i32.eq (local.get $nr) (i32.const 82)) (i32.eq (local.get $nr) (i32.const 83)))
+			(then (i32.store (i32.const 0x830) (i32.add (i32.load (i32.const 0x830)) (i32.const 1)))))
+		(if (i32.eq (local.get $nr) (i32.const 57)) (then (i32.store (i32.const 0x83c) (i32.const 0))))
+		(i32.const 0))
+
+	;; mmap (222) hands out 0xa0000 and counts at 0x84c; every mapping starts where it is asked about
+	;; and runs for the length at 0x850 (1 MiB, until the test shrinks it)
+	(data (i32.const 0x850) "\00\00\10\00")
+	(func (export "wasm_syscall_6") (param $sp i32) (param $tp i32) (param $nr i32)
+		(param $a i32) (param $b i32) (param $c i32) (param $d i32) (param $e i32) (param $f i32) (result i32)
+		(if (i32.eq (local.get $nr) (i32.const 222))
+			(then
+				(i32.store (i32.const 0x84c) (i32.add (i32.load (i32.const 0x84c)) (i32.const 1)))
+				(return (i32.const 0xa0000))))
+		(i32.const -38))
+	(func (export "wasm_current_mm") (result i32) (i32.const 1))
+	;; program "T"'s stack runs from 0x5000 to 0xa000; anything else is its own mapping's start
+	(func (export "wasm_user_stack_low") (param $at i32) (result i32)
+		(select (i32.const 0x5000) (local.get $at)
+			(i32.and (i32.ge_u (local.get $at) (i32.const 0x9000)) (i32.lt_u (local.get $at) (i32.const 0xa000)))))
+	;; kernel patch 0022: the path-query generation at 0x858 and the view at 0x85c
+	(func (export "wasm_fs_gen") (result i32) (i32.load (i32.const 0x858)))
+	(func (export "wasm_fs_view") (result i32) (i32.load (i32.const 0x85c)))
+	(data (i32.const 0x85c) "\01")
+	(data (i32.const 0x864) "\05")
+	(func (export "wasm_user_stack_high") (param $at i32) (result i32)
+		(i32.add (local.get $at) (i32.load (i32.const 0x850))))
 
 	;; tkill (130): the signal at its default action ends task 3, which never runs again
 	(func (export "wasm_syscall_2") (param $sp i32) (param $tp i32) (param $nr i32)
 		(param $a i32) (param $b i32) (result i32)
+		;; fcntl (25) F_GETFL: fd 5 is O_WRONLY | O_SYNC, any other O_WRONLY
+		(if (i32.eq (local.get $nr) (i32.const 25))
+			(then (return (select (i32.const 0x101001) (i32.const 1) (i32.eq (local.get $a) (i32.const 5))))))
 		(if (i32.ne (local.get $nr) (i32.const 130)) (then (return (i32.const -38))))
 		(i32.store (i32.const 0x800) (local.get $b))
 		(call $say (i32.const 0x4f0) (i32.const 13))
@@ -184,6 +260,16 @@
 	;; clone (220): task 3 makes task 4 and waits for it, as CLONE_VFORK does; returns the child's pid
 	(func (export "wasm_syscall_5") (param $sp i32) (param $tp i32) (param $nr i32)
 		(param $a i32) (param $b i32) (param $c i32) (param $d i32) (param $e i32) (result i32)
+		;; statx (291): the toy file is a regular file of mode 0644 and 5 bytes
+		;; and counts at 0x860, its size at 0x864, with STATX_MNT_ID and mount 0 in its mask
+		(if (i32.eq (local.get $nr) (i32.const 291))
+			(then
+				(i32.store (i32.const 0x860) (i32.add (i32.load (i32.const 0x860)) (i32.const 1)))
+				(i32.store (local.get $e) (i32.const 0x17ff))
+				(i32.store16 (i32.add (local.get $e) (i32.const 28)) (i32.const 0x81a4))
+				(i64.store (i32.add (local.get $e) (i32.const 40)) (i64.extend_i32_u (i32.load (i32.const 0x864))))
+				(i64.store (i32.add (local.get $e) (i32.const 144)) (i64.const 0))
+				(return (i32.const 0))))
 		(if (i32.ne (local.get $nr) (i32.const 220)) (then (return (i32.const -38))))
 		(drop (call $create (i32.const 3) (i32.const 4) (i32.const 0x480) (i32.const 0) (i32.const 0) (i32.const 0) (i32.const 0)))
 		(i32.const 4))
@@ -191,6 +277,43 @@
 	;; execve (221): loads program "U", wakes the waiting parent, then returns to user mode as exec does
 	(func (export "wasm_syscall_3") (param $sp i32) (param $tp i32) (param $nr i32)
 		(param $a i32) (param $b i32) (param $c i32) (result i32)
+		;; mkdirat (34) counts at 0x838 and finds the directory there; read (63) gives "hello" once
+		;; (0x83c remembers); write (64) appends to 0x2800, its length at 0x840
+		(if (i32.eq (local.get $nr) (i32.const 34))
+			(then
+				(i32.store (i32.const 0x838) (i32.add (i32.load (i32.const 0x838)) (i32.const 1)))
+				(return (i32.const -17))))
+		(if (i32.eq (local.get $nr) (i32.const 63))
+			(then
+				(if (i32.load (i32.const 0x83c)) (then (return (i32.const 0))))
+				(i32.store (i32.const 0x83c) (i32.const 1))
+				(if (i32.eq (i32.load (i32.const 0x844)) (i32.const 1))
+					(then
+						(memory.copy (local.get $b) (i32.const 0x880) (i32.const 50))
+						(return (i32.const 50))))
+				(memory.copy (local.get $b) (i32.const 0x760) (i32.const 5))
+				(return (i32.const 5))))
+		;; getdents64 (61) lists / once per open; msync (227) succeeds
+		(if (i32.eq (local.get $nr) (i32.const 61))
+			(then
+				(if (i32.load (i32.const 0x83c)) (then (return (i32.const 0))))
+				(i32.store (i32.const 0x83c) (i32.const 1))
+				(memory.copy (local.get $b) (i32.const 0x900) (i32.const 72))
+				(return (i32.const 72))))
+		(if (i32.eq (local.get $nr) (i32.const 227)) (then (return (i32.const 0))))
+		;; unlinkat (35) counts at 0x848
+		(if (i32.eq (local.get $nr) (i32.const 35))
+			(then
+				(i32.store (i32.const 0x848) (i32.add (i32.load (i32.const 0x848)) (i32.const 1)))
+				(return (i32.const 0))))
+		(if (i32.eq (local.get $nr) (i32.const 64))
+			(then
+				(memory.copy
+					(i32.add (i32.const 0x2800) (i32.load (i32.const 0x840)))
+					(local.get $b)
+					(local.get $c))
+				(i32.store (i32.const 0x840) (i32.add (i32.load (i32.const 0x840)) (local.get $c)))
+				(return (local.get $c))))
 		(if (i32.ne (local.get $nr) (i32.const 221)) (then (return (i32.const -38))))
 		(drop (call $load (i32.const 0x700) (i32.const 0x704) (i32.const 0x10000) (i32.const 0)))
 		(drop (call $switch (i32.const 4) (i32.const 3)))
@@ -225,6 +348,12 @@
 			(if (i64.ne (i64.and (i64.atomic.rmw.xchg (i32.const 0x308) (i64.const 0)) (i64.const 4)) (i64.const 0))
 				(then (call $say (i32.const 0x550) (i32.const 12))))
 			(br $wait)))
-	(func (export "wasm_console_irq") (result i32) (i32.const 2))
+	;; the test has the kernel release the task named at 0x854 when input next arrives
+	(func (export "wasm_console_irq") (result i32)
+		(if (i32.load (i32.const 0x854))
+			(then
+				(call $release (i32.load (i32.const 0x854)))
+				(i32.store (i32.const 0x854) (i32.const 0))))
+		(i32.const 2))
 	(func (export "get_user_stack_pointer") (result i32) (i32.const 0x3000))
 	(func (export "get_user_tls_base") (result i32) (i32.const 0)))
