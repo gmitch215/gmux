@@ -261,8 +261,8 @@ static int fast2(
     struct kb_cpu* cpu, int op, uint64_t a, uint64_t b, int n, uint64_t* out
 ) {
     int f = frac_bits(n), top = (1 << exp_bits(n)) - 1, ea, eb, er, inexact;
-    if ((cpu->fpcr & 0x03c00000) || ((a >> f) & top) == top ||
-        ((b >> f) & top) == top)
+    if ((cpu->fpcr & 0x03c00000) || (int) ((a >> f) & top) == top ||
+        (int) ((b >> f) & top) == top)
         return 0;
     uint64_t r;
     if (n == 64) {
@@ -587,7 +587,7 @@ static void store_v(struct kb_cpu* cpu, uint64_t a, unsigned rt, int bytes) {
 
 static int load_store(struct kb_cpu* cpu, uint32_t i, uint64_t a) {
     unsigned rt = i & 31;
-    if ((i & 0x3a000000) == 0x28000000 || (i & 0x3a000000) == 0x2c000000) {
+    if ((i & 0x3a000000) == 0x28000000) {
         /* ldp/stp of s, d or q */
         int bytes = 4 << (i >> 30);
         unsigned rt2 = (i >> 10) & 31;
@@ -606,11 +606,12 @@ static int load_store(struct kb_cpu* cpu, uint32_t i, uint64_t a) {
         }
         return 0;
     }
-    if ((i & 0x3b000000) == 0x1c000000) { /* ldr literal: s, d, q */
+    if ((i & 0x3f000000) == 0x1c000000) { /* ldr literal: s, d, q */
+        if (i >> 30 == 3) return 1;
         load_v(cpu, a, rt, 4 << (i >> 30));
         return 0;
     }
-    if ((i & 0x3a000000) == 0x38000000 || (i & 0x3b000000) == 0x3d000000) {
+    if ((i & 0x3a000000) == 0x38000000) {
         /* ldr/str: offset, unscaled, pre and post index, register offset */
         unsigned size = i >> 30, opc = (i >> 22) & 3;
         int bytes = (opc & 2) && size == 0 ? 16 : 1 << size;

@@ -853,6 +853,8 @@ for (const code of [
 	'ldp s0, s1, [x4, #8]',
 	'ldp d1, d2, [x4, #16]',
 	'ldp q1, q2, [x4, #16]',
+	'ldr s1, 1f\n\tldr d2, 2f\n\tb 3f\n\t.balign 8\n1:\t.word 0x3f8ccccd\n\t.word 0\n2:\t.quad 0x400921fb54442d18\n3:',
+	'ldr q1, 1f\n\tb 2f\n\t.balign 16\n1:\t.quad 0x1122334455667788\n\t.quad 0x99aabbccddeeff00\n2:',
 	'ld1 {v0.16b}, [x4]',
 	'add x5, x4, #16\n\tld1 {v1.4s, v2.4s}, [x5]',
 	'ld2 {v1.4s, v2.4s}, [x4]',
