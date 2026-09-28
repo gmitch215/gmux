@@ -1,0 +1,198 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Gregory Mitchell <me@gmitch215.xyz>
+Date: Mon, 28 Sep 2026 05:40:00 -0400
+Subject: [PATCH] wasm: give the host a generation for path queries
+
+The host answers a repeated statx of an absolute path from its earlier
+answer when nothing the lookup could see has changed. wasm_fs_gen reads a
+counter moved by every mtime and ctime store, every atime that changes
+and every size change of a root-filesystem file, directory or symlink
+(the multigrain ctime swaps included), by any change to the mount tree
+(namespace_unlock) and by a chroot (set_fs_root). Creating, removing,
+renaming, chmod, chown and xattrs store a ctime even in the same clock
+tick as the last change; a write in the same tick grows the file without
+storing a time, hence i_size_write; relatime stores an unchanged atime on
+every read while the atime is not newer than the ctime, hence the compare.
+Other filesystems and device, fifo and socket nodes do not count, since a
+console or /dev/null moves its times at every read and write; the host
+keeps no answer about a special file and none whose lookup left the root
+mount. wasm_fs_view is the task's root dentry when its lookups depend on
+nothing but the path: it holds CAP_DAC_READ_SEARCH, resolves in the first
+mount namespace and has its root on that filesystem; otherwise 0.
+---
+--- a/arch/wasm/include/asm/wasm.h
++++ b/arch/wasm/include/asm/wasm.h
+@@ -46,6 +46,8 @@
+ unsigned int wasm_current_euid(void);
+ unsigned long wasm_current_mm(void);
+ unsigned long wasm_free_pages(void);
++unsigned long wasm_fs_gen(void);
++unsigned long wasm_fs_view(void);
+ 
+ /* gmux: a fork child's own memory (arch/wasm/mm/private.c): the host fills and forgets it */
+ struct mm_struct;
+--- a/arch/wasm/mm/Makefile
++++ b/arch/wasm/mm/Makefile
+@@ -1,3 +1,3 @@
+ # SPDX-License-Identifier: GPL-2.0-only
+ 
+-obj-y += init.o owner.o private.o advice.o checkpoint.o
++obj-y += init.o owner.o private.o advice.o checkpoint.o fsgen.o
+--- /dev/null
++++ b/arch/wasm/mm/fsgen.c
+@@ -0,0 +1,50 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * For the host's path-query cache: a generation that every timestamp change of an inode on the root
++ * filesystem, every mount change and every chroot moves (wasm_fs_changed and wasm_fs_moved in
++ * include/linux/fs.h), and the view a task resolves paths in. The host may answer a query from an
++ * earlier answer only while both are what they were, and only for a lookup that stayed on the root
++ * mount, so changes on other filesystems (a tty's times, /dev/null's) leave the generation alone.
++ */
++
++#include <linux/capability.h>
++#include <linux/cred.h>
++#include <linux/fs.h>
++#include <linux/fs_struct.h>
++#include <linux/mount.h>
++#include <linux/nsproxy.h>
++#include <linux/sched.h>
++#include <asm/wasm.h>
++
++unsigned long wasm_fs_generation;
++/* the root filesystem, once the host has first asked; until then every inode counts */
++struct super_block *wasm_fs_root_sb;
++
++__visible unsigned long wasm_fs_gen(void)
++{
++	return READ_ONCE(wasm_fs_generation);
++}
++
++/*
++ * the current task's root dentry when its path queries depend on nothing but the path and the
++ * generation: it may search every directory (CAP_DAC_READ_SEARCH), resolves in the first mount
++ * namespace, and its root is on the filesystem the generation watches (the first asker's). 0
++ * otherwise, and the host asks the kernel
++ */
++__visible unsigned long wasm_fs_view(void)
++{
++	struct super_block *sb;
++
++	if (!current->fs || !current->nsproxy)
++		return 0;
++	if (current->nsproxy->mnt_ns != init_nsproxy.mnt_ns)
++		return 0;
++	if (!cap_raised(current_cred()->cap_effective, CAP_DAC_READ_SEARCH))
++		return 0;
++	sb = current->fs->root.mnt->mnt_sb;
++	if (!READ_ONCE(wasm_fs_root_sb))
++		WRITE_ONCE(wasm_fs_root_sb, sb);
++	if (sb != wasm_fs_root_sb)
++		return 0;
++	return (unsigned long)current->fs->root.dentry;
++}
+--- a/fs/fs_struct.c
++++ b/fs/fs_struct.c
+@@ -18,6 +18,7 @@
+ 	struct path old_root;
+ 
+ 	path_get(path);
++	wasm_fs_moved();
+ 	write_seqlock(&fs->seq);
+ 	old_root = fs->root;
+ 	fs->root = *path;
+--- a/fs/inode.c
++++ b/fs/inode.c
+@@ -2775,6 +2775,7 @@
+ {
+ 	trace_inode_set_ctime_to_ts(inode, &ts);
+ 	set_normalized_timespec64(&ts, ts.tv_sec, ts.tv_nsec);
++	wasm_fs_changed(inode);
+ 	inode->i_ctime_sec = ts.tv_sec;
+ 	inode->i_ctime_nsec = ts.tv_nsec;
+ 	return ts;
+@@ -2871,6 +2872,7 @@
+ 	/* Try to swap the nsec value into place. */
+ 	if (try_cmpxchg(&inode->i_ctime_nsec, &cur, now.tv_nsec)) {
+ 		/* If swap occurred, then we're (mostly) done */
++		wasm_fs_changed(inode);
+ 		inode->i_ctime_sec = now.tv_sec;
+ 		trace_ctime_ns_xchg(inode, cns, now.tv_nsec, cur);
+ 		mgtime_counter_inc(mg_ctime_swaps);
+@@ -2945,6 +2947,7 @@
+ retry:
+ 	old = cur;
+ 	if (try_cmpxchg(&inode->i_ctime_nsec, &cur, update.tv_nsec)) {
++		wasm_fs_changed(inode);
+ 		inode->i_ctime_sec = update.tv_sec;
+ 		mgtime_counter_inc(mg_ctime_swaps);
+ 		return update;
+--- a/fs/namespace.c
++++ b/fs/namespace.c
+@@ -1689,6 +1689,8 @@
+ 	struct mnt_namespace *ns = emptied_ns;
+ 	LIST_HEAD(list);
+ 
++	/* any change to the mount tree ends here; a read-only holder bumps it needlessly, harmlessly */
++	wasm_fs_moved();
+ 	hlist_move_list(&unmounted, &head);
+ 	list_splice_init(&ex_mountpoints, &list);
+ 	emptied_ns = NULL;
+--- a/include/linux/fs.h
++++ b/include/linux/fs.h
+@@ -1153,8 +1153,37 @@
+  * (normally i_rwsem), otherwise on 32bit/SMP an update of i_size_seqcount
+  * can be lost, resulting in subsequent i_size_read() calls spinning forever.
+  */
++#ifdef CONFIG_WASM
++/*
++ * gmux: counts every size change and every mtime or ctime store (an unchanged value too: a chmod or
++ * a create in the same clock tick as the last change stores the same time) of a file, directory or
++ * symlink on the root filesystem (on any filesystem until the host first asks), every atime that
++ * changes, every mount change and every chroot, so the host can answer a path query from what it saw
++ * before while nothing that query could see has changed. A device, fifo or socket node's times move
++ * with every read and write of it; the host keeps no answer about one, so they do not count
++ * (arch/wasm/mm/fsgen.c)
++ */
++extern unsigned long wasm_fs_generation;
++extern struct super_block *wasm_fs_root_sb;
++#define wasm_fs_moved() WRITE_ONCE(wasm_fs_generation, wasm_fs_generation + 1)
++#define wasm_fs_changed(inode)						\
++	do {								\
++		struct super_block *__sb = READ_ONCE(wasm_fs_root_sb);	\
++		umode_t __m = (inode)->i_mode;				\
++		if ((!__sb || (inode)->i_sb == __sb) &&			\
++		    (S_ISREG(__m) || S_ISDIR(__m) || S_ISLNK(__m) || !__m))	\
++			wasm_fs_moved();				\
++	} while (0)
++#else
++#define wasm_fs_moved() do { } while (0)
++#define wasm_fs_changed(inode) do { } while (0)
++#endif
++
+ static inline void i_size_write(struct inode *inode, loff_t i_size)
+ {
++	/* a write in the same tick as the last one grows the file without storing a time */
++	if (inode->i_size != i_size)
++		wasm_fs_changed(inode);
+ #if BITS_PER_LONG==32 && defined(CONFIG_SMP)
+ 	preempt_disable();
+ 	write_seqcount_begin(&inode->i_size_seqcount);
+@@ -1621,6 +1650,9 @@
+ static inline struct timespec64 inode_set_atime_to_ts(struct inode *inode,
+ 						      struct timespec64 ts)
+ {
++	/* relatime stores an unchanged atime whenever it is not newer than the ctime */
++	if (inode->i_atime_sec != ts.tv_sec || inode->i_atime_nsec != ts.tv_nsec)
++		wasm_fs_changed(inode);
+ 	inode->i_atime_sec = ts.tv_sec;
+ 	inode->i_atime_nsec = ts.tv_nsec;
+ 	return ts;
+@@ -1655,6 +1687,7 @@
+ static inline struct timespec64 inode_set_mtime_to_ts(struct inode *inode,
+ 						      struct timespec64 ts)
+ {
++	wasm_fs_changed(inode);
+ 	inode->i_mtime_sec = ts.tv_sec;
+ 	inode->i_mtime_nsec = ts.tv_nsec;
+ 	return ts;
