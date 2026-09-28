@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 # package census: ~50 packages for wasm32-linux-musl with scripts/cc-strict; libraries install into a
-# per-run prefix so later packages link against them. no rm anywhere: each run builds in its own tree
+# per-run prefix so later packages link against them. no rm anywhere: each run builds in its own tree,
+# in the container's /tmp by default, so `docker run --rm` discards it (1.6 GB a round) and only the
+# outputs, logs and results reach /rig/census; CENSUS_BUILD=<dir> keeps a tree to look into
 # ROUND tags the out, logs and build dirs (default 9); EXTRA_CFLAGS adds to every compile (-msimd128)
 set -uo pipefail
 W=/rig/linux-wasm/workspace
@@ -13,7 +15,7 @@ D=/rig/census
 ROUND=${ROUND:-9}
 mkdir -p $D/src $D/out$ROUND $D/logs$ROUND
 RUN=$(date +%s)
-B=$D/b$ROUND-$RUN
+B=${CENSUS_BUILD:-/tmp/census}/b$ROUND-$RUN
 P=$B/prefix
 mkdir -p $B $P/include $P/lib
 RESULTS=$D/results$ROUND-$RUN.tsv

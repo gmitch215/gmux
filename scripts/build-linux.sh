@@ -2,6 +2,7 @@
 # builds the kernel, musl, BusyBox, the initramfs and the tests/c probes from the pins in
 # src/sources.json with src/*/patches applied, into a new directory, on a linux host with docker.
 # LLVM=<linux-wasm llvm install> reuses a built toolchain; otherwise it is built (about an hour).
+# KERNEL_CACHE=<dir> on the same filesystem shares one kernel checkout across runs (below).
 # stage the result with scripts/build-kernel.sh <dir>/out, then check it with tests/c/run.ts
 set -euo pipefail
 work=${1:?usage: scripts/build-linux.sh <new directory>}
@@ -32,9 +33,26 @@ git -C "$lw" checkout -q "$(pin linux-wasm commit)"
 retry() { "$@" || "$@" || "$@"; }
 src=$lw/workspace/src
 # the kernel at exactly its pin; linux-wasm's --shallow-exclude clone of the branch fails on GitHub at times
-git init -q "$src/kernel"
-retry git -C "$src/kernel" fetch -q --depth 1 "$(pin linux repo)" "$(pin linux commit)"
-git -C "$src/kernel" checkout -q FETCH_HEAD
+fetch_kernel() {
+	git init -q "$1"
+	retry git -C "$1" fetch -q --depth 1 "$(pin linux repo)" "$(pin linux commit)"
+	git -C "$1" checkout -q FETCH_HEAD
+}
+# KERNEL_CACHE=<dir> keeps one pristine checkout per pin (2 GB) and gives each run a hardlinked copy:
+# git apply replaces the files it patches, the build writes under O=, and the end checks the
+# checkout is still clean
+pristine=
+if [ -n "${KERNEL_CACHE:-}" ]; then
+	pristine=$KERNEL_CACHE/linux-$(pin linux commit)
+	if [ ! -d "$pristine/.git" ]; then
+		fetch_kernel "$pristine.part"
+		mv "$pristine.part" "$pristine"
+	fi
+	mkdir -p "$src"
+	cp -al "$pristine" "$src/kernel"
+else
+	fetch_kernel "$src/kernel"
+fi
 epoch=${SOURCE_DATE_EPOCH:-$(git -C "$src/kernel" log -1 --format=%ct)}
 # linux-wasm's fetch commits its musl and BusyBox patches with git am, and musl's version string is
 # git describe of that commit, so its committer and date are pinned too
@@ -166,9 +184,14 @@ run "export LINUX_WASM=/rig/linux-wasm REAL_LLVM=$W/install/llvm/bin TMPDIR=/rig
 		-fPIC -O2 -c /rig/repo/tests/c/side/callback.c -o /rig/callback.o
 	/rig/linux-wasm/tools/fake-llvm/ld.lld -shared -o /rig/out/probes/libcallback.so /rig/callback.o"
 
+if [ -n "$pristine" ] && [ -n "$(git -C "$pristine" status --porcelain)" ]; then
+	echo "the build wrote into the kernel checkout it shares with $pristine; fetch a new KERNEL_CACHE" >&2
+	exit 1
+fi
 cp "$lw/workspace/install/kernel-$V/vmlinux.wasm" "$work/out/"
 cp "$lw/workspace/install/busybox-$V/bin/busybox" "$work/out/busybox.wasm"
 cp "$lw/workspace/install/musl-$V/lib/libc.a" "$work/out/"
 cp "$work/rootfs/bin/katybug" "$work/out/katybug.wasm"
 (cd "$work/out" && sha256sum vmlinux.wasm busybox.wasm katybug.wasm libc.a initramfs.cpio.gz probes/*.wasm probes/libz.so probes/libcallback.so > SHA256SUMS)
+ts "$root/scripts/wasm/inputs.ts" "$work/repo" > "$work/out/INPUTS"
 cat "$work/out/SHA256SUMS"
