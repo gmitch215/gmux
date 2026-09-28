@@ -11,6 +11,7 @@
 	(import "env" "wasm_cpu_clock_get_monotonic" (func $clock (param i64) (result i64)))
 	(import "env" "wasm_start_cpu" (func $startCpu (param i32 i32)))
 	(import "env" "wasm_release_task" (func $release (param i32)))
+	(import "env" "wasm_random_get_bytes" (func $random (param i32 i32) (result i32)))
 
 	(global $init_task (export "init_task") i32 (i32.const 1))
 	(global $boot_command_line (export "boot_command_line") i32 (i32.const 0x100))
@@ -341,6 +342,8 @@
 	;; bit for frame 200, past the count, that the host must ignore
 	(data (i32.const 0x1100) "\96\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\01\00\00\00\00\00\00\00\00\00\01\00\00")
 	(func (export "wasm_free_pages") (result i32) (i32.const 0x1100))
+	;; told of a restore (kernel patch 0023): 32 fresh host bytes where the crng's key would be
+	(func (export "wasm_restored") (drop (call $random (i32.const 0x1200) (i32.const 32))))
 	;; cpu 1 sleeps on its interrupt word and reports the console's interrupt (2) when the host raises it
 	(func (export "_start_secondary") (param $idle i32)
 		(loop $wait

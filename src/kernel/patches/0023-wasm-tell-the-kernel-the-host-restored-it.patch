@@ -1,0 +1,82 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Gregory Mitchell <me@gmitch215.xyz>
+Date: Mon, 28 Sep 2026 11:45:00 -0400
+Subject: [PATCH] wasm: tell the kernel the host restored it
+
+The host calls wasm_restored after every restore from a checkpoint. It
+does what a hypervisor's resume does for a guest:
+
+A checkpoint can be restored more than once: the site ships one image
+taken after boot, which every new machine restores instead of booting.
+The crng's keys are in that image, so every copy would draw the same
+random numbers until its next scheduled reseed, the problem a forked
+virtual machine has. wasm_restored mixes 32 fresh host bytes into the
+input pool and reseeds at once (wasm_crng_fork), as add_vmfork_randomness
+does for VMGENID, without its console notice, which a terminal would
+show after every restore.
+
+The host clock ran on while the machine was stored, so the first tick
+after a restore sees every grace period as old as the pause: a restore
+more than CONFIG_RCU_CPU_STALL_TIMEOUT (21 s) after its checkpoint
+printed an RCU stall and dumped every cpu. The pause is not a stall;
+wasm_restored resets the RCU stall and soft-lockup detectors, as a
+paused virtual machine's clock (pvclock) does.
+---
+--- a/arch/wasm/kernel/Makefile
++++ b/arch/wasm/kernel/Makefile
+@@ -11,6 +11,7 @@
+ obj-y += process.o
+ obj-y += ptrace.o
+ obj-y += random.o
+ obj-y += reboot.o
++obj-y += restored.o
+ obj-y += setup.o
+ obj-y += signal.o
+--- /dev/null
++++ b/arch/wasm/kernel/restored.c
+@@ -0,0 +1,26 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * gmux: the host restored this machine from a checkpoint. Other machines may restore the same one
++ * (a shipped image, a copied store), and the host clock ran on over the pause.
++ */
++
++#include <linux/nmi.h>
++#include <linux/rcupdate.h>
++#include <linux/string.h>
++#include <linux/types.h>
++
++extern ssize_t wasm_random_get_bytes(u8 *buffer, ssize_t count);
++void wasm_crng_fork(const void *id, size_t len);
++
++__visible void wasm_restored(void)
++{
++	u8 id[32];
++
++	/* no two copies draw the same random numbers */
++	if (wasm_random_get_bytes(id, (ssize_t)sizeof(id)) == (ssize_t)sizeof(id))
++		wasm_crng_fork(id, sizeof(id));
++	memzero_explicit(id, sizeof(id));
++	/* the pause is not a stall */
++	rcu_cpu_stall_reset();
++	touch_all_softlockup_watchdogs();
++}
+--- a/drivers/char/random.c
++++ b/drivers/char/random.c
+@@ -971,6 +971,16 @@
+ 		credit_init_bits(len * 8);
+ }
+
++#ifdef CONFIG_WASM
++/* gmux: a restored copy of a machine (arch/wasm/kernel/restored.c): mix its bytes in, rekey now */
++void wasm_crng_fork(const void *id, size_t len)
++{
++	add_device_randomness(id, len);
++	if (crng_ready())
++		crng_reseed(NULL);
++}
++#endif
++
+ #if IS_ENABLED(CONFIG_VMGENID)
+ static BLOCKING_NOTIFIER_HEAD(vmfork_chain);
+

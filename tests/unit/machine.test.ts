@@ -462,14 +462,60 @@ describe('Machine', () => {
 			expect(await r.run(restored, () => false)).toBe('halted');
 		});
 
-		it('leaves memory as the snapshot recorded it until the machine runs again', async () => {
+		it('leaves memory as the snapshot recorded it until the machine runs again, but for the reseed', async () => {
 			const { restored, snapshot } = await checkpointed();
 			const now = new Uint8Array(restored.memory.buffer);
 			const [from, to] = [snapshot.scratch, snapshot.scratch + 32 * 0x10000];
+			const reseed = (i: number) => i >= 0x1200 && i < 0x1220;
 			let changed = 0;
 			for (let i = 0; i < snapshot.memory.byteLength; i++)
-				if ((i < from || i >= to) && now[i] !== snapshot.memory[i]) changed++;
+				if ((i < from || i >= to) && !reseed(i) && now[i] !== snapshot.memory[i]) changed++;
 			expect(changed).toBe(0);
+		});
+
+		it('restores through a lazy reader with no process pages to defer', async () => {
+			const r = rig({ asyncify: true });
+			const machine = new Machine(r.machineOptions);
+			await r.run(machine, () => r.output().includes('parent ok'));
+			const snapshot = await machine.checkpoint();
+			const saved = snapshot.memory.slice();
+			const restored = await Machine.restore(
+				r.machineOptions,
+				{ ...snapshot, memory: new Uint8Array(0), owners: undefined },
+				undefined,
+				{ byteLength: saved.byteLength, read: (s, e) => saved.slice(s, e) }
+			);
+			// the toy runs on zeroed memory too (its data segments), so the bytes are the check
+			const now = new Uint8Array(restored.memory.buffer);
+			const [from, to] = [snapshot.scratch, snapshot.scratch + 32 * 0x10000];
+			let changed = 0;
+			for (let i = 0; i < saved.byteLength; i++)
+				if ((i < from || i >= to) && (i < 0x1200 || i >= 0x1220) && now[i] !== saved[i])
+					changed++;
+			expect(changed).toBe(0);
+			restored.type('s');
+			await r.run(restored, () => r.output().includes('parent back ok'));
+			expect(r.output()).not.toContain('bad');
+		});
+
+		it('rekeys the kernel random numbers of every restored copy, and not on a resume', async () => {
+			const r = rig({ asyncify: true });
+			const machine = new Machine(r.machineOptions);
+			await r.run(machine, () => r.output().includes('parent ok'));
+			const snapshot = await machine.checkpoint();
+			const copy = () => ({ ...snapshot, memory: snapshot.memory.slice() });
+			const key = (m: Machine) =>
+				new Uint8Array(m.memory.buffer).slice(0x1200, 0x1220).join();
+			const a = await Machine.restore(r.machineOptions, copy());
+			const b = await Machine.restore(r.machineOptions, copy());
+			expect([a.stats.restoreHooks, b.stats.restoreHooks]).toEqual([1, 1]);
+			expect(key(a)).not.toBe(key(b));
+			expect(key(a)).not.toBe(snapshot.memory.slice(0x1200, 0x1220).join());
+			const again = await a.checkpoint();
+			const before = key(a);
+			const resumed = await Machine.resume({ ...r.machineOptions, memory: a.memory }, again);
+			expect(resumed.stats.restoreHooks).toBe(1);
+			expect(key(resumed)).toBe(before);
 		});
 
 		it('zeroes the pages the kernel reports free, within its frame count', async () => {

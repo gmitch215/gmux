@@ -534,6 +534,8 @@ export interface MachineStats {
 	touchedPages: number;
 	/** free pages the last checkpoint zeroed instead of saving (kernel patch 0020) */
 	freePages: number;
+	/** restores the kernel was told of: crng rekeyed, stall detectors reset (kernel patch 0023) */
+	restoreHooks: number;
 	/** processes that joined a shared program instance instead of instantiating */
 	sharedEntries: number;
 	/** the console driver's reads from the host */
@@ -603,6 +605,7 @@ export class Machine {
 		filledPages: 0,
 		touchedPages: 0,
 		freePages: 0,
+		restoreHooks: 0,
 		sharedEntries: 0,
 		consoleReads: 0,
 		consoleRaises: 0,
@@ -2893,7 +2896,8 @@ export class Machine {
 				page = end;
 			}
 			machine.deferredSource = (start, end) => lazy.read(start, end);
-		} else if (image) image.write(into);
+		} else if (lazy) into.set(await lazy.read(0, into.byteLength));
+		else if (image) image.write(into);
 		else if (!inPlace) into.set(snapshot.memory);
 		const behind = BigInt(snapshot.now) - machine.now();
 		if (behind > 0n) machine.clockOffset = behind;
@@ -3008,6 +3012,16 @@ export class Machine {
 				? snapshot.readyAt.map((i) => made[i]!)
 				: snapshot.ready.map((id) => machine.runners.get(id)!).filter(Boolean))
 		);
+		// kernel patch 0023: a checkpoint can be restored more than once (a shipped image, a copied
+		// store), and the clock ran on over the pause; the kernel rekeys its crng and resets its stall
+		// detectors, as a resumed virtual machine does
+		if (!inPlace) {
+			const restored = machine.exp(machine.cpuZero).wasm_restored;
+			if (restored) {
+				restored();
+				machine.stats.restoreHooks++;
+			}
+		}
 		return machine;
 	}
 

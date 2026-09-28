@@ -11,7 +11,7 @@ keep=boot_command_line,init_task,initrd_start,initrd_end,get_user_stack_pointer,
 keep+=,ret_from_fork,_start,_start_secondary,raise_exception,wasm_user_work_pending
 keep+=,wasm_user_stack_low,wasm_user_stack_high,wasm_trap_unwound_kernel,wasm_user_interrupt
 keep+=,wasm_owner_table,wasm_current_owner,wasm_current_set,wasm_current_euid,wasm_current_mm,wasm_console_irq
-keep+=,wasm_free_pages,wasm_fs_gen,wasm_fs_view
+keep+=,wasm_free_pages,wasm_fs_gen,wasm_fs_view,wasm_restored
 for n in 0 1 2 3 4 5 6; do keep+=",wasm_syscall_$n"; done
 wasm2wat --enable-threads "$in/vmlinux.wasm" -o "$tmp/vmlinux.wat"
 "$root/scripts/ts" "$root/scripts/wasm/strip-exports.ts" "$tmp/vmlinux.wat" "$tmp/vmlinux.min.wat" "$keep"
@@ -33,13 +33,16 @@ sum=$(shasum -a 256 "$in/busybox.wasm" | cut -d' ' -f1)
 # and the hash of the patches the pipeline built from (scripts/wasm/inputs.ts), which tests/c/run.ts checks
 inputs=
 [ -f "$in/INPUTS" ] && inputs=$(printf ', "inputs": "%s"' "$(cat "$in/INPUTS")")
+kb=
 if [ -f "$in/katybug.wasm" ]; then
 	"$root/scripts/wasm/instrument.sh" "$in/katybug.wasm" "$out/katybug.wasm"
-	kb=$(shasum -a 256 "$in/katybug.wasm" | cut -d' ' -f1)
-	printf '{ "busybox": "%s", "katybug": "%s"%s }\n' "$sum" "$kb" "$inputs" > "$out/manifest.json"
-else
-	printf '{ "busybox": "%s"%s }\n' "$sum" "$inputs" > "$out/manifest.json"
+	kb=$(printf ', "katybug": "%s"' "$(shasum -a 256 "$in/katybug.wasm" | cut -d' ' -f1)")
 fi
 # and the builds a checkpoint can unwind, which the site runs
 "$root/scripts/wasm/asyncify.sh" "$out"
+# and the hash of everything the site's machine is made of, which a bootstrap image
+# (scripts/bootstrap.ts) must have been taken from to be used
+image=$(cd "$out" && cat vmlinux.async.wasm busybox.async.wasm busybox.guard.wasm initramfs.bin \
+	$([ -f katybug.wasm ] && echo katybug.wasm) | shasum -a 256 | cut -d' ' -f1)
+printf '{ "busybox": "%s"%s%s, "image": "%s" }\n' "$sum" "$kb" "$inputs" "$image" > "$out/manifest.json"
 ls -la "$out"
