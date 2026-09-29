@@ -278,6 +278,24 @@ optimized since; at 10 ms it moved none of these, so the cold cost is compiling 
 new module, not frames held in old code. On one pinned core V8's background compiles of each
 fresh module land on whatever run comes next, and the restore rig does not measure there.
 
+Where the cold restore goes was split under node 26.8 (V8 14.6) on six programs, each with V8's
+compile flags changed one at a time. Instantiation is 0.2-2.1 ms and construction 3-38 ms, before
+the timed part. The rest of cold minus warm is 7-86 ms (lua 13.6, gzip 14.5, bzip2 76.2, sqlite
+85.9, sed 35.1, gawk 23.1), and compilation is 97-99% of it: lazy Liftoff compilation is 0-3 ms
+(29 ms on sqlite) and tier-up is the remainder, 6-73 ms. The control, the default run first and
+last, drifts by up to a factor of two on gzip and sqlite. The site already compiles its modules when
+the isolate starts and a restore never compiles, so only those two costs can remain deployed.
+Measured on Free, one image taken mid-job (a background `gzip -9` of 600,000 numbers, output
+checked) was restored into 10 fresh isolates and 30 warm ones: cold 965 ms (940-1,227), warm 933 ms
+(871-1,169), paired per redeploy +60 ms at the median (-22 to +220), Mann-Whitney z 2.89. That is
+3-6% of the request; the same job under node is +55% (432 ms against 278 ms). A 92 ms warm-up at
+isolate start removes the node penalty. On Free it would add 626 ms to every isolate start and save
+nothing measurable, and the variant that warms only on a restore needs 58 subrequests against the
+cap of 50, so the site has no warm-up. The deployed wall includes the asset fetches and `cpuTime`
+was 0 in 34 of 50 rows, so compute and fetch are not separated. workerd keeps a compiled-module
+cache across isolates (its documentation describes one); whether it holds optimized code is not
+known, and it may be why the deployed penalty is small.
+
 Changed pages are found at checkpoint time by hashing each 64 KiB page, packed with a small page index
 into rows of up to 2 MB, and written only after `ctx.storage.sync()` succeeds. There is no store
 barrier (Dirty Tracking, below).
@@ -342,6 +360,36 @@ woken sooner than a quiet period that doubles from 1 s to an hour while it runs 
 input or a file sync, and drops back to 1 s when it does something. A user's timer fires late by
 about as long as the machine had been quiet. With a warm socket attached, the socket drives the
 machine and only unsaved work wants the alarm.
+
+Idle wakes were measured once the site ran unattended. An alarm wake slept in 50 ms steps until its
+5 s wall budget ended, and a turn that ended on the budget counted as activity, so the quiet period
+never backed off: on Free a machine doing nothing woke every 5.94 s and billed 4,972 ms of wall a
+wake (111 wakes in 653 s). That is 14,546 wakes and 9,257 GB-s a day, 71% of Free's 13,000 GB-s.
+Ending an unattended turn at its first wait for a Linux timer took the wall to 91 ms and the day to
+136 GB-s. A keep-or-drop rule (`src/worker/thermal.ts`) keeps a wake when the chance of another use
+inside its window, times the cost of the restore it saves, exceeds the request, row and idle wall
+the wake costs, all priced in parts per million of Free's daily Durable Object meters. With ten
+minutes of history it drops every idle wake: a wake costs 20 ppm and the restore it saves 0.72 ppm.
+On a deployed object it kept 80 wakes with no history, dropped at the first idle wake after ten
+minutes and armed no alarm after; in its first 11 minutes the meters read 89 requests, 67 rows
+written and 0.816 GB-s.
+
+Dropping every wake stops a silent background job after ten minutes until someone attaches, so the
+wake policies were also measured over four hours of virtual time on the real kernel, with the object
+replaced at every wake, on a silent `sleep 60` loop (240 iterations ideal). Keeping every wake with a
+checkpoint at the end of each costs 14,134 rows a day at a 1 minute floor (237 iterations; 7 idle
+machines fit in Free's rows meter), 872 rows and 94 wakes at a 15 minute floor (23 iterations; 114
+machines), and 165 rows and 19 wakes at a 60 minute floor (11 iterations; 608 machines). Without a
+checkpoint at the end of a kept wake every policy loses the silent job's state when the object is
+replaced. The quiet period, kept in the instance, restarted at 1 s after a replacement and cycled 2,
+4, 8 and 16 second wakes: 10,071 wakes a day for a machine used every 3 minutes with every wake
+kept, against 2,386 when it is stored with the cadence. The defaults are now a 15 minute floor with
+a checkpoint at each kept wake, the stored quiet period, and an unattended turn that ends at a wait
+over 100 ms: that adds about 20 ms to an idle wake in the simulation (30 to 53 ms) and gives a job
+that sleeps briefly 22 times the throughput per woken event. The wall budget was found unenforced
+on the deployed clock, since `Date.now()` stands still while code runs and a guest waiting every few
+milliseconds ran one event of about 15 minutes (110-115 GB-s); waited time now counts against it.
+The new defaults have not yet run on Free.
 
 ### Two Sockets per Terminal
 
@@ -459,7 +507,7 @@ charged to the process's highest address (42 MB here).
 Katybug (`src/gmux/katybug/`) runs x86-64 and AArch64 Linux ELFs inside the machine: `binfmt_misc`
 hands a foreign ELF to `/bin/katybug`, which decodes basic blocks into the gmux IR and interprets
 them, turning guest syscalls into the machine's own. Guest addresses are 64-bit and live in
-mappings, each backed by one host block, so a guest can map above 4 GiB (PIE at
+mappings, each backed by 64 KiB host blocks allocated on first touch, so a guest can map above 4 GiB (PIE at
 `0x555555554000`, the stack below `0x7ffffff00000`, `mmap` from `0x100000000000`) while the machine
 stays wasm32.
 
@@ -486,6 +534,26 @@ A signal the process inherits as ignored stays ignored for the guest, as `execve
 Katybug had started every guest disposition at default while the host's stayed ignored, so a guest
 asking `sigaction` was told "default". A CI runner starts its steps with `SIGPIPE` ignored, which is
 where it showed.
+
+A mapping is a table of host pieces, not one block. The no-MMU kernel hands a wasm process memory as
+contiguous runs, and an 8 MiB stack, a grown heap or a 1.3 MB executable read whole asks for a run
+that fragmented memory does not have: a 1,335,296-byte request failed in a 50 MB machine (800 wasm
+pages) with 17 MB free. Each mapping now owns 64 KiB pieces allocated zeroed on first touch, so a
+stack costs the pieces it touches. An inline cache covers one piece; a load or store that crosses a
+piece boundary misses it and is served through both pieces. `read`, `write`, `readv`, `writev`,
+`send` and `recv` go piece by piece, a small range that crosses a boundary and must be flat is
+bounced through a buffer of at most 64 KiB, and the ELF loader reads each segment straight into its
+pieces instead of reading the file into one block. Pieces of 16 KiB and over come from `mmap`,
+because a `calloc` of 64 KiB is padded to 17 pages and the nommu kernel serves that from an order-5
+run. The native suite passes 35 of 35, the transcripts 117 of 117 lines on both architectures, the
+instruction corpora (32,045 and 14,993 cases) are equal, and 15 machine probes pass in three modes.
+Piece size was timed in a machine under node, 4 KiB against 64 KiB over 9 rounds, as the ratio of
+per-round medians: 1.017 on a loop inside one piece, 1.002 on a linear walk, 1.069 on a load per
+4 KiB and 1.178 on a load that straddles a 4 KiB boundary, so 64 KiB stays. Coreutils' 516 tests
+still pass 0 at 800 pages (native 353). The kernel asks for a 33-page run for each exec's stack (128
+KiB and an argument page), which the allocator rounds to 64; after 104 execs an 800-page machine has
+60 to 76 free runs of 32 pages and none of 64. At 1,200 pages, with 64 KiB `calloc` pieces, 39 tests
+pass, 402 fail and 75 skip.
 
 Each decoded block then goes through a plan before it runs. The first plan is flag demand: a flag
 write is dropped when every flag it sets is written again before anything reads it. The block's
@@ -617,6 +685,41 @@ faster. The interpreter skips the resolves: using them cost it 2-3%, since dispa
 Every IR op carries a semantic class (`kb_class` in `run.c`), and the flag and memory plans read
 the classes, not opcodes.
 
+How much of the remaining memory traffic one validated host offset could cover was counted from the
+hot traces themselves (`experiments/aot-oracle/scripts/provenance.ts` over `-DKB_HOT` dumps with
+exact per-exit weights). An access qualifies when its base is an entry register or a constant, so
+one check of its window at the trace's start covers it; only a syscall can change mappings, and a
+syscall ends a block, so nothing inside a trace invalidates the check:
+
+| workload | provable | largest remainder |
+| --- | --- | --- |
+| factor | 91.2% | base plus index, 3.6% |
+| gzip | 55.7% | base plus index, 41.2% |
+| bzip2 | 44.9% | base plus index, 49.9% |
+| sqlite | 68.4% | loaded pointer, 14.2% |
+| sha256 | 87.3% | base plus index, 10.2% |
+
+Every access the memory plan already groups comes out provable, and the outputs are equal with the
+dump on and off. Mappings change 0.08-3.58 times per million block runs, so a check carried across
+trace entries under a generation would rarely be invalidated.
+
+The same lifted form was then built up one change at a time, on x86 and inside the machine, against
+the native algorithm run through the same harness (`experiments/aot-oracle/scripts/ladder.sh`):
+
+| rung | sha256 | factor | sqlite |
+| --- | --- | --- | --- |
+| base, r x86 / wasm | 7.9 / 9.4 | 5.2 / 8.2 | 18.4 / 23.8 |
+| temporaries kept block-local | -9% / -7% | -10% / -19% | -12% / -4% |
+| traces and trace-level groups | -17% / -4% | +2% / -1% | -15% / -20% |
+| back-edge polls | -7% / -13% | -1% / 0% | -3% / -1% |
+| provenance windows | -40% / -31% | -4% / -4% | -3% / -2% |
+| all of the above, r | 3.3 / 5.0 | 4.5 / 6.3 | 13.0 / 17.8 |
+| native algorithm, r | 1.14 / 1.20 | 0.96 / 1.38 | 0.66 / 1.12 |
+
+Block-local temporaries pay everywhere; the provenance windows pay only on sha256. The four changes
+close 68%, 16% and 31% of the distance to the native algorithm on x86, so most of it remains. Steps
+under about 10% sit inside the spread between link orders on some rows.
+
 Where the pending-signal check sits was measured with `-DKB_POLL`
 (`experiments/aot-oracle/scripts/poll.sh`), lifted time against checking at every block:
 
@@ -677,12 +780,25 @@ AArch64 floating point and Advanced SIMD (`a64v.c`) are computed in software on 
 significands, because wasm has no rounding-mode control: every FPCR rounding mode, flush-to-zero,
 default NaN, and FPSR's cumulative flags, with add, subtract, multiply and divide taking the host's
 result when the mode is the default and the operands are ordinary. The AArch64 corpus
-(`tests/c/katybug/a64-ops.sh`, native on Apple silicon through Docker) is 14,747 cases, FPSR
+(`tests/c/katybug/a64-ops.sh`, native on Apple silicon through Docker) is 14,993 cases, FPSR
 included, all equal. GCC's `-Wtautological-compare` found that an FP or vector load from a literal
 (`ldr q0, label`) never decoded, since its match masked out the bit it compared; it had no case in
 the corpus, and now has two. Signal frames carry the FP and vector registers on both architectures. The cost
-is about 5 ns per scalar FP operation, and a vector fused multiply-add loop runs 45% slower than it
+is about 5 ns per scalar FP operation, and a vector fused multiply-add loop ran 45% slower than it
 did before exactness.
+
+Fused multiply-add now takes a host path at the default FPCR when its operands are finite. A
+single-precision result comes from an exact double product with its rounding error carried in a
+TwoSum and rounded to odd; a double-precision result from the host's `fma` plus Boldo and Muller's
+error term, with the inexact flag read from the residual. Other rounding modes, flush-to-zero,
+default NaN, NaN and infinite operands, zero factors, subnormal double operands and extreme
+exponents go to the software core. On an Apple M2 Pro, against a build that gives every operation
+the host's result, the `fmla` loop went from +62% to +6%, a mixed loop from +20% to +4%, and a
+dependent pair of scalar `fmadd` from +70% to +13% (16,777,216 iterations, best of 3). The corpus
+is equal with the planner on and off, and 30 million random cases each of double and single agree
+with the software core, flags included. In a machine under node the fast path makes the `fmla`
+loop 1.657 times faster than the software path, the mixed loop 1.077 and the scalar pair 1.050; a
+loop that uses no fused multiply-add reads 0.996 (spreads up to 3.6%), which is the noise floor.
 
 x86 `rep movs` and `rep stos` copy and fill forward in 1 MiB chunks of host memory, and element by
 element up to the next page when a range is not one mapping, so a fault stops at the exact element
@@ -693,6 +809,22 @@ host call, which is then restarted as Linux restarts it; before, the host restar
 and the handler waited for the call to return. 128-bit multiplies and divides are 64-bit halves under
 wasm (`wide.h`), so wasm32 code no longer calls compiler-rt's `__multi3`, `__udivti3` or `__divti3`;
 lifted factor gained 3%.
+
+Four libc string functions run as host kernels. Katybug recognizes `strlen`, `memcmp`, `strcmp` and
+`memchr` by their code, not their names, since guest binaries are stripped: a block at a function's
+entry whose length, first eight bytes and FNV-1a hash match musl 1.2.5's bytes gets a leading
+`KB_PRIM` op, and those bytes occur exactly once in each static x86-64 and AArch64 binary and in
+both musl loaders. A kernel reads the guest's pages directly and, if it reaches one it cannot read,
+gives up before it changes anything, so the function's own ops run and the fault is the
+interpreter's; twelve fault cases (a page end, a hole, `PROT_NONE`, two adjacent mappings) print 33
+lines identical to native x86-64 and arm64. Against the run with the kernels off, on the Ryzen host
+(three link orders, two rounds, 0 of 522 samples dirty), `sort -r` goes from `r` 347 to 288 (-16.9%)
+on x86-64 and by 15.3% on AArch64. Alone, memcmp gives -5.7%, strcmp -6.6%, memchr -4.9% and strlen
+-0.6%, which roughly add up. Shell arithmetic gains 5.0%, a SQLite index build 2.9%, awk 1.7% and
+`nl` 5.2% (inside that workload's 8-12% link-order spread); the kernels-off arm's own link-order
+spread is 0.5-2.5% (`nl` 9.7%). The 5.3 million recognized calls in `sort` buy about 1.3 s of 7.97
+s, roughly 0.25 us each. A kernel does not pay when calls are few or operands short. glibc's
+versions are ifunc variants with other bytes, so a Debian guest recognizes none.
 
 Three changes cut dispatch. Block fusion decodes through direct jumps into one block; each block
 links the two successors it last saw, so most transitions skip the block hash; and a block run 64
@@ -730,12 +862,58 @@ exits predicts every arm within 4.2%, but only by giving blocks and side exits n
 arms differ too little for crossing costs to be read from them. Each op's own work is most of the
 time: 3.2-3.8 ns an op.
 
+So each crossing was priced alone, on a guest that varies one kind at a time, and the table was
+frozen before it predicted anything. On an Apple M2 Pro (unpinned, so spread stands in for
+pinning), a chained block dispatch costs 9.29 ns on an x86-64 guest and 5.26 on an AArch64 one, a
+trace build's 10.54 and 5.80, a mapping slow path 7.58 and 4.42 (0.51 and 0.46 per extra mapping),
+a trace side exit net of its lookup 4.61 and 10.99, and a block-cache lookup zero within error.
+Predicting the four programs above from that table, with one per-op cost taken from each program's
+base arm and nothing fitted, misses the 5% bound in 13 of 32 x86-64 cells (worst 11.0%, `sort` at
+8-block traces) and 7 of 32 AArch64 cells (worst 6.6%); only the fusion build holds on both. Two
+terms are wrong. The lookup priced at nothing saves 1.8-4.3 ns in the real programs, which hold
+19,000-98,000 blocks where the microbenchmark held a handful. The trace build's block dispatch is
+13.5-23.8 ns implied against 10.54 tabled, plausibly because a trace block runs 2.5-3.5 times the
+ops of a chained one (not tested). The exit cost that would close the gap is 50-790 ns and changes
+with the arm, so it is not a constant. The same table prices a JS call into wasm at 1.59 ns, a
+wasm-to-JS import at 3.54, a wasm to JS to wasm thunk at 7.21, a burrow guest calling a host import
+at 108 ns, native to burrow at 125 ns, and an awaited Durable Object to Durable Object call on
+local workerd at about 300 us.
+
+A guarded return-address stack does not pay. A decoder notes each block's calls; entering a block
+pushes their return addresses onto a 64-entry stack, and a block that ends in a return compares the
+popped address with the guest's `pc` and takes the block cached at that call site instead of doing
+the hash lookup. A mismatch (a `longjmp`, a redirected return slot, a signal frame) searches down
+the stack and then falls back to the lookup, so a return to a changed address runs what the
+register says. The tests overwrite a return slot 100 times and unwind ten frames with `longjmp` 50
+times, and every corpus and transcript is equal with the stack on and off. It removes 30-80% of
+block-cache lookups (a bash loop of function calls: 15.3 M to 4.9 M) and moves time inside noise:
+over 12 workload and architecture cells and 324 samples, on against off is -0.3 to +0.9% with a
+same-setting control of -0.8 to +0.6% and link-order spread of 0.0-4.2%. Deep recursion does no
+better: `fib(43)` is 2.6% slower on x86-64 and 2.0% on AArch64 although the stack removes 1.40
+billion of its return lookups, and a parser about 90 frames deep moves -0.6% and +0.2%. A block
+costs about 170 ns in bash, a lookup is a small part of it, and the pushes cost about what the
+lookups saved. The stack was removed from Katybug after these measurements; `returns.c` stays as a
+test of the interpreter's own returns, and `experiments/call-return/` keeps the rig.
+
 Deferred flags do not pay consistently. Four settings were measured: computing every flag
 (`KATYBUG_PLAN=0`), dropping the flag writes nothing reads, recording flags as an expression, and
 evaluating the branch straight from the record (the default). On the Ryzen all four are within 2.4%
 of each other and the default is fastest on seven of eight programs; on the Apple host dropping dead
 writes alone is fastest on five of six, and the spread reaches 8.5%. Flags stay exact in signal
 frames under every setting.
+
+Neither native host is the deployed one, so both defaults were measured again with Katybug as a
+guest of the wasm kernel under node 26.10 (V8): 10 arms on sqlite, bash, awk and `sort` for both
+architectures, three link orders, four rounds, one output across all arms of a workload. Against
+the shipped settings (fused flags, 32-block traces), geometric mean over the four workloads for
+x86-64 and AArch64: no traces +4.0% and +6.0%; traces of 1 block +4.2% and +6.0%, 4 blocks +2.6%
+and +2.8%, 8 blocks +1.1% and +1.0%, 16 blocks +0.1% and +0.1%, 64 blocks -0.2% and -0.1%; flags
+dead-only +6.6% and +2.4%, as an expression +4.2% and +1.1%, every flag computed +1.7% and -0.9%
+(the AArch64 figure is one `sort` row at 15% link-order spread). The shipped arm's link-order spread
+is 0.2-2.2%, so a difference under about 2% is inside it. Traces gain more under V8 than on either
+native host, the Apple host's dead-only optimum does not carry over, and computing every flag costs
+only 1.7% on x86-64, which caps what carrying flags across trace boundaries could recover. Both
+defaults stay.
 
 With `KATYBUG_CACHE=<dir>`, a process writes its decoded blocks, with their profile and trace
 shape, to a file named by the hash of its ELF, and the next process of that ELF takes them instead of
@@ -1319,6 +1497,53 @@ core under Node 26.10 (V8 14.6). Under Node 24.21 (V8 13.6) V8's own deflate is 
 fully interpreted run takes 37% longer (`r` 18.36) and the 74.0% rung 16% longer (8.33), and a
 crossing still costs about 0.5 us. On an Apple M-series laptop the same ladder runs at 7.40 interpreted and
 0.97 promoted.
+
+A planner picks the cut over the call graph (`experiments/promotion-cut`). It takes the dynamic call
+graph (indirect calls counted where they ran), a cost per crossing and a code budget in bytes, and
+chooses the native set that minimizes interpreted work left plus native work plus crossings on cut
+edges. Run on zlib, bzip2 1.0.8 and zstd 1.5.6 (freestanding wasm32 rebuilds of 32, 22 and 265
+functions; none has a mutually recursive cluster) against three simpler policies, on an Apple M2 Pro
+(5 rounds, 2 repeats, median spread of an `r` 3%, at most 11%): min-cut is never worse than
+promoting the hottest function beyond the spread, and is the only policy that finds a set at bzip2's
+tightest budget, though there the gain (12.80 against 13.17 all interpreted) is inside the spread at
+the other crossing cost. Caller-with-callees closure is worse on zstd (`r` 5.22 against 1.68 at a
+10% budget), and cutting at strongly connected components equals hottest. The crossings a run makes
+equal the predicted count in all 96 measured rows. Under a byte budget min-cut is a heuristic, since
+the problem contains knapsack; with no budget it equals enumeration on 200 random graphs. zstd's
+`i64` and float functions cannot cross burrow's `i32` imports, so 22 of its 265 functions (3.64% of
+its instructions) stay interpreted, and `r` is 1.65 at the largest budget against 1.10 fully native.
+
+The crossing cost is the number the planner leans on, and it reads three ways. The isolated
+native-to-burrow thunk costs 125 ns on the M2 Pro (149-195 ns at the guest's argument count, 100-138
+on a pinned Ryzen 9 9900X); one more crossing inside a run costs 188-246 ns on the Mac and 155-212
+on the Ryzen; and the promotion rungs' residuals fit 253-354 ns on the Mac (271-346 for zlib and
+zstd) and 213-351 on the Ryzen. Priced at 125 ns the model predicts crossing-heavy sets 16-22% too
+fast; priced at the fit it is within about 7%. The JavaScript glue is at most about 10 ns of it;
+argument count and the crossing inside a run explain most of the rest, and a body that thrashes the
+cache between crossings adds only 1-15%. In a Durable Object on Free the same thunk costs 455, 466,
+656 and 860 ns at 2, 3, 5 and 7 arguments, 3.0-4.4 times the Mac. A plain Worker on Free hit error
+1102 above about 50,000 crossings, so the deployed loop runs in a Durable Object.
+
+A profile takes 12.6-16.6 s to make and about 1 ms to load (`experiments/profile-cache`). A record
+per guest, keyed by the module's SHA-256, holds the call graph, the ladder's two end timings, the
+plan and target sets and the mined fusion catalog. It is used only while its provenance (format,
+burrow version, wasm3 pin, a hash of burrow's interpreter sources, a hash of the scripts that write
+it, the planner's arguments) is current, and changing any of nine burrow key inputs refuses it. Cold
+pipeline against cached load, median of three (spread): zlib 16,575 ms (2%) against 1.1 ms, bzip2
+16,139 ms (2%) against 1.0 ms, zstd 12,587 ms (1%) against 1.7 ms, 7,356 to 15,908 times. Timing
+the two ends and mining the catalog is 87-97% of a cold profile. Every cached file equals the cold
+run's byte for byte, and the plan derived again from the cached graph equals the cached plan. What
+is left of a restart is rebuilding the promoted rungs from the cached sets, 228-747 ms.
+
+A wasm-to-wasm planner (constant propagation and folding, branch pruning, unreachable code, dead
+locals, fixed globals, unused blocks and functions) is exact and has nothing to do on compiler
+output. On zlib, bzip2 and zstd at -O2 it removes 0 of 13,246, 31,066 and 202,075 instructions,
+since clang has already done that work. At -O0 it removes 3.38, 8.94 and 0.57% of static and 8.07,
+7.90 and 1.01% of dynamic instructions, and `r` under wasm3 moves by 0.974-1.007 against a 0.2-8.6%
+spread (the same module run twice differs by up to 1.8%). It is exact by checksum under V8 and wasm3
+on nine guests, with each transform alone and on 400 random programs, and two mutants (branch depths
+not retargeted, locals not cleared at `end`) fail its tests. What -O0 costs is stack-slot loads and
+stores, which the planner does not touch.
 
 ---
 
