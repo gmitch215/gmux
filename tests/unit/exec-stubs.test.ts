@@ -1,10 +1,13 @@
 import { execFileSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
+import { lstatSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { gunzipSync, gzipSync } from 'node:zlib';
 import { describe, expect, it } from 'vitest';
+import { stub } from '../../scripts/wasm/exec-stubs.ts';
+import { stageKatybug } from '../../scripts/wasm/stage-katybug.ts';
+import { dylinkInfo } from '../../src/worker/machine/dl.ts';
 import { stubHash } from '../../src/worker/machine/machine.ts';
 
 const MAGIC = [0, 0x61, 0x73, 0x6d, 1, 0, 0, 0];
@@ -28,8 +31,8 @@ function cpio(files: [string, Uint8Array, number][]): Uint8Array {
 }
 
 /** every archive in the stream, later files over earlier ones, as the kernel unpacks them */
-function unpack(archive: Uint8Array): Map<string, Uint8Array> {
-	const data = gunzipSync(archive);
+function unpack(archive: Uint8Array, compressed = true): Map<string, Uint8Array> {
+	const data = compressed ? gunzipSync(archive) : Buffer.from(archive);
 	const files = new Map<string, Uint8Array>();
 	for (let p = 0; p < data.length;) {
 		const field = (i: number) =>
@@ -94,5 +97,71 @@ describe('exec stubs', () => {
 		renamed[renamed.length - 33] = renamed[renamed.length - 33]! ^ 1;
 		expect(stubHash(renamed)).toBeNull();
 		expect(stubHash(new Uint8Array([...stub, 0]))).toBeNull();
+	});
+});
+
+describe('staging another katybug', () => {
+	const sha = (bytes: Uint8Array) => createHash('sha256').update(bytes).digest('hex');
+	// the same program with 36 KiB of data and bss: one page more than the build's 16 KiB one
+	const grown = new Uint8Array(PROGRAM);
+	grown.set([0x80, 0xa0, 0x02], 8 + 13);
+	const dir = mkdtempSync(join(tmpdir(), 'gmux-stage-test-'));
+	const build = join(dir, 'build');
+	mkdirSync(join(build, 'kernel'), { recursive: true });
+	mkdirSync(join(build, 'probes'));
+	writeFileSync(
+		join(build, 'kernel/initramfs.bin'),
+		cpio([['bin/katybug', stub(PROGRAM)!, 0o100755]])
+	);
+	writeFileSync(
+		join(build, 'kernel/manifest.json'),
+		JSON.stringify({ busybox: 'b', katybug: sha(PROGRAM), inputs: 'i' })
+	);
+	writeFileSync(join(build, 'kernel/katybug.wasm'), PROGRAM);
+	writeFileSync(join(dir, 'grown.wasm'), grown);
+	writeFileSync(join(dir, 'grown.fueled.wasm'), PLAIN);
+	const key = stageKatybug(
+		build,
+		join(dir, 'grown.wasm'),
+		join(dir, 'out'),
+		join(dir, 'grown.fueled.wasm')
+	);
+	const kernel = join(dir, 'out/kernel');
+	const manifest = JSON.parse(readFileSync(join(kernel, 'manifest.json'), 'utf8'));
+
+	it('gives the kernel a stub with the new program data size, keyed by its hash', () => {
+		expect(dylinkInfo(grown)!.memorySize).toBe(0x9000);
+		const seen = unpack(readFileSync(join(kernel, 'initramfs.bin')), false).get('bin/katybug')!;
+		expect(dylinkInfo(seen)!.memorySize).toBe(0x9000);
+		expect(stubHash(seen)).toBe(sha(grown));
+		expect(manifest.katybug).toBe(sha(grown));
+		expect(key).toBe(sha(grown));
+	});
+
+	it('registers the instrumented build and keeps the rest of the build', () => {
+		expect(readFileSync(join(kernel, 'katybug.wasm'))).toEqual(Buffer.from(PLAIN));
+		expect(manifest.busybox).toBe('b');
+		expect(manifest.inputs).toBe('i');
+		expect(lstatSync(join(dir, 'out/probes')).isSymbolicLink()).toBe(true);
+		expect(readFileSync(join(build, 'kernel/manifest.json'), 'utf8')).toContain(sha(PROGRAM));
+	});
+
+	it('links no ancestor of the staging directory into it', () => {
+		mkdirSync(join(build, 'nested'));
+		const nested = join(build, 'nested/out');
+		stageKatybug(build, join(dir, 'grown.wasm'), nested, join(dir, 'grown.fueled.wasm'));
+		expect(() => lstatSync(join(nested, 'nested'))).toThrow();
+		expect(lstatSync(join(nested, 'probes')).isSymbolicLink()).toBe(true);
+		const cyclic = join(build, 'batch/run/out');
+		mkdirSync(join(build, 'batch/run'), { recursive: true });
+		stageKatybug(build, join(dir, 'grown.wasm'), cyclic, join(dir, 'grown.fueled.wasm'));
+		expect(() => lstatSync(join(cyclic, 'batch'))).toThrow();
+	});
+
+	it('refuses a file binfmt_wasm would not run', () => {
+		writeFileSync(join(dir, 'plain.wasm'), PLAIN);
+		expect(() => stageKatybug(build, join(dir, 'plain.wasm'), join(dir, 'bad'))).toThrow(
+			/no dylink.0|dylink.0 section/
+		);
 	});
 });
