@@ -1,0 +1,11 @@
+{
+	"name": "gmux-restore-cold",
+	"main": "src/index.ts",
+	"compatibility_date": "2026-08-01",
+	"compatibility_flags": ["nodejs_compat"],
+	"workers_dev": true,
+	"assets": { "directory": "assets", "binding": "ASSETS" },
+	"durable_objects": { "bindings": [{ "name": "RIG", "class_name": "Rig" }] },
+	"migrations": [{ "tag": "v1", "new_sqlite_classes": ["Rig"] }],
+	"rules": [{ "type": "Data", "globs": ["**/*.bin"], "fallthrough": true }]
+}
