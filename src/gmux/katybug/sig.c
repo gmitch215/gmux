@@ -91,13 +91,13 @@ static void terminate(struct kb_cpu* cpu, int s) {
     if (getenv("KATYBUG_DEBUG")) {
         uint8_t* p = kb_host(cpu, cpu->ipc, 8);
         fprintf(
-            stderr, "katybug: signal %d (%s) at %#llx", s,
+            kb_log, "katybug: signal %d (%s) at %#llx", s,
             cpu->last_fault ? cpu->last_fault : "sent",
             (unsigned long long) cpu->ipc
         );
-        for (int i = 0; p && i < 8; i++) fprintf(stderr, " %02x", p[i]);
+        for (int i = 0; p && i < 8; i++) fprintf(kb_log, " %02x", p[i]);
         fprintf(
-            stderr, " address %#llx after %llu blocks\n",
+            kb_log, " address %#llx after %llu blocks\n",
             (unsigned long long) cpu->fault_addr,
             (unsigned long long) cpu->steps
         );

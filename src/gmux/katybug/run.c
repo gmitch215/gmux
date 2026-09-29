@@ -234,16 +234,21 @@ static int muldiv(struct kb_cpu* cpu, int kind, int w, uint64_t v) {
 
 /* x86 movs and stos, down when the direction flag is set (memmove copies
  * backward that way) */
-/* a forward rep in one go over host memory: up to 1 MiB whose ranges are
- * each one mapping, or 0 when they are not; an overlapping movs keeps the
- * element order */
+/* a forward rep in one go over host memory: up to 1 MiB, cut at the end of
+ * either range's piece, or 0 when no whole element is left there; an
+ * overlapping movs keeps the element order */
 static uint64_t string_bulk(struct kb_cpu* cpu, int stos, int w, uint64_t n) {
     uint64_t* r = cpu->r;
     if (n > (1u << 20) / (unsigned) w) n = (1u << 20) / (unsigned) w;
-    uint64_t len = n * (uint64_t) w;
-    uint8_t* d = kb_host(cpu, r[7], len);
-    uint8_t* s = stos ? NULL : kb_host(cpu, r[6], len);
+    uint64_t len = n * (uint64_t) w, kd, ks = len;
+    uint8_t* d = kb_span(cpu, r[7], &kd);
+    uint8_t* s = stos ? NULL : kb_span(cpu, r[6], &ks);
     if (!d || (!stos && !s)) return 0;
+    if (kd < len) len = kd;
+    if (ks < len) len = ks;
+    len -= len % (uint64_t) w;
+    if (!len) return 0;
+    n = len / (uint64_t) w;
     if (stos && w == 1)
         memset(d, (int) (uint8_t) r[0], len);
     else if (stos)
@@ -416,6 +421,7 @@ const uint16_t kb_class[] = {
     [KB_EXIT] = KB_K_CONTROL | KB_K_FLAGS_R,
     /* fcmp writes flags, fcsel reads them: read-all keeps earlier writes */
     [KB_A64V] = KB_K_VECTOR | OPAQUE | KB_K_FLAGS_R,
+    [KB_PRIM] = KB_K_CONTROL | OPAQUE | KB_K_FLAGS_R,
 };
 
 /*
@@ -648,6 +654,7 @@ int kb_fuse(
         return 0;
     if (t - b->pc + 0x80000000ull >= 0x100000000ull) return 0;
     if (branch && cold - b->pc + 0x80000000ull >= 0x100000000ull) return 0;
+    if (kb_prim_at(f->cpu, t)) return 0; /* a call into one stays a block */
     f->hi[f->n] = end;
     for (int i = 0; i <= f->n; i++)
         if (t >= f->lo[i] && t < f->hi[i]) return 0;
@@ -811,6 +818,17 @@ static int translate(struct kb_cpu* cpu, struct kb_block* b) {
     int bad = cpu->arch == KB_X86   ? kb_x86_block(cpu, b)
               : cpu->arch == KB_A64 ? kb_a64_block(cpu, b)
                                     : kb_wasm_block(cpu, b);
+    int prim = !bad && cpu->arch != KB_WASM ? kb_prim_at(cpu, b->pc) : 0;
+    if (prim) {
+        void* p = realloc(b->ins, ((size_t) b->n + 1) * sizeof *b->ins);
+        if (!p) bad = 1;
+        if (p) {
+            b->ins = p;
+            memmove(b->ins + 1, b->ins, (size_t) b->n * sizeof *b->ins);
+            b->ins[0] = (struct kb_ins){KB_PRIM, 8, 0, 0, 0, prim};
+            b->n++;
+        }
+    }
     if (!bad && !cpu->noplan) plan_flags(cpu, b);
     if (!bad && !cpu->noplan) plan_demand(cpu, b);
     if (!bad && !cpu->noplan) plan_mem(cpu, b);
@@ -844,7 +862,7 @@ int kb_block_ready(struct kb_cpu* cpu, struct kb_block* b) {
         mem += is_access(b->ins[i].op) || b->ins[i].op == KB_RESOLVE;
     if (mem && !(b->ic = calloc((size_t) mem, sizeof *b->ic))) return 1;
 #ifdef KB_AOT
-    if (!cpu->trace) kb_aot_attach(cpu, b);
+    if (!cpu->trace && !cpu->tracing) kb_aot_attach(cpu, b);
 #else
     (void) cpu;
 #endif
@@ -854,10 +872,16 @@ int kb_block_ready(struct kb_cpu* cpu, struct kb_block* b) {
 /* b emptied for its code to be decoded again: pc and its place in the cache
  * stay, so blocks linked to it stay linked */
 static void reset(struct kb_block* b) {
+#ifdef KB_AOT
+    if (b->aot) kb_aot_detach(b);
+#endif
     free(b->ins);
     free(b->pcs);
     free(b->ic);
     free(b->seg);
+#ifdef KB_HOT
+    free(b->exits);
+#endif
     struct kb_block keep = {.pc = b->pc, .chain = b->chain};
     *b = keep;
 }
@@ -912,6 +936,9 @@ static void retrace(struct kb_cpu* cpu, struct kb_block* b) {
     b->chain = chain;
     b->traced = 1;
     cpu->traces++;
+    #ifdef KB_AOT
+    if (!cpu->trace) kb_aot_attach(cpu, b);
+    #endif
 }
 #endif
 
@@ -953,6 +980,15 @@ void kb_hot_dump(struct kb_cpu* cpu) {
                     b->ins[i].a, b->ins[i].b, b->ins[i].c,
                     (long long) b->ins[i].imm
                 );
+            if (b->exits) {
+                fprintf(f, "exits");
+                for (int i = 0; i < b->n; i++)
+                    if (b->exits[i])
+                        fprintf(
+                            f, " %d:%llu", i, (unsigned long long) b->exits[i]
+                        );
+                fprintf(f, "\n");
+            }
         }
     fclose(f);
 }
@@ -1083,6 +1119,12 @@ static uint64_t step(struct kb_cpu* cpu, struct kb_block* blk) {
                 if (x->imm & 0x100 ? (r[x->a] == 0) == !(x->imm & 1)
                                    : kb_cond(cpu, (int) (x->imm & 0xff))) {
                     cpu->trace_exits++;
+#ifdef KB_HOT
+                    if (!blk->exits)
+                        blk->exits =
+                            calloc((size_t) blk->n, sizeof *blk->exits);
+                    if (blk->exits) blk->exits[i]++;
+#endif
                     cpu->plan_ops_ran -=
                         (uint64_t) (blk->n - 1 - i); /* not run */
                     return blk->pc +
@@ -1315,6 +1357,11 @@ static uint64_t step(struct kb_cpu* cpu, struct kb_block* blk) {
                 string(cpu, (int) x->imm, x->w, x->c);
                 CHECK();
                 break;
+            case KB_PRIM: {
+                uint64_t ret;
+                if (kb_prim(cpu, (int) x->imm, &ret)) return ret;
+                break;
+            }
         }
     }
     return blk->next;

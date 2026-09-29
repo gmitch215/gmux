@@ -1029,9 +1029,7 @@ int kb_wasm_load(struct kb_cpu* cpu, const char* path) {
                 uint32_t flags = U32(s);
                 uint64_t off = flags == 0 ? const_expr(&s) : 0;
                 uint32_t k = U32(s);
-                uint8_t* host =
-                    flags == 0 ? kb_host(cpu, MEM_BASE + off, k) : NULL;
-                if (host) memcpy(host, s, k);
+                if (flags == 0) kb_write(cpu, MEM_BASE + off, s, k);
                 s += k;
             }
         }
@@ -1106,7 +1104,7 @@ int kb_wasm_main(struct kb_cpu* cpu, int argc, char** argv) {
     int rc = kb_wasm_load(cpu, argv[2]);
     if (rc) {
         fprintf(
-            stderr, "katybug: cannot load wasm module %s (%d)\n", argv[2], rc
+            kb_log, "katybug: cannot load wasm module %s (%d)\n", argv[2], rc
         );
         return 126;
     }

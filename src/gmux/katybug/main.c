@@ -28,8 +28,9 @@ static const char* self(const char* argv0) {
 }
 
 int main(int argc, char** argv) {
+    kb_log_init(argc == 3 && !strcmp(argv[1], "--katybug-resume"));
     if (argc < 2) {
-        fprintf(stderr, "usage: katybug <x86-64 or aarch64 ELF> [args...]\n");
+        fprintf(kb_log, "usage: katybug <x86-64 or aarch64 ELF> [args...]\n");
         return 2;
     }
     kb_self = self(argv[0]);
@@ -40,7 +41,7 @@ int main(int argc, char** argv) {
     {
         if (kb_resume(cpu, atoi(argv[2]))) {
             fprintf(
-                stderr, "katybug: fork: the parent's state did not arrive\n"
+                kb_log, "katybug: fork: the parent's state did not arrive\n"
             );
             return 127;
         }
@@ -58,12 +59,12 @@ int main(int argc, char** argv) {
     if (getenv("KATYBUG_ARGV0")) argv[1] = getenv("KATYBUG_ARGV0");
     int rc = kb_load_elf(cpu, path, argc - 1, argv + 1, env);
     if (rc) {
-        fprintf(stderr, "katybug: cannot load %s (%d)\n", argv[1], rc);
+        fprintf(kb_log, "katybug: cannot load %s (%d)\n", argv[1], rc);
         return 126;
     }
     kb_sig_inherit(cpu);
     if (getenv("KATYBUG_TRACE"))
-        cpu->trace = fopen(getenv("KATYBUG_TRACE"), "w");
+        cpu->trace = kb_own_fopen(getenv("KATYBUG_TRACE"), "w");
     cpu->noplan =
         getenv("KATYBUG_PLAN") && !strcmp(getenv("KATYBUG_PLAN"), "0");
     cpu->segments = KB_TRACE;
@@ -78,13 +79,13 @@ int main(int argc, char** argv) {
     if (cpu->fault && !cpu->exited) {
         uint8_t* p = kb_host(cpu, cpu->pc, 4);
         fprintf(
-            stderr, "katybug: %s at %#llx", cpu->fault,
+            kb_log, "katybug: %s at %#llx", cpu->fault,
             (unsigned long long) cpu->pc
         );
         if (p)
-            fprintf(stderr, " (%02x %02x %02x %02x)", p[0], p[1], p[2], p[3]);
+            fprintf(kb_log, " (%02x %02x %02x %02x)", p[0], p[1], p[2], p[3]);
         fprintf(
-            stderr, " after %llu blocks\n", (unsigned long long) cpu->steps
+            kb_log, " after %llu blocks\n", (unsigned long long) cpu->steps
         );
     }
     /* the decoded code held at the end: blocks and their ops */
@@ -94,7 +95,7 @@ int main(int argc, char** argv) {
             held++, held_ops += (uint64_t) b->n;
     if (getenv("KATYBUG_STATS"))
         fprintf(
-            stderr,
+            kb_log,
             "katybug: %llu blocks; plan dropped %llu of %llu flag writes "
             "decoded, %llu of %llu run; grouped %llu of %llu accesses "
             "decoded; dropped %llu of %llu pure ops decoded, %llu of %llu "
@@ -116,6 +117,7 @@ int main(int argc, char** argv) {
             (unsigned long long) held_ops, (unsigned long long) cpu->decoded,
             (unsigned long long) cpu->loaded, (unsigned long long) cpu->lookups
         );
+    if (getenv("KATYBUG_STATS")) kb_prim_report();
 #ifdef KB_HOT
     kb_hot_dump(cpu);
 #endif

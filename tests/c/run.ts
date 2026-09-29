@@ -97,6 +97,8 @@ const probes: Record<string, Probe> = {
 			'bash -c \'x=$(echo sub); echo $x; (exit 7); echo "subshell $?"; for i in 1 2 3; do echo $i | cat; done | wc -l\'; ' +
 			"sqlite3 :memory: 'with recursive c(x) as (select 1 union all select x+1 from c where x<10000) " +
 			"select count(*), sum(x), max(x), sum(x*x) % 1000003 from c;'; " +
+			// katybug ran musl's strlen as a host kernel
+			"KATYBUG_STATS=1 KATYBUG_PRIM_LOG=/tmp/pl sqlite3 :memory: 'select 1' > /dev/null 2>&1; echo \"prim strlen kernels $(grep -c 'prim strlen [1-9]' /tmp/pl)\"; " +
 			'echo filed > /tmp/f; curl -s file:///tmp/f; ' +
 			"{ printf 'HTTP/1.0 200 OK\\r\\n\\r\\nserved\\n' | nc -l -p 18083 > /dev/null; } & sleep 1; " +
 			'curl -s http://127.0.0.1:18083/; wait',
@@ -110,6 +112,7 @@ const probes: Record<string, Probe> = {
 			'subshell 7',
 			'3',
 			'10000|50005000|10000|334854',
+			'prim strlen kernels 1',
 			'filed',
 			'served'
 		]

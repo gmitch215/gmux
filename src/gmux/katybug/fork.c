@@ -83,11 +83,21 @@ int64_t kb_fork(struct kb_cpu* cpu) {
     }
     int bad = put(p[1], cpu, sizeof *cpu) || put(p[1], &n, sizeof n) ||
               put(p[1], cloexec, sizeof *cloexec * (size_t) n);
-    for (int i = 0; !bad && i < cpu->nmaps; i++)
-        if (cpu->maps[i].host)
-            bad =
-                put(p[1], cpu->maps[i].host,
-                    cpu->maps[i].end - cpu->maps[i].start);
+    for (int i = 0; !bad && i < cpu->nmaps; i++) {
+        struct kb_mapping* m = &cpu->maps[i];
+        uint64_t np = kb_pieces(m->start, m->end);
+        for (uint64_t k = 0; !bad && k < np; k++) {
+            uint8_t here = m->pieces[k] != NULL;
+            bad = put(p[1], &here, 1);
+            if (!bad && here) {
+                uint64_t lo, hi;
+                uint64_t va =
+                    (((m->start >> KB_PIECE_BITS) + k) << KB_PIECE_BITS);
+                kb_piece(m, va > m->start ? va : m->start, &lo, &hi);
+                bad = put(p[1], m->pieces[k], hi - lo);
+            }
+        }
+    }
     close(p[1]);
     /* a child that got no state exits 127 on its own; the parent still sees a
      * fork that happened */
@@ -108,9 +118,19 @@ int kb_resume(struct kb_cpu* cpu, int fd) {
     cpu->restore_mask = 0;
     for (int i = 0; i < cpu->nmaps; i++) {
         struct kb_mapping* m = &cpu->maps[i];
-        if (!m->host) continue;
-        m->host = malloc(m->end - m->start);
-        if (!m->host || get(fd, m->host, m->end - m->start)) return -1;
+        uint64_t np = kb_pieces(m->start, m->end);
+        m->pieces = calloc((size_t) np, sizeof *m->pieces);
+        if (!m->pieces) return -1;
+        for (uint64_t k = 0; k < np; k++) {
+            uint8_t here;
+            if (get(fd, &here, 1)) return -1;
+            if (!here) continue;
+            uint64_t lo, hi;
+            uint64_t va = (((m->start >> KB_PIECE_BITS) + k) << KB_PIECE_BITS);
+            uint8_t* piece =
+                kb_piece(m, va > m->start ? va : m->start, &lo, &hi);
+            if (!piece || get(fd, piece, hi - lo)) return -1;
+        }
     }
     close(fd);
     for (int i = 0; i < n; i++) fcntl(cloexec[i], F_SETFD, FD_CLOEXEC);

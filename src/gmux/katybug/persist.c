@@ -62,7 +62,7 @@ static uint64_t file_hash(const char* path) {
 static uint32_t settings(const struct kb_cpu* cpu) {
     return (uint32_t) cpu->noplan | KB_FUSE << 1 | KB_CHAIN << 2 |
            KB_LAZY << 3 | (uint32_t) cpu->segments << 5 |
-           (uint32_t) KB_POLL << 13;
+           (uint32_t) KB_POLL << 13 | (uint32_t) kb_prim_enabled() << 24;
 }
 
 /** the guest bytes a block was decoded from, hashed; *ok is 0 when a range is
@@ -72,11 +72,20 @@ uint64_t kb_code_hash(struct kb_cpu* cpu, const struct kb_block* b, int* ok) {
     *ok = b->nseg > 0;
     for (int i = 0; *ok && i < b->nseg; i++) {
         uint64_t lo = b->seg[2 * i], len = b->seg[2 * i + 1] - lo;
-        uint8_t* p = len ? kb_host(cpu, lo, len) : NULL;
-        if (!p)
+        if (!len) {
             *ok = 0;
-        else
-            h = fnv(p, len, fnv((const uint8_t*) &lo, 8, h));
+            break;
+        }
+        h = fnv((const uint8_t*) &lo, 8, h);
+        for (uint64_t done = 0, k; *ok && done < len; done += k) {
+            const uint8_t* p = kb_span(cpu, lo + done, &k);
+            if (!p)
+                *ok = 0;
+            else {
+                if (k > len - done) k = len - done;
+                h = fnv(p, k, h);
+            }
+        }
     }
     return h;
 }
@@ -150,6 +159,10 @@ int kb_persist_take(struct kb_cpu* cpu, struct kb_block* b) {
     for (int i = 0; i < t->count; i++) {
         struct record* r = &t->rec[i];
         if (r->pc != b->pc || !t->ins[i]) continue;
+        /* a string function's whole body decides its first op */
+        int had =
+            r->n && t->ins[i][0].op == KB_PRIM ? (int) t->ins[i][0].imm : 0;
+        if (kb_prim_at(cpu, r->pc) != had) return 0;
         struct kb_block c = {
             .pc = r->pc, .nseg = (int) r->nseg, .seg = t->seg[i]
         };

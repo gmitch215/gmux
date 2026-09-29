@@ -4,8 +4,17 @@
 #include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <sys/uio.h>
 
 #include "f80.h"
+
+/* a mapping's host memory comes in blocks of at most 1 << KB_PIECE_BITS bytes,
+ * so no allocation is larger (mem.c); an inline cache covers one piece */
+#ifndef KB_PIECE_BITS
+    #define KB_PIECE_BITS 16
+#endif
+/* the most bytes kb_buf copies for a range across pieces */
+#define KB_BUF_MAX (64u << 10)
 
 /* -DKB_PROFILE keeps the interpreter's hot helpers out of line, so a profile
  * can attribute their time */
@@ -113,8 +122,12 @@ enum kb_op
     KB_EXIT,  /* a trace's side exit: leave, to the block's pc plus the int32 at
                  imm >> 16, if cond imm & 0xff holds (bit 8 clear), or if a is
                  zero (bit 8 set, bit 0 clear) or nonzero (both set) */
-    KB_A64V   /* AArch64 floating point, Advanced SIMD, FPCR/FPSR: imm is the
+    KB_A64V,  /* AArch64 floating point, Advanced SIMD, FPCR/FPSR: imm is the
                  instruction word, b a load or store's address; a64v.c */
+    KB_PRIM   /* first op of a block at the entry of a string function (imm 1
+                 strlen, 2 memcmp, 3 strcmp, 4 memchr): runs it as a host
+                 kernel and returns to the caller, or falls through to the
+                 function's own ops; prim.c */
 };
 
 /* semantic classes (run.c, kb_class): the plans read these, not opcodes */
@@ -212,6 +225,9 @@ struct kb_block {
 #if defined(KB_HOT) || defined(KB_COUNT)
     uint64_t runs; /* times the interpreter ran it, for kb_hot_dump */
 #endif
+#ifdef KB_HOT
+    uint64_t* exits; /* runs that left at each KB_EXIT op, once one has */
+#endif
 #ifdef KB_COUNT
     /* guest instructions, and the cpu struct words step() reads and writes */
     int insns, rd, wr;
@@ -225,7 +241,8 @@ struct kb_block {
 
 struct kb_mapping {
     uint64_t start, end;
-    uint8_t* host; /* mappings never overlap; each owns its block */
+    uint8_t** pieces; /* mappings never overlap; each owns its pieces (mem.c),
+                         which are NULL until touched */
     int prot;
 };
 
@@ -237,7 +254,7 @@ struct kb_sigaction {
  * a foreign Linux process (x86-64 or AArch64 ELF) run by decoding its
  * instructions to the gmux IR and interpreting that; its syscalls become the
  * host's own POSIX calls. Guest addresses are 64-bit and live in mappings, each
- * backed by one contiguous host block
+ * backed by host blocks of one piece each
  */
 struct kb_cpu {
     uint64_t r[KB_NREGS];
@@ -305,6 +322,27 @@ struct kb_cpu {
 
 /* mem.c */
 uint8_t* kb_host(struct kb_cpu* cpu, uint64_t va, uint64_t len);
+uint8_t* kb_span(struct kb_cpu* cpu, uint64_t va, uint64_t* len);
+uint8_t* kb_buf(struct kb_cpu* cpu, uint64_t va, uint64_t len);
+void kb_flush(struct kb_cpu* cpu);
+int kb_read(struct kb_cpu* cpu, uint64_t va, void* dst, uint64_t len);
+int kb_write(struct kb_cpu* cpu, uint64_t va, const void* src, uint64_t len);
+int kb_iov(
+    struct kb_cpu* cpu, uint64_t va, uint64_t len, struct iovec* iov, int max
+);
+uint64_t kb_pieces(uint64_t start, uint64_t end);
+uint8_t* kb_piece(
+    struct kb_mapping* m, uint64_t va, uint64_t* lo, uint64_t* hi
+);
+int kb_grow(struct kb_cpu* cpu, struct kb_mapping* m, uint64_t end);
+
+/* prim.c: string functions as host kernels (KATYBUG_PRIM=0 turns them off,
+ * KATYBUG_PRIM=memcmp,strlen keeps only those); the mask has bit i for
+ * function i */
+int kb_prim_enabled(void);
+int kb_prim_at(struct kb_cpu* cpu, uint64_t pc);
+int kb_prim(struct kb_cpu* cpu, int id, uint64_t* next);
+void kb_prim_report(void);
 uint8_t* kb_host_ic(
     struct kb_cpu* cpu, struct kb_ic* ic, uint64_t va, uint64_t len
 );
@@ -379,6 +417,7 @@ void kb_count_report(struct kb_cpu* cpu);
 /* the lifted blocks (generated, see experiments/aot-oracle): attaches a region
  * to a block whose IR matches one exactly */
 void kb_aot_attach(struct kb_cpu* cpu, struct kb_block* b);
+void kb_aot_detach(struct kb_block* b);
 void kb_aot_string(struct kb_cpu* cpu, int stos, int w, int rep);
 extern volatile int* kb_pending_flag;
 #endif
@@ -397,6 +436,15 @@ extern const char* kb_self;
 void kb_syscall(struct kb_cpu* cpu);
 int64_t kb_err(int e);
 char* kb_str(struct kb_cpu* cpu, uint64_t va);
+
+/* sys.c: guest descriptors are the host's, so katybug's own live at the top of
+ * the table where the guest does not look; kb_log is where its diagnostics go
+ * (a private copy of stderr, so a guest that closes fd 2 does not silence it),
+ * and kb_own_fd copies a descriptor up there */
+extern FILE* kb_log;
+void kb_log_init(int resumed);
+int kb_own_fd(int fd);
+FILE* kb_own_fopen(const char* path, const char* mode);
 
 /* fork.c: fork by exec of katybug and a state transfer, where the host cannot
  * fork (wasm) */

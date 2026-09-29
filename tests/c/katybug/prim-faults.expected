@@ -1,0 +1,31 @@
+strlen in a page 100
+strlen ends at the last byte 95
+strlen runs off the page fault 4096
+strlen unaligned off fault 4096
+strlen in the hole fault 4096
+strlen across mappings 150
+strlen into PROT_NONE fault 4096
+memcmp equal 0
+memcmp differs early -1
+memcmp a runs off fault 4096
+memcmp b runs off fault 4096
+memcmp n 0 in the hole 0
+memcmp across mappings -7
+memcmp into PROT_NONE fault 4096
+strcmp equal 0
+strcmp differs -1
+strcmp differs, reversed 1
+strcmp a runs off fault 4096
+strcmp b in the hole fault 4096
+strcmp differs before the page end -1
+strcmp across mappings 0
+memchr in a page 2100
+memchr huge n, match early 2100
+memchr runs off fault 4096
+memchr n 0 in the hole -9999
+memchr unaligned runs off fault 4096
+memchr across mappings 4100
+memchr last byte 4095
+memchr past the end of n -9999
+memchr into PROT_NONE fault 4096
+faults 12

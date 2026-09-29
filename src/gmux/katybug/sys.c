@@ -101,6 +101,54 @@ static int64_t ret(int64_t v) {
     return v < 0 ? kb_err(errno) : v;
 }
 
+/* read, write, or with at pread and pwrite, on guest memory: one host call
+ * over the pieces, at most 256 of them (*done is how many bytes that was) */
+static int64_t io_batch(
+    struct kb_cpu* cpu, int wr, int at, int fd, uint64_t va, uint64_t len,
+    int64_t off, uint64_t* done
+) {
+    struct iovec iov[256];
+    int n = len ? kb_iov(cpu, va, len, iov, 256) : 0;
+    if (n < 0) return -14;
+    *done = 0;
+    for (int i = 0; i < n; i++) *done += iov[i].iov_len;
+    if (n <= 1) {
+        void* p = n ? iov[0].iov_base : NULL;
+        size_t k = n ? iov[0].iov_len : 0;
+        if (!at) return ret(wr ? write(fd, p, k) : read(fd, p, k));
+        return ret(
+            wr ? pwrite(fd, p, k, (off_t) off) : pread(fd, p, k, (off_t) off)
+        );
+    }
+    if (!at) return ret(wr ? writev(fd, iov, n) : readv(fd, iov, n));
+    return ret(
+        wr ? pwritev(fd, iov, n, (off_t) off) : preadv(fd, iov, n, (off_t) off)
+    );
+}
+
+/* a buffer past one batch goes on in the next while each call takes all it
+ * was given, as a blocking write does; a read goes on for a regular file only,
+ * where the rest is there, and stops at once on a pipe, a socket or a terminal
+ */
+static int64_t guest_io(
+    struct kb_cpu* cpu, int wr, int at, int fd, uint64_t va, uint64_t len,
+    int64_t off
+) {
+    int64_t total = 0;
+    for (;;) {
+        uint64_t chunk;
+        int64_t got = io_batch(cpu, wr, at, fd, va, len, off, &chunk);
+        if (got < 0) return total ? total : got;
+        total += got;
+        if ((uint64_t) got < chunk || chunk >= len) return total;
+        if (!wr) {
+            struct stat st;
+            if (fstat(fd, &st) || !S_ISREG(st.st_mode)) return total;
+        }
+        va += chunk, len -= chunk, off += (int64_t) chunk;
+    }
+}
+
 /* the x86-64 syscall numbers katybug knows, as generic (AArch64) numbers; -1
    for unknown. The non-*at forms become their *at forms in norm() */
 static int x86_to_generic(uint64_t n) {
@@ -236,6 +284,98 @@ static int x86_to_generic(uint64_t n) {
     }
 }
 
+FILE* kb_log;
+
+/* the first descriptor katybug keeps for itself: 1000, or 16 under the limit
+ * when that is lower; -1 when the limit leaves no room. Fixed at the first
+ * call, so a guest's setrlimit cannot move it */
+static int own_base(void) {
+    static int base = -2;
+    if (base != -2) return base;
+    struct rlimit rl;
+    if (getrlimit(RLIMIT_NOFILE, &rl) < 0)
+        base = -1;
+    else if (rl.rlim_cur == RLIM_INFINITY || rl.rlim_cur > 1016)
+        base = 1000;
+    else
+        base = rl.rlim_cur > 32 ? (int) rl.rlim_cur - 16 : -1;
+    return base;
+}
+
+/* the guest's descriptors end below katybug's own: a number at or past the
+ * base is out of range, as one past RLIMIT_NOFILE is on Linux */
+static int past_limit(int fd) {
+    int base = own_base();
+    return base >= 0 && fd >= base;
+}
+
+/* RLIMIT_NOFILE as the guest sees it: the host's, capped at the base, and only
+ * ever lowered by the guest (the host's own limit is left alone) */
+static int64_t nofile_limit(struct kb_cpu* cpu, uint64_t nv, uint64_t ov) {
+    static struct rlimit seen;
+    static int init;
+    if (!init) {
+        if (getrlimit(RLIMIT_NOFILE, &seen) < 0) return kb_err(errno);
+        rlim_t cap = (rlim_t) own_base();
+        if (seen.rlim_cur == RLIM_INFINITY || seen.rlim_cur > cap)
+            seen.rlim_cur = cap;
+        if (seen.rlim_max == RLIM_INFINITY || seen.rlim_max > cap)
+            seen.rlim_max = cap;
+        init = 1;
+    }
+    if (ov) {
+        kb_store(cpu, ov, (uint64_t) seen.rlim_cur, 8);
+        kb_store(cpu, ov + 8, (uint64_t) seen.rlim_max, 8);
+    }
+    if (nv) {
+        uint64_t c = kb_load(cpu, nv, 8), m = kb_load(cpu, nv + 8, 8);
+        if (c > m) return -22;
+        if (m > seen.rlim_max) return -1;
+        seen.rlim_cur = (rlim_t) c;
+        seen.rlim_max = (rlim_t) m;
+    }
+    return 0;
+}
+
+/* a copy of fd above the guest's range (or a plain dup when there is none);
+ * the copy is close-on-exec, the guest's descriptors are not katybug's */
+int kb_own_fd(int fd) {
+    int base = own_base();
+    int copy = base < 0 ? -1 : fcntl(fd, F_DUPFD_CLOEXEC, base + 1);
+    return copy < 0 ? dup(fd) : copy;
+}
+
+FILE* kb_own_fopen(const char* path, const char* mode) {
+    FILE* f = fopen(path, mode);
+    int fd = f ? kb_own_fd(fileno(f)) : -1;
+    FILE* g = fd < 0 ? NULL : fdopen(fd, mode);
+    if (!g) {
+        if (fd >= 0) close(fd);
+        return f;
+    }
+    fclose(f);
+    return g;
+}
+
+/* the descriptor at own_base() is a copy of stderr: a fork's child inherits it
+ * at the same number (kb_fork keeps it across the exec) */
+void kb_log_init(int resumed) {
+    kb_log = stderr;
+    int base = own_base();
+    if (base < 0) return;
+    int fd = -1;
+    if (resumed && fcntl(base, F_GETFD) >= 0)
+        fd = base;
+    else if (fcntl(base, F_GETFD) < 0) {
+        fd = fcntl(2, F_DUPFD_CLOEXEC, base);
+        if (fd != base && fd >= 0) close(fd), fd = -1;
+    }
+    FILE* f = fd < 0 ? NULL : fdopen(fd, "w");
+    if (!f) return;
+    setvbuf(f, NULL, _IONBF, 0);
+    kb_log = f;
+}
+
 /* getdents64 through the host's readdir: one DIR per guest descriptor, and an
    entry that did not fit in the last buffer kept for the next call */
 static struct {
@@ -246,7 +386,7 @@ static struct {
 static int64_t dents(struct kb_cpu* cpu, int fd, uint64_t buf, uint64_t size) {
     if (fd < 0 || fd >= 1024) return -9;
     if (!dirs[fd].dir) {
-        int copy = dup(fd);
+        int copy = kb_own_fd(fd);
         if (copy < 0) return kb_err(errno);
         dirs[fd].dir = fdopendir(copy);
         if (!dirs[fd].dir) {
@@ -267,7 +407,7 @@ static int64_t dents(struct kb_cpu* cpu, int fd, uint64_t buf, uint64_t size) {
             if (!used) return -22;
             break;
         }
-        uint8_t* p = kb_host(cpu, buf + used, rec);
+        uint8_t* p = kb_buf(cpu, buf + used, rec);
         if (!p) return -14;
         memset(p, 0, rec);
         uint64_t ino = (uint64_t) e->d_ino, off = used + rec;
@@ -354,22 +494,10 @@ static int64_t put_stat(struct kb_cpu* cpu, uint64_t buf, struct stat* st) {
         memcpy(&q[9], at, sizeof at);
         n = 128;
     }
-    uint8_t* p = kb_host(cpu, buf, n);
+    uint8_t* p = kb_buf(cpu, buf, n);
     if (!p) return -14;
     memcpy(p, out, n);
     return 0;
-}
-
-char* kb_str(struct kb_cpu* cpu, uint64_t va) {
-    /* guest strings live in one mapping: find its end within it */
-    uint8_t* p = kb_host(cpu, va, 1);
-    if (!p) return NULL;
-    for (uint64_t n = 0; n < 4096; n++) {
-        uint8_t* c = kb_host(cpu, va + n, 1);
-        if (!c) return NULL;
-        if (!*c) return (char*) p;
-    }
-    return NULL;
 }
 
 /* the guest's argv or envp as a host array, NULL-terminated */
@@ -443,8 +571,18 @@ static int64_t mmap_anon(
     if (!(flags & 0x10)) cpu->mmap_next = m->end + 4096;
     if (!(flags & 0x20) && fd >= 0) /* a file mapping, private: read it in */
     {
-        ssize_t got = pread((int) fd, m->host, (size_t) len, (off_t) off);
-        if (got < 0) return kb_err(errno);
+        for (uint64_t done = 0; done < len;) {
+            uint64_t lo, hi, va = m->start + done;
+            uint8_t* p = kb_piece(m, va, &lo, &hi);
+            if (!p) return -12;
+            uint64_t k = hi - va < len - done ? hi - va : len - done;
+            ssize_t got = pread(
+                (int) fd, p + (va - lo), (size_t) k, (off_t) (off + done)
+            );
+            if (got < 0) return kb_err(errno);
+            if (!got) break;
+            done += (uint64_t) got;
+        }
     }
     return (int64_t) m->start;
 }
@@ -458,20 +596,14 @@ static int64_t brk_to(struct kb_cpu* cpu, uint64_t want) {
     if (end > top) {
         if (kb_free_at(cpu, top, end - top) != top)
             return (int64_t) cpu->brk_end;
-        /* the heap mapping below grows in place, or new pages start one; guest
-         * pointers are guest addresses, so the host block may move */
+        /* the heap mapping below grows in place, or new pages start one */
         struct kb_mapping* m = NULL;
         for (int i = 0; i < cpu->nmaps && !m; i++)
             if (cpu->maps[i].end == top && cpu->maps[i].prot == 3 &&
                 top > cpu->brk_start)
                 m = &cpu->maps[i];
         if (m) {
-            uint8_t* h = realloc(m->host, end - m->start);
-            if (!h) return (int64_t) cpu->brk_end;
-            memset(h + (top - m->start), 0, end - top);
-            m->host = h;
-            m->end = end;
-            cpu->mapgen++;
+            if (kb_grow(cpu, m, end)) return (int64_t) cpu->brk_end;
         }
         else if (!kb_map(cpu, top, end - top, 3))
             return (int64_t) cpu->brk_end;
@@ -634,6 +766,8 @@ static int64_t rlimit(struct kb_cpu* cpu, int res, uint64_t nv, uint64_t ov) {
                               -1,           RLIMIT_NOFILE, -1,
                               RLIMIT_AS};
     if (res < 0 || res > 9 || map[res] < 0) return -22;
+    if (map[res] == RLIMIT_NOFILE && own_base() >= 0)
+        return nofile_limit(cpu, nv, ov);
     struct rlimit rl;
     if (getrlimit(map[res], &rl) < 0) return kb_err(errno);
     if (ov) {
@@ -655,7 +789,7 @@ static int64_t rlimit(struct kb_cpu* cpu, int res, uint64_t nv, uint64_t ov) {
     return 0;
 }
 
-void kb_syscall(struct kb_cpu* cpu) {
+static void syscall_body(struct kb_cpu* cpu) {
 #if KB_POLL == 2
     kb_syscalled = 1;
 #endif
@@ -761,7 +895,9 @@ void kb_syscall(struct kb_cpu* cpu) {
         if (g == 1) goto done;
     }
     switch (nr) {
-        case -2: v = (int64_t) a[0]; break; /* dup2 of an fd to itself */
+        case -2: /* dup2 of an fd to itself */
+            v = past_limit((int) a[0]) ? -9 : (int64_t) a[0];
+            break;
         case 98:
             v = kb_futex(cpu, a);
             if (v == KB_SWITCHED) {
@@ -781,32 +917,19 @@ void kb_syscall(struct kb_cpu* cpu) {
                 v = -22;
             break;
         case 63:
-        case 64: {
-            uint8_t* p = kb_host(cpu, a[1], a[2]);
-            if (!p && a[2]) {
-                v = -14;
-                break;
-            }
-            v =
-                ret(nr == 63 ? read((int) a[0], p, (size_t) a[2])
-                             : write((int) a[0], p, (size_t) a[2]));
+        case 64:
+            v = guest_io(cpu, nr == 64, 0, (int) a[0], a[1], a[2], 0);
             break;
-        }
         case 65:
         case 66: {
             v = 0;
             for (uint64_t k = 0; k < a[2]; k++) {
                 uint64_t base = kb_load(cpu, a[1] + 16 * k, 8);
                 uint64_t len = kb_load(cpu, a[1] + 16 * k + 8, 8);
-                uint8_t* p = kb_host(cpu, base, len);
-                if (!p && len) {
-                    v = v ? v : -14;
-                    break;
-                }
-                ssize_t got = nr == 65 ? read((int) a[0], p, (size_t) len)
-                                       : write((int) a[0], p, (size_t) len);
+                int64_t got =
+                    guest_io(cpu, nr == 66, 0, (int) a[0], base, len, 0);
                 if (got < 0) {
-                    v = v ? v : kb_err(errno);
+                    v = v ? v : got;
                     break;
                 }
                 v += got;
@@ -824,6 +947,10 @@ void kb_syscall(struct kb_cpu* cpu) {
             break;
         }
         case 57:
+            if (past_limit((int) a[0])) {
+                v = -9;
+                break;
+            }
             forget_dir((int) a[0]);
             v = ret(close((int) a[0]));
             break;
@@ -831,10 +958,18 @@ void kb_syscall(struct kb_cpu* cpu) {
         case 62:
             v = ret((int64_t) lseek((int) a[0], (off_t) a[1], (int) a[2]));
             break;
-        case 23: v = ret(dup((int) a[0])); break;
-        case 24: v = ret(dup2((int) a[0], (int) a[1])); break;
+        case 23: v = past_limit((int) a[0]) ? -9 : ret(dup((int) a[0])); break;
+        case 24:
+            v = past_limit((int) a[0]) || past_limit((int) a[1])
+                    ? -9
+                    : ret(dup2((int) a[0], (int) a[1]));
+            break;
         case 25: /* fcntl: duplicates, the descriptor flag and status flags */
-            if (a[1] == 0)
+            if (past_limit((int) a[0]))
+                v = -9;
+            else if ((a[1] == 0 || a[1] == 1030) && past_limit((int) a[2]))
+                v = -22;
+            else if (a[1] == 0)
                 v = ret(fcntl((int) a[0], F_DUPFD, (int) a[2]));
             else if (a[1] == 1030)
                 v = ret(fcntl((int) a[0], F_DUPFD_CLOEXEC, (int) a[2]));
@@ -866,7 +1001,7 @@ void kb_syscall(struct kb_cpu* cpu) {
                 if (ioctl((int) a[0], TIOCGWINSZ, &ws) < 0)
                     v = kb_err(errno);
                 else {
-                    uint8_t* p = kb_host(cpu, a[2], 8);
+                    uint8_t* p = kb_buf(cpu, a[2], 8);
                     if (p) memcpy(p, &ws, 8);
                     v = p ? 0 : -14;
                 }
@@ -919,7 +1054,7 @@ void kb_syscall(struct kb_cpu* cpu) {
             break;
         }
         case 17: {
-            uint8_t* p = kb_host(cpu, a[0], a[1]);
+            uint8_t* p = kb_buf(cpu, a[0], a[1]);
             v = p && getcwd((char*) p, (size_t) a[1])
                     ? (int64_t) strlen((char*) p) + 1
                     : kb_err(errno);
@@ -949,7 +1084,7 @@ void kb_syscall(struct kb_cpu* cpu) {
         }
         case 78: {
             char* path = kb_str(cpu, a[1]);
-            uint8_t* p = kb_host(cpu, a[2], a[3]);
+            uint8_t* p = kb_buf(cpu, a[2], a[3]);
             v = path && p ? ret(readlinkat(
                                 host_dirfd((int64_t) a[0]), path, (char*) p,
                                 (size_t) a[3]
@@ -1060,7 +1195,7 @@ void kb_syscall(struct kb_cpu* cpu) {
         case 226: v = kb_protect(cpu, a[0], a[1], (int) a[2]) ? -12 : 0; break;
         case 233: v = 0; break;
         case 160: {
-            uint8_t* p = kb_host(cpu, a[0], 6 * 65);
+            uint8_t* p = kb_buf(cpu, a[0], 6 * 65);
             if (!p) {
                 v = -14;
                 break;
@@ -1093,12 +1228,12 @@ void kb_syscall(struct kb_cpu* cpu) {
             break;
         }
         case 278: {
-            uint8_t* p = kb_host(cpu, a[0], a[1]);
+            size_t n = a[1] > 256 ? 256 : (size_t) a[1];
+            uint8_t* p = kb_buf(cpu, a[0], n);
             if (!p) {
                 v = -14;
                 break;
             }
-            size_t n = a[1] > 256 ? 256 : (size_t) a[1];
             v = getentropy(p, n) < 0 ? kb_err(errno) : (int64_t) n;
             break;
         }
@@ -1169,18 +1304,11 @@ void kb_syscall(struct kb_cpu* cpu) {
         }
         case 55: v = ret(fchown((int) a[0], (uid_t) a[1], (gid_t) a[2])); break;
         case 67:
-        case 68: {
-            uint8_t* p = kb_host(cpu, a[1], a[2]);
-            if (!p && a[2]) {
-                v = -14;
-                break;
-            }
-            v =
-                ret(nr == 67
-                        ? pread((int) a[0], p, (size_t) a[2], (off_t) a[3])
-                        : pwrite((int) a[0], p, (size_t) a[2], (off_t) a[3]));
+        case 68:
+            v = guest_io(
+                cpu, nr == 68, 1, (int) a[0], a[1], a[2], (int64_t) a[3]
+            );
             break;
-        }
         case 71:
             v = sendfile_guest(cpu, (int) a[0], (int) a[1], a[2], a[3]);
             break;
@@ -1335,7 +1463,7 @@ void kb_syscall(struct kb_cpu* cpu) {
             else if (a[0] == 4)
                 v = a[1] > 1 ? -22 : (dumpable = a[1], 0);
             else if (a[0] == 15 || a[0] == 16) {
-                uint8_t* p = kb_host(cpu, a[1], 16);
+                uint8_t* p = kb_buf(cpu, a[1], 16);
                 if (!p) {
                     v = -14;
                     break;
@@ -1383,7 +1511,7 @@ done:
     r[0] = (uint64_t) v;
     if (getenv("KATYBUG_STRACE"))
         fprintf(
-            stderr,
+            kb_log,
             "katybug: syscall %lld (guest %llu) %#llx %#llx %#llx %#llx = "
             "%lld\n",
             (long long) nr, (unsigned long long) guest,
@@ -1399,4 +1527,9 @@ done:
         cpu->pc -= x86 ? 2 : 4;
         cpu->sigreturned = 1;
     }
+}
+
+void kb_syscall(struct kb_cpu* cpu) {
+    syscall_body(cpu);
+    kb_flush(cpu);
 }

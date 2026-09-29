@@ -24,7 +24,7 @@ static int64_t addr_in(
     struct kb_cpu* cpu, uint64_t va, uint64_t len, struct sockaddr_storage* ss,
     socklen_t* hl
 ) {
-    uint8_t* p = kb_host(cpu, va, len);
+    uint8_t* p = kb_buf(cpu, va, len);
     if (!p || len < 2 || len > sizeof *ss) return -14;
     memset(ss, 0, sizeof *ss);
     uint16_t fam;
@@ -99,7 +99,7 @@ static int64_t addr_out(
         n = 28;
     }
     uint64_t room = kb_load(cpu, lenp, 4);
-    uint8_t* p = kb_host(cpu, va, room < n ? room : n);
+    uint8_t* p = kb_buf(cpu, va, room < n ? room : n);
     if (!p && room && n) return -14;
     memcpy(p, out, room < n ? room : n);
     kb_store(cpu, lenp, n, 4);
@@ -137,6 +137,14 @@ static int host_msg(uint64_t f) {
 static int64_t sent(struct kb_cpu* cpu, ssize_t n, uint64_t flags) {
     if (n < 0 && errno == EPIPE && !(flags & 0x4000)) kb_raise(cpu, 13, 0);
     return ret(n);
+}
+
+/* a send on a byte stream that a batch of pieces did not cover goes on with the
+ * rest, as a blocking send does; a datagram is one send */
+static int is_stream(int fd) {
+    int t;
+    socklen_t l = sizeof t;
+    return getsockopt(fd, SOL_SOCKET, SO_TYPE, &t, &l) == 0 && t == SOCK_STREAM;
 }
 
 /* the socket options katybug maps, Linux (level, name) to the host's; 0 when
@@ -243,22 +251,26 @@ static int64_t msg(
     uint64_t iov = kb_load(cpu, m + 16, 8), iovlen = kb_load(cpu, m + 24, 8);
     if (send && kb_load(cpu, m + 40, 8)) return -95;
     if (iovlen > 1024) return -22;
-    struct iovec* h = calloc(iovlen ? iovlen : 1, sizeof *h);
+    struct iovec* h = NULL;
+    int nh = 0;
     for (uint64_t i = 0; i < iovlen; i++) {
         uint64_t base = kb_load(cpu, iov + 16 * i, 8),
                  len = kb_load(cpu, iov + 16 * i + 8, 8);
-        h[i].iov_base = kb_host(cpu, base, len);
-        h[i].iov_len = (size_t) len;
-        if (!h[i].iov_base && len) {
+        int room = (int) (len >> KB_PIECE_BITS) + 2;
+        struct iovec* g =
+            len ? realloc(h, (size_t) (nh + room) * sizeof *h) : h;
+        int n = g && len ? kb_iov(cpu, base, len, g + nh, room) : 0;
+        if (!g && len) n = -1;
+        if (g) h = g;
+        if (n < 0) {
             free(h);
             return -14;
         }
+        nh += n;
     }
     struct sockaddr_storage ss;
     struct msghdr hm;
     memset(&hm, 0, sizeof hm);
-    hm.msg_iov = h;
-    hm.msg_iovlen = (int) iovlen;
     int64_t v;
     if (send) {
         socklen_t hl = 0;
@@ -268,9 +280,30 @@ static int64_t msg(
         }
         hm.msg_name = name ? &ss : NULL;
         hm.msg_namelen = hl;
-        v = sent(cpu, sendmsg(fd, &hm, host_msg(flags)), flags);
+        int stream = !name && is_stream(fd);
+        int64_t total = 0;
+        for (int at = 0;;) {
+            int cnt = nh - at > 1024 ? 1024 : nh - at;
+            uint64_t chunk = 0;
+            for (int i = 0; i < cnt; i++) chunk += h[at + i].iov_len;
+            hm.msg_iov = h + at;
+            hm.msg_iovlen = cnt;
+            v = sent(cpu, sendmsg(fd, &hm, host_msg(flags)), flags);
+            if (v < 0) {
+                if (total) v = total;
+                break;
+            }
+            total += v;
+            at += cnt;
+            if (!stream || (uint64_t) v < chunk || at >= nh) {
+                v = total;
+                break;
+            }
+        }
     }
     else {
+        hm.msg_iov = h;
+        hm.msg_iovlen = nh > 1024 ? 1024 : nh;
         hm.msg_name = &ss;
         hm.msg_namelen = sizeof ss;
         v = ret(recvmsg(fd, &hm, host_msg(flags)));
@@ -331,28 +364,64 @@ int64_t kb_net(struct kb_cpu* cpu, int64_t nr, const uint64_t* a) {
                 return kb_err(errno);
             return addr_out(cpu, a[1], a[2], &ss, hl);
         case 206: {
-            uint8_t* p = kb_host(cpu, a[1], a[2]);
-            if (!p && a[2]) return -14;
-            if (a[4]) {
-                if ((v = addr_in(cpu, a[4], a[5], &ss, &hl)) < 0) return v;
-                return sent(
-                    cpu,
-                    sendto(
-                        fd, p, (size_t) a[2], host_msg(a[3]),
-                        (struct sockaddr*) &ss, hl
-                    ),
-                    a[3]
-                );
+            if (a[4] && (v = addr_in(cpu, a[4], a[5], &ss, &hl)) < 0) return v;
+            int stream = !a[4] && is_stream(fd);
+            uint64_t va = a[1], len = a[2];
+            int64_t total = 0;
+            for (;;) {
+                struct iovec iov[256];
+                int n = len ? kb_iov(cpu, va, len, iov, 256) : 0;
+                if (n < 0) return -14;
+                uint64_t chunk = 0;
+                for (int i = 0; i < n; i++) chunk += iov[i].iov_len;
+                void* p = n ? iov[0].iov_base : NULL;
+                size_t k = n ? iov[0].iov_len : 0;
+                if (n > 1) {
+                    struct msghdr hm;
+                    memset(&hm, 0, sizeof hm);
+                    hm.msg_name = a[4] ? &ss : NULL;
+                    hm.msg_namelen = a[4] ? hl : 0;
+                    hm.msg_iov = iov;
+                    hm.msg_iovlen = n;
+                    v = sent(cpu, sendmsg(fd, &hm, host_msg(a[3])), a[3]);
+                }
+                else if (a[4])
+                    v = sent(
+                        cpu,
+                        sendto(
+                            fd, p, k, host_msg(a[3]), (struct sockaddr*) &ss, hl
+                        ),
+                        a[3]
+                    );
+                else
+                    v = sent(cpu, send(fd, p, k, host_msg(a[3])), a[3]);
+                if (v < 0) return total ? total : v;
+                total += v;
+                if (!stream || (uint64_t) v < chunk || chunk >= len)
+                    return total;
+                va += chunk, len -= chunk;
             }
-            return sent(cpu, send(fd, p, (size_t) a[2], host_msg(a[3])), a[3]);
         }
         case 207: {
-            uint8_t* p = kb_host(cpu, a[1], a[2]);
-            if (!p && a[2]) return -14;
-            ssize_t n = recvfrom(
-                fd, p, (size_t) a[2], host_msg(a[3]), (struct sockaddr*) &ss,
-                &hl
-            );
+            struct iovec iov[256];
+            int cnt = a[2] ? kb_iov(cpu, a[1], a[2], iov, 256) : 0;
+            if (cnt < 0) return -14;
+            ssize_t n;
+            if (cnt > 1) {
+                struct msghdr hm;
+                memset(&hm, 0, sizeof hm);
+                hm.msg_name = &ss;
+                hm.msg_namelen = sizeof ss;
+                hm.msg_iov = iov;
+                hm.msg_iovlen = cnt;
+                n = recvmsg(fd, &hm, host_msg(a[3]));
+                hl = hm.msg_namelen;
+            }
+            else
+                n = recvfrom(
+                    fd, cnt ? iov[0].iov_base : NULL, cnt ? iov[0].iov_len : 0,
+                    host_msg(a[3]), (struct sockaddr*) &ss, &hl
+                );
             if (n < 0) return kb_err(errno);
             if (a[4]) addr_out(cpu, a[4], a[5], &ss, hl);
             return n;
@@ -364,7 +433,7 @@ int64_t kb_net(struct kb_cpu* cpu, int64_t nr, const uint64_t* a) {
             /* option values pass as they are: ints, and timeval/linger lay out
              * alike on 64-bit hosts */
             if (nr == 208) {
-                uint8_t* p = kb_host(cpu, a[3], a[4]);
+                uint8_t* p = kb_buf(cpu, a[3], a[4]);
                 if (!p && a[4]) return -14;
                 return ret(setsockopt(fd, level, name, p, (socklen_t) a[4]));
             }
@@ -389,7 +458,7 @@ int64_t kb_net(struct kb_cpu* cpu, int64_t nr, const uint64_t* a) {
                                           : t;
                 memcpy(buf, &t, 4);
             }
-            uint8_t* p = kb_host(cpu, a[3], len);
+            uint8_t* p = kb_buf(cpu, a[3], len);
             if (!p && len) return -14;
             memcpy(p, buf, len);
             kb_store(cpu, a[4], len, 4);

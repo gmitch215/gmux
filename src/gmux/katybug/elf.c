@@ -28,7 +28,7 @@ static uint64_t push_bytes(
     struct kb_cpu* cpu, uint64_t* sp, const void* p, size_t n
 ) {
     *sp -= n;
-    memcpy(kb_host(cpu, *sp, n), p, n);
+    kb_write(cpu, *sp, p, n);
     return *sp;
 }
 
@@ -36,66 +36,90 @@ static void push_word(struct kb_cpu* cpu, uint64_t* sp, uint64_t v) {
     push_bytes(cpu, sp, &v, 8);
 }
 
-/* a whole ELF file in memory, or NULL */
-static uint8_t* read_file(const char* path, long* size) {
-    FILE* f = fopen(path, "rb");
-    if (!f) return NULL;
-    fseek(f, 0, SEEK_END);
-    *size = ftell(f);
-    fseek(f, 0, SEEK_SET);
-    uint8_t* file = malloc((size_t) *size + 1);
-    if (!file || fread(file, 1, (size_t) *size, f) != (size_t) *size) {
-        free(file);
-        file = NULL;
-    }
-    fclose(f);
-    return file;
-}
-
 struct image {
     uint64_t base, entry, phdr, end;
     int phnum;
+    char interp[4096]; /* PT_INTERP, empty when there is none */
 };
+
+static int phdr_at(FILE* f, const struct ehdr* eh, int i, struct phdr* ph) {
+    return fseek(f, (long) (eh->phoff + (uint64_t) i * sizeof *ph), SEEK_SET) ||
+           fread(ph, sizeof *ph, 1, f) != 1;
+}
+
+/* the file's [off, off + n) straight into the guest at va, a piece at a
+ * time: no buffer, so nothing is as large as the file */
+static int load_bytes(
+    struct kb_cpu* cpu, FILE* f, uint64_t off, uint64_t va, uint64_t n
+) {
+    if (fseek(f, (long) off, SEEK_SET)) return -2;
+    for (uint64_t done = 0, k; done < n; done += k) {
+        uint8_t* p = kb_span(cpu, va + done, &k);
+        if (!p) return -6;
+        if (k > n - done) k = n - done;
+        if (fread(p, 1, (size_t) k, f) != (size_t) k) return -2;
+    }
+    return 0;
+}
 
 /* maps an ELF image's PT_LOAD segments at base (ET_EXEC: at their own
  * addresses); 0 on success */
 static int map_image(
-    struct kb_cpu* cpu, uint8_t* file, long size, uint64_t base,
-    struct image* im
+    struct kb_cpu* cpu, FILE* f, uint64_t base, struct image* im
 ) {
-    struct ehdr* eh = (struct ehdr*) file;
-    if (size < (long) sizeof *eh || memcmp(eh->ident, "\177ELF\2\1", 6) != 0)
+    struct ehdr eh;
+    if (fread(&eh, sizeof eh, 1, f) != 1 ||
+        memcmp(eh.ident, "\177ELF\2\1", 6) != 0 ||
+        eh.phentsize != sizeof(struct phdr))
         return -2;
-    int arch = eh->machine == 62 ? KB_X86 : eh->machine == 183 ? KB_A64 : -1;
+    int arch = eh.machine == 62 ? KB_X86 : eh.machine == 183 ? KB_A64 : -1;
     if (arch < 0) return -3;
     cpu->arch = arch;
-    if (eh->type != 3) base = 0;
-    struct phdr* ph = (struct phdr*) (file + eh->phoff);
+    if (eh.type != 3) base = 0;
+    struct phdr ph;
     uint64_t lo = ~0ull, hi = 0, phdr_va = 0;
-    for (int i = 0; i < eh->phnum; i++) {
-        if (ph[i].type == 6) phdr_va = ph[i].vaddr; /* PT_PHDR */
-        if (ph[i].type != 1) continue;
-        if (ph[i].vaddr < lo) lo = ph[i].vaddr;
-        if (ph[i].vaddr + ph[i].memsz > hi) hi = ph[i].vaddr + ph[i].memsz;
-        if (!phdr_va && eh->phoff >= ph[i].offset &&
-            eh->phoff < ph[i].offset + ph[i].filesz)
-            phdr_va = ph[i].vaddr + (eh->phoff - ph[i].offset);
+    im->interp[0] = 0;
+    for (int i = 0; i < eh.phnum; i++) {
+        if (phdr_at(f, &eh, i, &ph)) return -2;
+        if (ph.type == 6) phdr_va = ph.vaddr; /* PT_PHDR */
+        if (ph.type == 3) {                   /* PT_INTERP */
+            if (!ph.filesz || ph.filesz > sizeof im->interp) return -2;
+            if (fseek(f, (long) ph.offset, SEEK_SET) ||
+                fread(im->interp, 1, (size_t) ph.filesz, f) != ph.filesz)
+                return -2;
+            im->interp[ph.filesz - 1] = 0;
+        }
+        if (ph.type != 1) continue;
+        if (ph.vaddr < lo) lo = ph.vaddr;
+        if (ph.vaddr + ph.memsz > hi) hi = ph.vaddr + ph.memsz;
+        if (!phdr_va && eh.phoff >= ph.offset &&
+            eh.phoff < ph.offset + ph.filesz)
+            phdr_va = ph.vaddr + (eh.phoff - ph.offset);
     }
     if (lo > hi) return -5;
     lo &= ~0xfffull;
     /* one mapping for the whole image: segments may share pages */
     if (!kb_map(cpu, base + lo, hi - lo, 7)) return -6;
-    for (int i = 0; i < eh->phnum; i++) {
-        if (ph[i].type != 1 || !ph[i].filesz) continue;
-        memcpy(
-            kb_host(cpu, base + ph[i].vaddr, ph[i].filesz), file + ph[i].offset,
-            ph[i].filesz
-        );
+    for (int i = 0; i < eh.phnum; i++) {
+        if (phdr_at(f, &eh, i, &ph)) return -2;
+        if (ph.type != 1 || !ph.filesz) continue;
+        int e = load_bytes(cpu, f, ph.offset, base + ph.vaddr, ph.filesz);
+        if (e) return e;
     }
-    *im = (struct image){
-        base, base + eh->entry, base + phdr_va, base + hi, eh->phnum
-    };
+    im->base = base, im->entry = base + eh.entry, im->phdr = base + phdr_va;
+    im->end = base + hi, im->phnum = eh.phnum;
     return 0;
+}
+
+/* opens path and maps it; 0 on success, -1 when it cannot be opened */
+static int map_file(
+    struct kb_cpu* cpu, const char* path, uint64_t base, struct image* im
+) {
+    FILE* f = fopen(path, "rb");
+    if (!f) return -1;
+    int e = map_image(cpu, f, base, im);
+    fclose(f);
+    return e;
 }
 
 /** loads an ELF, and the dynamic loader its PT_INTERP names, and builds the
@@ -103,29 +127,13 @@ static int map_image(
 int kb_load_elf(
     struct kb_cpu* cpu, const char* path, int argc, char** argv, char** envp
 ) {
-    long size;
-    uint8_t* file = read_file(path, &size);
-    if (!file) return -1;
     struct image im, ld = {0};
-    int e = map_image(cpu, file, size, PIE_BASE, &im);
-    if (e) {
-        free(file);
-        return e;
-    }
-    struct ehdr* eh = (struct ehdr*) file;
-    struct phdr* ph = (struct phdr*) (file + eh->phoff);
-    for (int i = 0; i < eh->phnum; i++) {
-        if (ph[i].type != 3) continue; /* PT_INTERP */
-        file[ph[i].offset + ph[i].filesz - 1] = 0;
-        long lsize;
-        uint8_t* lf = read_file((const char*) file + ph[i].offset, &lsize);
+    int e = map_file(cpu, path, PIE_BASE, &im);
+    if (e) return e;
+    if (im.interp[0]) {
         int arch = cpu->arch;
-        e = lf ? map_image(cpu, lf, lsize, LD_BASE, &ld) : -1;
-        free(lf);
-        if (e || cpu->arch != arch) {
-            free(file);
-            return e ? e : -3;
-        }
+        e = map_file(cpu, im.interp, LD_BASE, &ld);
+        if (e || cpu->arch != arch) return e ? e : -3;
     }
     cpu->brk_start = cpu->brk_end = (im.end + 0xfffull) & ~0xfffull;
     cpu->mmap_next = 0x100000000000ull;
@@ -189,6 +197,5 @@ int kb_load_elf(
     cpu->pc = ld.entry ? ld.entry : im.entry;
     free(av);
     free(ev);
-    free(file);
     return 0;
 }
