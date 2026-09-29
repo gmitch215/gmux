@@ -678,6 +678,11 @@ export class Machine {
 		if (options.syscallCache) this.fsCache = new Map();
 	}
 
+	/** whether a task is ready to run, which a machine with no timer to wait on can still have */
+	get runnable(): boolean {
+		return this.ready.length > 0;
+	}
+
 	/** the earliest Linux timer an idle task waits for, in kernel-clock nanoseconds, or null */
 	get deadline(): bigint | null {
 		return this.nextDeadline();

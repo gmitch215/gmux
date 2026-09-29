@@ -8,7 +8,7 @@ import manifest from '../build/kernel/manifest.json';
 import vmlinux from '../build/kernel/vmlinux.async.wasm';
 import { bootstrapOf, fits, type BootstrapIndex } from './worker/bootstrap';
 import type { Sql } from './worker/durable';
-import { Keeper } from './worker/keeper';
+import { Keeper, QUANTUM_MS, type Policy } from './worker/keeper';
 import { claim, verify, type OwnerStore } from './worker/owner';
 import { placement, prime, type PlacementStore } from './worker/placement';
 import { CMDLINE, MAXIMUM_PAGES, siteOptions } from './worker/site-machine';
@@ -20,7 +20,6 @@ export interface Env {
 
 // a keystroke runs the machine briefly; a tick or an alarm gives it a full quantum
 const INPUT_MS = 250;
-const QUANTUM_MS = 5000;
 
 // a replaced object's machine memory stays charged to its isolate, so its successor restores into it
 const MEMORIES = new Map<string, WeakRef<WebAssembly.Memory>>();
@@ -58,33 +57,44 @@ export class MachineDO extends DurableObject<Env> {
 		super(ctx, env);
 		ctx.storage.sql.exec('CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v TEXT)');
 		const id = ctx.id.toString();
-		this.keeper = new Keeper({
-			sql: sqlOf(ctx.storage.sql),
-			alarms: ctx.storage,
-			sync: () => ctx.storage.sync(),
-			options: () =>
-				siteOptions(
-					{
-						vmlinux,
-						busybox,
-						busyboxGuard,
-						katybug,
-						initrd: new Uint8Array(initrd),
-						manifest
-					},
-					{
-						memory: MEMORIES.get(id)?.deref(),
-						// the rootfs's own executables carry their hash (exec stubs); anything else is hashed
-						sha256: (bytes) => createHash('sha256').update(bytes).digest('hex'),
-						write: (text) => {
-							this.keeper.activity();
-							this.pending += text;
-							queueMicrotask(() => this.flush());
+		this.keeper = new Keeper(
+			{
+				sql: sqlOf(ctx.storage.sql),
+				alarms: ctx.storage,
+				sync: () => ctx.storage.sync(),
+				decided: (decision) =>
+					console.log(JSON.stringify({ gmux: 'thermal', ...decision })),
+				options: () =>
+					siteOptions(
+						{
+							vmlinux,
+							busybox,
+							busyboxGuard,
+							katybug,
+							initrd: new Uint8Array(initrd),
+							manifest
+						},
+						{
+							memory: MEMORIES.get(id)?.deref(),
+							// the rootfs's own executables carry their hash (exec stubs); anything else is hashed
+							sha256: (bytes) => createHash('sha256').update(bytes).digest('hex'),
+							write: (text) => {
+								this.keeper.activity();
+								this.pending += text;
+								queueMicrotask(() => this.flush());
+							}
 						}
-					}
-				),
-			bootstrap: () => this.bootstrap()
-		});
+					),
+				bootstrap: () => this.bootstrap()
+			},
+			{},
+			this.policy()
+		);
+	}
+
+	/** the keeper's choices; the idle-machine measurements override it (experiments/decisions) */
+	protected policy(): Partial<Policy> {
+		return {};
 	}
 
 	/** scripts/bootstrap.ts's image in the static assets, when it was taken from this build */
@@ -144,7 +154,7 @@ export class MachineDO extends DurableObject<Env> {
 	 * checkpoint; overlapping events join the pump already running, and input typed meanwhile
 	 * reaches the machine as it runs
 	 */
-	private async pump(budgetMs: number) {
+	private async pump(budgetMs: number, unattended = false) {
 		if (this.pumping) return;
 		this.pumping = true;
 		const started = Date.now();
@@ -158,7 +168,7 @@ export class MachineDO extends DurableObject<Env> {
 				console.log(JSON.stringify({ gmux: from, ...this.keeper.counts }));
 			}
 			MEMORIES.set(this.ctx.id.toString(), new WeakRef(machine.memory));
-			const stop = this.keeper.turn(budgetMs);
+			const stop = this.keeper.turn(budgetMs, unattended);
 			const outcome = await machine.run(
 				() => {
 					if (this.typed) {
@@ -167,7 +177,7 @@ export class MachineDO extends DurableObject<Env> {
 					}
 					return stop();
 				},
-				(ms) => scheduler.wait(Math.min(ms, 50))
+				this.keeper.sleeper((ms) => scheduler.wait(Math.min(ms, 50)))
 			);
 			if (outcome === 'halted') {
 				this.send({ t: 'status', d: outcome });
@@ -212,7 +222,13 @@ export class MachineDO extends DurableObject<Env> {
 					claimed: this.owner.get() !== null,
 					running: this.keeper.machine !== null,
 					stats: this.keeper.machine?.stats ?? null,
-					durable: { ...this.keeper.counts, quietMs: this.keeper.quietMs }
+					durable: { ...this.keeper.counts, quietMs: this.keeper.quietMs },
+					policy: this.keeper.policy,
+					thermal: {
+						...this.keeper.thermal,
+						history: this.keeper.history,
+						alarm: await this.ctx.storage.getAlarm()
+					}
 				});
 			case '/_gmux/claim': {
 				if (request.method !== 'POST')
@@ -234,6 +250,7 @@ export class MachineDO extends DurableObject<Env> {
 					server.addEventListener('close', () => void this.warm--);
 				} else {
 					this.ctx.acceptWebSocket(server, ['control']);
+					this.keeper.arrived();
 				}
 				return new Response(null, { status: 101, webSocket: client });
 			}
@@ -254,7 +271,7 @@ export class MachineDO extends DurableObject<Env> {
 
 	/** a Linux timer came due, or unsaved work: run the machine for a quantum, or checkpoint it */
 	override async alarm() {
-		if (await this.keeper.woke(this.pumping)) await this.pump(QUANTUM_MS);
+		if (await this.keeper.woke(this.pumping)) await this.pump(QUANTUM_MS, this.warm === 0);
 		else await this.keeper.arm(this.warm > 0);
 	}
 }

@@ -6,14 +6,17 @@ import { bootstrapOf, CHUNK, packImage, type BootstrapIndex } from '../../src/wo
 import { encodeSnapshot } from '../../src/worker/durable.ts';
 import {
 	checkpointCost,
+	DEFAULT_POLICY,
 	Keeper,
 	QUIET_MAX_MS,
 	QUIET_MIN_MS,
 	STEPS_MAX,
 	STEPS_MIN,
-	type KeeperHost
+	type KeeperHost,
+	type Policy
 } from '../../src/worker/keeper.ts';
 import { Machine } from '../../src/worker/machine/machine.ts';
+import { MIN_SPAN_MS, type Decision } from '../../src/worker/thermal.ts';
 
 const PARK_IMPORTS = [
 	'wasm_serialize_tasks',
@@ -198,6 +201,319 @@ describe('Keeper', () => {
 		expect(keeper.alarm.next).toBe(r.clock.wall + 5000);
 	});
 
+	it('ends an unattended turn at its first wait for a timer, where an attended one waits out its budget', async () => {
+		const r = rig();
+		const keeper = new Keeper(r.host);
+		await r.run((await keeper.open()).machine, () => r.output().includes('parent ok'));
+		const waited: number[] = [];
+		const sleep = keeper.sleeper(async (ms) => void waited.push(ms));
+		let stop = keeper.turn(5000, true);
+		expect(stop()).toBe(false);
+		// a yield (0 ms) is not a wait for a timer
+		await sleep(0);
+		expect(stop()).toBe(false);
+		await sleep(400);
+		expect(stop()).toBe(true);
+		expect(waited).toEqual([0, 400]);
+		// it ended idle, not by its budget, so the machine counts as quiet and the alarm backs off
+		await keeper.ran(1);
+		expect(keeper.quietMs).toBe(2 * QUIET_MIN_MS);
+		stop = keeper.turn(5000);
+		await sleep(400);
+		expect(stop()).toBe(false);
+	});
+
+	describe('thermal rule', () => {
+		/** the rule alone, without the floor that keeps a wake it drops */
+		const RULE: Partial<Policy> = { wake: 'rule' };
+
+		/** an idle machine, checkpointed so only its timer wants the alarm */
+		async function idle(r: ReturnType<typeof rig>, keeper: Keeper) {
+			const { machine } = await keeper.open();
+			await r.run(machine, () => r.output().includes('parent ok'));
+			await keeper.checkpoint();
+		}
+
+		it('keeps waking an idle machine while it has watched too little to read a rate', async () => {
+			const r = rig();
+			const decisions: Decision[] = [];
+			const keeper = new Keeper({ ...r.host, decided: (d) => decisions.push(d) });
+			await idle(r, keeper);
+			r.clock.wall += MIN_SPAN_MS - 1;
+			await keeper.arm();
+			expect(decisions).toHaveLength(1);
+			expect(decisions[0]).toMatchObject({ level: 'machine', kept: true, reuse: null });
+			expect(keeper.alarm.next).toBe(r.clock.wall + 2 * QUIET_MIN_MS);
+			expect(keeper.thermal).toMatchObject({ kept: 1, dropped: 0, last: decisions[0] });
+		});
+
+		it('drops the timer wake of an idle machine nobody returns to, and says why', async () => {
+			const r = rig();
+			const decisions: Decision[] = [];
+			const keeper = new Keeper({ ...r.host, decided: (d) => decisions.push(d) }, {}, RULE);
+			await idle(r, keeper);
+			r.clock.wall += MIN_SPAN_MS;
+			await keeper.arm();
+			expect(keeper.alarm.next).toBeNull();
+			expect(decisions[0]).toMatchObject({ kept: false, reuse: 0, why: expect.any(String) });
+			expect(decisions[0]!.gain).toBeLessThan(0);
+			expect(keeper.thermal).toMatchObject({ kept: 0, dropped: 1, last: decisions[0] });
+			expect(keeper.history!.dropped).toBe(r.clock.wall);
+			// stored, so a new instance of the object knows the machine was dropped
+			expect(new Keeper(r.host).history).toEqual(keeper.history);
+		});
+
+		it('leaves unsaved work its checkpoint alarm when it drops the timer', async () => {
+			const r = rig();
+			const keeper = new Keeper(r.host);
+			await idle(r, keeper);
+			keeper.activity();
+			await keeper.arm();
+			r.clock.wall += MIN_SPAN_MS;
+			await keeper.arm();
+			expect(keeper.thermal.dropped).toBe(1);
+			expect(keeper.alarm.next).toBeGreaterThan(r.clock.wall);
+		});
+
+		it('takes no decision for a machine that just did something, or one a warm socket drives', async () => {
+			const r = rig();
+			const decisions: Decision[] = [];
+			const keeper = new Keeper({ ...r.host, decided: (d) => decisions.push(d) });
+			await idle(r, keeper);
+			r.clock.wall += MIN_SPAN_MS;
+			keeper.activity();
+			await keeper.arm();
+			expect(keeper.alarm.next).toBe(r.clock.wall + QUIET_MIN_MS);
+			await keeper.arm(true);
+			expect(decisions).toHaveLength(0);
+		});
+
+		it('counts an arrival, stores it, and lets it undo a drop', async () => {
+			const r = rig();
+			const keeper = new Keeper(r.host, {}, RULE);
+			await idle(r, keeper);
+			r.clock.wall += MIN_SPAN_MS;
+			await keeper.arm();
+			expect(keeper.history!.dropped).toBeDefined();
+			keeper.arrived();
+			expect(keeper.history).toMatchObject({ events: 1, last: r.clock.wall });
+			expect(keeper.history!.dropped).toBeUndefined();
+			expect(new Keeper(r.host).history).toEqual(keeper.history);
+		});
+	});
+
+	describe('policy', () => {
+		/** an idle machine past the thermal rule's first ten minutes, so the rule drops its timer wake */
+		async function dropped(policy: Partial<Policy>, host: Partial<KeeperHost> = {}) {
+			const r = rig();
+			const keeper = new Keeper({ ...r.host, ...host }, {}, policy);
+			const { machine } = await keeper.open();
+			await r.run(machine, () => r.output().includes('parent ok'));
+			await keeper.checkpoint();
+			r.clock.wall += MIN_SPAN_MS;
+			await keeper.arm();
+			return { r, keeper };
+		}
+
+		it('defaults to what the site runs', () => {
+			expect(new Keeper(rig().host).policy).toEqual(DEFAULT_POLICY);
+			expect(DEFAULT_POLICY).toMatchObject({
+				turnEnd: 'over',
+				wake: 'floor',
+				floorMs: 900_000,
+				saveWake: true,
+				rearmBusy: true,
+				persistQuiet: true
+			});
+		});
+
+		describe('turn end', () => {
+			/** the first wait of `ms`, `after` ms into a 5 s turn, and whether the turn ended */
+			async function ended(
+				turnEnd: Policy['turnEnd'],
+				ms: number,
+				after = 0,
+				overMs?: number
+			) {
+				const r = rig();
+				const keeper = new Keeper(
+					r.host,
+					{},
+					{ turnEnd, overMs: overMs ?? DEFAULT_POLICY.overMs }
+				);
+				await r.run((await keeper.open()).machine, () => r.output().includes('parent ok'));
+				const stop = keeper.turn(5000, true);
+				r.clock.wall += after;
+				await keeper.sleeper(async () => {})(ms);
+				return stop();
+			}
+
+			it('first ends at any wait for a timer, budget at none', async () => {
+				expect(await ended('first', 1)).toBe(true);
+				expect(await ended('budget', 4000)).toBe(false);
+			});
+
+			it('remaining ends only when the wait outlasts what is left of the budget', async () => {
+				expect(await ended('remaining', 400)).toBe(false);
+				expect(await ended('remaining', 5001)).toBe(true);
+				expect(await ended('remaining', 400, 4700)).toBe(true);
+				expect(await ended('remaining', 200, 4700)).toBe(false);
+			});
+
+			it('over ends only when the wait is longer than the threshold', async () => {
+				expect(await ended('over', 100)).toBe(false);
+				expect(await ended('over', 101)).toBe(true);
+				expect(await ended('over', 5, 0, 1)).toBe(true);
+			});
+
+			it('ends an unattended turn once its short waits add up to the budget, with the clock stopped', async () => {
+				const r = rig();
+				const keeper = new Keeper(r.host, {}, { turnEnd: 'over' });
+				await r.run((await keeper.open()).machine, () => r.output().includes('parent ok'));
+				const sleep = keeper.sleeper(async () => {});
+				const stop = keeper.turn(5000, true);
+				for (let i = 0; i < 500; i++) await sleep(10);
+				expect(stop()).toBe(false);
+				await sleep(10);
+				expect(stop()).toBe(true);
+				// an attended turn's waits are the wall clock's to count
+				const attended = keeper.turn(5000);
+				for (let i = 0; i < 600; i++) await sleep(10);
+				expect(attended()).toBe(false);
+			});
+
+			it('never ends an attended turn, or at a yield', async () => {
+				const r = rig();
+				const keeper = new Keeper(r.host, {}, { turnEnd: 'over', overMs: 0 });
+				await r.run((await keeper.open()).machine, () => r.output().includes('parent ok'));
+				const stop = keeper.turn(5000);
+				await keeper.sleeper(async () => {})(400);
+				expect(stop()).toBe(false);
+				const unattended = keeper.turn(5000, true);
+				await keeper.sleeper(async () => {})(0);
+				expect(unattended()).toBe(false);
+			});
+		});
+
+		describe('wake', () => {
+			it('rule leaves the drop alone', async () => {
+				const { keeper } = await dropped({ wake: 'rule' });
+				expect(keeper.alarm.next).toBeNull();
+			});
+
+			it('always keeps the timer wake the rule dropped, at its quiet time', async () => {
+				const { r, keeper } = await dropped({ wake: 'always' });
+				expect(keeper.thermal.dropped).toBe(1);
+				expect(keeper.alarm.next).toBe(r.clock.wall + keeper.quietMs);
+				expect(keeper.history!.dropped).toBeUndefined();
+			});
+
+			it('floor holds it off to one wake per floorMs', async () => {
+				const { r, keeper } = await dropped({ wake: 'floor', floorMs: 900_000 });
+				expect(keeper.alarm.next).toBe(r.clock.wall + 900_000);
+				// a quiet time already past the floor stays
+				const late = await dropped({ wake: 'floor', floorMs: 1000 });
+				expect(late.keeper.alarm.next).toBe(late.r.clock.wall + late.keeper.quietMs);
+			});
+
+			it('ontime keeps it only while the host reports a user timer, and no sooner than the floor', async () => {
+				const pending = (ms: number | null) => ({ userTimerMs: async () => ms });
+				const none = await dropped({ wake: 'ontime', floorMs: 60_000 }, pending(null));
+				expect(none.keeper.alarm.next).toBeNull();
+				expect(none.keeper.history!.dropped).toBeDefined();
+				const soon = await dropped({ wake: 'ontime', floorMs: 60_000 }, pending(5000));
+				expect(soon.keeper.alarm.next).toBe(soon.r.clock.wall + 60_000);
+				const far = await dropped({ wake: 'ontime', floorMs: 60_000 }, pending(3_000_000));
+				expect(far.keeper.alarm.next).toBe(far.r.clock.wall + 3_000_000);
+				const unasked = await dropped({ wake: 'ontime' });
+				expect(unasked.keeper.alarm.next).toBeNull();
+			});
+		});
+
+		describe('rearm a busy machine', () => {
+			/** a machine stopped mid-run: a task ready, no idle cpu, so no Linux deadline */
+			async function busy(policy: Partial<Policy>) {
+				const r = rig();
+				const keeper = new Keeper(r.host, {}, policy);
+				const { machine } = await keeper.open();
+				let steps = 0;
+				await r.run(machine, () => ++steps > 2);
+				expect(machine.deadline).toBeNull();
+				return { r, keeper, machine };
+			}
+
+			it('wakes it after the quiet period, where without it only unsaved work does', async () => {
+				const off = await busy({ rearmBusy: false });
+				expect(off.machine.runnable).toBe(true);
+				await off.keeper.arm();
+				expect(off.keeper.alarm.next).toBe(off.r.clock.wall + 5000);
+				const on = await busy({});
+				await on.keeper.arm();
+				expect(on.keeper.alarm.next).toBe(on.r.clock.wall + 2 * QUIET_MIN_MS);
+			});
+
+			it('leaves a machine with nothing to run alone', async () => {
+				const r = rig();
+				const keeper = new Keeper(r.host);
+				const { machine } = await keeper.open();
+				expect(machine.runnable).toBe(false);
+				await keeper.arm();
+				expect(keeper.alarm.next).toBe(r.clock.wall + 5000);
+			});
+		});
+
+		describe('save each wake', () => {
+			async function turnEnded(policy: Partial<Policy>, attended: boolean) {
+				const r = rig();
+				const keeper = new Keeper(r.host, {}, policy);
+				await r.run((await keeper.open()).machine, () => r.output().includes('parent ok'));
+				keeper.turn(5000, !attended);
+				await keeper.ran(1, attended);
+				return keeper.counts.checkpoints;
+			}
+
+			it('checkpoints at the end of an alarm turn, and never at the end of an attended one', async () => {
+				expect(await turnEnded({ saveWake: false }, false)).toBe(0);
+				expect(await turnEnded({}, false)).toBe(1);
+				expect(await turnEnded({}, true)).toBe(0);
+			});
+		});
+
+		describe('quiet period', () => {
+			const quiet = (r: ReturnType<typeof rig>) =>
+				r.sql.exec("SELECT v FROM gmux_meta WHERE k = 'quiet'").toArray()[0]?.v;
+
+			it('is lost with the instance when the policy does not keep it', async () => {
+				const r = rig();
+				const keeper = new Keeper(r.host, {}, { persistQuiet: false });
+				await r.run((await keeper.open()).machine, () => r.output().includes('parent ok'));
+				for (let i = 0; i < 3; i++) await keeper.arm();
+				expect(keeper.quietMs).toBe(8 * QUIET_MIN_MS);
+				expect(quiet(r)).toBeUndefined();
+				expect(new Keeper(r.host, {}, { persistQuiet: false }).quietMs).toBe(QUIET_MIN_MS);
+			});
+
+			it('is kept in gmux_meta by default, one row per change', async () => {
+				const r = rig();
+				const keeper = new Keeper(r.host);
+				await r.run((await keeper.open()).machine, () => r.output().includes('parent ok'));
+				for (let i = 0; i < 3; i++) await keeper.arm();
+				expect(quiet(r)).toBe(String(8 * QUIET_MIN_MS));
+				expect(new Keeper(r.host).quietMs).toBe(8 * QUIET_MIN_MS);
+				// a policy that does not keep it ignores the row
+				expect(new Keeper(r.host, {}, { persistQuiet: false }).quietMs).toBe(QUIET_MIN_MS);
+				for (let i = 0; i < 30; i++) await keeper.arm();
+				const before = r.sql.written;
+				await keeper.arm();
+				expect(keeper.quietMs).toBe(QUIET_MAX_MS);
+				expect(r.sql.written - before).toBe(0);
+				keeper.activity();
+				await keeper.arm();
+				expect(quiet(r)).toBe(String(QUIET_MIN_MS));
+			});
+		});
+	});
+
 	it('checkpoints unsaved work when its alarm comes due, and runs the machine for a timer', async () => {
 		const r = rig();
 		const keeper = new Keeper(r.host);
@@ -239,7 +555,7 @@ describe('Keeper', () => {
 		/** runs `stop` until it says stop, `stepMs` of real time a step, on a clock that never moves */
 		const drive = (r: ReturnType<typeof rig>, stop: () => boolean, stepMs: number) => {
 			let steps = 0;
-			while (!stop()) if (++steps > 1e6) throw new Error('the turn never stopped');
+			while (!stop()) if (++steps > 2e6) throw new Error('the turn never stopped');
 			// the look that said stop came after a step too
 			r.clock.wall += (steps + 1) * stepMs;
 			return steps;

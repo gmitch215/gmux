@@ -1,9 +1,15 @@
 import { decodeSnapshot, DurableStore, encodeSnapshot, type Sql, type Written } from './durable.ts';
 import { Machine, type MachineOptions, type Snapshot } from './machine/machine.ts';
 import { Alarm, Cadence, type AlarmStorage, type IntervalOptions } from './schedule.ts';
+import { arrive, begin, machineWake, type Decision, type History } from './thermal.ts';
+
+/** what an event's pump may spend of wall time when an alarm or a tick runs the machine, ms */
+export const QUANTUM_MS = 5000;
 
 /** what the keeper needs from its Durable Object */
 export interface KeeperHost {
+	/** told every keep-or-drop decision the thermal rule makes, with its inputs */
+	decided?(decision: Decision): void;
 	sql: Sql;
 	alarms: AlarmStorage;
 	/** resolves once every write so far is durable (`ctx.storage.sync`) */
@@ -12,6 +18,8 @@ export interface KeeperHost {
 	options(): MachineOptions;
 	/** wall time, ms since the epoch */
 	now?(): number;
+	/** ms until the earliest timer a user process waits on (not the kernel's own), null for none */
+	userTimerMs?(): Promise<number | null>;
 	/**
 	 * a machine checkpointed after boot (src/worker/bootstrap.ts), when the host has one taken from
 	 * this build: a machine with nothing stored restores it instead of booting
@@ -49,6 +57,43 @@ export const STEPS_MIN = 500;
 export const STEPS_MAX = 12_000;
 /** the event right after a restore spent part of its CPU on the restore: half the steps */
 export const RESTORE_SHARE = 0.5;
+
+/**
+ * The choices the idle-machine measurements compare. The defaults are what the site runs; each
+ * other value is an option under test
+ */
+export interface Policy {
+	/**
+	 * how an alarm turn ends: `first` at the first wait for a timer, `budget` never (it sleeps out
+	 * its wall budget), `remaining` when a wait outlasts what is left of the budget, `over` when a
+	 * wait is longer than `overMs`
+	 */
+	turnEnd: 'first' | 'budget' | 'remaining' | 'over';
+	overMs: number;
+	/**
+	 * what happens to a timer wake the thermal rule drops: `rule` it is dropped, `always` every wake
+	 * is kept, `floor` it is held off to one wake per `floorMs`, `ontime` it is kept (no more than
+	 * one per `floorMs`) only while the host reports a user timer pending
+	 */
+	wake: 'rule' | 'always' | 'floor' | 'ontime';
+	floorMs: number;
+	/** checkpoints at the end of every alarm turn, so what a silent job did in it survives the object being lost */
+	saveWake: boolean;
+	/** wakes a machine that has runnable work and no timer to wait on (a checkpoint clears the alarm that would have) */
+	rearmBusy: boolean;
+	/** keeps the quiet period in `gmux_meta`, so an object that lost its instance does not restart it */
+	persistQuiet: boolean;
+}
+
+export const DEFAULT_POLICY: Policy = {
+	turnEnd: 'over',
+	overMs: 100,
+	wake: 'floor',
+	floorMs: 900_000,
+	saveWake: true,
+	rearmBusy: true,
+	persistQuiet: true
+};
 
 /** one pump's steps, and what stopped it */
 interface Turn {
@@ -96,15 +141,43 @@ export class Keeper {
 	private active = false;
 	private dirty = false;
 	private readonly host: KeeperHost;
+	/** what arrivals it has seen, which the thermal rule reads a reuse probability from */
+	history: History | null;
+	/** the last keep-or-drop decision, and how many of each this instance made */
+	thermal: { last: Decision | null; kept: number; dropped: number } = {
+		last: null,
+		kept: 0,
+		dropped: 0
+	};
 
-	constructor(host: KeeperHost, interval: IntervalOptions = {}) {
+	readonly policy: Policy;
+
+	constructor(host: KeeperHost, interval: IntervalOptions = {}, policy: Partial<Policy> = {}) {
 		this.host = host;
+		this.policy = { ...DEFAULT_POLICY, ...policy };
 		this.store = new DurableStore(host.sql);
 		this.alarm = new Alarm(host.alarms);
-		const learned = host.sql
-			.exec("SELECT v FROM gmux_meta WHERE k = 'cadence'")
-			.toArray()[0]?.v;
+		const meta = (k: string) =>
+			host.sql.exec('SELECT v FROM gmux_meta WHERE k = ?', k).toArray()[0]?.v;
+		const learned = meta('cadence');
 		this.cadence = new Cadence(interval, learned ? JSON.parse(String(learned)) : undefined);
+		const seen = meta('thermal');
+		this.history = seen ? JSON.parse(String(seen)) : null;
+		const quiet = this.policy.persistQuiet ? Number(meta('quiet')) : 0;
+		if (quiet >= QUIET_MIN_MS) this.quietMs = quiet;
+	}
+
+	private saveHistory() {
+		this.host.sql.exec(
+			"INSERT OR REPLACE INTO gmux_meta (k, v) VALUES ('thermal', ?)",
+			JSON.stringify(this.history)
+		);
+	}
+
+	/** somebody attached to the machine */
+	arrived() {
+		this.history = arrive(this.history, this.now());
+		this.saveHistory();
 	}
 
 	private now() {
@@ -159,6 +232,10 @@ export class Keeper {
 		from: 'running' | 'restored' | 'bootstrapped' | 'booted';
 	}> {
 		if (this.machine) return { machine: this.machine, from: 'running' };
+		if (!this.history) {
+			this.history = begin(this.now());
+			this.saveHistory();
+		}
 		const restored = await this.restore(this.host.options().memory);
 		if (restored) {
 			this.counts.restores++;
@@ -189,10 +266,15 @@ export class Keeper {
 	 * the step cap, whichever comes first. The previous turn, when its cap stopped it, teaches the
 	 * cost of a step: its steps over the real time from its start to now (one the clock stopped may
 	 * have slept, so it teaches nothing). A dearer step lowers the cap at once; a cheaper one raises
-	 * it at most twofold a turn
+	 * it at most twofold a turn; `unattended` also ends it at the first wait (see `sleeper`)
 	 */
-	turn(budgetMs: number): () => boolean {
+	turn(budgetMs: number, unattended = false): () => boolean {
+		this.unattended = unattended;
+		this.idled = false;
+		this.waitedMs = 0;
 		const start = this.now();
+		this.budgetMs = budgetMs;
+		this.startedAt = start;
 		const last = this.lastTurn;
 		// a deployed clock can stand still from one event to the next, and a step then looks free
 		// (one event ran 18 s of CPU on a cap learned at 0 ms): a turn the clock never saw teaches nothing
@@ -208,8 +290,42 @@ export class Keeper {
 		const stepCap = this.stepCap;
 		return () => {
 			if (++turn.steps > stepCap) turn.stopped = 'steps';
-			else if (this.now() - start > budgetMs) turn.stopped = 'wall';
-			return turn.stopped !== null;
+			// a deployed clock stands still while code runs, so an unattended turn's waits count too
+			else if (Math.max(this.now() - start, this.waitedMs) > budgetMs) turn.stopped = 'wall';
+			return turn.stopped !== null || this.idled;
+		};
+	}
+
+	private unattended = false;
+	private idled = false;
+	private budgetMs = 0;
+	private startedAt = 0;
+	private waitedMs = 0;
+
+	private endsTurn(ms: number): boolean {
+		if (!this.unattended || ms <= 0) return false;
+		switch (this.policy.turnEnd) {
+			case 'first':
+				return true;
+			case 'budget':
+				return false;
+			case 'remaining':
+				return ms > this.budgetMs - (this.now() - this.startedAt);
+			case 'over':
+				return ms > this.policy.overMs;
+		}
+	}
+
+	/**
+	 * the pump's wait for a Linux timer. On an unattended turn (an alarm woke the machine) a wait the
+	 * policy's `turnEnd` names ends the turn and the alarm holds the rest (sleeping out the budget
+	 * billed 5 s a wake); the others count against the budget
+	 */
+	sleeper(wait: (ms: number) => Promise<void>): (ms: number) => Promise<void> {
+		return (ms) => {
+			if (this.endsTurn(ms)) this.idled = true;
+			else if (this.unattended && ms > 0) this.waitedMs += ms;
+			return wait(ms);
 		};
 	}
 
@@ -224,7 +340,9 @@ export class Keeper {
 		this.cadence.ran(Math.max(ms, turn ? turn.steps * this.stepMs : 0));
 		// a turn stopped by its budget had work left: the machine is busy, not quiet
 		if (turn?.stopped) this.activity();
-		const written = this.machine && this.cadence.due ? await this.checkpoint() : null;
+		const saveNow = this.policy.saveWake && this.unattended;
+		const written =
+			this.machine && (this.cadence.due || saveNow) ? await this.checkpoint() : null;
 		await this.arm(attended);
 		return written;
 	}
@@ -271,6 +389,23 @@ export class Keeper {
 		return written;
 	}
 
+	/** the timer wake the rule dropped, as the policy leaves it: null, or the time it is kept at */
+	private async dropped(timer: number, now: number): Promise<number | null> {
+		const { wake, floorMs } = this.policy;
+		let kept: number | null = null;
+		if (wake === 'always') kept = timer;
+		else if (wake === 'floor') kept = Math.max(timer, now + floorMs);
+		else if (wake === 'ontime') {
+			const userMs = (await this.host.userTimerMs?.()) ?? null;
+			if (userMs !== null) kept = Math.max(timer, now + Math.max(userMs, floorMs));
+		}
+		if (kept === null && this.history && this.history.dropped === undefined) {
+			this.history = { ...this.history, dropped: now };
+			this.saveHistory();
+		}
+		return kept;
+	}
+
 	/**
 	 * the next Linux deadline, no sooner than the quiet period, and unsaved work an interval of wall
 	 * time from now, on the one alarm
@@ -278,15 +413,33 @@ export class Keeper {
 	async arm(attended = false) {
 		const machine = this.machine;
 		const now = this.now();
-		this.quietMs = this.active ? QUIET_MIN_MS : Math.min(this.quietMs * 2, QUIET_MAX_MS);
+		const idle = !this.active;
+		const quiet = this.active ? QUIET_MIN_MS : Math.min(this.quietMs * 2, QUIET_MAX_MS);
+		if (this.policy.persistQuiet && quiet !== this.quietMs)
+			this.host.sql.exec(
+				"INSERT OR REPLACE INTO gmux_meta (k, v) VALUES ('quiet', ?)",
+				String(quiet)
+			);
+		this.quietMs = quiet;
 		this.active = false;
 		const deadline = machine?.deadline ?? null;
-		this.alarm.want(
-			'timer',
-			attended || deadline === null
-				? null
-				: now + Math.max(this.quietMs, Number(deadline - machine!.clockNs) / 1e6)
-		);
+		const rearm = this.policy.rearmBusy && machine?.runnable === true;
+		let timer = attended
+			? null
+			: deadline === null
+				? rearm
+					? now + this.quietMs
+					: null
+				: now + Math.max(this.quietMs, Number(deadline - machine!.clockNs) / 1e6);
+		// a machine that did nothing visible is kept awake only while its arrivals pay for the wake
+		if (timer !== null && idle) {
+			const decision = machineWake(this.history, now, timer - now);
+			this.thermal.last = decision;
+			this.thermal[decision.kept ? 'kept' : 'dropped']++;
+			this.host.decided?.(decision);
+			if (!decision.kept) timer = await this.dropped(timer, now);
+		}
+		this.alarm.want('timer', timer);
 		this.alarm.want('checkpoint', machine && this.dirty ? now + this.cadence.interval : null);
 		await this.alarm.sync();
 	}
