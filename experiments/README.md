@@ -35,14 +35,15 @@ The numbers below are summaries. The full tables, with hosts, runs and spreads, 
 
 ## Running a Rig
 
-Deployed rigs need a Cloudflare account and `wrangler`. Deploy the folder's Worker, run its driver
-against the URL it prints, then delete the Worker. Rigs that boot the real kernel need `build/`
-(`bun run hydrate`, or the pipeline in `scripts/build-linux.sh`), and several need the boot rig
-staged first:
+Deployed rigs need a Cloudflare account and `wrangler`. Deploy the folder's Worker, pass the URL it
+prints to the driver as `WORKER_URL`, then delete the Worker. Drivers have no default URL and stop
+when it is unset. Rigs that boot the real kernel need `build/` (`bun run hydrate`, or the pipeline
+in `scripts/build-linux.sh`), and several need the boot rig staged first:
 
 ```sh
 experiments/boot/scripts/stage.sh
-node --experimental-strip-types experiments/<name>/scripts/<driver>.ts
+WORKER_URL=https://<worker>.<subdomain>.workers.dev \
+	node --experimental-strip-types experiments/<name>/scripts/<driver>.ts
 ```
 
 Each driver's header comment gives its arguments.
@@ -78,6 +79,8 @@ tail calls on an Apple M-series laptop.
 | `quanta-job/` | a CPU-heavy job across many events, and process counts, on the boot rig | | drivers only, run against the boot rig's Worker |
 | `socket/` | holding one outbound connection in an object of its own | one TLS connection stayed open 901 s and answered 19 DNS queries exact while the object using it was evicted four times | a connection belongs to the request that opened it, so a small separate object keeps it alive |
 | `console-interrupt/` | what typing into the console costs the host | an idle minute went from 139 host checks to 0, and a typed command from 1,044 ms of machine time to 0 | the kernel used to poll the console; now the console raises an interrupt when input arrives |
+| `thermal/` | one keep-or-drop rule for an idle machine's timer wake, left running for a day on Free | an idle wake had billed about 5 s of wall every 6 s (71% of Free's daily duration); ending an unattended turn at its first wait cut it to about 91 ms | once the rule has 10 minutes of history it drops every wake, because a wake (a request and a row) costs more than the restore it saves |
+| `decisions/` | the options for idle machines: when a timer wake is kept, how an alarm turn ends, and whether the backoff survives eviction | a wake at most every 15 minutes, checkpointed, costs about 94 wakes and 870 rows a day, so 114 idle machines fit in a Free day | found that a silent job's work was never checkpointed, that a busy machine's alarms stopped after a checkpoint, and that a turn's wall budget is not enforced on Free's frozen clock |
 
 ## The Booted Machine
 
@@ -103,6 +106,7 @@ tail calls on an Apple M-series laptop.
 | `mmu/` | a software MMU, a process in its own memory, checked memory access, and lazy restore | translating every memory access made programs 2.06-2.66 times slower; checking every load and store for a non-root process 1.26-2.86 times slower | a restore now loads each paused process's pages only when it next runs, and fetched 14.4 MiB instead of 61.2. A process in its own memory computes at full speed, and its system calls that copy buffers are slower |
 | `write-back/` | writing back changed pages against rewriting the whole image every quantum, and whether `fsync` survives a lost machine | 33-130 times fewer checkpoint rows | files saved with `fsync`, `O_SYNC`, `msync` or `sync` come back after a lost machine, and unsaved files do not, as on Linux. The shipped site restored itself from storage four times in 240 s with nobody connected |
 | `staged-init/` | starting the site from a machine image shipped in its assets | a prompt in 1.4-1.6 s, against 3.2 s booting | a startup that takes 74 s of CPU live restores in 146 ms from an image taken after it |
+| `restore-cold/` | a restore into a fresh isolate against one into a warm isolate, and warming up the resume path at startup | on Free a cold restore is 3-6% slower (965 against 933 ms); under Node it is 55% slower | a warm-up at startup removes the Node gap but adds about 626 ms to every isolate start on Free, and a warm-up before the first restore needs more than Free's 50 fetches per request |
 
 ## Lanes
 
@@ -121,8 +125,16 @@ Katybug runs unmodified x86-64 and AArch64 Linux programs inside the machine by 
 | directory | what it measures | result | notes |
 | --- | --- | --- | --- |
 | `katybug-profile/` | Katybug against native x86-64, and where its time goes | 99 (`factor`) to 331 (`bash`) times slower than native | 64-93% of the time is the loop that picks the next instruction. Removing four small costs from that loop made it 13-27% faster |
+| `katybug-settings/` | Katybug's trace length and lazy-flag settings with Katybug as a guest of the wasm kernel under Node, the way it ships | traces make it 4% (x86-64) to 6% (AArch64) faster; 16 and 64 segments are within the spread of the shipped 32, and the fused flags setting is fastest or tied everywhere | computing flags eagerly costs about 2%, which bounds what carrying flags inside traces could still save |
+| `string-kernels/` | `strlen`, `memcmp`, `strcmp` and `memchr` from musl run as host code over guest memory, found by their exact bytes | `sort` 16.9% faster on x86-64 and 15.3% on AArch64; the other workloads 0-5% | glibc's versions are chosen at load time and are not recognized |
+| `call-return/` | a stack of return addresses in place of a block lookup on each return (since removed from Katybug; the rig's on arm needs a source copy from before the removal) | removes 30-80% of block lookups, up to all 1.40 billion on a recursive `fib`, and no workload got faster; `fib` got 2-3% slower | a return to a changed address stays exact, including a `longjmp` ten frames up |
+| `katybug-fp/` | AArch64 fused multiply-add on the host's FPU when the result is provably the same as the software core's | the `fmla` loop went from 62% to 6% slower than a plain build, a mixed FP loop from 20% to 4% | exact on 14,993 instruction cases and 30 million fuzzed ones. Under Node, with Katybug inside a machine, the fast path makes the `fmla` loop 1.66 times faster and the others 5-8% |
+| `katybug-machine/` | loops timed with Katybug as a guest inside a machine under Node, here comparing the size of the pieces guest mappings are built from | 4 KiB pieces are 7-18% slower than 64 KiB where accesses cross piece boundaries, and level where they do not (9 rounds) | the pieces let a guest's stack and heap grow without one large contiguous allocation from the kernel |
 | `trace-length/` | joining blocks of guest code, linking them, and following hot paths (traces) of each length | links made programs 1.4-6.8% faster and joining blocks 3.3-5.6%; traces ran anywhere from 5.3% faster to 2.2% slower | the order files are linked in changes a build's speed by 1-4% on its own, so each build is linked three ways and averaged |
 | `aot-oracle/` | how fast Katybug could get by turning the hottest code into C ahead of time | the translated code runs 9-29 times slower than native in the machine, and 5-25 times slower even compiled natively | wasm adds little; the way guest code is represented is most of the cost. Checking for signals at loop back-edges and after each system call stays exact and made one program 18.6% faster |
 | `interp-topology/` | wasm3 against Katybug's wasm frontend, each run inside wasm and natively | running inside wasm makes wasm3 1.23-3.40 times slower and Katybug 2.12-2.67 times slower | Katybug's wasm frontend is 15-55 times slower than wasm3; it exists to check correctness, not for speed |
 | `promotion-ladder/` | zlib compression with its hottest functions made native while wasm3 interprets the rest | 13.24 times slower than V8 fully interpreted, 7.10 with the hottest function native, 1.08 with everything native | each call between native code and the interpreter costs about 0.5 us, which is why the middle steps gain less than their share of the work |
-| `cut-model/` | a model of run time as work in each mode plus the cost of each crossing, checked against the two rigs above | predicts the zlib ladder within 5.5% | on the trace sweep it fits within 4.2% only by giving some costs negative values, so those runs differ too little to measure crossing costs from |
+| `cut-model/` | a model of run time as work in each mode plus the cost of each crossing, checked against the two rigs above | predicts the zlib ladder within 5.5%; with crossing costs measured one at a time and frozen first, it predicts the trace sweep within 5% on 19 of 32 x86-64 cells and 25 of 32 AArch64 cells | an isolated block lookup measures about 0 ns while real programs save 2-4 ns per lookup from chaining, and trace blocks cost more to dispatch than one fixed price per block |
+| `promotion-cut/` | choosing which functions to make native by a minimum cut over the call graph with a byte budget, and what one crossing costs | never worse than taking the hottest function, and better only at the tightest budget on bzip2 | a crossing costs 100-195 ns measured alone, 155-246 ns inside a run and 213-354 ns fitted from whole runs; deployed on Free it is 455-860 ns |
+| `profile-cache/` | keeping a guest's profile, plan and fusion catalog across restarts, keyed by the module and every tool that made them | a restart loads in 1.0-1.7 ms instead of 12.6-16.6 s of profiling | any changed key refuses the record; rebuilding the native steps (0.2-0.7 s) is what is left of a restart |
+| `wasm-planner/` | constant folding, branch pruning and dead code removal on a wasm module before wasm3 loads it | removes nothing from clang `-O2` output and never moved `r` beyond the spread | exact on nine guests and 400 random programs; it removes 1-9% of instructions only from `-O0` builds |
