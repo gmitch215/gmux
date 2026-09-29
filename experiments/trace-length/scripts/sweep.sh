@@ -9,6 +9,7 @@
 # usage: sweep.sh <out dir> [name=cflags[|ENV=value ...]]...  (ROUNDS=2, LAYOUTS=3,
 # ARCHES="x86_64 aarch64"; the default arms are the trace-length sweep, the traces one build with
 # KATYBUG_SEGMENTS). Needs build/katybug/transcript{,-aarch64} (tests/c/katybug/transcript.sh).
+# KATYBUG_SRC builds from another copy of src/gmux/katybug; WORKLOADS replaces the four programs.
 set -uo pipefail
 here=$(cd "$(dirname "$0")" && pwd)
 root=$(cd "$here/../../.." && pwd)
@@ -20,7 +21,7 @@ shift
 layouts=${LAYOUTS:-3}
 mkdir -p "$out"
 out=$(cd "$out" && pwd)
-srcs=("$root"/src/gmux/katybug/*.c)
+srcs=("${KATYBUG_SRC:-$root/src/gmux/katybug}"/*.c)
 names=() builds=()
 for spec in "$@"; do
 	n=${spec%%=*} flags=${spec#*=} env=
@@ -41,6 +42,19 @@ for spec in "$@"; do
 	[ $k -eq ${#builds[@]} ] && builds+=("$flags")
 done
 [ -f "$out/in" ] || seq 1 200000 > "$out/in"
+# WORKLOADS=<file> of name|@ command lines replaces the four (an {arch} in a line becomes x86_64 or aarch64)
+workloads() {
+	if [ -n "${WORKLOADS:-}" ]; then
+		sed "s/{arch}/$arch/g" "$WORKLOADS"
+		return
+	fi
+	cat << EOF
+sqlite|@ $U/sqlite3 :memory: 'with recursive c(x) as (select 1 union all select x+1 from c where x<200000) select count(*), sum(x*x) % 1000003 from c;'
+bash|@ $U/bash -c 'i=0; s=0; while [ \$i -lt 20000 ]; do s=\$((s+i*i%7)); i=\$((i+1)); done; echo \$s'
+awk|@ $T/busybox awk '{s += \$1 * 3} END {print s}' in
+sort|@ $U/coreutils --coreutils-prog=sort -r in
+EOF
+}
 stat() { (grep -ho "$1" "$2" || true) | awk -v f="$3" '{s += $f} END {print s + 0}'; }
 printf 'arch\tworkload\tarm\tblocks\texits\tops\tlookups\theld\tseconds\tcpu\tspread\n'
 for arch in ${ARCHES:-x86_64 aarch64}; do
@@ -79,10 +93,5 @@ for arch in ${ARCHES:-x86_64 aarch64}; do
 				{w += $1; c += $2; if (NR == 1 || $2 < lo) lo = $2; if ($2 > hi) hi = $2}
 				END {printf "%.3f\t%.3f\t%.4f\n", w / NR, c / NR, c ? (hi - lo) / (c / NR) : 0}'
 		done
-	done << EOF
-sqlite|@ $U/sqlite3 :memory: 'with recursive c(x) as (select 1 union all select x+1 from c where x<200000) select count(*), sum(x*x) % 1000003 from c;'
-bash|@ $U/bash -c 'i=0; s=0; while [ \$i -lt 20000 ]; do s=\$((s+i*i%7)); i=\$((i+1)); done; echo \$s'
-awk|@ $T/busybox awk '{s += \$1 * 3} END {print s}' in
-sort|@ $U/coreutils --coreutils-prog=sort -r in
-EOF
+	done < <(workloads)
 done

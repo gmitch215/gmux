@@ -1,0 +1,23 @@
+{
+	"name": "gmux-cut-model",
+	"main": "src/lane.ts",
+	"compatibility_date": "2026-09-20",
+	"durable_objects": {
+		"bindings": [
+			{
+				"name": "MACHINE",
+				"class_name": "Machine"
+			},
+			{
+				"name": "LANE",
+				"class_name": "Lane"
+			}
+		]
+	},
+	"migrations": [
+		{
+			"tag": "v1",
+			"new_sqlite_classes": ["Machine", "Lane"]
+		}
+	]
+}
