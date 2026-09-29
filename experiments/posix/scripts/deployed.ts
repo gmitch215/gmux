@@ -1,6 +1,7 @@
 // on a deployed Free machine: a signal handler that blocks, pthreads, and the POSIX
 // surface the kernel config now builds (sockets, flock, eventfd, epoll, timerfd, inotify, /dev/null)
-const B = process.env.G08_URL ?? 'https://gmux-boot.gmitch215-free.workers.dev';
+const B = process.env.WORKER_URL;
+if (!B) throw new Error('set WORKER_URL to the deployed worker, e.g. https://<name>.<subdomain>.workers.dev');
 const cases = [
 	['blocking signal handler', 'sig; echo END-$((1+1))', (o) => o.includes('handler slept') && o.includes('after pause')],
 	['pthreads', 'thr; echo END-$((1+1))', (o) => o.includes('threads count 40000')],

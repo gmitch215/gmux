@@ -1,5 +1,6 @@
 // the whole-kernel checkpoint on a deployed Free object: checkpoint mid-pipeline, ctx.abort(), restore
-const B = process.env.G08_URL ?? 'https://gmux-boot.gmitch215-free.workers.dev';
+const B = process.env.WORKER_URL;
+if (!B) throw new Error('set WORKER_URL to the deployed worker, e.g. https://<name>.<subdomain>.workers.dev');
 const name = process.argv[2] ?? `ck-${Date.now()}`;
 // BIG=1 runs 1 GiB so the checkpoint always lands mid-job
 const big = process.env.BIG === '1';

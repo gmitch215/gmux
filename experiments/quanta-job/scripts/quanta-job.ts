@@ -1,5 +1,6 @@
 // pre-place the object past first-placement, boot, then run a CPU-bound job across many events
-const B = 'https://gmux-boot.gmitch215-free.workers.dev';
+const B = process.env.WORKER_URL;
+if (!B) throw new Error('set WORKER_URL to the deployed worker, e.g. https://<name>.<subdomain>.workers.dev');
 const name = process.argv[2];
 const expected = process.argv[3];
 const get = async (path) =>

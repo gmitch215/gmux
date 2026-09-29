@@ -1,11 +1,12 @@
 // deploy while a machine is live: deploy (warm socket open) | hib-deploy (warm socket closed first)
-const B = 'wss://gmux-publication.gmitch215-free.workers.dev';
+const B = process.env.WORKER_URL;
+if (!B) throw new Error('set WORKER_URL to the deployed worker, e.g. https://<name>.<subdomain>.workers.dev');
 const [name, scenario, idle] = [process.argv[2], process.argv[3], Number(process.argv[4] ?? 90)];
 const t0 = Date.now();
 const FLAG = process.env.DEPLOYED_FLAG ?? '/tmp/gmux-publication/deployed';
 const log = (...a) => console.log(`${((Date.now() - t0) / 1000).toFixed(1)}s`, ...a);
 function open(kind) {
-	const ws = new WebSocket(`${B}/ws?kind=${kind}&do=${name}`);
+	const ws = new WebSocket(`${B.replace(/^http/, 'ws')}/ws?kind=${kind}&do=${name}`);
 	const inbox = [];
 	let waiter = null;
 	ws.addEventListener('message', (e) =>

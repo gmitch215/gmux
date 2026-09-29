@@ -1,5 +1,6 @@
 // keep-alive client: ramps retained memory on one object and reports instance changes
-const B = 'https://gmux-object-memory.gmitch215-free.workers.dev';
+const B = process.env.WORKER_URL;
+if (!B) throw new Error('set WORKER_URL to the deployed worker, e.g. https://<name>.<subdomain>.workers.dev');
 const [name, step, max, pause] = [
 	process.argv[2],
 	Number(process.argv[3] ?? 8),

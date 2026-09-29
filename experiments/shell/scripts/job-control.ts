@@ -1,5 +1,6 @@
 // on a deployed machine: pipes, a blocked reader, ^C, a busy loop, background jobs; one fresh machine per case
-const B = process.env.G08_URL ?? 'https://gmux-boot.gmitch215-free.workers.dev';
+const B = process.env.WORKER_URL;
+if (!B) throw new Error('set WORKER_URL to the deployed worker, e.g. https://<name>.<subdomain>.workers.dev');
 const cases = [
 	['pipe', 'yes | head -1; echo END-$((1+1))', (o) => /\ny\r?\n/.test(o)],
 	['blocked reader woken by a writer', '(sleep 1; echo woke) | cat; echo END-$((1+1))', (o) => o.includes('woke')],

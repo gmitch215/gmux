@@ -1,5 +1,6 @@
 // boots one arm per fresh object and reports whether the machine survives a pipeline: the checkpoint rig's Free-only fault
-const B = process.env.G08_URL ?? 'https://gmux-boot.gmitch215-free.workers.dev';
+const B = process.env.WORKER_URL;
+if (!B) throw new Error('set WORKER_URL to the deployed worker, e.g. https://<name>.<subdomain>.workers.dev');
 const arms = process.argv.slice(2);
 for (const arm of arms) {
 	const name = `arm-${arm}-${Date.now()}`;

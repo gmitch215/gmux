@@ -1,6 +1,7 @@
 // one socket object, a client evicted mid-run and idle gaps; the connection must be the same one
 // throughout and every answer must equal a direct DoH query
-const B = process.env.G6_URL ?? 'https://gmux-socket.gmitch215-free.workers.dev';
+const B = process.env.WORKER_URL;
+if (!B) throw new Error('set WORKER_URL to the deployed worker, e.g. https://<name>.<subdomain>.workers.dev');
 const gaps = (process.argv[2] ?? '0,30,120,300').split(',').map(Number);
 const t = Date.now();
 const socket = `sock-${t}`;

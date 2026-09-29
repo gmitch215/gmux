@@ -1,10 +1,11 @@
 // hibernatable control socket beside a standard warm socket holding parked JSPI tasks: close-warm | keep-warm
-const B = 'wss://gmux-residency.gmitch215-free.workers.dev';
+const B = process.env.WORKER_URL;
+if (!B) throw new Error('set WORKER_URL to the deployed worker, e.g. https://<name>.<subdomain>.workers.dev');
 const [name, scenario, idle] = [process.argv[2], process.argv[3], Number(process.argv[4] ?? 90)];
 const t0 = Date.now();
 const log = (...a) => console.log(`${((Date.now() - t0) / 1000).toFixed(1)}s`, ...a);
 function open(kind) {
-	const ws = new WebSocket(`${B}/ws?kind=${kind}&do=${name}`);
+	const ws = new WebSocket(`${B.replace(/^http/, 'ws')}/ws?kind=${kind}&do=${name}`);
 	const inbox = [];
 	let waiter = null;
 	ws.addEventListener('message', (e) =>

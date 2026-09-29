@@ -1,6 +1,7 @@
 // aggregate bandwidth and isolate packing at 1..256 simultaneous lanes, each lane warm
 // first; POD=n dispatches through pods of n lanes instead of one flat fan-out
-const B = process.env.G9_URL ?? 'https://gmux-lane-pods.gmitch215-free.workers.dev';
+const B = process.env.WORKER_URL;
+if (!B) throw new Error('set WORKER_URL to the deployed worker, e.g. https://<name>.<subdomain>.workers.dev');
 const passes = Number(process.env.PASSES ?? 16);
 const bytes = (16 << 20) * passes;
 const pod = Number(process.env.POD ?? 0);

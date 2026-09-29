@@ -5,15 +5,14 @@
 # Alpine's busybox-static; userland/commands.txt adds coreutils, bash, sqlite3 and curl built from
 # pinned sources by userland-build.sh.
 # usage: tests/c/katybug/transcript.sh [busybox|userland]...  (default: both); KATYBUG_ARCH=aarch64
-# checks the arm64 builds (default x86_64); NATIVE_HOST names the host whose docker runs the native
-# side (default paisley-park for x86_64, local for aarch64); local means this machine, which must run
-# containers of that architecture (CI's runner, or an arm64 Mac); KATYBUG_FORK=exec sends every guest
-# fork through fork.c's exec and state transfer, as on wasm
+# checks the arm64 builds (default x86_64); NATIVE_HOST required: the host whose docker runs the native
+# side; local means this machine, which must run containers of that architecture (CI's runner, or an
+# arm64 Mac); KATYBUG_FORK=exec sends every guest fork through fork.c's exec and state transfer, as on wasm
 set -euo pipefail
 here=$(cd "$(dirname "$0")" && pwd)
 root=$(cd "$here/../../.." && pwd)
 case ${KATYBUG_ARCH:-x86_64} in
-	x86_64) platform=linux/amd64 sfx= host=${NATIVE_HOST:-paisley-park} ;;
+	x86_64) platform=linux/amd64 sfx= host=${NATIVE_HOST:?set NATIVE_HOST to an ssh host with docker, or local} ;;
 	aarch64) platform=linux/arm64 sfx=-aarch64 host=${NATIVE_HOST:-local} ;;
 	*)
 		echo "KATYBUG_ARCH: x86_64 or aarch64" >&2

@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
-# the instruction corpus (x86-ops.ts): run natively on a Linux x86-64 host (NATIVE_HOST, default
-# paisley-park, the binary under ~/gmux-rig/k3) and under a native build of katybug here; every case
+# the instruction corpus (x86-ops.ts): run natively on a Linux x86-64 host (NATIVE_HOST required,
+# the binary under ~/gmux-rig/k3) and under a native build of katybug here; every case
 # must match. usage: tests/c/katybug/ops.sh
 set -euo pipefail
 here=$(cd "$(dirname "$0")" && pwd)
 root=$(cd "$here/../../.." && pwd)
-host=${NATIVE_HOST:-paisley-park}
+host=${NATIVE_HOST:?set NATIVE_HOST to an ssh host with docker, or local}
 out=$(mktemp -d)
 cc -std=c11 -D_DEFAULT_SOURCE -D_DARWIN_C_SOURCE -O2 ${KATYBUG_CFLAGS:-} -o "$out/katybug" "$root"/src/gmux/katybug/*.c -lm
 "$root/scripts/ts" "$here/x86-ops.ts" > "$out/x86-ops.S"

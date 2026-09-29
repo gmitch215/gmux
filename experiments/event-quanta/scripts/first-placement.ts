@@ -1,5 +1,6 @@
 // keep-alive client: burns on fresh objects and reports whether each kept its instance afterwards
-const B = 'https://gmux-event-quanta.gmitch215-free.workers.dev';
+const B = process.env.WORKER_URL;
+if (!B) throw new Error('set WORKER_URL to the deployed worker, e.g. https://<name>.<subdomain>.workers.dev');
 const [prefix, iters, count] = [process.argv[2], process.argv[3], Number(process.argv[4] ?? 10)];
 const results = [];
 for (let i = 0; i < count; i++) {

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Lua's test suite on native musl and on gmux from one command, file by file, with the
 # comparison printed. The native side builds the same Lua source in an Alpine container on a Linux
-# host with docker (NATIVE_HOST, default paisley-park; CPUs and memory capped, work under
+# host with docker (NATIVE_HOST required; CPUs and memory capped, work under
 # ~/gmux-rig/t1); the gmux side boots build/kernel in Node, one machine per file.
 # usage: tests/suites/lua.sh <lua.wasm> <lua source .tgz> <lua tests .tgz>
 set -euo pipefail
@@ -10,7 +10,7 @@ src=${2:?lua source .tgz}
 tests=${3:?lua tests .tgz}
 here=$(cd "$(dirname "$0")" && pwd)
 root=$(cd "$here/../.." && pwd)
-host=${NATIVE_HOST:-paisley-park}
+host=${NATIVE_HOST:?set NATIVE_HOST to an ssh host with docker, or local}
 out=$(mktemp -d)
 
 tar -xzf "$tests" -C "$out"

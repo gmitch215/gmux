@@ -1,4 +1,5 @@
-const B = 'https://gmux-boot.gmitch215-free.workers.dev';
+const B = process.env.WORKER_URL;
+if (!B) throw new Error('set WORKER_URL to the deployed worker, e.g. https://<name>.<subdomain>.workers.dev');
 const [name, cmd, events] = [process.argv[2], process.argv[3], Number(process.argv[4] ?? 5)];
 const get = async (path) =>
 	(await fetch(`${B}${path}${path.includes('?') ? '&' : '?'}do=${name}`)).json();

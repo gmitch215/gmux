@@ -1,6 +1,6 @@
 #!/bin/bash
 # usage: rate.sh <do-name> <seconds> ; logs "epoch_ms instance total_ms dns connect tls ttfb ip" per request at ~1 req/s
-B=https://gmux-residency.gmitch215-free.workers.dev
+B=${WORKER_URL:?set WORKER_URL to the deployed worker URL}
 end=$(( $(date +%s) + $2 ))
 while [ $(date +%s) -lt $end ]; do
 	s=$(node -p 'Date.now()')

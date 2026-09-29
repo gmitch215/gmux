@@ -1,7 +1,8 @@
-const base = 'wss://gmux-boot.gmitch215-free.workers.dev';
+const base = process.env.WORKER_URL;
+if (!base) throw new Error('set WORKER_URL to the deployed worker, e.g. https://<name>.<subdomain>.workers.dev');
 const name = process.argv[2] ?? `g10ws-${Date.now()}`;
 const job = process.argv[3] ?? 'yes | head -c 268435456 | sha256sum; echo JOB$((1+1))DONE';
-const ws = new WebSocket(`${base}/term?do=${name}`);
+const ws = new WebSocket(`${base.replace(/^http/, 'ws')}/term?do=${name}`);
 const queue: any[] = [];
 let waiter: ((m: any) => void) | null = null;
 ws.addEventListener('message', (e) => {

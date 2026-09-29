@@ -1,5 +1,6 @@
 // tests/c probes and libc-test's thread suite on a deployed Free machine, one machine each
-const B = process.env.G08_URL ?? 'https://gmux-boot.gmitch215-free.workers.dev';
+const B = process.env.WORKER_URL;
+if (!B) throw new Error('set WORKER_URL to the deployed worker, e.g. https://<name>.<subdomain>.workers.dev');
 const passes = (n) => (o) => (o.match(/^PASS /gm) ?? []).length === n && !/^FAIL /m.test(o);
 const probes = [
 	['isolation', 'isolation', (o) => o.includes('TRUST kernel-address write accepted') && passes(14)(o)],

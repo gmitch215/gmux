@@ -1,4 +1,5 @@
-const B = 'https://gmux-object-memory.gmitch215-free.workers.dev';
+const B = process.env.WORKER_URL;
+if (!B) throw new Error('set WORKER_URL to the deployed worker, e.g. https://<name>.<subdomain>.workers.dev');
 const [name, kind, step, max] = [
 	process.argv[2],
 	process.argv[3],

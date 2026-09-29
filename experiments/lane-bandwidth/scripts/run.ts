@@ -1,6 +1,7 @@
 // sequential read bandwidth on a deployed lane. The deployed clock stands still while the object computes, so the client
 // times each request: passes=P against passes=0 on the same warm lane, medians of five
-const B = process.env.G5_URL ?? 'https://gmux-lane-bandwidth.gmitch215-free.workers.dev';
+const B = process.env.WORKER_URL;
+if (!B) throw new Error('set WORKER_URL to the deployed worker, e.g. https://<name>.<subdomain>.workers.dev');
 const name = `bandwidth-${Date.now()}`;
 const timed = async (q) => {
 	const t0 = performance.now();

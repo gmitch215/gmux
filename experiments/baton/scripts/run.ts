@@ -1,5 +1,6 @@
 // a headless job driven by its partner's requests, both ways, then by alarms; polled until done
-const B = process.env.G10_URL ?? 'https://gmux-baton.gmitch215-free.workers.dev';
+const B = process.env.WORKER_URL;
+if (!B) throw new Error('set WORKER_URL to the deployed worker, e.g. https://<name>.<subdomain>.workers.dev');
 const quanta = Number(process.argv[2] ?? 60);
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const arms = [

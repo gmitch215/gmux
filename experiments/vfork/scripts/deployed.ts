@@ -1,5 +1,6 @@
 // on a deployed Free machine: BusyBox $(...) through gmux's vfork, and a C program's vfork
-const B = process.env.G08_URL ?? 'https://gmux-boot.gmitch215-free.workers.dev';
+const B = process.env.WORKER_URL;
+if (!B) throw new Error('set WORKER_URL to the deployed worker, e.g. https://<name>.<subdomain>.workers.dev');
 const cases = [
 	['$(...)', 'echo A=$(echo hi) C=$(echo $(echo nested)) D=`echo back`; echo END-$((1+1))', (o) => o.includes('A=hi C=nested D=back')],
 	['vfork: execve, _exit, failed execve', 'vf; echo END-$((1+1))', (o) => o.includes('from-exec') && o.includes('second exited 7') && o.includes('third exited 9')]

@@ -1,6 +1,7 @@
 // keep-alive client: the site's placement step on fresh objects, then a burn past a second; a placed
 // object should keep its instance through the burn
-const B = 'https://gmux-event-quanta.gmitch215-free.workers.dev';
+const B = process.env.WORKER_URL;
+if (!B) throw new Error('set WORKER_URL to the deployed worker, e.g. https://<name>.<subdomain>.workers.dev');
 const [prefix, count] = [process.argv[2], Number(process.argv[3] ?? 5)];
 const get = async (path) => (await fetch(`${B}${path}`)).json();
 const pause = () => new Promise((r) => setTimeout(r, 1500));

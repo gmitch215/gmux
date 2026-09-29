@@ -1,5 +1,6 @@
 // on a deployed Free machine: Lua's error handling, then its test suite file by file (_port=true)
-const B = process.env.G08_URL ?? 'https://gmux-boot.gmitch215-free.workers.dev';
+const B = process.env.WORKER_URL;
+if (!B) throw new Error('set WORKER_URL to the deployed worker, e.g. https://<name>.<subdomain>.workers.dev');
 const name = `setjmp-${Date.now()}`;
 const get = async (path) => (await fetch(`${B}${path}${path.includes('?') ? '&' : '?'}do=${name}`)).json().catch(() => ({}));
 const until = async (cmd, marker, rounds = 60) => {

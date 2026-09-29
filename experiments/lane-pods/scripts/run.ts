@@ -1,5 +1,6 @@
 // flat against pods of 32 at 32..256 lanes, each lane's first call (cold) then a warm one; then lane-to-lane
-const B = process.env.G9_URL ?? 'https://gmux-lane-pods.gmitch215-free.workers.dev';
+const B = process.env.WORKER_URL;
+if (!B) throw new Error('set WORKER_URL to the deployed worker, e.g. https://<name>.<subdomain>.workers.dev');
 const t = Date.now();
 for (const n of [32, 64, 128, 256]) {
 	for (const pod of [0, 32]) {
