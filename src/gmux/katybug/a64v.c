@@ -399,11 +399,75 @@ static uint64_t fop2(
     cpu->fpsr |= IOC;
     return dnan(n);
 }
+/* single-precision fused multiply-add in doubles when FPCR is all defaults and
+ * every operand is finite: the product is exact in a double, TwoSum gives the
+ * sum's error, and rounding to odd first makes the cast to float one rounding.
+ * A result in the top or bottom binade could be tiny or overflow, so it stays
+ * in software */
+static int fast_fma32(
+    struct kb_cpu* cpu, uint64_t c, uint64_t a, uint64_t b, uint64_t* out
+) {
+    if ((cpu->fpcr & 0x03c00000) || ((c >> 23) & 255) == 255 ||
+        ((a >> 23) & 255) == 255 || ((b >> 23) & 255) == 255)
+        return 0;
+    float fx, fy, fz, fr;
+    uint32_t w = (uint32_t) a, v = (uint32_t) b, u = (uint32_t) c, rw;
+    memcpy(&fx, &w, 4);
+    memcpy(&fy, &v, 4);
+    memcpy(&fz, &u, 4);
+    double p = (double) fx * (double) fy, z = fz, s = p + z, bp = s - p,
+           ap = s - bp, t = (p - ap) + (z - bp), o = s;
+    if (t != 0) {
+        uint64_t bits;
+        memcpy(&bits, &s, 8);
+        if (!(bits & 1)) bits += (t > 0) == (s > 0) ? 1 : -1;
+        memcpy(&o, &bits, 8);
+    }
+    fr = (float) o;
+    memcpy(&rw, &fr, 4);
+    int x = (int) (rw >> 23) & 255;
+    if (x < 2 || x > 253) return 0;
+    if (t != 0 || (double) fr != s) cpu->fpsr |= IXC;
+    *out = rw;
+    return 1;
+}
+/* double-precision fused multiply-add: the host's fma gives the result and
+ * the error-free transforms (Boldo and Muller's ErrFma) give what it dropped.
+ * The factors stay within 2^-255 to 2^256 so the product's error is a normal
+ * number, the addend is below 2^256, and the result is off the top and bottom
+ * binades, so the flag is IXC or nothing */
+static int fast_fma64(
+    struct kb_cpu* cpu, uint64_t c, uint64_t a, uint64_t b, uint64_t* out
+) {
+    if ((cpu->fpcr & 0x03c00000) || (((a >> 52) & 2047) - 0x300u) > 0x1ffu ||
+        (((b >> 52) & 2047) - 0x300u) > 0x1ffu || ((c >> 52) & 2047) > 0x4ff)
+        return 0;
+    double x, y, z, r;
+    memcpy(&x, &a, 8);
+    memcpy(&y, &b, 8);
+    memcpy(&z, &c, 8);
+    r = fma(x, y, z);
+    uint64_t rb;
+    memcpy(&rb, &r, 8);
+    int e = (int) (rb >> 52) & 2047;
+    if (e < 2 || e > 2045) return 0;
+    double u1 = x * y, u2 = fma(x, y, -u1), s = z + u2, bs = s - z,
+           a2 = (z - (s - bs)) + (u2 - bs), t = u1 + s, bt = t - u1,
+           b2 = (u1 - (t - bt)) + (s - bt), g = (t - r) + b2;
+    if (g + a2 != 0) cpu->fpsr |= IXC;
+    *out = rb;
+    return 1;
+}
 /* FPMulAdd: c + a * b, rounded once */
 static uint64_t ffma(
     struct kb_cpu* cpu, uint64_t c, uint64_t a, uint64_t b, int n
 ) {
-    uint64_t ops[3] = {c & nmask(n), a & nmask(n), b & nmask(n)}, r;
+    uint64_t r;
+#ifndef KB_NO_FMA_FAST
+    if (n == 32 && fast_fma32(cpu, c, a, b, &r)) return r;
+    if (n == 64 && fast_fma64(cpu, c, a, b, &r)) return r;
+#endif
+    uint64_t ops[3] = {c & nmask(n), a & nmask(n), b & nmask(n)};
     struct fpv v[3] = {
         unpack(cpu, ops[0], n), unpack(cpu, ops[1], n), unpack(cpu, ops[2], n)
     };

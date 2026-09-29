@@ -1039,6 +1039,23 @@ for (const t of ['s', 'd'] as const) {
 			6
 		);
 	}
+	// default FPCR at the edges of the host fast path: subnormal, overflowing, tiny and NaN operands
+	const fma = `fmadd ${t}0, ${t}1, ${t}2, ${t}3`;
+	for (const [name, kinds] of [
+		['subnormal', `i${u}${u}${u}`],
+		['subnormal factor', `i${u}${m}${m}`],
+		['subnormal addend', `i${m}${m}${u}`],
+		['overflow', `i${o}${o}${o}`],
+		['overflow product', `i${o}${m}${m}`],
+		['overflow sum', `i${m}${m}${o}`],
+		['tiny', `i${w}${w}${w}`],
+		['tiny sum', `i${w}${w}${u}`],
+		['nan factor', `i${n}${m}${m}`],
+		['nan addend', `i${m}${m}${n}`],
+		['special', `i${n}${n}${n}`]
+	] as const)
+		addV(`fmadd ${t} default ${name}`, fma, kinds, 8);
+	addV(`fmadd ${t} default residual`, fma, `i${m}${m}${c}`, 8);
 	// FZ on every kind of operation, and FZ with a directed mode
 	for (const [op, code, kinds] of [
 		['fsub', `fsub ${t}0, ${t}1, ${t}2`, `i${u}${u}i`],
@@ -1136,6 +1153,19 @@ for (const [mode, name] of RMODES) {
 	])
 		addV(`${code} ${name}`, `${rm}${code}`, kinds, 4);
 }
+// vector fused multiply-add at the edges of the host fast path, default FPCR
+for (const [code, kinds] of [
+	['fmla v0.4s, v1.4s, v2.4s', 'ZZZi'],
+	['fmls v0.4s, v1.4s, v2.4s', 'ZZZi'],
+	['fmla v0.4s, v1.4s, v2.4s', 'uuui'],
+	['fmla v0.4s, v1.4s, v2.4s', 'oooi'],
+	['fmla v0.4s, v1.4s, v2.4s', 'wwui'],
+	['fmla v0.2d, v1.2d, v2.2d', 'NNNi'],
+	['fmla v0.2d, v1.2d, v2.2d', 'UUUi'],
+	['fmla v0.2d, v1.2d, v2.2d', 'OOOi'],
+	['fmla v0.2d, v1.2d, v2.2d', 'WWUi']
+])
+	addV(`${code} default ${kinds}`, code, kinds, 6);
 for (const [code, kinds] of [
 	['fcvtl v0.4s, v1.4h', 'iPii'],
 	['fcvtl2 v0.4s, v1.8h', 'iPii'],
