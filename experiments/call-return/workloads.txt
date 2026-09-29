@@ -1,0 +1,6 @@
+bash-func|@ $U/bash -c 'f() { s=$((s+$1)); }; i=0; s=0; while [ $i -lt 6000 ]; do f $i; i=$((i+1)); done; echo $s'
+bash-arith|@ $U/bash -c 'i=0; s=0; while [ $i -lt 6000 ]; do s=$((s+i*i%7)); i=$((i+1)); done; echo $s'
+sqlite-cte|@ $U/sqlite3 :memory: 'with recursive c(x) as (select 1 union all select x+1 from c where x<100000) select count(*), sum(x*x) % 1000003 from c;'
+sqlite-index|@ $U/sqlite3 :memory: 'create table t(a text, b int); with recursive c(x) as (select 1 union all select x+1 from c where x<30000) insert into t select hex(x*2654435761), x from c; create index ta on t(a); select count(*) from t where a > "9";'
+awk-keys|@ $T/busybox awk '{c[$1 % 500]++; t = t + length($1)} END {for (k in c) n += c[k]; print n, t}' in30k
+sort|@ $U/coreutils --coreutils-prog=sort -r in
