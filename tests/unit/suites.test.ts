@@ -2,8 +2,8 @@ import { mkdirSync, mkdtempSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
-import { command, pairs, results } from '../suites/coreutils-gmux.ts';
-import { KV, onBaseline } from '../suites/free.ts';
+import { same } from '../suites/account.ts';
+import { command, pairs, results, settle } from '../suites/coreutils-gmux.ts';
 
 describe('tests/suites, the upstream suite runner', () => {
 	it("reads the driver's lines from a machine's console, CRs and log lines and all", () => {
@@ -25,6 +25,23 @@ describe('tests/suites, the upstream suite runner', () => {
 		expect(command(['tests/a.sh'], true)).toMatch(/^CU_LOG=1 sh /);
 	});
 
+	it('ends a hung test as TIMEOUT and runs the rest of its batch again, or reports LOST', () => {
+		const got = new Map([
+			['a', 'PASS'],
+			['b', 'FAIL']
+		]);
+		expect(settle(['a', 'b'], got, true)).toEqual({ lines: ['PASS a', 'FAIL b'], rest: [] });
+		expect(settle(['a', 'b', 'c', 'd'], got, true)).toEqual({
+			lines: ['PASS a', 'FAIL b', 'TIMEOUT c'],
+			rest: ['d']
+		});
+		expect(settle(['a', 'b', 'c', 'd'], got, false)).toEqual({
+			lines: ['PASS a', 'FAIL b', 'LOST c', 'LOST d'],
+			rest: []
+		});
+		expect(settle(['c'], new Map(), true)).toEqual({ lines: ['TIMEOUT c'], rest: [] });
+	});
+
 	it('puts the tree under /cu with its bash and the driver', () => {
 		const cu = mkdtempSync(join(tmpdir(), 'gmux-suite-'));
 		mkdirSync(join(cu, 'tests/misc'), { recursive: true });
@@ -40,12 +57,11 @@ describe('tests/suites, the upstream suite runner', () => {
 		);
 	});
 
-	it('holds the Free account to its baseline: no Worker, no namespace, only its two KV', () => {
-		expect(onBaseline({ workers: [], namespaces: [], kv: [...KV].reverse() })).toBe(true);
-		expect(onBaseline({ workers: ['gmux-suite'], namespaces: [], kv: KV })).toBe(false);
-		expect(onBaseline({ workers: [], namespaces: ['gmux-suite_SuiteMachine'], kv: KV })).toBe(
-			false
-		);
-		expect(onBaseline({ workers: [], namespaces: [], kv: [KV[0]!] })).toBe(false);
+	it('compares an account with what it held before, whatever the order', () => {
+		const before = { workers: ['a', 'b'], namespaces: ['n'], kv: ['x', 'y'] };
+		expect(same(before, { workers: ['b', 'a'], namespaces: ['n'], kv: ['y', 'x'] })).toBe(true);
+		expect(same(before, { ...before, workers: ['a', 'b', 'gmux-suite'] })).toBe(false);
+		expect(same(before, { ...before, namespaces: [] })).toBe(false);
+		expect(same(before, { ...before, kv: ['x'] })).toBe(false);
 	});
 });

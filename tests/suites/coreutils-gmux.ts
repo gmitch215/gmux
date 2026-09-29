@@ -9,6 +9,7 @@ import {
 } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join, relative } from 'node:path';
+import { isMainThread, parentPort, Worker, workerData } from 'node:worker_threads';
 import { appendCpio } from '../../scripts/wasm/cpio-append.ts';
 import { Machine } from '../../src/worker/machine/machine.ts';
 
@@ -22,7 +23,9 @@ import { Machine } from '../../src/worker/machine/machine.ts';
  * BATCH sets the tests per machine (default 20), PAGES the machine's memory (default 2400 in Node,
  * 800 deployed: a Free isolate running these at 1200 exceeds its 128 MB and is reset), WALL the ms a
  * deployed request runs the machine, CU_LOG=1 the end of each failing test's log, DEBUG=1 each
- * exchange with the Worker, RAW=<file> every machine's console, GMUX_BUILD another build
+ * exchange with the Worker, RAW=<file> every machine's console, GMUX_BUILD another build,
+ * TEST_TIMEOUT the seconds a Node test may run before its machine is ended and it prints TIMEOUT
+ * (default 120), TIMES=<file> the ms each Node test took
  */
 const RESULT = /^(PASS|FAIL|SKIP|ERROR) (tests\/\S+)\r?$/gm;
 const DRIVER = '/coreutils-test.sh';
@@ -50,7 +53,39 @@ export function results(output: string): Map<string, string> {
 	return new Map([...output.matchAll(RESULT)].map((m) => [m[2]!, m[1]!]));
 }
 
-async function inNode(image: Uint8Array, tests: string[]): Promise<string> {
+/**
+ * a test that runs longer than this many seconds (boot included for a batch's first) is ended as
+ * TIMEOUT; the slowest passing test at 1200 pages took 50 s, 99% under 10 s
+ */
+export const TEST_TIMEOUT = 120;
+
+/**
+ * the output lines for a batch and the tests still to run: results in order up to the first test
+ * with none; that one is TIMEOUT when its machine was ended for it (the rest run on a new machine),
+ * else LOST
+ */
+export function settle(
+	tests: string[],
+	got: Map<string, string>,
+	timedOut: boolean
+): { lines: string[]; rest: string[] } {
+	const at = tests.findIndex((t) => !got.has(t));
+	if (at < 0) return { lines: tests.map((t) => `${got.get(t)} ${t}`), rest: [] };
+	const lines = tests.slice(0, at).map((t) => `${got.get(t)} ${t}`);
+	if (!timedOut)
+		return {
+			lines: [...lines, ...tests.slice(at).map((t) => `${got.get(t) ?? 'LOST'} ${t}`)],
+			rest: []
+		};
+	return { lines: [...lines, `TIMEOUT ${tests[at]}`], rest: tests.slice(at + 1) };
+}
+
+/** a machine in this thread, sending each chunk of its console to `post` until the batch ends */
+async function inMachine(
+	initrd: string,
+	tests: string[],
+	post: (text: string) => void
+): Promise<void> {
 	const root = new URL('../../', import.meta.url).pathname;
 	const build = process.env.GMUX_BUILD ?? join(root, 'build');
 	const read = (p: string) => new Uint8Array(readFileSync(join(build, p)));
@@ -59,7 +94,7 @@ async function inNode(image: Uint8Array, tests: string[]): Promise<string> {
 	let typed = false;
 	const machine = new Machine({
 		vmlinux: new WebAssembly.Module(read('kernel/vmlinux.wasm')),
-		initrd: image,
+		initrd: new Uint8Array(readFileSync(initrd)),
 		cmdline: 'maxcpus=3 root=/dev/ram0 rootfstype=ramfs init=/init console=hvc console=ttyS0',
 		registry: new Map([
 			[manifest.busybox as string, new WebAssembly.Module(read('kernel/busybox.wasm'))],
@@ -70,18 +105,54 @@ async function inNode(image: Uint8Array, tests: string[]): Promise<string> {
 		sharedKernel: true,
 		write: (text) => {
 			output += text;
+			post(text);
 			if (!typed && output.includes('# ')) {
 				typed = true;
 				machine.type(`${command(tests, !!process.env.CU_LOG)}\n`);
 			}
 		}
 	});
-	const started = Date.now();
 	await machine.run(
-		() => output.includes('END-42') || Date.now() - started > tests.length * 600_000,
+		() => output.includes('END-42'),
 		(ms) => new Promise((r) => setTimeout(r, Math.min(ms, 50)))
 	);
-	return output;
+}
+
+/**
+ * one batch in a worker thread, ended from here when a test has run past the limit: a guest that
+ * spins inside one machine step never returns to that machine's own loop, so only another thread
+ * can stop it
+ */
+function inNode(initrd: string, tests: string[]): Promise<{ output: string; timedOut: boolean }> {
+	const limit = Number(process.env.TEST_TIMEOUT ?? TEST_TIMEOUT) * 1000;
+	return new Promise((resolve) => {
+		const worker = new Worker(new URL(import.meta.url), { workerData: { initrd, tests } });
+		let output = '';
+		let mark = Date.now();
+		const finish = (timedOut: boolean) => {
+			clearInterval(watchdog);
+			void worker.terminate();
+			resolve({ output, timedOut });
+		};
+		const watchdog = setInterval(() => Date.now() - mark > limit && finish(true), 1000);
+		worker.on('message', (text: string | null) => {
+			if (text === null) return finish(false);
+			output += text;
+			for (const m of text.matchAll(RESULT)) {
+				// TIMES=<file> keeps the ms each test took (the first includes the boot)
+				if (process.env.TIMES)
+					appendFileSync(process.env.TIMES, `${Date.now() - mark} ${m[1]} ${m[2]}\n`);
+				mark = Date.now();
+			}
+		});
+		worker.on('error', () => finish(false));
+	});
+}
+
+if (!isMainThread && workerData?.initrd) {
+	const { initrd, tests } = workerData as { initrd: string; tests: string[] };
+	await inMachine(initrd, tests, (text) => parentPort!.postMessage(text));
+	parentPort!.postMessage(null);
 }
 
 /** one batch on a deployed rig: boot, type the batch, poll until the marker; null if the machine was lost */
@@ -157,7 +228,6 @@ if (import.meta.main) {
 		);
 	}
 	if (stage) process.exit(0);
-	const image = url ? new Uint8Array() : new Uint8Array(readFileSync(initrd));
 	// a new deployment answers "Worker not found" for its Durable Objects for a while
 	for (let waited = 0; url && waited < 180; waited += 5) {
 		const r = await fetch(`${url}/abort?do=ready`).catch(() => null);
@@ -166,16 +236,21 @@ if (import.meta.main) {
 	}
 	let lost = 0;
 	for (let i = 0; i < all.length; i += size) {
-		const batch = all.slice(i, i + size);
-		let out: string | null = null;
-		for (let attempt = 0; attempt < 3 && out === null; attempt++) {
-			out = url ? await deployed(url, batch) : await inNode(image, batch);
-			if (out === null) lost++;
+		// a test that hangs ends its machine; the rest of its batch runs on a new one
+		for (let todo = all.slice(i, i + size); todo.length;) {
+			let out: string | null = null;
+			let timedOut = false;
+			for (let attempt = 0; attempt < 3 && out === null; attempt++) {
+				if (url) out = await deployed(url, todo);
+				else ({ output: out, timedOut } = await inNode(initrd, todo));
+				if (out === null) lost++;
+			}
+			// RAW=<file> keeps every machine's console
+			if (process.env.RAW) appendFileSync(process.env.RAW, out ?? '');
+			const step = settle(todo, results(out ?? ''), timedOut);
+			for (const line of step.lines) console.log(line);
+			todo = step.rest;
 		}
-		// RAW=<file> keeps every machine's console
-		if (process.env.RAW) appendFileSync(process.env.RAW, out ?? '');
-		const got = results(out ?? '');
-		for (const t of batch) console.log(`${got.get(t) ?? 'LOST'} ${t}`);
 	}
 	if (lost) console.error(`machines lost to the platform: ${lost}`);
 }

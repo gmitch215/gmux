@@ -7,10 +7,11 @@
 # under ~/gmux-rig/t3, or local, work under build/suite/native; default local). The test container
 # is read-only with size-capped tmpfs for the tree and scratch, so a test that writes without bound
 # stops at the cap, not at the host's disk; a remote host needs 25 GB free before anything starts.
-# The gmux side deploys tests/suites/worker to the Free account (FREE_CLOUDFLARE_ACCOUNT_ID,
-# FREE_CLOUDFLARE_API_TOKEN), runs the tests in machines there, deletes the Worker and checks the
-# account is back on its baseline; GMUX_URL=<a deployed suite Worker> uses that one instead, NODE=1
-# runs the machines in Node.
+# The gmux side deploys tests/suites/worker as WORKER_NAME to the account wrangler reads
+# (CLOUDFLARE_ACCOUNT_ID, CLOUDFLARE_API_TOKEN), runs the tests in machines there, deletes the Worker
+# and checks the account holds what it held before; GMUX_URL=<a deployed suite Worker> uses that one
+# instead, NODE=1 runs the machines in Node. GMUX_BUILD stages another build (default build/), and
+# WORKER_DIR another copy of the Worker whose ../../../build is that build.
 # usage: tests/suites/coreutils.sh [test...]  (default: every shell test)
 set -euo pipefail
 here=$(cd "$(dirname "$0")" && pwd)
@@ -60,15 +61,18 @@ if [ -n "${NODE:-}" ]; then
 else
 	url=${GMUX_URL:-}
 	if [ -z "$url" ]; then
-		"${node[@]}" "$here/coreutils-gmux.ts" "$out/cu" "$out/bash" --stage "$root/build/suite/assets/initramfs.bin"
-		export CLOUDFLARE_ACCOUNT_ID=${FREE_CLOUDFLARE_ACCOUNT_ID:?} CLOUDFLARE_API_TOKEN=${FREE_CLOUDFLARE_API_TOKEN:?}
+		name=${WORKER_NAME:?WORKER_NAME names the Worker to deploy}
+		: "${CLOUDFLARE_ACCOUNT_ID:?}" "${CLOUDFLARE_API_TOKEN:?}"
+		worker=${WORKER_DIR:-$here/worker}
+		"${node[@]}" "$here/coreutils-gmux.ts" "$out/cu" "$out/bash" --stage "${GMUX_BUILD:-$root/build}/suite/assets/initramfs.bin"
+		bun "$here/account.ts" save "$out/account.json"
 		teardown() {
-			(cd "$here/worker" && bunx wrangler delete --force > /dev/null 2>&1) || true
+			(cd "$worker" && bunx wrangler delete --name "$name" --force > /dev/null 2>&1) || true
 			echo "deleted at $(date +%T)"
-			bun "$here/free.ts"
+			bun "$here/account.ts" check "$out/account.json"
 		}
 		trap teardown EXIT
-		url=$(cd "$here/worker" && bunx wrangler deploy 2>&1 | grep -o 'https://[^ ]*\.workers\.dev' | head -1)
+		url=$(cd "$worker" && bunx wrangler deploy --name "$name" 2>&1 | grep -o 'https://[^ ]*\.workers\.dev' | head -1)
 		[ -n "$url" ] || {
 			echo "deploy gave no URL" >&2
 			exit 1
