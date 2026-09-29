@@ -171,13 +171,16 @@ static inline __attribute__((always_inline)) int aot_muldiv(
    between lifted blocks without looking for a pending signal (the verification
    check stays: an unmatched block has no IR to run), -DAOT_NO_RANGE_CHECK
    trusts a load or store's cached mapping whenever its generation holds */
-/* back: the transition goes to the same or a lower address; KB_POLL (kb.h)
-   polls only there, or every KB_POLL_FUEL transitions */
+/* back: the transition goes to the same or a lower address; AOT_POLL (kb.h's
+   KB_POLL unless set) polls only there, or every KB_POLL_FUEL transitions */
+#ifndef AOT_POLL
+    #define AOT_POLL KB_POLL
+#endif
 #ifdef AOT_NO_SIGNAL_CHECK
     #define AOT_CONTINUE(ok, back) (ok)
-#elif KB_POLL == 1 || KB_POLL == 2
+#elif AOT_POLL == 1 || AOT_POLL == 2
     #define AOT_CONTINUE(ok, back) ((!(back) || !*kb_pending_flag) && (ok))
-#elif KB_POLL == 3
+#elif AOT_POLL == 3
     #define AOT_CONTINUE(ok, back)                                             \
         ((--fuel || (fuel = KB_POLL_FUEL, !*kb_pending_flag)) && (ok))
 #else

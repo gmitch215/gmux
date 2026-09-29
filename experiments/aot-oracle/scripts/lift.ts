@@ -5,11 +5,20 @@ import { readFileSync, writeFileSync } from 'node:fs';
  * dump (one process), which clang then compiles into katybug.wasm with -DKB_AOT. A region holds guest
  * registers and flags in locals and moves between its blocks with goto; everything else leaves to the
  * interpreter. A decoded block runs a region only if its IR matches the lifted one exactly
- * (kb_aot_attach), so the guard is the IR itself.
+ * (kb_aot_attach), so the guard is the IR itself. A block may be a trace (KB_EXIT side exits).
  *
- * `lift.ts <out.c> <coverage 0..1> <dump.hot>...`
+ * `lift.ts [--temps] [--nogroups] [--windows] <out.c> <coverage 0..1> <dump.hot>...`
+ *
+ * The flags are the representation ladder's rungs (ladder.sh): `--temps` keeps only architectural
+ * registers across blocks and helper calls, `--nogroups` ignores the memory plan's KB_RESOLVE groups,
+ * `--windows` runs each block's provable accesses (entry base or constant address plus offset) as
+ * plain host accesses inside windows resolved once at the block's entry, with a checked copy of the
+ * block for a window that does not resolve.
  */
-const [out = '', coverageArg = '0.99', ...dumps] = process.argv.slice(2);
+const args = process.argv.slice(2);
+const flags = new Set(args.filter((a) => a.startsWith('--')));
+const [out = '', coverageArg = '0.99', ...dumps] = args.filter((a) => !a.startsWith('--'));
+const opt = { temps: flags.has('--temps'), nogroups: flags.has('--nogroups'), windows: flags.has('--windows') };
 const coverage = Number(coverageArg);
 const root = new URL('../../../', import.meta.url).pathname;
 
@@ -21,7 +30,11 @@ const OPS = opBody
 	.map((s) => s.trim())
 	.filter(Boolean);
 const op = Object.fromEntries(OPS.map((name, i) => [name.replace(/^KB_/, ''), i])) as Record<string, number>;
+const opName = (o: number) => OPS[o]!.replace(/^KB_/, '');
 const KB_ZERO = 63;
+const KB_T0 = 32;
+const SPAN = 16 * 255; // the memory plan's window (run.c plan_mem)
+const MAX_WINDOWS = 8;
 
 interface Ins {
 	op: number;
@@ -53,6 +66,7 @@ function parse(path: string): Block[] {
 		}
 		blocks.push({ pc: BigInt(`0x${m[1]}`), next: BigInt(`0x${m[2]}`), target: BigInt(`0x${m[3]}`), runs: BigInt(m[5]!), ins });
 		i += n;
+		if ((lines[i + 1] ?? '').startsWith('exits')) i++;
 	}
 	return blocks;
 }
@@ -63,9 +77,161 @@ const liftable = (b: Block) => b.ins.every((x) => !unliftable.has(x.op));
 const hex = (v: bigint) => `0x${BigInt.asUintN(64, v).toString(16)}ull`;
 const imm64 = (v: bigint) => `(uint64_t) ${hex(v)}`;
 
+// the registers an op reads and writes, for the temporaries' liveness
+function rw(x: Ins): { r: number[]; w: number[] } {
+	const name = opName(x.op);
+	switch (name) {
+		case 'MOVI':
+		case 'CARRY':
+		case 'SETCC':
+		case 'FSBASE':
+			return { r: [], w: [x.a] };
+		case 'MOV':
+		case 'ZEXT':
+		case 'SEXT':
+		case 'BSWAP':
+		case 'CLZ':
+		case 'CTZ':
+		case 'POPCNT':
+		case 'LD':
+		case 'LDS':
+			return { r: [x.b], w: [x.a] };
+		case 'ADD':
+		case 'SUB':
+		case 'AND':
+		case 'OR':
+		case 'XOR':
+		case 'SHL':
+		case 'SHR':
+		case 'SAR':
+		case 'ROR':
+		case 'MUL':
+		case 'UMULH':
+		case 'SMULH':
+		case 'UDIV':
+		case 'SDIV':
+		case 'UREM':
+		case 'SREM':
+		case 'SEL':
+			return { r: [x.b, x.c], w: [x.a] };
+		case 'INS':
+			return { r: [x.a, x.b], w: [x.a] };
+		case 'X86SHD':
+			return { r: [x.a, x.b, x.c], w: [x.a] };
+		case 'ST':
+		case 'FLAGS':
+			return { r: name === 'ST' ? [x.a, x.b] : [x.a, x.b, x.c], w: [] };
+		case 'BRZ':
+			return { r: [x.a], w: [] };
+		case 'EXIT':
+			return { r: x.imm & 0x100n ? [x.a] : [], w: [] };
+		case 'JMP':
+		case 'X86MD':
+		case 'RESOLVE':
+		case 'SSE':
+		case 'X87':
+			return { r: [x.b], w: [] };
+		case 'X86FLAGS':
+			return x.imm === 0n ? { r: [], w: [x.a] } : x.imm === 1n ? { r: [x.a], w: [] } : { r: [], w: [] };
+		default:
+			return { r: [], w: [] };
+	}
+}
+const isTemp = (r: number) => r >= KB_T0 && r < KB_ZERO;
+
+// the entry-relative windows of a block: accesses whose base is a register's entry value or a
+// constant, plus an offset, grouped into spans the memory plan's size, at most MAX_WINDOWS
+interface Win {
+	root: number; // register, or -1 for a constant address
+	lo: bigint;
+	hi: bigint;
+}
+interface Hit {
+	win: number;
+	off: bigint;
+}
+function windowsOf(b: Block): { wins: Win[]; hits: Map<number, Hit> } {
+	type Val = { k: 'root'; id: number; off: bigint } | { k: 'const'; off: bigint } | { k: 'unk' };
+	const v: Val[] = Array.from({ length: 64 }, (_, r) => (r === KB_ZERO ? { k: 'const', off: 0n } : { k: 'root', id: r, off: 0n }));
+	const unk = (...regs: number[]) => {
+		for (const r of regs) if (r < 64 && r !== KB_ZERO) v[r] = { k: 'unk' };
+	};
+	const acc: { i: number; root: number; off: bigint; w: number }[] = [];
+	const add = (p: bigint, q: bigint, sub = false) => BigInt.asIntN(64, sub ? p - q : p + q);
+	for (const [i, x] of b.ins.entries()) {
+		const name = opName(x.op);
+		if (name === 'LD' || name === 'LDS' || name === 'ST') {
+			const B = v[x.b]!;
+			if (B.k === 'const') acc.push({ i, root: -1, off: add(B.off, x.imm), w: x.w });
+			else if (B.k === 'root' && B.id < KB_T0) acc.push({ i, root: B.id, off: add(B.off, x.imm), w: x.w });
+			if (name !== 'ST') unk(x.a);
+			continue;
+		}
+		if (name === 'SYSCALL') {
+			unk(0, 1, 11);
+			continue;
+		}
+		if (name === 'X86MD') unk(0, 2);
+		else if (name === 'X86STR') unk(7, 6, 1);
+		else if (name === 'SSE') {
+			const code = Number(x.imm & 0xffn);
+			const pre = Number((x.imm >> 8n) & 0xffn);
+			if ([0x2c, 0x2d, 0x50, 0xc5, 0xd7].includes(code)) unk(x.a & 15);
+			if (code === 0x7e && pre === 0x66 && !(x.c & 0x80)) unk(x.c & 15);
+		} else if (name === 'X87') {
+			if (Number(x.imm & 0xffffn) === 0xdfe0) unk(0);
+		} else {
+			const { w } = rw(x);
+			for (const a of w) {
+				if (a === KB_ZERO) continue;
+				const B = v[x.b]!;
+				const C = v[x.c]!;
+				if (name === 'MOVI') v[a] = { k: 'const', off: BigInt.asIntN(64, x.imm) };
+				else if (name === 'MOV') v[a] = B;
+				else if (name === 'ADD' || name === 'SUB') {
+					const sub = name === 'SUB';
+					if (B.k === 'const' && C.k === 'const') v[a] = { k: 'const', off: add(B.off, C.off, sub) };
+					else if (B.k === 'root' && C.k === 'const') v[a] = { k: 'root', id: B.id, off: add(B.off, C.off, sub) };
+					else if (!sub && B.k === 'const' && C.k === 'root') v[a] = { k: 'root', id: C.id, off: add(B.off, C.off) };
+					else v[a] = { k: 'unk' };
+				} else if ((name === 'ZEXT' || name === 'SEXT') && x.w >= 8) v[a] = B;
+				else v[a] = { k: 'unk' };
+			}
+		}
+	}
+	const wins: Win[] = [];
+	const hits = new Map<number, Hit>();
+	const roots = [...new Set(acc.map((a) => a.root))];
+	const found: { win: Win; list: typeof acc }[] = [];
+	for (const rt of roots) {
+		const list = acc.filter((a) => a.root === rt).sort((p, q) => (p.off < q.off ? -1 : p.off > q.off ? 1 : 0));
+		for (let s = 0; s < list.length; ) {
+			let e = s + 1;
+			let hi = list[s]!.off + BigInt(list[s]!.w);
+			while (e < list.length) {
+				const end = list[e]!.off + BigInt(list[e]!.w);
+				if (Number((end > hi ? end : hi) - list[s]!.off) > SPAN) break;
+				if (end > hi) hi = end;
+				e++;
+			}
+			found.push({ win: { root: rt, lo: list[s]!.off, hi }, list: list.slice(s, e) });
+			s = e;
+		}
+	}
+	found.sort((p, q) => q.list.length - p.list.length);
+	for (const f of found.slice(0, MAX_WINDOWS)) {
+		wins.push(f.win);
+		for (const a of f.list) hits.set(a.i, { win: wins.length - 1, off: a.off - f.win.lo });
+	}
+	return { wins, hits };
+}
+
 const lines: string[] = ['#include <string.h>', '#include "aot.h"', ''];
 const table: { pc: bigint; next: bigint; target: bigint; n: number; region: number; idx: number; name: string }[] = [];
 const regionNames: string[] = [];
+const regionSizes: number[] = [];
+let irIns = 0;
+let windowCount = 0;
 
 dumps.forEach((dump, region) => {
 	const all = parse(dump);
@@ -85,11 +251,12 @@ dumps.forEach((dump, region) => {
 
 	const R = `r${region}`;
 	regionNames.push(`${R}_run`);
+	regionSizes.push(chosen.length);
 	const index = new Map(chosen.map((b, j) => [b.pc, j]));
 	// the fields that name registers: SSE and x87 carry an xmm index and a memory marker in a and c,
 	// and string ops read theirs through the cpu after the spill
 	const registerFields = (x: Ins) => {
-		const name = OPS[x.op]!.replace(/^KB_/, '');
+		const name = opName(x.op);
 		if (name === 'SSE' || name === 'X87') return [x.b];
 		if (name === 'X86STR' || name === 'PC' || name === 'SYSCALL') return [];
 		// an access's c and a resolve's a are memory-plan groups
@@ -99,51 +266,75 @@ dumps.forEach((dump, region) => {
 	};
 	const regs = new Set<number>([0, 2]);
 	for (const b of chosen) for (const x of b.ins) for (const r of registerFields(x)) if (r !== KB_ZERO) regs.add(r);
+	// a temporary read before it is written in a block lives across blocks and stays region state
+	const liveIn = new Set<number>();
+	for (const b of chosen) {
+		const written = new Set<number>();
+		for (const x of b.ins) {
+			const { r, w } = rw(x);
+			for (const t of r) if (isTemp(t) && t !== 62 && !written.has(t)) liveIn.add(t);
+			for (const t of w) written.add(t);
+		}
+	}
+	if (liveIn.size) console.error(`${dump}: temporaries live across blocks: ${[...liveIn].join(' ')}`);
+	const cross = (r: number) => !opt.temps || !isTemp(r) || liveIn.has(r);
 	const reg = (r: number) => (r === KB_ZERO ? '(uint64_t) 0' : `g${r}`);
 	const dst = (r: number) => (r === KB_ZERO ? 'sink' : `g${r}`);
-	const regList = [...regs].sort((a, b) => a - b);
+	const regList = [...regs].filter(cross).sort((a, b) => a - b);
 
-	chosen.forEach((b, j) => {
-		lines.push(`static const struct kb_ins ${R}_i${j}[] = {`);
-		for (const x of b.ins) lines.push(`\t{${x.op}, ${x.w}, ${x.a}, ${x.b}, ${x.c}, (int64_t) ${hex(x.imm)}},`);
-		lines.push('};');
-		table.push({ pc: b.pc, next: b.next, target: b.target, n: b.ins.length, region, idx: j, name: `${R}_i${j}` });
-	});
-	lines.push(`static unsigned char ${R}_ok[${chosen.length}];`, `static struct kb_block* ${R}_blk[${chosen.length}];`, '');
-
-	const body: string[] = [];
-	let ipcNow = 0n;
-	// the cpu words each moves: ipc, the registers, five flags and df; a reload also reads mapgen
-	const state = regList.length + 7;
-	const spill = () => {
-		body.push(`\tcpu->ipc = ${hex(ipcNow)};`);
-		body.push(...regList.map((r) => `\tcpu->r[${r}] = g${r};`));
-		body.push('\tcpu->n = f.n; cpu->z = f.z; cpu->c = f.c; cpu->v = f.v; cpu->p = f.p; cpu->df = df;');
-		body.push(`\tAOT_COUNT_WR(${state});`);
-	};
-	const reload = () => {
-		body.push(...regList.map((r) => `\tg${r} = cpu->r[${r}];`));
-		body.push('\tf.n = cpu->n; f.z = cpu->z; f.c = cpu->c; f.v = cpu->v; f.p = cpu->p; df = cpu->df; gen = cpu->mapgen;');
-		body.push(`\tAOT_COUNT_RD(${state});`);
-	};
-	// a block's exit: straight into the next lifted block when there is one and no signal waits
-	const leave = (from: bigint, to: bigint) => {
-		const k = index.get(to);
-		if (k === undefined) return `{ pc = ${hex(to)}; goto out; }`;
-		return `{ if (AOT_CONTINUE(${R}_ok[${k}], ${to <= from ? 1 : 0})) goto B${k}; pc = ${hex(to)}; goto out; }`;
-	};
-
-	chosen.forEach((b, j) => {
-		body.push(`B${j}: {`, `\tstruct kb_ic* ic = ${R}_blk[${j}]->ic;`, '\t(void) ic;', `\tAOT_COUNT_BLOCK(${R}_blk[${j}]);`);
+	const emit = (b: Block, j: number, mode: 'plain' | 'fast' | 'slow') => {
+		const fast = mode === 'fast';
+		const pin = fast ? windowsOf(b) : { wins: [] as Win[], hits: new Map<number, Hit>() };
+		const label = mode === 'slow' ? `S${j}` : `B${j}`;
+		const body: string[] = [];
+		let ipcNow = 0n;
 		let ipc = b.pc;
 		let m = 0;
+		const grouped = (x: Ins) => !opt.nogroups && x.c !== 0;
+		const temps = opt.temps ? [...new Set(b.ins.flatMap((x) => [...registerFields(x), ...rw(x).w]))].filter((r) => isTemp(r) && !cross(r)) : [];
+		// the cpu words each moves: ipc, the registers, five flags and df; a reload also reads mapgen
+		const state = regList.length + 7;
+		const spill = (extra: number[]) => {
+			body.push(`\tcpu->ipc = ${hex(ipcNow)};`);
+			body.push(...[...regList, ...extra].map((r) => `\tcpu->r[${r}] = g${r};`));
+			body.push('\tcpu->n = f.n; cpu->z = f.z; cpu->c = f.c; cpu->v = f.v; cpu->p = f.p; cpu->df = df;');
+			body.push(`\tAOT_COUNT_WR(${state + extra.length});`);
+		};
+		const reload = () => {
+			body.push(...regList.map((r) => `\tg${r} = cpu->r[${r}];`));
+			body.push('\tf.n = cpu->n; f.z = cpu->z; f.c = cpu->c; f.v = cpu->v; f.p = cpu->p; df = cpu->df; gen = cpu->mapgen;');
+			body.push(`\tAOT_COUNT_RD(${state});`);
+		};
+		// a block's exit: straight into the next lifted block when there is one and no signal waits
+		const leave = (from: bigint, to: bigint) => {
+			const k = index.get(to);
+			if (k === undefined) return `{ pc = ${hex(to)}; goto out; }`;
+			return `{ if (AOT_CONTINUE(${R}_ok[${k}], ${to <= from ? 1 : 0})) goto B${k}; pc = ${hex(to)}; goto out; }`;
+		};
 		const fault = (why?: string, sig?: number) =>
 			`{ ${why ? `cpu->fault = "${why}"; cpu->fault_sig = ${sig}; ` : ''}cpu->ipc = ${hex(ipc)}; pc = ${hex(b.pc)}; goto out; }`;
+
+		body.push(`${label}: {`, `\tstruct kb_ic* ic = ${R}_blk[${j}]->ic;`, '\t(void) ic;', `\tAOT_COUNT_BLOCK(${R}_blk[${j}]);`);
+		if (temps.length) body.push(`\tuint64_t ${temps.map((r) => `g${r}`).join(', ')};`);
+		if (pin.wins.length) {
+			const base = windowCount;
+			windowCount += pin.wins.length;
+			body.push(`\tuint8_t *${pin.wins.map((_, k) => `w${k}`).join(', *')};`);
+			pin.wins.forEach((w, k) => {
+				const len = Number(w.hi - w.lo);
+				const va = w.root < 0 ? hex(w.lo) : `${reg(w.root)} + ${imm64(w.lo)}`;
+				body.push(
+					`\t{ uint64_t va = ${va}; struct kb_ic* q = &${R}_win[${base + k}];`,
+					`\t  w${k} = q->gen == gen && ${len}u <= q->span && va - q->lo <= q->span - ${len}u ? q->host + (va - q->lo) : kb_host_ic(cpu, q, va, ${len}u); }`
+				);
+			});
+			body.push(`\tif (!(${pin.wins.map((_, k) => `w${k}`).join(' && ')})) goto S${j};`);
+		}
 		b.ins.forEach((x, i) => {
 			ipcNow = ipc;
 			const [A, B, C, W] = [reg(x.a), reg(x.b), reg(x.c), x.w];
 			const D = dst(x.a);
-			const name = OPS[x.op]!.replace(/^KB_/, '');
+			const name = opName(x.op);
 			switch (name) {
 				case 'MOVI': body.push(`\t${D} = ${imm64(x.imm)};`); break;
 				case 'MOV': body.push(`\t${D} = ${B};`); break;
@@ -175,25 +366,39 @@ dumps.forEach((dump, region) => {
 				case 'LD':
 				case 'LDS': {
 					const v = name === 'LDS' ? `(uint64_t) aot_sext(v, ${W})` : 'v';
+					const hit = pin.hits.get(i);
+					if (hit) {
+						body.push(`\t{ uint64_t v = 0; memcpy(&v, w${hit.win} + ${hit.off}, ${W}); ${D} = ${v}; }`);
+						m++;
+						break;
+					}
 					// a grouped access reads through its group's resolved bytes when the span resolved
 					const g = x.c - 1;
+					const gr = grouped(x);
 					// the interpreter writes a faulting load's destination before it checks, and so does this
 					body.push(
 						`\t{ uint64_t va = ${B} + ${imm64(x.imm)}, v = 0; struct kb_ic* q = &ic[${m}];`,
-						...(x.c ? [`\t  if (gh[${g}]) { memcpy(&v, gh[${g}] + (va - gva[${g}]), ${W}); ${D} = ${v}; } else {`] : []),
+						...(gr ? [`\t  if (gh[${g}]) { memcpy(&v, gh[${g}] + (va - gva[${g}]), ${W}); ${D} = ${v}; } else {`] : []),
 						`\t  int slow = __builtin_expect(AOT_SLOW(q, gen, va, ${W}), 0);`,
 						`\t  if (slow) v = kb_load_ic(cpu, q, va, ${W}); else memcpy(&v, q->host + (va - q->lo), ${W});`,
 						`\t  ${D} = ${v};`,
-						`\t  if (slow && cpu->fault) ${fault()} ${x.c ? '} ' : ''}}`
+						`\t  if (slow && cpu->fault) ${fault()} ${gr ? '} ' : ''}}`
 					);
 					m++;
 					break;
 				}
 				case 'ST': {
+					const hit = pin.hits.get(i);
+					if (hit) {
+						body.push(`\t{ uint64_t v = ${A}; memcpy(w${hit.win} + ${hit.off}, &v, ${W}); }`);
+						m++;
+						break;
+					}
 					const g = x.c - 1;
+					const gr = grouped(x);
 					body.push(
 						`\t{ uint64_t va = ${B} + ${imm64(x.imm)}, v = ${A}; struct kb_ic* q = &ic[${m}];`,
-						...(x.c ? [`\t  if (gh[${g}]) memcpy(gh[${g}] + (va - gva[${g}]), &v, ${W}); else`] : []),
+						...(gr ? [`\t  if (gh[${g}]) memcpy(gh[${g}] + (va - gva[${g}]), &v, ${W}); else`] : []),
 						`\t  if (__builtin_expect(AOT_SLOW(q, gen, va, ${W}), 0)) { kb_store_ic(cpu, q, va, v, ${W}); if (cpu->fault) ${fault()} }`,
 						`\t  else memcpy(q->host + (va - q->lo), &v, ${W}); }`
 					);
@@ -202,10 +407,11 @@ dumps.forEach((dump, region) => {
 				}
 				case 'RESOLVE':
 					// the whole span, range included: AOT_NO_RANGE_CHECK trusts accesses, never a span
-					body.push(
-						`\t{ uint64_t va = ${B} + ${imm64(x.imm)}; struct kb_ic* q = &ic[${m}]; gva[${x.a}] = va;`,
-						`\t  gh[${x.a}] = q->gen == gen && ${16 * W}u <= q->span && va - q->lo <= q->span - ${16 * W}u ? q->host + (va - q->lo) : kb_host_ic(cpu, q, va, ${16 * W}u); }`
-					);
+					if (!opt.nogroups && !fast)
+						body.push(
+							`\t{ uint64_t va = ${B} + ${imm64(x.imm)}; struct kb_ic* q = &ic[${m}]; gva[${x.a}] = va;`,
+							`\t  gh[${x.a}] = q->gen == gen && ${16 * W}u <= q->span && va - q->lo <= q->span - ${16 * W}u ? q->host + (va - q->lo) : kb_host_ic(cpu, q, va, ${16 * W}u); }`
+						);
 					m++;
 					break;
 				case 'FLAGS': body.push(`\taot_flags(&f, ${x.imm}, ${B}, ${C}, ${A}, ${W});`); break;
@@ -213,6 +419,12 @@ dumps.forEach((dump, region) => {
 				case 'SEL': body.push(`\t${D} = aot_cond(&f, ${x.imm}) ? ${B} : ${C};`); break;
 				case 'BR': body.push(`\tif (aot_cond(&f, ${x.imm})) ${leave(b.pc, b.target)}`); break;
 				case 'BRZ': body.push(`\tif ((${A} != 0) == ${x.imm !== 0n ? 1 : 0}) ${leave(b.pc, b.target)}`); break;
+				case 'EXIT': {
+					const to = BigInt.asUintN(64, b.pc + BigInt.asIntN(32, x.imm >> 16n));
+					const cond = x.imm & 0x100n ? `(${A} == 0) == ${x.imm & 1n ? 0 : 1}` : `aot_cond(&f, ${x.imm & 0xffn})`;
+					body.push(`\tif (${cond}) ${leave(b.pc, to)}`);
+					break;
+				}
 				case 'JMP': body.push(`\tpc = ${B}; if (AOT_CONTINUE(1, pc <= ${hex(b.pc)})) goto dispatch; goto out;`); break;
 				case 'PC': ipc = x.imm; break;
 				case 'CARRY': body.push(`\t${D} = (uint64_t) f.c;`); break;
@@ -241,7 +453,8 @@ dumps.forEach((dump, region) => {
 				case 'SSE':
 				case 'X87': {
 					const call = name === 'SSE' ? 'kb_sse' : 'kb_x87';
-					spill();
+					// a helper reads its address from the cpu; a temporary base is spilled for it alone
+					spill(isTemp(x.b) && !cross(x.b) ? [x.b] : []);
 					body.push(
 						`\tif (${call}(cpu, &${R}_blk[${j}]->ins[${i}]) && !cpu->fault) { cpu->fault = "unknown ${name.toLowerCase()} instruction"; cpu->fault_sig = 4; }`,
 						`\tif (cpu->fault) { cpu->ipc = ${hex(ipc)}; return ${hex(b.pc)}; }`
@@ -250,12 +463,12 @@ dumps.forEach((dump, region) => {
 					break;
 				}
 				case 'X86STR':
-					spill();
+					spill([]);
 					body.push(`\tkb_aot_string(cpu, ${x.imm}, ${W}, ${x.c});`, `\tif (cpu->fault) { cpu->ipc = ${hex(ipc)}; return ${hex(b.pc)}; }`);
 					reload();
 					break;
 				case 'SYSCALL':
-					spill();
+					spill([]);
 					body.push(
 						`\tcpu->pc = ${hex(b.next)};`,
 						'\tAOT_COUNT_RD(2); AOT_COUNT_WR(1);',
@@ -271,10 +484,31 @@ dumps.forEach((dump, region) => {
 					throw new Error(`no lifting for ${name}`);
 			}
 		});
-		const lastOp = OPS[b.ins.at(-1)!.op]!.replace(/^KB_/, '');
+		const lastOp = opName(b.ins.at(-1)!.op);
 		if (lastOp !== 'JMP' && !(lastOp === 'SYSCALL')) body.push(`\t${leave(b.pc, b.next)}`);
 		body.push('}');
+		return body;
+	};
+
+	const twins = new Set<number>();
+	const body: string[] = [];
+	chosen.forEach((b, j) => {
+		irIns += b.ins.length;
+		if (opt.windows && windowsOf(b).wins.length) {
+			twins.add(j);
+			body.push(...emit(b, j, 'fast'), ...emit(b, j, 'slow'));
+		} else body.push(...emit(b, j, 'plain'));
 	});
+
+	chosen.forEach((b, j) => {
+		lines.push(`static const struct kb_ins ${R}_i${j}[] = {`);
+		for (const x of b.ins) lines.push(`\t{${x.op}, ${x.w}, ${x.a}, ${x.b}, ${x.c}, (int64_t) ${hex(x.imm)}},`);
+		lines.push('};');
+		table.push({ pc: b.pc, next: b.next, target: b.target, n: b.ins.length, region, idx: j, name: `${R}_i${j}` });
+	});
+	lines.push(`static unsigned char ${R}_ok[${chosen.length}];`, `static struct kb_block* ${R}_blk[${chosen.length}];`);
+	if (opt.windows) lines.push(`static struct kb_ic ${R}_win[${Math.max(1, windowCount)}];`);
+	lines.push('');
 
 	lines.push(`static uint64_t ${R}_run(struct kb_cpu* cpu, uint64_t pc) {`);
 	lines.push(...regList.map((r) => `\tuint64_t g${r} = cpu->r[${r}];`));
@@ -301,6 +535,7 @@ dumps.forEach((dump, region) => {
 	lines.push('out:', `\tAOT_COUNT_WR(${regList.length + 6});`);
 	lines.push(...regList.map((r) => `\tcpu->r[${r}] = g${r};`));
 	lines.push('\tcpu->n = f.n; cpu->z = f.z; cpu->c = f.c; cpu->v = f.v; cpu->p = f.p; cpu->df = df;', '\treturn pc;', '}', '');
+	console.error(`${R}: ${regList.length} region registers, ${twins.size} blocks with windows, ${windowCount} windows so far`);
 });
 
 table.sort((a, b) => (a.pc < b.pc ? -1 : a.pc > b.pc ? 1 : 0));
@@ -310,7 +545,17 @@ lines.push(
 	'};',
 	`static unsigned char* const aot_ok[] = {${regionNames.map((n) => n.replace('_run', '_ok')).join(', ')}};`,
 	`static struct kb_block** const aot_blk[] = {${regionNames.map((n) => n.replace('_run', '_blk')).join(', ')}};`,
+	`static const int aot_n[] = {${regionSizes.join(', ')}};`,
 	`static uint64_t (*const aot_run[])(struct kb_cpu*, uint64_t) = {${regionNames.join(', ')}};`,
+	'',
+	'void kb_aot_detach(struct kb_block* b) {',
+	`\tfor (int r = 0; r < ${regionNames.length}; r++)`,
+	'\t\tfor (int i = 0; i < aot_n[r]; i++)',
+	'\t\t\tif (aot_blk[r][i] == b) {',
+	'\t\t\t\taot_ok[r][i] = 0;',
+	'\t\t\t\taot_blk[r][i] = NULL;',
+	'\t\t\t}',
+	'}',
 	'',
 	'void kb_aot_attach(struct kb_cpu* cpu, struct kb_block* b) {',
 	'\t(void) cpu;',
@@ -336,4 +581,4 @@ lines.push(
 	'}'
 );
 writeFileSync(out, `${lines.join('\n')}\n`);
-console.error(`wrote ${out}: ${table.length} blocks in ${regionNames.length} regions`);
+console.error(`wrote ${out}: ${table.length} blocks in ${regionNames.length} regions, ${irIns} IR ops (${irIns * 16} bytes), ${windowCount} windows`);
