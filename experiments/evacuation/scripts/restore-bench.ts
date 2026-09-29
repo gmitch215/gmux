@@ -53,6 +53,20 @@ const kernel = (f: string) => join(build, 'kernel', f);
 const manifest = JSON.parse(readFileSync(kernel('manifest.json'), 'utf8'));
 const median = (xs: number[]) => [...xs].sort((x, y) => x - y)[Math.floor(xs.length / 2)]!;
 const debug = (text: string) => process.env.DEBUG && console.error(text);
+// SPLIT=1 adds constructMs and instantiateMs (medians over the cold restores) to the output
+const split = !!process.env.SPLIT;
+let coldModule: WebAssembly.Module | undefined;
+let instantiated = 0;
+if (split) {
+	const Instance = WebAssembly.Instance;
+	WebAssembly.Instance = class extends Instance {
+		constructor(module: WebAssembly.Module, imports?: WebAssembly.Imports) {
+			const t = performance.now();
+			super(module, imports);
+			if (module === coldModule) instantiated += performance.now() - t;
+		}
+	};
+}
 
 let fresh = 0;
 for (const [name, cmd] of workloads) {
@@ -149,7 +163,14 @@ for (const [name, cmd] of workloads) {
 		const snapshot = await machine.checkpoint();
 		const p = programs.find((x) => x.arm === arm)!;
 		if (!snapshot.runners.some((r) => r.user?.hash === p.hash)) throw new Error(`${name} ${arm}: not running at the checkpoint`);
-		if (cold) registry.set(p.hash, new WebAssembly.Module(tagged(p.bytes, `cold${fresh++}`)));
+		if (cold) {
+			const bytes = tagged(p.bytes, `cold${fresh++}`);
+			const t0 = performance.now();
+			coldModule = new WebAssembly.Module(bytes);
+			if (split) push(`${arm}Construct`, performance.now() - t0);
+			instantiated = 0;
+			registry.set(p.hash, coldModule);
+		}
 		const into = cold && reenter !== undefined ? { ...options, reenterAfterRestore: reenter } : options;
 		debug(`${name} ${arm}: checkpointed, restoring`);
 		machine = await Machine.restore(into, { ...snapshot, memory: snapshot.memory.slice() });
@@ -160,6 +181,7 @@ for (const [name, cmd] of workloads) {
 		if (!marks.has(b)) throw new Error(`${name} ${arm}: no end after the restore ${machine.crashed ?? ''}`);
 		if (reenter !== undefined) debug(`${name} ${arm}: ${machine.stats.reentries} re-entries`);
 		const rest = marks.get(b)! - t;
+		if (split && cold) push(`${arm}Instantiate`, instantiated);
 		await check(`${arm} restored`, n);
 		return rest;
 	};
@@ -187,7 +209,20 @@ for (const [name, cmd] of workloads) {
 		r[arm] = +(median(results[arm]!) / base).toFixed(3);
 		r[`${arm}Warm`] = +(median(results[`${arm}Warm`]!) / base).toFixed(3);
 		r[`${arm}Cold`] = +(median(results[`${arm}Cold`]!) / cold).toFixed(3);
+		if (split)
+			for (const key of ['', 'Warm', 'Cold', 'Construct', 'Instantiate']) {
+				const xs = [...results[`${arm}${key}`]!].sort((x, y) => x - y);
+				r[`${arm}${key}Ms`] = +median(xs).toFixed(1);
+				r[`${arm}${key}Min`] = +xs[0]!.toFixed(1);
+				r[`${arm}${key}Max`] = +xs[xs.length - 1]!.toFixed(1);
+			}
 	}
+	if (split)
+		for (const key of ['plain', 'plainCold']) {
+			const xs = [...results[key]!].sort((x, y) => x - y);
+			r[`${key}Min`] = +xs[0]!.toFixed(1);
+			r[`${key}Max`] = +xs[xs.length - 1]!.toFixed(1);
+		}
 	console.log(JSON.stringify({ workload: name, yields: total, at: k, plainRestMs: Math.round(base), plainColdRestMs: Math.round(cold), ...r }));
 }
 process.exit(0);
