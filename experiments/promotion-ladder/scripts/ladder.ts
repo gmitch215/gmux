@@ -18,16 +18,20 @@ import { join } from 'node:path';
  */
 const [mode = '', a1 = '', a2 = '', a3 = ''] = process.argv.slice(2);
 
-interface Fn {
+export interface Fn {
 	name: string;
 	header: string;
 	locals: string[];
 	body: string[];
 	params: number;
 	result: boolean;
+	/** takes or returns something other than i32, which a burrow import cannot carry */
+	wide: boolean;
 }
 
-function parse(wat: string) {
+export function parse(text: string) {
+	// wasm-tools quotes the names it had to disambiguate ($"#func91 name") and annotates them
+	const wat = text.replace(/ \(@name "[^"]*"\)/g, '').replace(/\$"([^"]*)"/g, (_, s: string) => `$${s.replace(/[^A-Za-z0-9_.]/g, '_')}`);
 	const lines = wat.split('\n');
 	const head: string[] = [];
 	const tail: string[] = [];
@@ -42,7 +46,7 @@ function parse(wat: string) {
 		const sig = m[2]!;
 		const params = (sig.match(/\(param ([^)]*)\)/)?.[1] ?? '').split(/\s+/).filter(Boolean).length;
 		const result = /\(result/.test(sig);
-		const fn: Fn = { name: m[1]!, header: line, locals: [], body: [], params, result };
+		const fn: Fn = { name: m[1]!, header: line, locals: [], body: [], params, result, wide: /\b(i64|f32|f64)\b/.test(sig) };
 		if ((line.match(/\(/g) ?? []).length === (line.match(/\)/g) ?? []).length) {
 			// an empty body printed on one line, e.g. (func $f (type 1) (param i32 i32))
 			fn.header = line.replace(/\)$/, '');
@@ -61,8 +65,8 @@ function parse(wat: string) {
 
 const sigOf = (fn: Fn) => fn.header.replace(/^ {2}\(func \$\S+ \(;\d+;\) \(type \d+\)/, '').trim();
 const paramList = (fn: Fn) => Array.from({ length: fn.params }, (_, i) => `    local.get ${i}`);
-const emit = (fn: Fn) => [fn.header, ...fn.locals, ...fn.body, '  )'];
-const wasmTools = (args: string[], input?: string) => execFileSync('wasm-tools', args, { input, maxBuffer: 1 << 28 });
+export const emit = (fn: Fn) => [fn.header, ...fn.locals, ...fn.body, '  )'];
+export const wasmTools = (args: string[], input?: string) => execFileSync('wasm-tools', args, { input, maxBuffer: 1 << 28 });
 
 // #region prepare
 if (mode === 'prepare') {
@@ -111,16 +115,23 @@ if (mode === 'prepare') {
 	// bottom-up: a function can go native once every function it calls directly is native, so native
 	// code never calls back into wasm3; each step promotes the hottest eligible one
 	const shareOf = (set: Set<string>) => [...set].reduce((s, n) => s + counts[n]!, 0) / total;
-	const rungs = [{ target: 0, set: new Set<string>(), share: 0 }];
+	const rungs = [{ target: 0, set: new Set<string>(), share: 0, label: 'interpreted' }];
 	const done = new Set<string>();
-	for (;;) {
+	// a sets file ({label: [function, ...]}) replaces the ladder: the empty set, each given set, every function
+	const given = a3 ? (JSON.parse(readFileSync(a3, 'utf8')) as Record<string, string[]>) : null;
+	if (given) {
+		for (const [label, names] of Object.entries(given)) rungs.push({ target: 0, set: new Set(names), share: shareOf(new Set(names)), label });
+		rungs.push({ target: 1, set: new Set(fns.filter((fn) => !fn.wide).map((fn) => fn.name)), share: 1, label: 'native' });
+		for (const r of rungs) r.target = r.share;
+	}
+	for (; !given; ) {
 		const eligible = fns.filter((fn) => !done.has(fn.name) && [...callees.get(fn.name)!].every((c) => done.has(c) || c === fn.name));
 		if (!eligible.length) break;
 		const next = eligible.sort((x, y) => counts[y.name]! - counts[x.name]!)[0]!;
 		done.add(next.name);
 		const share = shareOf(done);
 		// a rung per step that moves the share, and the last, which holds every function
-		if (share > rungs.at(-1)!.share + 1e-4 || done.size === fns.length) rungs.push({ target: share, set: new Set(done), share });
+		if (share > rungs.at(-1)!.share + 1e-4 || done.size === fns.length) rungs.push({ target: share, set: new Set(done), share, label: "" });
 	}
 
 	const byName = new Map(fns.map((fn) => [fn.name, fn]));
@@ -178,6 +189,7 @@ if (mode === 'prepare') {
 		);
 		return {
 			rung: k,
+			label: rung.label,
 			target: rung.target,
 			share: rung.share,
 			promoted,
@@ -210,22 +222,29 @@ if (mode === 'run') {
 	const reference = v8.run!(2 * n) >>> 0;
 	const v8ms = median(Array.from({ length: rounds }, () => time(() => v8.run!(2 * n)).ms - time(() => v8.run!(n)).ms));
 
-	const rows: { rung: number; target: number; share: number; ms: number; crossings: number }[] = [];
+	const rows: { rung: number; label: string; target: number; share: number; ms: number; crossings: number }[] = [];
 	for (const r of rungs) {
 		const vm = await createInterpreter({ module: wasm3Module });
 		let native: Record<string, (...a: number[]) => number> = {};
 		let crossings = 0;
+		const lean = process.env.LADDER_GLUE === 'lean';
 		const imports = Object.fromEntries(
-			Object.entries(r.imports as Record<string, string>).map(([name, signature]) => [
+			Object.entries(r.imports as Record<string, string>).map(([name, signature]) => {
+				let entry: ((...a: number[]) => number) | undefined;
+				return [
 				name,
 				{
 					signature,
-					fn: (...args: number[]) => {
-						crossings++;
-						return native[`f_${name}`]!(...args);
-					}
+					// LADDER_GLUE=lean drops the crossing counter, the name lookup and the rest arguments (crossings read 0)
+					fn: lean
+						? (a: number, b: number, c: number, d: number, e: number) => (entry ??= native[`f_${name}`]!)(a, b, c, d, e)
+						: (...args: number[]) => {
+								crossings++;
+								return native[`f_${name}`]!(...args);
+							}
 				}
-			])
+			];
+			})
 		);
 		const guest = vm.load(new Uint8Array(readFileSync(join(out, `rung${r.rung}.interp.wasm`))), { imports: { native: imports } });
 		// burrow keeps the interpreter's memory private; the rig reaches it to share guest memory natively
@@ -245,18 +264,19 @@ if (mode === 'run') {
 			diffs.push(two.ms - one.ms);
 			perRun = crossings - 2 * c1;
 		}
-		rows.push({ rung: r.rung, target: r.target, share: r.share, ms: median(diffs), crossings: Math.max(perRun, 0) });
+		rows.push({ rung: r.rung, label: r.label ?? '', target: r.target, share: r.share, ms: median(diffs), crossings: Math.max(perRun, 0) });
 	}
+	if (process.env.LADDER_JSON) writeFileSync(process.env.LADDER_JSON, JSON.stringify({ node: process.version, v8: process.versions.v8, n, rounds, v8ms, rows }, null, '\t'));
 	const rI = rows[0]!.ms / v8ms;
 	const rN = rows.at(-1)!.ms / v8ms;
 	console.log(`V8 ${process.versions.v8} (node ${process.version}): ${v8ms.toFixed(1)} ms per ${n} deflates; all interpreted r ${rI.toFixed(2)}, all native through one crossing r ${rN.toFixed(2)}`);
-	console.log('| rung | target | closed share | ms | r | Amdahl r | crossings per deflate |');
-	console.log('| --- | --- | --- | --- | --- | --- | --- |');
+	console.log('| rung | label | target | closed share | ms | r | Amdahl r | crossings per deflate |');
+	console.log('| --- | --- | --- | --- | --- | --- | --- | --- |');
 	for (const row of rows) {
 		const r = row.ms / v8ms;
 		const amdahl = (1 - row.share) * rI + row.share * rN;
 		console.log(
-			`| ${row.rung} | ${(100 * row.target).toFixed(1)}% | ${(100 * row.share).toFixed(3)}% | ${row.ms.toFixed(1)} | ${r.toFixed(2)} | ${amdahl.toFixed(2)} | ${(row.crossings / n).toFixed(0)} |`
+			`| ${row.rung} | ${row.label} | ${(100 * row.target).toFixed(1)}% | ${(100 * row.share).toFixed(3)}% | ${row.ms.toFixed(1)} | ${r.toFixed(2)} | ${amdahl.toFixed(2)} | ${(row.crossings / n).toFixed(0)} |`
 		);
 	}
 }
