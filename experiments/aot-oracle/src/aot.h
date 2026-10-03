@@ -2,6 +2,8 @@
 #define AOT_H
 
 #include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 #include "kb.h"
@@ -195,15 +197,88 @@ static inline __attribute__((always_inline)) int aot_muldiv(
 
 /* -DKB_COUNT: a region's own cpu traffic (entry loads, exit stores, spills
    around helpers) and its block runs, beside the interpreter's (run.c) */
+enum
+{
+    AOT_C_REGION, /* entry loads and exit stores */
+    AOT_C_SSE,
+    AOT_C_X87,
+    AOT_C_STR,
+    AOT_C_SYS,
+    AOT_C_FS,
+    AOT_C_SLOT, /* slots form: loads served by a local [0], stores that updated
+                   one [1] */
+    AOT_C_FIX,  /* slots form: loads at a stub or edge [0], re-reads after an
+                   unknown store [1] */
+    AOT_C_MEM /* slots form: guest loads [0] and stores [1] that went to memory
+               */
+};
+
+/* -DKB_COUNT: where regions are left, by the guest pc the interpreter resumes
+   at; KATYBUG_EXITS=<n> prints the n most common at exit */
+#ifdef KB_COUNT
+struct aot_exit {
+    uint64_t pc, n;
+};
+static struct aot_exit aot_exits[1024];
+
+static void aot_exit_at(uint64_t pc) {
+    for (unsigned h = (unsigned) (pc ^ (pc >> 10)) & 1023, k = 0; k < 1024;
+         k++, h = (h + 1) & 1023)
+        if (aot_exits[h].n == 0 || aot_exits[h].pc == pc) {
+            aot_exits[h].pc = pc;
+            aot_exits[h].n++;
+            return;
+        }
+}
+
+static int aot_exit_order(const void* a, const void* b) {
+    const struct aot_exit *x = a, *y = b;
+    return x->n < y->n ? 1 : x->n > y->n ? -1 : 0;
+}
+
+__attribute__((destructor)) static void aot_exit_report(void) {
+    const char* e = getenv("KATYBUG_EXITS");
+    if (!e) return;
+    qsort(aot_exits, 1024, sizeof aot_exits[0], aot_exit_order);
+    for (int i = 0; i < atoi(e) && i < 1024 && aot_exits[i].n; i++)
+        fprintf(
+            stderr, "katybug exit: %llx %llu\n",
+            (unsigned long long) aot_exits[i].pc,
+            (unsigned long long) aot_exits[i].n
+        );
+}
+    #define AOT_COUNT_EXIT(pc) aot_exit_at(pc)
+#else
+    #define AOT_COUNT_EXIT(pc) ((void) 0)
+#endif
+
 #ifdef KB_COUNT
     #define AOT_COUNT_BLOCK(b) ((b)->runs++)
     #define AOT_COUNT_RD(n) (kb_count.rd += (n))
     #define AOT_COUNT_WR(n) (kb_count.wr += (n))
+    #define AOT_COUNT_RDC(c, n) (kb_count.rd += (n), kb_count.cat[c][0] += (n))
+    #define AOT_COUNT_WRC(c, n) (kb_count.wr += (n), kb_count.cat[c][1] += (n))
+    #define AOT_COUNT_CAT(c, i, n) (kb_count.cat[c][i] += (n))
 #else
     #define AOT_COUNT_BLOCK(b) ((void) 0)
     #define AOT_COUNT_RD(n) ((void) 0)
     #define AOT_COUNT_WR(n) ((void) 0)
+    #define AOT_COUNT_RDC(c, n) ((void) 0)
+    #define AOT_COUNT_WRC(c, n) ((void) 0)
+    #define AOT_COUNT_CAT(c, i, n) ((void) 0)
 #endif
+
+/* KATYBUG_REGS=1 runs the regions built with lift.ts --regs in their precise
+ * form (aot_runp), 2 the one built with --slots (aot_runs); anything else, the
+ * form every earlier arm used */
+static inline int aot_regs(void) {
+    static int on = -1;
+    if (on < 0) {
+        const char* e = getenv("KATYBUG_REGS");
+        on = e && e[0] >= '1' && e[0] <= '2' ? e[0] - '0' : 0;
+    }
+    return on;
+}
 
 struct aot_entry {
     uint64_t pc, next, target;

@@ -16,6 +16,16 @@
 /* the most bytes kb_buf copies for a range across pieces */
 #define KB_BUF_MAX (64u << 10)
 
+/* 0 (default): every load and store checks its cache's mapping generation,
+ * every block link its code generation, every back edge and syscall for a
+ * signal. -DKB_EPOCH=1: a block checks kb_epoch once when it starts, and what
+ * an epoch covers (mapping generation, code generation, signal state) is looked
+ * at only after one changed; a load or store checks its range alone (off until
+ * timed under V8) */
+#ifndef KB_EPOCH
+    #define KB_EPOCH 0
+#endif
+
 /* -DKB_PROFILE keeps the interpreter's hot helpers out of line, so a profile
  * can attribute their time */
 #ifdef KB_PROFILE
@@ -125,7 +135,8 @@ enum kb_op
     KB_A64V,  /* AArch64 floating point, Advanced SIMD, FPCR/FPSR: imm is the
                  instruction word, b a load or store's address; a64v.c */
     KB_PRIM   /* first op of a block at the entry of a string function (imm 1
-                 strlen, 2 memcmp, 3 strcmp, 4 memchr): runs it as a host
+                 strlen, 2 memcmp, 3 strcmp, 4 memchr, 5 memcpy, 6 memmove, 7
+                 memset): runs it as a host
                  kernel and returns to the caller, or falls through to the
                  function's own ops; prim.c */
 };
@@ -209,6 +220,9 @@ struct kb_block {
     int n;
     struct kb_ins* ins;
     struct kb_ic* ic; /* one per load or store, in op order */
+    int nic;          /* how many */
+    uint32_t epoch,   /* kb_epoch when the block last checked its assumptions */
+        mapgen;       /* kb_cpu's when its caches were last known current */
     uint32_t* pcs;    /* each op's guest instruction, as an offset from pc, in
                          place of KB_PC ops (NULL in a trace, which keeps them) */
     int flag_writes,
@@ -340,6 +354,15 @@ int kb_grow(struct kb_cpu* cpu, struct kb_mapping* m, uint64_t end);
  * KATYBUG_PRIM=memcmp,strlen keeps only those); the mask has bit i for
  * function i */
 int kb_prim_enabled(void);
+/* thunk.c: library calls found by the name a loaded object imports them under;
+ * the ids continue prim.c's */
+enum
+{
+    KB_THUNK_MEMCPY = 5,
+    KB_THUNK_MEMMOVE,
+    KB_THUNK_MEMSET
+};
+int kb_thunk_at(struct kb_cpu* cpu, uint64_t pc);
 int kb_prim_at(struct kb_cpu* cpu, uint64_t pc);
 int kb_prim(struct kb_cpu* cpu, int id, uint64_t* next);
 void kb_prim_report(void);
@@ -370,6 +393,11 @@ int kb_wasm_load(struct kb_cpu* cpu, const char* path);
 int kb_wasm_main(struct kb_cpu* cpu, int argc, char** argv);
 extern const char* kb_wasm_traps[];
 
+/* run.c: moves on whenever a mapping, executable code or the signal state
+ * changes, from a signal handler too, so the bump is one atomic add */
+extern volatile uint32_t kb_epoch;
+#define KB_BUMP() ((void) __atomic_fetch_add(&kb_epoch, 1, __ATOMIC_RELAXED))
+
 /* run.c */
 int kb_cond(struct kb_cpu* cpu, int cond);
 /* the flag bits made current before anything reads or writes them directly */
@@ -386,7 +414,8 @@ void kb_flags_sync(struct kb_cpu* cpu);
 int kb_run(struct kb_cpu* cpu);
 /* -DKB_POLL picks where pending signals are looked for: 2 (default) back-edges
  * and after a syscall; 0 every block, 1 back-edges only, 3 every KB_POLL_FUEL
- * blocks (lifted: block transitions); 1 and 3 miss signals, arms only */
+ * blocks (lifted: block transitions); 1 and 3 miss signals, arms only. The
+ * interpreter ignores it under KB_EPOCH, where the epoch guard polls */
 #ifndef KB_POLL
     #define KB_POLL 2
 #endif
@@ -407,11 +436,26 @@ void kb_hot_dump(struct kb_cpu* cpu);
 struct kb_count {
     uint64_t rd, wr, refills, entries;
     uint64_t lat_n, lat_sum,
-        lat_max;       /* host signal to the poll that sees it, ns */
-    uint64_t sys[512]; /* syscalls by the guest's own number */
+        lat_max;         /* host signal to the poll that sees it, ns */
+    uint64_t sys[512];   /* syscalls by the guest's own number */
+    uint64_t cat[10][2]; /* lifted code's cpu words read and written, by aot.h's
+                            AOT_C_ category */
+    /* the interpreter's checks, as run: a load or store's generation and range
+     * compares, a block link's code generation, the signal poll's tests, the
+     * thread and fault tests, the link and exit tests, the epoch compare and
+     * what it found changed (deopts), signal polls made */
+    uint64_t ck_gen, ck_range, ck_code, ck_poll, ck_thread, ck_fault, ck_link,
+        ck_exit, ck_epoch, deopt_map, deopt_code, polls;
+    /* state the guest reads that a later epoch would cover: fs base reads,
+       cpuid, indirect jumps and trace side exits taken or not */
+    uint64_t rd_fs, rd_cpuid, ijmp, exits;
+    uint64_t bump_map, bump_sig;
 };
 extern struct kb_count kb_count;
 void kb_count_report(struct kb_cpu* cpu);
+    #define KB_BUMP_AS(kind) (kb_count.bump_##kind++, KB_BUMP())
+#else
+    #define KB_BUMP_AS(kind) KB_BUMP()
 #endif
 #ifdef KB_AOT
 /* the lifted blocks (generated, see experiments/aot-oracle): attaches a region
@@ -440,11 +484,18 @@ char* kb_str(struct kb_cpu* cpu, uint64_t va);
 /* sys.c: guest descriptors are the host's, so katybug's own live at the top of
  * the table where the guest does not look; kb_log is where its diagnostics go
  * (a private copy of stderr, so a guest that closes fd 2 does not silence it),
- * and kb_own_fd copies a descriptor up there */
+ * and kb_own_fd copies a descriptor up there. A descriptor the host just made
+ * for the guest goes through kb_newfd (EMFILE at the guest's soft limit), and
+ * one at or past the base is kb_past_limit (EBADF) */
 extern FILE* kb_log;
 void kb_log_init(int resumed);
 int kb_own_fd(int fd);
 FILE* kb_own_fopen(const char* path, const char* mode);
+int kb_past_limit(int fd);
+int64_t kb_newfd(int fd);
+int64_t kb_newfd2(int* fds);
+void kb_nofile_get(uint64_t out[2]);
+void kb_nofile_set(const uint64_t in[2]);
 
 /* fork.c: fork by exec of katybug and a state transfer, where the host cannot
  * fork (wasm) */

@@ -19,6 +19,10 @@ enum
     P_MEMCMP,
     P_STRCMP,
     P_MEMCHR,
+    P_MEMCPY =
+        KB_THUNK_MEMCPY, /* the three below are found by name (thunk.c) */
+    P_MEMMOVE = KB_THUNK_MEMMOVE,
+    P_MEMSET = KB_THUNK_MEMSET,
     P_COUNT
 };
 
@@ -39,9 +43,9 @@ static const struct sig {
     {KB_A64, 4, 184, 0x12001c21aa0003e3ull, 0x9ec8006440306e0cull}, /* memchr */
 };
 
-static const char* const names[P_COUNT] = {
-    "", "strlen", "memcmp", "strcmp", "memchr"
-};
+static const char* const names[P_COUNT] = {"",        "strlen", "memcmp",
+                                           "strcmp",  "memchr", "memcpy",
+                                           "memmove", "memset"};
 
 static uint64_t calls[P_COUNT], gave_up[P_COUNT];
 
@@ -73,7 +77,8 @@ int kb_prim_at(struct kb_cpu* cpu, uint64_t pc) {
         for (uint32_t k = 0; k < s->len; k++) h = (h ^ p[k]) * 0x100000001b3ull;
         if (h == s->hash) return s->id;
     }
-    return 0;
+    int t = on >> KB_THUNK_MEMCPY ? kb_thunk_at(cpu, pc) : 0;
+    return t && (on >> t & 1) ? t : 0;
 }
 
 static uint64_t min3(uint64_t a, uint64_t b, uint64_t c) {
@@ -144,6 +149,50 @@ static int k_strcmp(struct kb_cpu* cpu, uint64_t a, uint64_t b, uint64_t* out) {
     }
 }
 
+/* every byte of [a, a + n) can be reached; the copy kernels check both ranges
+ * first so that a bad pointer leaves memory as it was and the guest's own code
+ * faults at its own instruction */
+static int reach(struct kb_cpu* cpu, uint64_t a, uint64_t n) {
+    if (a + n < a) return 0;
+    for (uint64_t off = 0, k; off < n; off += k)
+        if (!kb_span(cpu, a + off, &k)) return 0;
+    return 1;
+}
+
+/* move: overlapping ranges copy as memmove does; memcpy's overlap is left to
+ * the guest (musl's forward copy and glibc's differ there) */
+static int k_copy(
+    struct kb_cpu* cpu, uint64_t d, uint64_t s, uint64_t n, int move
+) {
+    if (!reach(cpu, s, n) || !reach(cpu, d, n)) return 0;
+    if (d != s && d < s + n && s < d + n) {
+        if (!move || n > KB_BUF_MAX) return 0;
+        uint8_t* t = malloc((size_t) n);
+        if (!t) return 0;
+        int ok = kb_read(cpu, s, t, n) && kb_write(cpu, d, t, n);
+        free(t);
+        return ok;
+    }
+    for (uint64_t off = 0, k; off < n; off += k) {
+        uint64_t ks, kd;
+        const uint8_t* ps = kb_span(cpu, s + off, &ks);
+        uint8_t* pd = kb_span(cpu, d + off, &kd);
+        k = min3(ks, kd, n - off);
+        memmove(pd, ps, (size_t) k);
+    }
+    return 1;
+}
+
+static int k_memset(struct kb_cpu* cpu, uint64_t d, uint64_t c, uint64_t n) {
+    if (!reach(cpu, d, n)) return 0;
+    for (uint64_t off = 0, k; off < n; off += k) {
+        uint8_t* p = kb_span(cpu, d + off, &k);
+        if (k > n - off) k = n - off;
+        memset(p, (int) (uint8_t) c, (size_t) k);
+    }
+    return 1;
+}
+
 /** runs function id for the call being made at its entry, and returns to the
  * caller: 1 with *next the caller's pc, or 0 (nothing changed) when a page the
  * function reads is not there and the function's own code should run */
@@ -160,6 +209,9 @@ int kb_prim(struct kb_cpu* cpu, int id, uint64_t* next) {
         ret = r[30];
     int ok = 0;
     switch (id) {
+        case P_MEMCPY: ok = k_copy(cpu, a, b, n, 0), v = a; break;
+        case P_MEMMOVE: ok = k_copy(cpu, a, b, n, 1), v = a; break;
+        case P_MEMSET: ok = k_memset(cpu, a, b, n), v = a; break;
         case P_STRLEN: ok = k_strlen(cpu, a, &v); break;
         case P_MEMCMP: ok = k_memcmp(cpu, a, b, n, &v); break;
         case P_STRCMP: ok = k_strcmp(cpu, a, b, &v); break;
@@ -168,7 +220,8 @@ int kb_prim(struct kb_cpu* cpu, int id, uint64_t* next) {
     if (!ok) return gave_up[id]++, 0;
     calls[id]++;
     /* int results are written as 32 bits, as the compiled code does */
-    r[0] = id == P_STRLEN || id == P_MEMCHR ? v : (uint32_t) v;
+    r[0] =
+        id == P_STRLEN || id == P_MEMCHR || id >= P_MEMCPY ? v : (uint32_t) v;
     if (x86) r[4] += 8;
     *next = ret;
     return 1;

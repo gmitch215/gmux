@@ -12,7 +12,8 @@ extern char** environ;
 /* fork without the host's fork, for hosts where it cannot copy a running wasm
    program (gmux's no-MMU kernel): vfork, exec katybug again, and send the new
    process the guest's whole state over a pipe: the cpu, the descriptors that
-   must regain FD_CLOEXEC, then every mapping's bytes in order */
+   must regain FD_CLOEXEC, the guest's descriptor limit, then every mapping's
+   bytes in order */
 
 static int put(int fd, const void* p, size_t n) {
     const uint8_t* b = p;
@@ -81,8 +82,11 @@ int64_t kb_fork(struct kb_cpu* cpu) {
         close(p[1]);
         return kb_err(errno);
     }
+    uint64_t nofile[2];
+    kb_nofile_get(nofile);
     int bad = put(p[1], cpu, sizeof *cpu) || put(p[1], &n, sizeof n) ||
-              put(p[1], cloexec, sizeof *cloexec * (size_t) n);
+              put(p[1], cloexec, sizeof *cloexec * (size_t) n) ||
+              put(p[1], nofile, sizeof nofile);
     for (int i = 0; !bad && i < cpu->nmaps; i++) {
         struct kb_mapping* m = &cpu->maps[i];
         uint64_t np = kb_pieces(m->start, m->end);
@@ -109,9 +113,12 @@ int64_t kb_fork(struct kb_cpu* cpu) {
 int kb_resume(struct kb_cpu* cpu, int fd) {
     int32_t n;
     int32_t cloexec[1024];
+    uint64_t nofile[2];
     if (get(fd, cpu, sizeof *cpu) || get(fd, &n, sizeof n) || n < 0 ||
-        n > 1024 || get(fd, cloexec, sizeof *cloexec * (size_t) n))
+        n > 1024 || get(fd, cloexec, sizeof *cloexec * (size_t) n) ||
+        get(fd, nofile, sizeof nofile))
         return -1;
+    kb_nofile_set(nofile);
     memset(cpu->cache, 0, sizeof cpu->cache);
     cpu->trace = NULL;
     cpu->fault = cpu->last_fault = NULL;

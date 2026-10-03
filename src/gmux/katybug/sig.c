@@ -77,6 +77,7 @@ static void on_host_signal(int h) {
         pending_code[s] = 0;
         pending_bits[s] = 1;
         any_pending = 1;
+        KB_BUMP_AS(sig);
     }
 }
 
@@ -109,6 +110,9 @@ static void terminate(struct kb_cpu* cpu, int s) {
         sigemptyset(&set);
         sigaddset(&set, h);
         sigprocmask(SIG_UNBLOCK, &set, NULL);
+#ifdef KB_HOT
+        kb_hot_dump(cpu);
+#endif
         raise(h);
     }
     cpu->exited = 1;
@@ -132,6 +136,7 @@ int64_t kb_sigaction(struct kb_cpu* cpu, int s, uint64_t act, uint64_t old) {
     a->restorer = kb_load(cpu, act + 16, 8);
     a->mask = kb_load(cpu, act + 24, 8);
     host_install(cpu, s);
+    KB_BUMP_AS(sig);
     return 0;
 }
 
@@ -188,6 +193,7 @@ int64_t kb_sigprocmask(
         return -22;
     cpu->sigmask &=
         ~((1ull << 8) | (1ull << 18)); /* sigkill and sigstop never block */
+    KB_BUMP_AS(sig);
     return 0;
 }
 
@@ -198,6 +204,7 @@ void kb_raise(struct kb_cpu* cpu, int s, int code) {
     pending_code[s] = code;
     pending_bits[s] = 1;
     any_pending = 1;
+    KB_BUMP_AS(sig);
     (void) cpu;
 }
 
@@ -397,6 +404,7 @@ void kb_sigreturn(struct kb_cpu* cpu) {
         cpu->sigmask = kb_load(cpu, uc + 40, 8);
     }
     cpu->sigreturned = 1;
+    KB_BUMP_AS(sig);
 }
 
 static void deliver_one(struct kb_cpu* cpu);
@@ -407,6 +415,7 @@ void kb_signals(struct kb_cpu* cpu) {
     if (cpu->restore_mask) {
         cpu->sigmask = cpu->saved_mask;
         cpu->restore_mask = 0;
+        KB_BUMP_AS(sig);
     }
 }
 
@@ -447,6 +456,7 @@ int64_t kb_sigsuspend(struct kb_cpu* cpu, uint64_t mask) {
     sigprocmask(SIG_SETMASK, &prev, NULL);
     cpu->saved_mask = old;
     cpu->restore_mask = 1;
+    KB_BUMP_AS(sig);
     return -4;
 }
 

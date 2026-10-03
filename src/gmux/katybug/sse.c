@@ -149,6 +149,10 @@ static v128 lanes32(v128 a, v128 b, int op) {
     return r;
 }
 
+static int sat(int v, int lo, int hi) {
+    return v < lo ? lo : v > hi ? hi : v;
+}
+
 static v128 lanes8(v128 a, v128 b, int op) {
     uint8_t x[16], y[16], z[16];
     memcpy(x, &a, 16);
@@ -161,6 +165,14 @@ static v128 lanes8(v128 a, v128 b, int op) {
             case 0xf8: z[i] = (uint8_t) (x[i] - y[i]); break;
             case 0xda: z[i] = x[i] < y[i] ? x[i] : y[i]; break;
             case 0xde: z[i] = x[i] > y[i] ? x[i] : y[i]; break;
+            case 0xdc: z[i] = (uint8_t) sat(x[i] + y[i], 0, 255); break;
+            case 0xd8: z[i] = (uint8_t) sat(x[i] - y[i], 0, 255); break;
+            case 0xec:
+                z[i] = (uint8_t) sat((int8_t) x[i] + (int8_t) y[i], -128, 127);
+                break;
+            case 0xe8:
+                z[i] = (uint8_t) sat((int8_t) x[i] - (int8_t) y[i], -128, 127);
+                break;
             default: z[i] = 0; break;
         }
     }
@@ -181,6 +193,18 @@ static v128 lanes16(v128 a, v128 b, int op) {
                 break;
             case 0xfd: z[i] = (uint16_t) (x[i] + y[i]); break;
             case 0xf9: z[i] = (uint16_t) (x[i] - y[i]); break;
+            case 0xdd: z[i] = (uint16_t) sat(x[i] + y[i], 0, 65535); break;
+            case 0xd9: z[i] = (uint16_t) sat(x[i] - y[i], 0, 65535); break;
+            case 0xed:
+                z[i] = (uint16_t) sat(
+                    (int16_t) x[i] + (int16_t) y[i], -32768, 32767
+                );
+                break;
+            case 0xe9:
+                z[i] = (uint16_t) sat(
+                    (int16_t) x[i] - (int16_t) y[i], -32768, 32767
+                );
+                break;
             default: z[i] = 0; break;
         }
     }
@@ -241,7 +265,10 @@ int kb_sse(struct kb_cpu* cpu, const struct kb_ins* x) {
     uint64_t* dst = cpu->x[x->a & 15];
     v128 dv;
     memcpy(&dv, dst, 16);
-#define PUT(v) memcpy(dst, &(v), 16)
+#define PUT(v)                                                                 \
+    do {                                                                       \
+        if (!cpu->fault) memcpy(dst, &(v), 16);                                \
+    } while (0)
     if (op == 0xae) {
         /* fxsave fxrstor ldmxcsr stmxcsr clflush; lfence mfence sfence (one
          * thread: nothing to order) */
@@ -358,6 +385,7 @@ int kb_sse(struct kb_cpu* cpu, const struct kb_ins* x) {
             double v = pre == 0xf2
                            ? d(xload(cpu, x, 8).q[0])
                            : (double) f((uint32_t) xload(cpu, x, 4).q[0]);
+            if (cpu->fault) return 0;
             if (op == 0x2d) v = nearbyint(v);
             int64_t r = trunc_to(v, rex_w ? 8 : 4);
             cpu->r[x->a & 15] = rex_w ? (uint64_t) r : (uint64_t) (uint32_t) r;
@@ -365,14 +393,15 @@ int kb_sse(struct kb_cpu* cpu, const struct kb_ins* x) {
         }
         case 0x2e:
         case 0x2f: /* ucomiss comiss ucomisd comisd */
+        {
+            uint64_t s = xload(cpu, x, pre == 0x66 ? 8 : 4).q[0];
+            if (cpu->fault) return 0;
             if (pre == 0x66)
-                compare(cpu, d(dst[0]), d(xload(cpu, x, 8).q[0]));
+                compare(cpu, d(dst[0]), d(s));
             else
-                compare(
-                    cpu, f((uint32_t) dst[0]),
-                    f((uint32_t) xload(cpu, x, 4).q[0])
-                );
+                compare(cpu, f((uint32_t) dst[0]), f((uint32_t) s));
             return 0;
+        }
         case 0x50: /* movmskps, movmskpd */
         {
             v128 s = xload(cpu, x, 16);
@@ -540,6 +569,14 @@ int kb_sse(struct kb_cpu* cpu, const struct kb_ins* x) {
         case 0xfd:
         case 0xda:
         case 0xde:
+        case 0xd8:
+        case 0xd9:
+        case 0xdc:
+        case 0xdd:
+        case 0xe8:
+        case 0xe9:
+        case 0xec:
+        case 0xed:
         case 0xd4:
         case 0xfb: {
             if (pre != 0x66) return -1;
@@ -549,7 +586,10 @@ int kb_sse(struct kb_cpu* cpu, const struct kb_ins* x) {
                     r.q[i] = op == 0xd4 ? dv.q[i] + s.q[i] : dv.q[i] - s.q[i];
             else if (op == 0x66 || op == 0x76 || op == 0xfa || op == 0xfe)
                 r = lanes32(dv, s, op);
-            else if (op == 0x65 || op == 0x75 || op == 0xf9 || op == 0xfd)
+            else if (
+                op == 0x65 || op == 0x75 || op == 0xf9 || op == 0xfd ||
+                op == 0xd9 || op == 0xdd || op == 0xe9 || op == 0xed
+            )
                 r = lanes16(dv, s, op);
             else
                 r = lanes8(dv, s, op);

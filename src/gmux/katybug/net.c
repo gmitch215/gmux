@@ -108,7 +108,8 @@ static int64_t addr_out(
 
 /* SOCK_NONBLOCK and SOCK_CLOEXEC ride on the type (accept4: on flags) */
 static int64_t sock_flags(int fd, uint64_t f) {
-    if (fd < 0) return kb_err(errno);
+    int64_t made = kb_newfd(fd);
+    if (made < 0) return made;
     if (f & 04000) fcntl(fd, F_SETFL, fcntl(fd, F_GETFL) | O_NONBLOCK);
     if (f & 02000000) fcntl(fd, F_SETFD, FD_CLOEXEC);
 #if defined(__APPLE__)
@@ -196,16 +197,24 @@ static int64_t do_poll(
 ) {
     if (n > 4096) return -22;
     struct pollfd* h = calloc(n ? n : 1, sizeof *h);
+    char* nval = calloc(n ? n : 1, 1);
+    int bad = 0;
     for (uint64_t i = 0; i < n; i++) {
         h[i].fd = (int) kb_load(cpu, fds + 8 * i, 4);
         h[i].events = host_events(kb_load(cpu, fds + 8 * i + 4, 2));
+        if (kb_past_limit(h[i].fd)) nval[i] = 1, h[i].fd = -1, bad++;
     }
-    int got = poll(h, (nfds_t) n, timeout_ms);
+    /* a descriptor out of range is ready at once with POLLNVAL, as on Linux */
+    int got = poll(h, (nfds_t) n, bad ? 0 : timeout_ms);
     if (got >= 0)
         for (uint64_t i = 0; i < n; i++)
-            kb_store(cpu, fds + 8 * i + 6, guest_events(h[i].revents), 2);
+            kb_store(
+                cpu, fds + 8 * i + 6,
+                guest_events(nval[i] ? POLLNVAL : h[i].revents), 2
+            );
+    free(nval);
     free(h);
-    return ret(got);
+    return ret(got >= 0 ? got + bad : got);
 }
 
 static int64_t do_select(
@@ -219,8 +228,10 @@ static int64_t do_select(
         for (uint64_t w = 0; sets[k] && w < words; w++) {
             uint64_t bits = kb_load(cpu, sets[k] + 8 * w, 8);
             for (int b = 0; b < 64; b++)
-                if (bits >> b & 1)
+                if (bits >> b & 1) {
+                    if (kb_past_limit((int) (64 * w + (uint64_t) b))) return -9;
                     FD_SET((int) (64 * w + (uint64_t) b), &fs[k]);
+                }
         }
     }
     struct timeval tv = {
@@ -336,6 +347,7 @@ int64_t kb_net(struct kb_cpu* cpu, int64_t nr, const uint64_t* a) {
             if (d < 0) return -97;
             if (socketpair(d, (int) (a[1] & 0xf), (int) a[2], sv) < 0)
                 return kb_err(errno);
+            if ((v = kb_newfd2(sv)) < 0) return v;
             sock_flags(sv[0], a[1]);
             sock_flags(sv[1], a[1]);
             kb_store(cpu, a[3], (uint64_t) (uint32_t) sv[0], 4);

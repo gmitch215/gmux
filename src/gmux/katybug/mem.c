@@ -16,17 +16,45 @@
  * for that (order 5), where 16 pages need order 4 and leave nothing over */
 #define MAP_MIN (16ull << 10)
 
+/* KATYBUG_PIECE_SKEW=base[,step] (off when unset): mmap block k starts at a
+ * multiple of 16 in [16, 4096) into a mapping a page longer, and the byte
+ * before it holds the offset in 16s */
+static int skew_on, skew_init;
+static uint64_t skew_base, skew_step, skew_n;
+
+static void skew_read(void) {
+    if (skew_init) return;
+    skew_init = 1;
+    const char* e = getenv("KATYBUG_PIECE_SKEW");
+    if (!e) return;
+    char* end;
+    skew_base = strtoull(e, &end, 0);
+    if (*end == ',') skew_step = strtoull(end + 1, NULL, 0);
+    skew_on = 1;
+}
+
 static uint8_t* block_new(uint64_t n) {
     if (n < MAP_MIN) return calloc(1, n);
-    void* p =
-        mmap(NULL, n, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
-    return p == MAP_FAILED ? NULL : p;
+    skew_read();
+    void* p = mmap(
+        NULL, skew_on ? n + PAGE : n, PROT_READ | PROT_WRITE,
+        MAP_PRIVATE | MAP_ANON, -1, 0
+    );
+    if (p == MAP_FAILED) return NULL;
+    if (!skew_on) return p;
+    uint64_t off = 16 + (((skew_base + skew_n++ * skew_step) % 4080) & ~15ull);
+    uint8_t* q = (uint8_t*) p + off;
+    q[-1] = (uint8_t) (off / 16);
+    return q;
 }
 
 static void block_free(uint8_t* p, uint64_t n) {
     if (!p) return;
+    skew_read();
     if (n < MAP_MIN)
         free(p);
+    else if (skew_on)
+        munmap(p - p[-1] * 16, n + PAGE);
     else
         munmap(p, n);
 }
@@ -34,7 +62,8 @@ static void block_free(uint8_t* p, uint64_t n) {
 /* p, n bytes, as a block of n2 bytes (both page multiples): the block, or NULL
  * with p untouched */
 static uint8_t* block_resize(uint8_t* p, uint64_t n, uint64_t n2) {
-    if (n >= MAP_MIN && n2 >= MAP_MIN && n2 < n) {
+    skew_read();
+    if (n >= MAP_MIN && n2 >= MAP_MIN && n2 < n && !skew_on) {
         munmap(p + n2, n - n2);
         return p;
     }
@@ -64,6 +93,7 @@ static struct kb_mapping* find(struct kb_cpu* cpu, uint64_t va) {
 static void changed(struct kb_cpu* cpu) {
     last = -1;
     cpu->mapgen++;
+    KB_BUMP_AS(map);
 }
 
 /** how many pieces [s, e) touches */
@@ -92,12 +122,13 @@ uint8_t* kb_piece(
 }
 
 /* kb_host, and when ic is given, ic keeps the piece; *cross is set when the
- * range is in one mapping but runs past its piece */
+ * range starts in an accessible mapping but runs past its piece (or its end,
+ * into the next mapping, which kb_read and kb_write check) */
 static uint8_t* translate(
     struct kb_cpu* cpu, struct kb_ic* ic, uint64_t va, uint64_t len, int* cross
 ) {
     struct kb_mapping* m = find(cpu, va);
-    if (!m || !m->prot || va + len > m->end || va + len < va) return NULL;
+    if (!m || !m->prot || va + len < va) return NULL;
     uint64_t lo, hi;
     uint8_t* p = kb_piece(m, va, &lo, &hi);
     if (!p) return NULL;
@@ -434,10 +465,14 @@ void kb_store_ic(
     kb_count.refills += ic != NULL;
 #endif
     int cross = 0;
+    uint8_t probe[8];
     uint8_t* p = translate(cpu, ic, va, (uint64_t) w, &cross);
     if (p)
         memcpy(p, &v, (size_t) w);
-    else if (!cross || !kb_write(cpu, va, &v, (uint64_t) w)) {
+    else if (
+        !cross || !kb_read(cpu, va, probe, (uint64_t) w) ||
+        !kb_write(cpu, va, &v, (uint64_t) w)
+    ) {
         cpu->fault = "store outside the address space";
         cpu->fault_sig = 11;
         cpu->fault_addr = va;

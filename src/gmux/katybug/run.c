@@ -709,6 +709,19 @@ static int lean_pcs(struct kb_cpu* cpu, struct kb_block* b) {
 int kb_syscalled;
 #endif
 
+volatile uint32_t kb_epoch = 1;
+
+/* a cache that every address misses: the fast path accepts an offset below span
+ * - 7, so an access of up to 8 bytes that starts there fits */
+#define KB_IC_COLD 7
+
+#ifdef KB_COUNT
+    /* evaluates to 0, counting the check as it goes */
+    #define KB_CK(field) (kb_count.field++, 0)
+#else
+    #define KB_CK(field) 0
+#endif
+
 #ifdef KB_COUNT
 struct kb_count kb_count;
 
@@ -851,6 +864,11 @@ static int translate(struct kb_cpu* cpu, struct kb_block* b) {
     return 0;
 }
 
+static void cold_caches(struct kb_block* b) {
+    for (int i = 0; i < b->nic; i++)
+        b->ic[i] = (struct kb_ic){0, KB_IC_COLD, NULL, 0};
+}
+
 /** a block's run-time parts from its ops: the inline caches (one per access
  * and KB_RESOLVE) and a lifted region; nonzero when out of memory */
 int kb_block_ready(struct kb_cpu* cpu, struct kb_block* b) {
@@ -861,6 +879,8 @@ int kb_block_ready(struct kb_cpu* cpu, struct kb_block* b) {
     for (int i = 0; i < b->n; i++)
         mem += is_access(b->ins[i].op) || b->ins[i].op == KB_RESOLVE;
     if (mem && !(b->ic = calloc((size_t) mem, sizeof *b->ic))) return 1;
+    b->nic = mem;
+    cold_caches(b);
 #ifdef KB_AOT
     if (!cpu->trace && !cpu->tracing) kb_aot_attach(cpu, b);
 #else
@@ -918,6 +938,10 @@ KB_NOINLINE static struct kb_block* block(struct kb_cpu* cpu, uint64_t pc) {
 static void retrace(struct kb_cpu* cpu, struct kb_block* b) {
     b->traced = 1;
     if (cpu->arch == KB_WASM || cpu->trace) return;
+    #ifdef KB_AOT
+    /* a promoted block keeps the IR its region was lifted from */
+    if (b->aot) return;
+    #endif
     struct kb_block t = {.pc = b->pc};
     cpu->tracing = 1;
     int bad = translate(cpu, &t), exits = 0;
@@ -949,12 +973,19 @@ static struct kb_block* next_block(struct kb_cpu* cpu, struct kb_block* prev) {
     (void) prev;
     return block(cpu, cpu->pc);
 #endif
+    (void) KB_CK(ck_link);
     struct kb_block** link = !prev                     ? NULL
                              : cpu->pc == prev->target ? &prev->to_target
                              : cpu->pc == prev->next   ? &prev->to_next
                                                        : NULL;
     if (!link) return block(cpu, cpu->pc);
-    if (!*link || (*link)->codegen != cpu->codegen) *link = block(cpu, cpu->pc);
+#if KB_EPOCH
+    /* a successor of an older code generation is found by kb_run's guard */
+    if (!*link) *link = block(cpu, cpu->pc);
+#else
+    if (!*link || KB_CK(ck_code) || (*link)->codegen != cpu->codegen)
+        *link = block(cpu, cpu->pc);
+#endif
     return *link;
 }
 
@@ -966,6 +997,7 @@ void kb_hot_dump(struct kb_cpu* cpu) {
     snprintf(path, sizeof path, "%s/%ld.hot", dir, (long) getpid());
     FILE* f = fopen(path, "w");
     if (!f) return;
+    fprintf(f, "arch %d\n", cpu->arch);
     for (int h = 0; h < 4096; h++)
         for (struct kb_block* b = cpu->cache[h]; b; b = b->chain) {
             if (!b->runs) continue;
@@ -989,18 +1021,33 @@ void kb_hot_dump(struct kb_cpu* cpu) {
                         );
                 fprintf(f, "\n");
             }
+            if (b->pcs) {
+                fprintf(f, "pcs");
+                for (int i = 0; i < b->n; i++)
+                    fprintf(f, " %u", (unsigned) b->pcs[i]);
+                fprintf(f, "\n");
+            }
         }
     fclose(f);
 }
 #endif
 
 /* a load or store translated once per mapping, not per access; kb_load_ic
- * refills a stale cache */
+ * refills a cache that misses. With epochs the block has already seen the
+ * mapping generation (guard in kb_run), so the range is all that is left */
+#if KB_EPOCH
+    #define IC_MISS(cpu, ic, va, w)                                            \
+        (KB_CK(ck_range) || (va) - (ic)->lo >= (ic)->span - KB_IC_COLD)
+#else
+    #define IC_MISS(cpu, ic, va, w)                                            \
+        (KB_CK(ck_gen) || (ic)->gen != (cpu)->mapgen || KB_CK(ck_range) ||     \
+         (va) - (ic)->lo > (ic)->span - (uint64_t) (w))
+#endif
+
 KB_NOINLINE static inline uint64_t load(
     struct kb_cpu* cpu, struct kb_ic* ic, uint64_t va, int w
 ) {
-    if (ic->gen != cpu->mapgen || va - ic->lo > ic->span - (uint64_t) w)
-        return kb_load_ic(cpu, ic, va, w);
+    if (IC_MISS(cpu, ic, va, w)) return kb_load_ic(cpu, ic, va, w);
     uint64_t v = 0;
     memcpy(&v, ic->host + (va - ic->lo), (size_t) w);
     return v;
@@ -1009,7 +1056,7 @@ KB_NOINLINE static inline uint64_t load(
 KB_NOINLINE static inline void store(
     struct kb_cpu* cpu, struct kb_ic* ic, uint64_t va, uint64_t v, int w
 ) {
-    if (ic->gen != cpu->mapgen || va - ic->lo > ic->span - (uint64_t) w)
+    if (IC_MISS(cpu, ic, va, w))
         kb_store_ic(cpu, ic, va, v, w);
     else
         memcpy(ic->host + (va - ic->lo), &v, (size_t) w);
@@ -1028,7 +1075,7 @@ KB_NOINLINE static inline void store(
      blk->pc)
 /* only the ops that can raise a fault check for one after them */
 #define CHECK()                                                                \
-    if (cpu->fault) return FAULTED()
+    if (KB_CK(ck_fault) || cpu->fault) return FAULTED()
 
 /* runs one block; returns the next pc. The memory plan's groups are for lifted
  * code: the interpreter skips the leading KB_RESOLVE ops and checks each access
@@ -1116,8 +1163,9 @@ static uint64_t step(struct kb_cpu* cpu, struct kb_block* blk) {
                 if (kb_cond(cpu, (int) x->imm)) return blk->target;
                 break;
             case KB_EXIT:
-                if (x->imm & 0x100 ? (r[x->a] == 0) == !(x->imm & 1)
-                                   : kb_cond(cpu, (int) (x->imm & 0xff))) {
+                if (KB_CK(exits) ||
+                    (x->imm & 0x100 ? (r[x->a] == 0) == !(x->imm & 1)
+                                    : kb_cond(cpu, (int) (x->imm & 0xff)))) {
                     cpu->trace_exits++;
 #ifdef KB_HOT
                     if (!blk->exits)
@@ -1131,11 +1179,19 @@ static uint64_t step(struct kb_cpu* cpu, struct kb_block* blk) {
                            (uint64_t) (int64_t) (int32_t) (x->imm >> 16);
                 }
                 break;
-            case KB_JMP: return B;
+            case KB_JMP: (void) KB_CK(ijmp); return B;
             case KB_SYSCALL:
                 cpu->pc = blk->next;
                 kb_syscall(cpu);
                 if (cpu->exited) return 0;
+#if KB_EPOCH
+                /* a block that goes on past its syscall must not read caches
+                 * from before it */
+                if (blk->mapgen != cpu->mapgen) {
+                    cold_caches(blk);
+                    blk->mapgen = cpu->mapgen;
+                }
+#endif
                 if (cpu->sigreturned) {
                     cpu->sigreturned = 0;
                     return cpu->pc;
@@ -1294,6 +1350,7 @@ static uint64_t step(struct kb_cpu* cpu, struct kb_block* blk) {
                  * only for a vendor it knows); mmx is claimed but faults if run
                  */
                 uint32_t leaf = (uint32_t) r[0], v[4] = {0, 0, 0, 0};
+                (void) KB_CK(rd_cpuid);
                 if (leaf == 0) {
                     v[0] = 1;
                     memcpy(&v[1], "Auth", 4);
@@ -1327,7 +1384,10 @@ static uint64_t step(struct kb_cpu* cpu, struct kb_block* blk) {
                 r[x->a] = crc;
                 break;
             }
-            case KB_FSBASE: r[x->a] = cpu->fs; break;
+            case KB_FSBASE:
+                (void) KB_CK(rd_fs);
+                r[x->a] = cpu->fs;
+                break;
             case KB_SETTP: cpu->tpidr = B; break;
             case KB_BRZ:
                 if ((r[x->a] != 0) == (x->imm != 0)) return blk->target;
@@ -1446,7 +1506,7 @@ void kb_count_report(struct kb_cpu* cpu) {
         f,
         "katybug count: insns %llu blocks %llu rd %llu wr %llu checks %llu "
         "refills %llu blockmaps %llu lifted %llu lchecks %llu entries %llu "
-        "regionmaps %llu regions %llu signals %llu latsum %llu latmax %llu\n",
+        "regionmaps %llu regions %llu signals %llu latsum %llu latmax %llu",
         (unsigned long long) insns, (unsigned long long) blocks,
         (unsigned long long) kb_count.rd, (unsigned long long) kb_count.wr,
         (unsigned long long) checks, (unsigned long long) kb_count.refills,
@@ -1457,6 +1517,38 @@ void kb_count_report(struct kb_cpu* cpu) {
         (unsigned long long) kb_count.lat_sum,
         (unsigned long long) kb_count.lat_max
     );
+    for (int c = 0; c < 10; c++)
+        fprintf(
+            f, " c%drd %llu c%dwr %llu", c,
+            (unsigned long long) kb_count.cat[c][0], c,
+            (unsigned long long) kb_count.cat[c][1]
+        );
+    fprintf(
+        f,
+        " ck_gen %llu ck_range %llu ck_code %llu ck_poll %llu ck_thread %llu "
+        "ck_fault %llu ck_link %llu ck_exit %llu ck_epoch %llu deopt_map %llu "
+        "deopt_code %llu polls %llu rd_fs %llu rd_cpuid %llu ijmp %llu "
+        "exits %llu bump_map %llu bump_sig %llu lookups %llu",
+        (unsigned long long) kb_count.ck_gen,
+        (unsigned long long) kb_count.ck_range,
+        (unsigned long long) kb_count.ck_code,
+        (unsigned long long) kb_count.ck_poll,
+        (unsigned long long) kb_count.ck_thread,
+        (unsigned long long) kb_count.ck_fault,
+        (unsigned long long) kb_count.ck_link,
+        (unsigned long long) kb_count.ck_exit,
+        (unsigned long long) kb_count.ck_epoch,
+        (unsigned long long) kb_count.deopt_map,
+        (unsigned long long) kb_count.deopt_code,
+        (unsigned long long) kb_count.polls,
+        (unsigned long long) kb_count.rd_fs,
+        (unsigned long long) kb_count.rd_cpuid,
+        (unsigned long long) kb_count.ijmp, (unsigned long long) kb_count.exits,
+        (unsigned long long) kb_count.bump_map,
+        (unsigned long long) kb_count.bump_sig,
+        (unsigned long long) cpu->lookups
+    );
+    fprintf(f, "\n");
     fprintf(f, "katybug syscalls:");
     for (int nr = 0; nr < 512; nr++)
         if (kb_count.sys[nr])
@@ -1474,9 +1566,37 @@ int kb_run(struct kb_cpu* cpu) {
 #endif
     int slice = 0;
     struct kb_block* prev = NULL;
-    while (!cpu->exited) {
+    while (KB_CK(ck_exit) || !cpu->exited) {
         struct kb_block* b = next_block(cpu, prev);
         prev = b;
+#if KB_EPOCH
+        if (b && (KB_CK(ck_epoch) || b->epoch != kb_epoch)) {
+            /* read before the checks: a bump during them is seen next time */
+            uint32_t e = kb_epoch;
+            uint64_t pc = cpu->pc;
+            (void) KB_CK(polls);
+            kb_signals(cpu);
+            if (cpu->exited) break;
+            if (cpu->pc != pc) {
+                prev = NULL; /* a handler's frame: another block */
+                continue;
+            }
+            if (b->codegen != cpu->codegen) {
+                (void) KB_CK(deopt_code);
+                reset(b);
+                if (translate(cpu, b)) {
+                    b->codegen = cpu->codegen - 1;
+                    b = prev = NULL;
+                }
+            }
+            if (b && b->mapgen != cpu->mapgen) {
+                (void) KB_CK(deopt_map);
+                cold_caches(b);
+                b->mapgen = cpu->mapgen;
+            }
+            if (b) b->epoch = e;
+        }
+#endif
         if (!b) {
             /* no instruction here at all: the jump itself faulted */
             cpu->fault = "jump outside the address space";
@@ -1538,11 +1658,17 @@ int kb_run(struct kb_cpu* cpu) {
             b->fall++;
         if (!b->traced && b->taken + b->fall >= KB_TRACE_AT) retrace(cpu, b);
 #endif
-#if KB_POLL == 1
-        if (next <= b->pc) kb_signals(cpu);
+#if KB_EPOCH
+        /* signals are looked for in the next block's guard */
+#elif KB_POLL == 1
+        if (next <= b->pc) {
+            (void) KB_CK(polls);
+            kb_signals(cpu);
+        }
 #elif KB_POLL == 2
-        if (next <= b->pc || kb_syscalled) {
+        if (KB_CK(ck_poll) || next <= b->pc || kb_syscalled) {
             kb_syscalled = 0;
+            (void) KB_CK(polls);
             kb_signals(cpu);
         }
 #elif KB_POLL == 3
@@ -1553,7 +1679,8 @@ int kb_run(struct kb_cpu* cpu) {
 #else
         kb_signals(cpu);
 #endif
-        if (kb_nthreads > 1 && next <= b->pc && ++slice >= KB_SLICE) {
+        if (KB_CK(ck_thread) ||
+            (kb_nthreads > 1 && next <= b->pc && ++slice >= KB_SLICE)) {
             slice = 0;
             kb_yield(cpu);
         }

@@ -83,6 +83,7 @@ static void load(struct kb_cpu* cpu, const struct kb_thread* t) {
     cpu->ftag = t->ftag, cpu->fcw = t->fcw, cpu->fcc = t->fcc;
     cpu->excl = ~0ull;
     cpu->lz = 0;
+    KB_BUMP_AS(sig); /* the mask is the thread's own */
 }
 
 /* the process's first thread, recorded when a second one starts */

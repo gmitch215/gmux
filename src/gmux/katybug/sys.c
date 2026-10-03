@@ -1,6 +1,7 @@
 #include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <limits.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -304,18 +305,18 @@ static int own_base(void) {
 
 /* the guest's descriptors end below katybug's own: a number at or past the
  * base is out of range, as one past RLIMIT_NOFILE is on Linux */
-static int past_limit(int fd) {
+int kb_past_limit(int fd) {
     int base = own_base();
     return base >= 0 && fd >= base;
 }
 
 /* RLIMIT_NOFILE as the guest sees it: the host's, capped at the base, and only
  * ever lowered by the guest (the host's own limit is left alone) */
-static int64_t nofile_limit(struct kb_cpu* cpu, uint64_t nv, uint64_t ov) {
+static struct rlimit* nofile_seen(void) {
     static struct rlimit seen;
     static int init;
     if (!init) {
-        if (getrlimit(RLIMIT_NOFILE, &seen) < 0) return kb_err(errno);
+        if (getrlimit(RLIMIT_NOFILE, &seen) < 0) return NULL;
         rlim_t cap = (rlim_t) own_base();
         if (seen.rlim_cur == RLIM_INFINITY || seen.rlim_cur > cap)
             seen.rlim_cur = cap;
@@ -323,16 +324,59 @@ static int64_t nofile_limit(struct kb_cpu* cpu, uint64_t nv, uint64_t ov) {
             seen.rlim_max = cap;
         init = 1;
     }
+    return &seen;
+}
+
+/* the first descriptor number the guest may not have: its soft limit, or no
+ * limit when katybug found no room for its own descriptors */
+static int nofile_soft(void) {
+    struct rlimit* seen = own_base() < 0 ? NULL : nofile_seen();
+    return seen ? (int) seen->rlim_cur : INT_MAX;
+}
+
+/* a descriptor the host just made for the guest: itself, or EMFILE (closed)
+ * when it would sit at or past the guest's soft limit */
+int64_t kb_newfd(int fd) {
+    if (fd < 0) return kb_err(errno);
+    if (fd < nofile_soft()) return fd;
+    close(fd);
+    return -24;
+}
+
+int64_t kb_newfd2(int* fds) {
+    if (fds[0] < nofile_soft() && fds[1] < nofile_soft()) return 0;
+    close(fds[0]);
+    close(fds[1]);
+    return -24;
+}
+
+/* the guest's limit pair travels to a KATYBUG_FORK=exec child */
+void kb_nofile_get(uint64_t out[2]) {
+    struct rlimit* seen = own_base() < 0 ? NULL : nofile_seen();
+    out[0] = seen ? (uint64_t) seen->rlim_cur : 0;
+    out[1] = seen ? (uint64_t) seen->rlim_max : 0;
+}
+
+void kb_nofile_set(const uint64_t in[2]) {
+    struct rlimit* seen = own_base() < 0 ? NULL : nofile_seen();
+    if (!seen || !in[1]) return;
+    seen->rlim_cur = (rlim_t) in[0];
+    seen->rlim_max = (rlim_t) in[1];
+}
+
+static int64_t nofile_limit(struct kb_cpu* cpu, uint64_t nv, uint64_t ov) {
+    struct rlimit* p = nofile_seen();
+    if (!p) return kb_err(errno);
     if (ov) {
-        kb_store(cpu, ov, (uint64_t) seen.rlim_cur, 8);
-        kb_store(cpu, ov + 8, (uint64_t) seen.rlim_max, 8);
+        kb_store(cpu, ov, (uint64_t) p->rlim_cur, 8);
+        kb_store(cpu, ov + 8, (uint64_t) p->rlim_max, 8);
     }
     if (nv) {
         uint64_t c = kb_load(cpu, nv, 8), m = kb_load(cpu, nv + 8, 8);
         if (c > m) return -22;
-        if (m > seen.rlim_max) return -1;
-        seen.rlim_cur = (rlim_t) c;
-        seen.rlim_max = (rlim_t) m;
+        if (m > p->rlim_max) return -1;
+        p->rlim_cur = (rlim_t) c;
+        p->rlim_max = (rlim_t) m;
     }
     return 0;
 }
@@ -789,6 +833,34 @@ static int64_t rlimit(struct kb_cpu* cpu, int res, uint64_t nv, uint64_t ov) {
     return 0;
 }
 
+/* the calls whose first argument is a descriptor and that have no case of
+ * their own for one past the base */
+static int fd_first(int64_t nr) {
+    switch (nr) {
+        case 29:
+        case 32:
+        case 44:
+        case 46:
+        case 50:
+        case 52:
+        case 55:
+        case 61:
+        case 62:
+        case 63:
+        case 64:
+        case 65:
+        case 66:
+        case 67:
+        case 68:
+        case 71:
+        case 80:
+        case 82:
+        case 83:
+        case 242: return 1;
+        default: return nr >= 200 && nr <= 212;
+    }
+}
+
 static void syscall_body(struct kb_cpu* cpu) {
 #if KB_POLL == 2
     kb_syscalled = 1;
@@ -894,9 +966,14 @@ static void syscall_body(struct kb_cpu* cpu) {
         }
         if (g == 1) goto done;
     }
+    if ((fd_first(nr) && kb_past_limit((int) a[0])) ||
+        (nr == 222 && !(a[3] & 0x20) && kb_past_limit((int) a[4]))) {
+        v = -9;
+        goto done;
+    }
     switch (nr) {
         case -2: /* dup2 of an fd to itself */
-            v = past_limit((int) a[0]) ? -9 : (int64_t) a[0];
+            v = kb_past_limit((int) a[0]) ? -9 : (int64_t) a[0];
             break;
         case 98:
             v = kb_futex(cpu, a);
@@ -939,7 +1016,7 @@ static void syscall_body(struct kb_cpu* cpu) {
         }
         case 56: {
             char* path = kb_str(cpu, a[1]);
-            v = path ? ret(openat(
+            v = path ? kb_newfd(openat(
                            host_dirfd((int64_t) a[0]), path,
                            host_oflags(cpu, a[2]), (int) a[3]
                        ))
@@ -947,7 +1024,7 @@ static void syscall_body(struct kb_cpu* cpu) {
             break;
         }
         case 57:
-            if (past_limit((int) a[0])) {
+            if (kb_past_limit((int) a[0])) {
                 v = -9;
                 break;
             }
@@ -958,21 +1035,23 @@ static void syscall_body(struct kb_cpu* cpu) {
         case 62:
             v = ret((int64_t) lseek((int) a[0], (off_t) a[1], (int) a[2]));
             break;
-        case 23: v = past_limit((int) a[0]) ? -9 : ret(dup((int) a[0])); break;
+        case 23:
+            v = kb_past_limit((int) a[0]) ? -9 : kb_newfd(dup((int) a[0]));
+            break;
         case 24:
-            v = past_limit((int) a[0]) || past_limit((int) a[1])
+            v = kb_past_limit((int) a[0]) || kb_past_limit((int) a[1])
                     ? -9
                     : ret(dup2((int) a[0], (int) a[1]));
             break;
         case 25: /* fcntl: duplicates, the descriptor flag and status flags */
-            if (past_limit((int) a[0]))
+            if (kb_past_limit((int) a[0]))
                 v = -9;
-            else if ((a[1] == 0 || a[1] == 1030) && past_limit((int) a[2]))
+            else if ((a[1] == 0 || a[1] == 1030) && (int) a[2] >= nofile_soft())
                 v = -22;
             else if (a[1] == 0)
-                v = ret(fcntl((int) a[0], F_DUPFD, (int) a[2]));
+                v = kb_newfd(fcntl((int) a[0], F_DUPFD, (int) a[2]));
             else if (a[1] == 1030)
-                v = ret(fcntl((int) a[0], F_DUPFD_CLOEXEC, (int) a[2]));
+                v = kb_newfd(fcntl((int) a[0], F_DUPFD_CLOEXEC, (int) a[2]));
             else if (a[1] == 1)
                 v = ret(fcntl((int) a[0], F_GETFD));
             else if (a[1] == 2)
@@ -1098,9 +1177,9 @@ static void syscall_body(struct kb_cpu* cpu) {
                 v = kb_err(errno);
                 break;
             }
+            if ((v = kb_newfd2(fds)) < 0) break;
             kb_store(cpu, a[0], (uint64_t) (uint32_t) fds[0], 4);
             kb_store(cpu, a[0] + 4, (uint64_t) (uint32_t) fds[1], 4);
-            v = 0;
             break;
         }
         case 93: /* exit: of the thread, the process with its last one */

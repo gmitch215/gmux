@@ -89,7 +89,7 @@ if (mode === 'run') {
 	await machine.run(() => output.includes('# '), sleep, 60_000);
 	const from = output.length;
 	const t = performance.now();
-	machine.type(`/bin/${loop}; echo "@@""done $?"\n`);
+	machine.type(`${process.env.LOOP_ENV ?? ''} /bin/${loop}; echo "@@""done $?"\n`);
 	const outcome = await machine.run(() => /@@done \d+/.test(output.slice(from)), sleep, 900_000);
 	const ms = performance.now() - t;
 	const status = output.slice(from).match(/@@done (\d+)/)?.[1];

@@ -1,0 +1,194 @@
+sse_movdqu_load mapped ok
+  flags 0xc5
+sse_movdqu_load unmapped fault at +0x90
+  flags 0xc5
+  fault flags 0xc5
+sse_movaps_load mapped ok
+  flags 0xc5
+sse_movaps_load unmapped fault at +0x90
+  flags 0xc5
+  fault flags 0xc5
+sse_movsd_load mapped ok
+  flags 0xc5
+sse_movsd_load unmapped fault at +0x90
+  flags 0xc5
+  fault flags 0xc5
+sse_movss_load mapped ok
+  flags 0xc5
+sse_movss_load unmapped fault at +0x90
+  flags 0xc5
+  fault flags 0xc5
+sse_movq_load mapped ok
+  flags 0xc5
+sse_movq_load unmapped fault at +0x90
+  flags 0xc5
+  fault flags 0xc5
+sse_movdqu_store mapped ok
+  flags 0xc5
+sse_movdqu_store unmapped fault at +0x90
+  flags 0xc5
+  fault flags 0xc5
+sse_movsd_store mapped ok
+  flags 0xc5
+sse_movsd_store unmapped fault at +0x90
+  flags 0xc5
+  fault flags 0xc5
+sse_paddq_mem mapped ok
+  flags 0xc5
+sse_paddq_mem unmapped fault at +0x90
+  flags 0xc5
+  fault flags 0xc5
+sse_cvtsi2sd_reg plain ok
+  flags 0xc5
+sse_cvtsi2sd_mem mapped ok
+  flags 0xc5
+sse_cvtsi2sd_mem unmapped fault at +0x90
+  flags 0xc5
+  fault flags 0xc5
+sse_cvtsi2ss_reg plain ok
+  flags 0xc5
+sse_cvttsd2si plain ok
+  rdx 0x1
+  flags 0xc5
+sse_cvttsd2si_mem mapped ok
+  r9 0x8000000000000000
+  flags 0xc5
+sse_cvttsd2si_mem unmapped fault at +0x90
+  flags 0xc5
+  fault flags 0xc5
+sse_cvttss2si plain ok
+  r9 0x0
+  flags 0xc5
+sse_movd_to_gpr plain ok
+  rdx 0x8800759c
+  flags 0xc5
+sse_movq_to_gpr plain ok
+  r12 0x7e37e43c8800759c
+  flags 0xc5
+sse_movd_to_xmm plain ok
+  flags 0xc5
+sse_movq_to_xmm plain ok
+  flags 0xc5
+sse_movd_store mapped ok
+  flags 0xc5
+sse_movd_store unmapped fault at +0x90
+  flags 0xc5
+  fault flags 0xc5
+sse_pmovmskb plain ok
+  rsi 0x29
+  flags 0xc5
+sse_movmskpd plain ok
+  r8 0x0
+  flags 0xc5
+sse_pextrw plain ok
+  rdi 0x8800
+  flags 0xc5
+sse_pinsrw plain ok
+  flags 0xc5
+sse_comisd plain ok
+  flags 0x1
+sse_comisd_mem mapped ok
+  flags 0x1
+sse_comisd_mem unmapped fault at +0x90
+  flags 0xc5
+  fault flags 0xc5
+sse_ucomiss plain ok
+  flags 0x0
+sse_stmxcsr mapped ok
+  flags 0xc5
+sse_stmxcsr unmapped fault at +0x90
+  flags 0xc5
+  fault flags 0xc5
+x87_fldl mapped ok
+  flags 0xc5
+x87_fldl unmapped fault at +0x90
+  flags 0xc5
+  fault flags 0xc5
+x87_fistpll mapped ok
+  flags 0xc5
+x87_fistpll unmapped fault at +0x92
+  flags 0xc5
+  fault flags 0xc5
+x87_fstpl mapped ok
+  flags 0xc5
+x87_fstpl unmapped fault at +0x92
+  flags 0xc5
+  fault flags 0xc5
+x87_fcomi plain ok
+  flags 0x1
+x87_fucomip plain ok
+  flags 0x1
+x87_fnstsw plain ok
+  rax 0x1111111111117800
+  flags 0xc5
+x87_fcmovb plain ok
+  flags 0xc5
+str_movsb short ok
+  rcx 0x0
+  rsi 0x20775a
+  rdi 0x7e000000006e
+  flags 0xc5
+str_movsb across fault at +0x90
+  rcx 0x3c
+  rsi 0x207778
+  rdi 0x7e0000001000
+  flags 0xc5
+  fault rcx 0x3c
+  fault rsi 0x207778
+  fault rdi 0x7e0000001000
+  fault flags 0xc5
+str_movsq short ok
+  rcx 0x0
+  rsi 0x2077a0
+  rdi 0x7e00000000b4
+  flags 0xc5
+str_movsq across fault at +0x90
+  rcx 0x5f
+  rsi 0x207778
+  rdi 0x7e0000001000
+  flags 0xc5
+  fault rcx 0x5f
+  fault rsi 0x207778
+  fault rdi 0x7e0000001000
+  fault flags 0xc5
+str_stosb short ok
+  rcx 0x0
+  rdi 0x7e000000006e
+  flags 0xc5
+str_stosb across fault at +0x90
+  rcx 0x3c
+  rdi 0x7e0000001000
+  flags 0xc5
+  fault rcx 0x3c
+  fault rdi 0x7e0000001000
+  fault flags 0xc5
+str_stosq short ok
+  rcx 0x0
+  rdi 0x7e00000000b4
+  flags 0xc5
+str_stosq across fault at +0x90
+  rcx 0x5f
+  rdi 0x7e0000001000
+  flags 0xc5
+  fault rcx 0x5f
+  fault rdi 0x7e0000001000
+  fault flags 0xc5
+str_stosb_down short ok
+  rcx 0x0
+  rdi 0x7e000000005a
+  flags 0xc5
+str_stosb_down across ok
+  rcx 0x0
+  rdi 0x7e0000000f74
+  flags 0xc5
+gpr_load mapped ok
+  rdx 0x3ff0000000000000
+  flags 0xc5
+gpr_load unmapped fault at +0x90
+  flags 0xc5
+  fault flags 0xc5
+gpr_store mapped ok
+  flags 0xc5
+gpr_store unmapped fault at +0x90
+  flags 0xc5
+  fault flags 0xc5
