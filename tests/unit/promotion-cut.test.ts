@@ -3,6 +3,7 @@ import {
 	bruteForce,
 	callees,
 	choose,
+	deps,
 	minCut,
 	policies,
 	reach,
@@ -153,6 +154,70 @@ describe('promotion cut planner', () => {
 				expect(s.objective).toBeLessThanOrEqual(split(g, new Set(), q).objective + 1e-9);
 				expect(s.objective).toBeGreaterThanOrEqual(optimum - 1e-9);
 			}
+		}
+	});
+
+	it('promotes a wide function only with every caller', () => {
+		// W has an i64 in its signature; A is hot and calls it, cold X calls it too
+		const wide = { ...node('W', 1500), wide: true };
+		const g: Graph = {
+			nodes: [node('main', 10), node('A', 1000), node('X', 5, 400), wide],
+			edges: [
+				{ from: 'main', to: 'A', count: 2 },
+				{ from: 'main', to: 'X', count: 1 },
+				{ from: 'A', to: 'W', count: 500 },
+				{ from: 'X', to: 'W', count: 1 }
+			]
+		};
+		expect(names(g, reach(deps(g), [3]))).toEqual(['A', 'W', 'X']);
+		// X cannot fit, so W and A stay interpreted for every policy
+		for (const policy of policies) expect(names(g, choose(policy, g, p, 300))).toEqual([]);
+		// with room, W goes with A and X; main only calls them, so it may cross
+		for (const policy of policies) {
+			const set = choose(policy, g, p, 1000);
+			expect(names(g, set)).toEqual(expect.arrayContaining(['A', 'W', 'X']));
+		}
+	});
+
+	it('never leaves a wide function native under an interpreted caller, on random graphs', () => {
+		let seed = 4242;
+		const next = () => (seed = (seed * 1103515245 + 12345) % 2147483648) / 2147483648;
+		for (let k = 0; k < 100; k++) {
+			const n = 4 + Math.floor(next() * 4);
+			const g: Graph = {
+				nodes: Array.from({ length: n }, (_, i) => ({
+					...node(`f${i}`, Math.floor(next() * 1000), 50 + Math.floor(next() * 100)),
+					wide: next() < 0.3
+				})),
+				edges: []
+			};
+			for (let e = 0; e < n * 2; e++) {
+				const from = Math.floor(next() * n);
+				const to = Math.floor(next() * n);
+				if (from !== to)
+					g.edges.push({
+						from: `f${from}`,
+						to: `f${to}`,
+						count: Math.floor(next() * 300)
+					});
+			}
+			const q: Params = { sI: 1, sN: 0.1, tau: next() * 5, lambda: 0 };
+			const budget = Math.floor(next() * 500);
+			const optimum = bruteForce(g, q, budget).objective;
+			for (const policy of policies) {
+				const set = choose(policy, g, q, budget);
+				for (const e of g.edges) {
+					const to = g.nodes.findIndex((x) => x.name === e.to);
+					const from = g.nodes.findIndex((x) => x.name === e.from);
+					if (g.nodes[to]!.wide && set.has(to)) expect(set.has(from)).toBe(true);
+				}
+				expect(split(g, set, q).objective).toBeGreaterThanOrEqual(optimum - 1e-9);
+			}
+			const free = bruteForce(g, q, Infinity);
+			expect(split(g, minCut(g, { ...q, lambda: 0 }), q).objective).toBeCloseTo(
+				free.objective,
+				6
+			);
 		}
 	});
 });

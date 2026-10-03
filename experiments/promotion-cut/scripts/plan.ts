@@ -17,7 +17,7 @@ import { join } from 'node:path';
  * `ladder.ts prepare`).
  */
 export interface Graph {
-	nodes: { name: string; count: number; bytes: number; params: number; result: boolean; pinned?: boolean }[];
+	nodes: { name: string; count: number; bytes: number; params: number; result: boolean; pinned?: boolean; wide?: boolean }[];
 	edges: { from: string; to: string; count: number }[];
 }
 
@@ -55,6 +55,17 @@ export function callees(g: Graph): number[][] {
 	const at = index(g);
 	const out = g.nodes.map(() => new Set<number>());
 	for (const e of g.edges) if (e.from !== e.to) out[at.get(e.from)!]!.add(at.get(e.to)!);
+	return out.map((s) => [...s]);
+}
+
+/**
+ * what a native function drags along: its callees, and for a function with an i64 or float in its
+ * signature (it cannot be entered through a burrow import) its callers too
+ */
+export function deps(g: Graph): number[][] {
+	const succ = callees(g);
+	const out = succ.map((s) => new Set(s));
+	succ.forEach((cs, u) => cs.forEach((v) => g.nodes[v]!.wide && out[v]!.add(u)));
 	return out.map((s) => [...s]);
 }
 
@@ -101,7 +112,7 @@ const closed = (g: Graph, succ: number[][], set: Set<number>) => [...set].every(
 
 /** chain of closed sets built by adding units in order; the best inside the budget by the model's J */
 function chain(g: Graph, p: Params, budget: number, units: number[][]): Set<number> {
-	const succ = callees(g);
+	const succ = deps(g);
 	let set = new Set<number>();
 	let best = { set, j: split(g, set, p).objective };
 	for (const unit of units) {
@@ -164,7 +175,7 @@ export function sccs(succ: number[][]): number[][] {
 
 /** strongly connected components as units, hottest component first, each with its callees */
 function scc(g: Graph, p: Params, budget: number) {
-	const comps = sccs(callees(g));
+	const comps = sccs(deps(g));
 	const heat = (c: number[]) => c.reduce((s, v) => s + g.nodes[v]!.count, 0);
 	return chain(g, p, budget, comps.sort((a, b) => heat(b) - heat(a)));
 }
@@ -218,7 +229,7 @@ export function minCut(g: Graph, p: Params): Set<number> {
 	const T = n + 1;
 	// native is the source side: a node left in T pays sI, a node in S pays sN and its bytes
 	const scale = 1e12;
-	const inf = 1e15;
+	const inf = Infinity;
 	const arcs: [number, number, number][] = [];
 	g.nodes.forEach((x, i) => {
 		arcs.push([S, i, x.count * p.sI * scale]);
@@ -230,6 +241,7 @@ export function minCut(g: Graph, p: Params): Set<number> {
 		if (u === v) continue;
 		arcs.push([v, u, e.count * p.tau * scale]);
 		arcs.push([u, v, inf]);
+		if (g.nodes[v]!.wide) arcs.push([v, u, inf]);
 	}
 	const { reachable } = maxflow(n + 2, arcs, S, T);
 	return new Set(g.nodes.map((_, i) => i).filter((i) => reachable[i]));
@@ -254,7 +266,7 @@ function mincut(g: Graph, p: Params, budget: number) {
 		if (bytes(cut(mid)) <= budget) hi = mid;
 		else lo = mid;
 	}
-	const succ = callees(g);
+	const succ = deps(g);
 	const pred = g.nodes.map(() => new Set<number>());
 	succ.forEach((cs, u) => cs.forEach((v) => pred[v]!.add(u)));
 	const j = (set: Set<number>) => split(g, set, p).objective;
@@ -288,13 +300,13 @@ function mincut(g: Graph, p: Params, budget: number) {
 
 export function choose(policy: Policy, g: Graph, p: Params, budget: number): Set<number> {
 	const set = { hottest, closure, scc, mincut }[policy](g, p, budget);
-	if (!closed(g, callees(g), set)) throw new Error(`${policy} returned a set that is not closed under calls`);
+	if (!closed(g, deps(g), set)) throw new Error(`${policy} returned a set that is not closed under calls`);
 	return set;
 }
 
 /** the exact optimum by enumeration, for graphs small enough (tests) */
 export function bruteForce(g: Graph, p: Params, budget: number): { set: Set<number>; objective: number } {
-	const succ = callees(g);
+	const succ = deps(g);
 	let best = { set: new Set<number>(), objective: Infinity };
 	for (let mask = 0; mask < 1 << g.nodes.length; mask++) {
 		const set = new Set(g.nodes.map((_, i) => i).filter((i) => mask & (1 << i)));
@@ -309,11 +321,6 @@ if (import.meta.main ?? process.argv[1]?.endsWith('plan.ts')) {
 	const [graphPath, endsPath, out, tauNs, ...fractions] = process.argv.slice(2);
 	if (!graphPath || !endsPath || !out || !tauNs || !fractions.length) throw new Error('usage: plan.ts <graph.json> <ends.json> <out dir> <tau ns> <budget fraction>...');
 	const g = JSON.parse(readFileSync(graphPath, "utf8")) as Graph & { total: number; bytes: number; nodes: { wide?: boolean }[] };
-	// a function with an i64 or float in its signature cannot cross a burrow import, so it stays interpreted, and so does everything that calls it
-	const callers = g.nodes.map(() => new Set<number>());
-	callees(g).forEach((cs, u) => cs.forEach((v) => callers[v]!.add(u)));
-	const pinned = reach(callers, g.nodes.flatMap((n, i) => (n.wide ? [i] : [])));
-	g.nodes.forEach((n, i) => (n.pinned = pinned.has(i)));
 	// ends.json is a `ladder.ts run` LADDER_JSON of the empty and the all-native rungs: ms per n units
 	const ends = JSON.parse(readFileSync(endsPath, 'utf8')) as { n: number; rows: { ms: number }[] };
 	const perUnit = (ms: number) => ms / 1e3 / ends.n;

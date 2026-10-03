@@ -139,19 +139,24 @@ if (mode === 'prepare') {
 	const importAt = head.findLastIndex((l) => /^ {2}\(type/.test(l)) + 1;
 	const manifest = rungs.map((rung, k) => {
 		const promoted = [...rung.set].sort();
-		// wasm3's side: each promoted function becomes a thunk passing the stack pointer first
+		// a wide function has no all-i32 thunk, so it is promoted only with every direct caller and is never entered from wasm3
+		for (const fn of fns)
+			for (const c of callees.get(fn.name)!)
+				if (byName.get(c)?.wide && rung.set.has(c) && !rung.set.has(fn.name)) throw new Error(`rung ${k}: ${fn.name} is interpreted and calls the promoted wide function ${c}`);
+		const entered = promoted.filter((n) => !byName.get(n)!.wide);
+		// wasm3's side: each entered function becomes a thunk passing the stack pointer first
 		const interpHead = [...head];
 		interpHead.splice(
 			importAt,
 			0,
-			...promoted.map((n) => {
+			...entered.map((n) => {
 				const fn = byName.get(n)!;
 				const params = ['i32', ...Array.from({ length: fn.params }, () => 'i32')].join(' ');
 				return `  (import "native" "${n}" (func $nat_${n} (param ${params})${fn.result ? ' (result i32)' : ''}))`;
 			})
 		);
 		const interpFns = fns.map((fn) =>
-			rung.set.has(fn.name) ? { ...fn, locals: [], body: ['    global.get $__stack_pointer', ...paramList(fn), `    call $nat_${fn.name}`] } : fn
+			entered.includes(fn.name) ? { ...fn, locals: [], body: ['    global.get $__stack_pointer', ...paramList(fn), `    call $nat_${fn.name}`] } : fn
 		);
 		writeFileSync(join(out, `rung${k}.interp.wasm`), wasmTools(['parse', '-o', '/dev/stdout'], [...interpHead, ...interpFns.flatMap(emit), ...tail].join('\n')));
 
@@ -170,7 +175,7 @@ if (mode === 'prepare') {
 			}
 			return { ...fn, locals: [...fn.locals, '    (local $tv_i32 i32) (local $tv_i64 i64) (local $tv_f32 f32) (local $tv_f64 f64)'], body };
 		});
-		const entries = promoted.map((n) => {
+		const entries = entered.map((n) => {
 			const fn = byName.get(n)!;
 			const params = ['i32', ...Array.from({ length: fn.params }, () => 'i32')].join(' ');
 			return [
@@ -193,7 +198,7 @@ if (mode === 'prepare') {
 			target: rung.target,
 			share: rung.share,
 			promoted,
-			imports: Object.fromEntries(promoted.map((n) => [n, `${byName.get(n)!.result ? 'i' : 'v'}(${'i'.repeat(byName.get(n)!.params + 1)})`]))
+			imports: Object.fromEntries(entered.map((n) => [n, `${byName.get(n)!.result ? 'i' : 'v'}(${'i'.repeat(byName.get(n)!.params + 1)})`]))
 		};
 	});
 	writeFileSync(join(out, 'rungs.json'), JSON.stringify({ total, counts, rungs: manifest }, null, '\t'));
