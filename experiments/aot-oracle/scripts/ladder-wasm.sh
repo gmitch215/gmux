@@ -25,7 +25,7 @@ flags() {
 }
 specs=()
 for arm in $arms; do
-	for w in sha256 factor sqlite; do
+	for w in ${WORKLOADS:-sha256 factor sqlite}; do
 		cp "$aot/aot-$arm-$w.c" "$out/aot-$arm-$w.c"
 		specs+=("$arm-$w=$(flags "$arm") /rig/out/aot-$arm-$w.c")
 	done

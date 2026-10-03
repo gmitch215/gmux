@@ -13,6 +13,12 @@ out=$(cd "$3" && pwd)
 shift 3
 image=gmux-lw-base:$(git -C "$lw" rev-parse --short=7 HEAD 2> /dev/null || "$root/scripts/ts" "$root/scripts/pin.ts" linux-wasm commit | cut -c1-7)
 W=/rig/linux-wasm/workspace
+# LAYOUT=n rotates the sources n places, which moves a build by its link order
+sources=("$root"/src/gmux/katybug/*.c)
+files=
+for ((i = 0; i < ${#sources[@]}; i++)); do
+	files+=" /rig/repo/src/gmux/katybug/$(basename "${sources[$(((i + ${LAYOUT:-0}) % ${#sources[@]}))]}")"
+done
 for spec in "$@"; do
 	name=${spec%%=*}
 	flags=${spec#*=}
@@ -21,6 +27,6 @@ for spec in "$@"; do
 		"$image" bash -c "set -euo pipefail; cd /tmp
 			LINUX_WASM=/rig/linux-wasm REAL_LLVM=$W/install/llvm/bin TMPDIR=/tmp \
 			/rig/repo/scripts/cc-strict --target=wasm-linux-musl -march=wasm32 --sysroot=$W/install/musl-wasm32_nommu \
-				-fPIC -O2 -Wl,-shared -D_DEFAULT_SOURCE $flags /rig/repo/src/gmux/katybug/*.c -o /rig/out/katybug-$name.wasm -lc"
+				-fPIC -O2 -Wl,-shared -D_DEFAULT_SOURCE $flags $files -o /rig/out/katybug-$name.wasm -lc"
 	echo "$name: $(wc -c < "$out/katybug-$name.wasm") bytes ($flags)"
 done
