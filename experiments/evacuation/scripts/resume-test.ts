@@ -29,7 +29,7 @@ function checkpoint(start, out, at) {
 	const inst = instance(evac, out, (i) => {
 		if (++ticks !== at) return;
 		i.exports.gmux_fp.value = i.exports.memory.grow(1) * 0x10000;
-		throw new WebAssembly.Exception(i.exports.gmux_ckpt, []);
+		i.exports.gmux_unwinding.value = 1;
 	});
 	try {
 		return { done: start(inst) };

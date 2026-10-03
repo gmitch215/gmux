@@ -61,6 +61,7 @@ type Exports = {
 	budget: WebAssembly.Global;
 	__stack_pointer: WebAssembly.Global;
 	gmux_fp: WebAssembly.Global;
+	gmux_unwinding: WebAssembly.Global;
 	gmux_ckpt: WebAssembly.Tag;
 };
 interface Snapshot {
@@ -68,7 +69,10 @@ interface Snapshot {
 	globals: number[];
 }
 
-/** an instance whose every import call is a tick (fuel refills nothing, so every check yields); onTick may throw a checkpoint first */
+/**
+ * an instance whose every import call is a tick (fuel refills nothing, so every check yields); onTick
+ * may start an unwind, as the machine does: set gmux_unwinding and return, the call not completed
+ */
 function instance(module: WebAssembly.Module, out: number[], onTick: (x: Exports) => void) {
 	const box: { x?: Exports } = {};
 	const i = new WebAssembly.Instance(module, {
@@ -76,7 +80,7 @@ function instance(module: WebAssembly.Module, out: number[], onTick: (x: Exports
 			__gmux_fuel: () => (onTick(box.x!), 0),
 			out: (v: number) => {
 				onTick(box.x!);
-				out.push(v);
+				if (!box.x!.gmux_unwinding?.value) out.push(v);
 			}
 		}
 	});
@@ -95,7 +99,7 @@ function checkpoint(
 	const x = instance(module, out, (x) => {
 		if (++ticks !== at) return;
 		x.gmux_fp.value = x.memory.grow(1) * 0x10000;
-		throw new WebAssembly.Exception(x.gmux_ckpt, []);
+		x.gmux_unwinding.value = 1;
 	});
 	try {
 		return { done: start(x) };
@@ -128,7 +132,9 @@ describe('evacuate.ts', () => {
 		['--resume', '--as-written'],
 		['--fold'],
 		['--resume', '--as-written', '--no-remat'],
-		['--fold', '--no-remat']
+		['--fold', '--no-remat'],
+		['--resume', '--try-sites'],
+		['--fold', '--try-sites']
 	];
 	for (const flags of arms) {
 		describe(flags.join(' '), () => {
@@ -164,6 +170,11 @@ describe('evacuate.ts', () => {
 				expect(stats.headEntries).toBeGreaterThan(0);
 				if (flags.includes('--no-remat')) expect(stats.rematerialized).toBe(0);
 				else expect(stats.rematerialized).toBeGreaterThan(0);
+			});
+
+			it('spills a host import site inline unless asked to keep its handler', () => {
+				if (flags.includes('--try-sites')) expect(stats.inlinedSites).toBe(0);
+				else expect(stats.inlinedSites).toBeGreaterThan(0);
 			});
 		});
 	}

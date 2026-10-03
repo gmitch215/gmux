@@ -25,6 +25,12 @@ const noSpill = flags.includes('--no-spill');
 const allLocals = flags.includes('--all-locals');
 // measurement arm: no handlers at fuel yields (the loop back edges' safepoints), to price them
 const noFuelSites = flags.includes('--no-fuel-sites');
+// measurement arm: a handler around every host import call too, as before the inline spill
+const trySites = flags.includes('--try-sites');
+// measurement arms: the same -O2 and nothing else (no flatten, so no handlers either), and the
+// module read and written back with no pass at all
+const noFlatten = flags.includes('--no-flatten');
+const noOpt = flags.includes('--no-opt') || !!process.env.GMUX_NO_OPT;
 // measurement arm: save every kept local instead of recomputing the cheap ones on resume
 const rematerializing = !flags.includes('--no-remat') && !allLocals && !noSpill;
 const F = binaryen.Features;
@@ -39,7 +45,7 @@ module.setFeatures(features);
 if (resume && !flags.includes('--as-written')) module.optimize();
 // flat, then locals coalesced while still flat: a handler spills every local of its function, which
 // keeps them all live across the call, so there must be few of them before handlers go in
-module.runPasses(['flatten', 'simplify-locals-nonesting', 'coalesce-locals', 'reorder-locals', 'vacuum']);
+if (!noFlatten) module.runPasses(['flatten', 'simplify-locals-nonesting', 'coalesce-locals', 'reorder-locals', 'vacuum']);
 
 // a checkpoint is only thrown at a safepoint, which is an import (a syscall, a fuel yield), so a call
 // needs a handler only if its callee can reach an import. An indirect call can land only on a table
@@ -330,6 +336,8 @@ function rematerialize(body, sites) {
 }
 
 let sites = 0;
+// labels of the site trys around a host import call (not another module's function)
+const hostSites = new Set();
 // per instrumented function: its locals, frame size and the ids of its sites
 const frames = new Map();
 // locals saved at sites, and those a resume recomputes instead, counted per site
@@ -446,6 +454,7 @@ if (handlers) {
 						keepAt.set(sites, needed(child));
 						const handler = module.block(null, [...spill(sites, child), module.rethrow(label)], unreachable);
 						const body = iid === E.CallId && imports.has(new E.Call(inner).target) ? module.block(null, [child, unwindCheck()], none) : child;
+						if (iid === E.CallId && imports.has(new E.Call(inner).target) && !foreign.has(new E.Call(inner).target)) hostSites.add(label);
 						block.setChildAt(i, module.try(label, body, ['gmux.ckpt'], [handler]));
 						sites++;
 					} else visit(child, collect);
@@ -638,7 +647,7 @@ function headSite(loop, path, keep) {
 	}
 	return ifs === 1 && [...defined].every((d) => !keep.has(d));
 }
-const stats = { variants: 0, resumableSites: 0, unresumableSites: 0, headEntries: 0 };
+const stats = { variants: 0, resumableSites: 0, unresumableSites: 0, headEntries: 0, inlinedSites: 0 };
 /** a loop's resume sites split into its fuel yield (see headSite), if it has one, and the rest */
 function heads(frame, loop, sites) {
 	const i = sites.findIndex((s) => headSite(loop, s.path, frame.keepAt.get(s.id)));
@@ -1003,6 +1012,60 @@ if (fold && handlers) {
 		module.addGlobalExport('gmux.unwinding', 'gmux_unwinding');
 	}
 }
+/**
+ * the host sets $gmux.unwinding and returns, so a host import's site has nothing to catch but its own
+ * unwind check: that throw moves to after the stores its handler ran, and the try goes
+ */
+function inlineHostSites() {
+	const check = (e) => {
+		const id = E.getExpressionId(e);
+		if (id === E.IfId) {
+			const cond = new E.If(e).condition;
+			return E.getExpressionId(cond) === E.GlobalGetId && E.getExpressionInfo(cond).name === 'gmux.unwinding' ? e : null;
+		}
+		if (id !== E.BlockId || !new E.Block(e).numChildren) return null;
+		return check(new E.Block(e).getChildAt(new E.Block(e).numChildren - 1));
+	};
+	const walk = (e) => {
+		const id = E.getExpressionId(e);
+		if (id === E.TryId) {
+			const t = new E.Try(e);
+			if (hostSites.has(t.name)) {
+				const found = check(t.body);
+				if (!found) throw new Error(`site ${t.name} has no unwind check`);
+				const handler = new E.Block(t.getCatchBodyAt(0));
+				const stores = [];
+				for (let i = 0; i < handler.numChildren - 1; i++) stores.push(module.copyExpression(handler.getChildAt(i)));
+				new E.If(found).ifTrue = module.block(null, [...stores, module.throw('gmux.ckpt', [])], unreachable);
+				stats.inlinedSites++;
+				return t.body;
+			}
+			t.body = walk(t.body);
+			for (let i = 0; i < t.numCatchBodies; i++) if (walk(t.getCatchBodyAt(i)) !== t.getCatchBodyAt(i)) throw new Error('a site is a catch body');
+		} else if (id === E.BlockId) {
+			const b = new E.Block(e);
+			for (let i = 0; i < b.numChildren; i++) {
+				const c = b.getChildAt(i);
+				const r = walk(c);
+				if (r !== c) b.setChildAt(i, r);
+			}
+		} else if (id === E.IfId) {
+			const x = new E.If(e);
+			x.ifTrue = walk(x.ifTrue);
+			if (x.ifFalse) x.ifFalse = walk(x.ifFalse);
+		} else if (id === E.LoopId) {
+			const l = new E.Loop(e);
+			l.body = walk(l.body);
+		}
+		return e;
+	};
+	for (let f = 0; f < module.getNumFunctions(); f++) {
+		const fn = module.getFunctionByIndex(f);
+		const body = binaryen.getFunctionInfo(fn).body;
+		if (body) binaryen._BinaryenFunctionSetBody(fn, walk(body));
+	}
+}
+if (handlers && !trySites) inlineHostSites();
 // the peeled copies repeat label names in sibling scopes, which wasm allows and binaryen's IR does
 // not; the binary format resolves labels by depth and reading it back names them uniquely
 const final = resume || fold || process.env.GMUX_ROUNDTRIP ? binaryen.readBinary(module.emitBinary()) : module;
@@ -1010,7 +1073,7 @@ final.setFeatures(features);
 binaryen.setOptimizeLevel(2);
 // measurement knob: the size up to which a function with several callers is inlined
 if (process.env.GMUX_FLEX_INLINE) binaryen.setFlexibleInlineMaxSize(Number(process.env.GMUX_FLEX_INLINE));
-if (!process.env.GMUX_NO_OPT) final.optimize();
+if (!noOpt) final.optimize();
 if (!final.validate()) throw new Error('invalid module');
 writeFileSync(output, final.emitBinary());
 console.log(JSON.stringify({ output, handlers, sites, functionsReachingASafepoint: reaches.size, functions: final.getNumFunctions(), saved, rematerialized, ...(resume || fold ? stats : {}) }));
