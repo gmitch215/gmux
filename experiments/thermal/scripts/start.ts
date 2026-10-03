@@ -1,7 +1,7 @@
 /**
  * Starts the idle day: claims the machine, gets a prompt, runs one command, leaves, and prints the
  * status. The machine then has no socket, so only the keeper's alarms and the thermal rule act.
- * `WORKER_URL=<url of the deployed worker> node --experimental-strip-types experiments/thermal/scripts/start.ts`
+ * `WORKER_URL=<url of the deployed worker> [COMMAND=<shell command to start>] node --experimental-strip-types experiments/thermal/scripts/start.ts`
  */
 if (!process.env.WORKER_URL) {
 	console.error('usage: WORKER_URL=<url of the deployed worker> node --experimental-strip-types start.ts');
@@ -32,7 +32,7 @@ function socket(kind: 'control' | 'warm', token: string): Promise<WebSocket> {
 const claimed = await retrying('/_gmux/claim', { method: 'POST' });
 const { token } = (await claimed.json()) as { token: string };
 if (!token) throw new Error(`claim: ${claimed.status}`);
-log('claimed');
+log('claimed', { token });
 
 let output = '';
 const control = await socket('control', token);
@@ -54,8 +54,9 @@ const started = Date.now();
 control.send(JSON.stringify({ t: 'in', d: '\n' }));
 await until('# ');
 log('prompt', { ms: Date.now() - started });
-control.send(JSON.stringify({ t: 'in', d: 'echo idle-day-$((6*7))\n' }));
-await until('idle-day-42');
+const command = process.env.COMMAND ?? 'echo idle-day';
+control.send(JSON.stringify({ t: 'in', d: `${command}\necho started-$((6*7))\n` }));
+await until('started-42');
 log('command');
 clearInterval(ticker);
 control.close();
