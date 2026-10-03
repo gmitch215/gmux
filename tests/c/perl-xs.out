@@ -1,0 +1,24 @@
+posix -4 4 1 2147483647
+strftime 1971-01-01 00:00:00
+strtol 31,0
+socket 127.0.0.1 2 1
+sockaddr 8080 10.1.2.3
+fcntl 0 1 64 128 2
+glob Dumper.pm
+$v = {
+  'a' => 'x',
+  'b' => [
+    1,
+    2
+  ]
+};
+list 55 9 3 4 720
+md5 75adc93b3fb1b8a2aa0d69c214055ab5
+sha256 5fd4ae1af2fcaa9c84065f0d9ccdf2a2f3fb761d5f7e827a2f89ce63c4f9572c
+base64 aGVsbG8sIHBlcmw=
+storable 1 2 3
+encode 3 1
+hires ok
+zlib same 2587417091 4191714040
+modules 34 of 34
+done

@@ -27,7 +27,7 @@ struct lib {
 
 static struct lib self = {0, 1, 0, 0, ""};
 static struct lib* libs;
-static char error[512];
+static char error[1024];
 static int failed;
 
 static void fail(const char* file, const char* why) {
@@ -35,9 +35,10 @@ static void fail(const char* file, const char* why) {
     failed = 1;
 }
 
-static void host_failed(void) {
-    __gmux_dlerror(error, sizeof error);
-    failed = 1;
+static void host_failed(const char* file) {
+    char why[sizeof error];
+    __gmux_dlerror(why, sizeof why);
+    fail(file, why);
 }
 
 static int readable(const char* path) {
@@ -113,7 +114,7 @@ void* dlopen(const char* file, int mode) {
     }
     unsigned long info[3]; // memory size, memory alignment, table size
     if (__gmux_dlprep(bytes, len, info) < 0) {
-        host_failed();
+        host_failed(path);
         free(bytes);
         return 0;
     }
@@ -130,7 +131,7 @@ void* dlopen(const char* file, int mode) {
     long handle = __gmux_dlopen(bytes, len, memory);
     free(bytes);
     if (handle < 0) {
-        host_failed();
+        host_failed(path);
         free(memory), free(l);
         return 0;
     }

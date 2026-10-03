@@ -1,0 +1,247 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Gregory Mitchell <me@gmitch215.xyz>
+Date: Fri, 2 Oct 2026 17:30:00 +0000
+Subject: [PATCH] wasm: refuse a shared mapping when no region id is left
+
+Once the 4,095 region ids were in use, a shared mapping took the open
+tags 0xffff or 0xfffe, which every non-root task could reach. The
+mapping now fails with ENOMEM and do_mmap undoes it as munmap would.
+
+A region's id was freed by looking at vm_usage, which also counts a fork
+child's mirrored copy: a child that outlived its parent's munmap kept the
+id and the tag for good. Each region now counts its own mappings and the
+span of pages it tagged. The last unmap clears the whole span, where it
+used to clear only the last mapping's pages, so a mapping of part of a
+region left the rest tagged and a reused id reached them.
+
+A second mapping of a region in one mm no longer replaces the first one's
+bits, and an unmap keeps the bits of every other mapping of the region,
+not only those that start at the same address.
+---
+ arch/wasm/include/asm/wasm.h |  2 +-
+ arch/wasm/mm/owner.c         | 72 +++++++++++++++++++++++++++---------
+ mm/nommu.c                   | 23 ++++++++++--
+ 3 files changed, 76 insertions(+), 21 deletions(-)
+
+diff --git a/arch/wasm/include/asm/wasm.h b/arch/wasm/include/asm/wasm.h
+index 06227b3e0..affda5df7 100644
+--- a/arch/wasm/include/asm/wasm.h
++++ b/arch/wasm/include/asm/wasm.h
+@@ -58,7 +58,7 @@ extern void wasm_user_touch(unsigned long addr, unsigned long len);
+ 
+ /* gmux: the page owner table (arch/wasm/mm/owner.c) */
+ struct vm_area_struct;
+-void wasm_owner_map(struct vm_area_struct *vma);
++int wasm_owner_map(struct vm_area_struct *vma);
+ void wasm_owner_unmap(struct vm_area_struct *vma, unsigned long start, unsigned long end);
+ 
+ #endif /* _ASM_WASM_WASM_H */
+diff --git a/arch/wasm/mm/owner.c b/arch/wasm/mm/owner.c
+index 4192ca25c..631069243 100644
+--- a/arch/wasm/mm/owner.c
++++ b/arch/wasm/mm/owner.c
+@@ -6,7 +6,8 @@
+  * Each mm has a set: two bits per region, readable and writable, for the regions it maps. The host
+  * runs a non-root task's programs in a build that checks every load and store against both
+  * (scripts/wasm/guard-pass.ts), and access_ok checks a non-root task's syscall buffers against them.
+- * When region ids run out a shared mapping falls back to WASM_OWNER_SHARED(_RO), open to every task.
++ * A region's id is free, and every page it tagged untagged, when its last mapping goes; when no id
++ * is left a mapping that needs one is refused, never opened to every task.
+  */
+ 
+ #include <linux/cred.h>
+@@ -20,8 +21,6 @@
+ #include <linux/xarray.h>
+ #include <asm/wasm.h>
+ 
+-#define WASM_OWNER_SHARED	0xffff
+-#define WASM_OWNER_SHARED_RO	0xfffe
+ #define WASM_OWNER_REGION	0x8000
+ #define WASM_REGIONS		4096
+ 
+@@ -29,6 +28,12 @@ static u16 *owners;
+ static unsigned long owners_pages;
+ static DEFINE_IDA(owner_ida);
+ static DEFINE_IDA(region_ida);
++/* by region id: its mappings (a fork child's copies do not count) and the pages it has tagged */
++static struct {
++	unsigned int users;
++	unsigned long first, last;
++} regions[WASM_REGIONS];
++static DEFINE_SPINLOCK(regions_lock);
+ /* each mm's set, by its tag: WASM_REGIONS / 4 bytes, region id's bits at byte id / 4 */
+ static DEFINE_XARRAY(owner_sets);
+ 
+@@ -72,7 +77,7 @@ static u8 *mm_set(struct mm_struct *mm)
+ 
+ static bool is_region(u16 tag)
+ {
+-	return (tag & WASM_OWNER_REGION) && tag < WASM_OWNER_SHARED_RO;
++	return tag & WASM_OWNER_REGION;
+ }
+ 
+ static void set_range(unsigned long start, unsigned long end, u16 tag)
+@@ -107,28 +112,51 @@ static unsigned int vma_bits(struct vm_area_struct *vma)
+ 	return 1 | (vma->vm_flags & VM_WRITE ? 2 : 0);
+ }
+ 
+-void wasm_owner_map(struct vm_area_struct *vma)
++static unsigned int get_bits(struct mm_struct *mm, u16 tag)
+ {
++	unsigned int id = tag & (WASM_REGIONS - 1);
++	u8 *set = mm_set(mm);
++
++	return set ? (set[id / 4] >> (id % 4 * 2)) & 3 : 0;
++}
++
++/* 0, or -ENOMEM when a shared mapping needs a region id and none is left */
++int wasm_owner_map(struct vm_area_struct *vma)
++{
++	unsigned long first = vma->vm_start >> PAGE_SHIFT, last = DIV_ROUND_UP(vma->vm_end, PAGE_SIZE);
+ 	u16 tag;
+ 
+ 	/* a fork child's bytes are not at these pages: they stay the parent's */
+ 	if (vma->vm_mm->context.private_memory)
+-		return;
++		return 0;
+ 	if (is_nommu_shared_mapping(vma->vm_flags)) {
++		unsigned int id;
++
+ 		/* without an MMU every mapping of a region is at the same address */
+ 		tag = tag_at(vma->vm_start);
+ 		if (!is_region(tag)) {
+-			int id = ida_alloc_range(&region_ida, 1, WASM_REGIONS - 1, GFP_KERNEL);
++			int fresh = ida_alloc_range(&region_ida, 1, WASM_REGIONS - 1, GFP_KERNEL);
+ 
+-			tag = id < 0 ? (vma->vm_flags & VM_WRITE ? WASM_OWNER_SHARED : WASM_OWNER_SHARED_RO)
+-				     : WASM_OWNER_REGION | id;
++			if (fresh < 0)
++				return -ENOMEM;
++			tag = WASM_OWNER_REGION | fresh;
++		}
++		id = tag & (WASM_REGIONS - 1);
++		spin_lock(&regions_lock);
++		if (!regions[id].users++) {
++			regions[id].first = first;
++			regions[id].last = last;
++		} else {
++			regions[id].first = min(regions[id].first, first);
++			regions[id].last = max(regions[id].last, last);
+ 		}
+-		if (is_region(tag))
+-			set_bits(vma->vm_mm, tag, vma_bits(vma));
++		spin_unlock(&regions_lock);
++		set_bits(vma->vm_mm, tag, get_bits(vma->vm_mm, tag) | vma_bits(vma));
+ 	} else {
+ 		tag = mm_owner(vma->vm_mm);
+ 	}
+ 	set_range(vma->vm_start, vma->vm_end, tag);
++	return 0;
+ }
+ 
+ void wasm_owner_unmap(struct vm_area_struct *vma, unsigned long start, unsigned long end)
+@@ -139,19 +167,29 @@ void wasm_owner_unmap(struct vm_area_struct *vma, unsigned long start, unsigned
+ 		return;
+ 	if (is_nommu_shared_mapping(vma->vm_flags) && is_region(tag) &&
+ 	    start == vma->vm_start && end == vma->vm_end) {
+-		/* the mm keeps what its other mappings of the region give it */
++		unsigned int id = tag & (WASM_REGIONS - 1);
++		unsigned long first, last;
+ 		struct vm_area_struct *other;
+ 		unsigned int bits = 0;
++		bool unused;
+ 		VMA_ITERATOR(vmi, vma->vm_mm, 0);
+ 
++		/* the mm keeps what its other mappings of the region give it */
+ 		for_each_vma(vmi, other)
+-			if (other != vma && other->vm_start == vma->vm_start)
++			if (other != vma && is_nommu_shared_mapping(other->vm_flags) &&
++			    tag_at(other->vm_start) == tag)
+ 				bits |= vma_bits(other);
+ 		set_bits(vma->vm_mm, tag, bits);
+-		if (vma->vm_region && vma->vm_region->vm_usage > 1)
++		spin_lock(&regions_lock);
++		unused = !--regions[id].users;
++		first = regions[id].first;
++		last = regions[id].last;
++		spin_unlock(&regions_lock);
++		if (!unused)
+ 			return;
+-		set_range(start, end, 0);
+-		ida_free(&region_ida, tag & (WASM_REGIONS - 1));
++		/* the last mapping may be a part of what the first one tagged */
++		set_range(first << PAGE_SHIFT, last << PAGE_SHIFT, 0);
++		ida_free(&region_ida, id);
+ 		return;
+ 	}
+ 	/* pages other mappings still share keep their tag */
+@@ -191,7 +229,7 @@ int wasm_user_range_ok(unsigned long addr, unsigned long size)
+ 		u16 tag = page < owners_pages ? READ_ONCE(owners[page]) : 0;
+ 		unsigned int id = tag & (WASM_REGIONS - 1);
+ 
+-		if (tag == WASM_OWNER_SHARED || tag == WASM_OWNER_SHARED_RO || (mine && tag == mine))
++		if (mine && tag == mine)
+ 			continue;
+ 		/* access_ok has no direction: a region the mm can read passes */
+ 		if (is_region(tag) && set && ((set[id / 4] >> (id % 4 * 2)) & 1))
+diff --git a/mm/nommu.c b/mm/nommu.c
+index f8a7fb7f6..166dfa062 100644
+--- a/mm/nommu.c
++++ b/mm/nommu.c
+@@ -562,11 +562,12 @@ static void put_nommu_region(struct vm_region *region)
+ 	__put_nommu_region(region);
+ }
+ 
+-static void setup_vma_to_mm(struct vm_area_struct *vma, struct mm_struct *mm)
++static int setup_vma_to_mm(struct vm_area_struct *vma, struct mm_struct *mm)
+ {
+ 	vma->vm_mm = mm;
+ #ifdef CONFIG_WASM
+-	wasm_owner_map(vma);
++	if (wasm_owner_map(vma))
++		return -ENOMEM;
+ #endif
+ 
+ 	/* add the VMA to the mapping */
+@@ -579,6 +580,7 @@ static void setup_vma_to_mm(struct vm_area_struct *vma, struct mm_struct *mm)
+ 		flush_dcache_mmap_unlock(mapping);
+ 		i_mmap_unlock_write(mapping);
+ 	}
++	return 0;
+ }
+ 
+ static void cleanup_vma_from_mm(struct vm_area_struct *vma)
+@@ -1207,7 +1209,11 @@ unsigned long do_mmap(struct file *file,
+ 	if (vma_iter_prealloc(&vmi, vma))
+ 		goto error_just_free;
+ 
+-	setup_vma_to_mm(vma, current->mm);
++	ret = setup_vma_to_mm(vma, current->mm);
++#ifdef CONFIG_WASM
++	if (ret < 0)
++		goto error_no_region_id;
++#endif
+ 	current->mm->map_count++;
+ 	/* add the VMA to the tree */
+ 	vma_iter_store_new(&vmi, vma);
+@@ -1239,6 +1245,17 @@ unsigned long do_mmap(struct file *file,
+ 	vm_area_free(vma);
+ 	return ret;
+ 
++#ifdef CONFIG_WASM
++error_no_region_id:
++	/* the mapping is made but no region id is left for it: undo it as munmap would */
++	vma_iter_free(&vmi);
++	if (region->vm_usage == 1)
++		current->mm->total_vm -= len >> PAGE_SHIFT;
++	up_write(&nommu_region_sem);
++	delete_vma(current->mm, vma);
++	return ret;
++#endif
++
+ sharing_violation:
+ 	up_write(&nommu_region_sem);
+ 	pr_warn("Attempt to share mismatched mappings\n");
+-- 
+2.43.0
+

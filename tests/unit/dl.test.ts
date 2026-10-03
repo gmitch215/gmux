@@ -1,7 +1,12 @@
 import binaryen from 'binaryen';
 import { createHash } from 'node:crypto';
 import { describe, expect, it } from 'vitest';
-import { DlProcess, dylinkInfo, type DlInstance } from '../../src/worker/machine/dl.ts';
+import {
+	DlProcess,
+	dylinkInfo,
+	type DlInstance,
+	type DlMisses
+} from '../../src/worker/machine/dl.ts';
 
 const sha256 = (bytes: Uint8Array) => createHash('sha256').update(bytes).digest('hex');
 
@@ -152,12 +157,69 @@ describe('dlopen', () => {
 		const other = build('(module (func (export "f")))', [0, 0, 0, 0]);
 		expect(open(other)).toBe(-1);
 		expect(error()).toMatch(
-			/not in the exec registry \(sha256 [0-9a-f]{64}\); code cannot be compiled at run time/
+			/not in the exec registry \(sha256 [0-9a-f]{64}\); this process cannot load it because a Worker cannot compile code at run time/
 		);
 		expect(open(new Uint8Array([0x7f, 0x45, 0x4c, 0x46, 2, 1, 1, 0]))).toBe(-1);
 		expect(error()).toBe('an ELF shared object, not a wasm side module');
 		expect(open(PROGRAM)).toBe(-1);
 		expect(error()).toMatch(/no dylink.0 section/);
+	});
+
+	it('records the miss against the executable and says what the next run gets', () => {
+		const other = build('(module (func (export "f")))', [0, 0, 0, 0]);
+		const exe = { hash: 'e'.repeat(64), name: 'prog' };
+		const refuse = (interpreter: boolean) => {
+			const misses: DlMisses = new Map();
+			const seen: string[] = [];
+			const memory = new WebAssembly.Memory({ initial: 1 });
+			const process = new DlProcess(memory, new Map(), sha256, DATA_START, {
+				misses,
+				interpreter,
+				onMiss: (e, lib) => seen.push(`${lib} for ${e}`)
+			});
+			process.exe = exe;
+			expect(process.prepare(other)).toBeNull();
+			return { misses, seen, error: process.lastError() };
+		};
+		const hash = sha256(other);
+		const without = refuse(false);
+		expect(without.misses).toEqual(new Map([[exe.hash, new Set([hash])]]));
+		expect(without.seen).toEqual([`${hash} for ${exe.hash}`]);
+		expect(without.error).toContain(`not in the exec registry (sha256 ${hash})`);
+		expect(without.error).toContain(`prog (sha256 ${exe.hash}) cannot load it`);
+		expect(without.error).toContain('the interpreted tier is not available, so the next run');
+		expect(refuse(true).error).toContain(
+			'the next run starts on the interpreted tier with this library interpreted'
+		);
+	});
+
+	it('records nothing for what the interpreted tier cannot take', () => {
+		const misses: DlMisses = new Map();
+		const exe = build('(module (func (export "_start")))', [0, 0, 0, 0]);
+		const memory = new WebAssembly.Memory({ initial: 1 });
+		const registry = new Map([[sha256(exe), new WebAssembly.Module(exe)]]);
+		const process = new DlProcess(memory, registry, sha256, DATA_START, {
+			misses,
+			interpreter: true
+		});
+		process.exe = { hash: 'e'.repeat(64), name: 'prog' };
+		expect(process.prepare(exe)).toBeNull();
+		expect(process.prepare(new Uint8Array([0x7f, 0x45, 0x4c, 0x46, 2, 1, 1, 0]))).toBeNull();
+		expect(process.prepare(PROGRAM)).toBeNull();
+		expect(misses.size).toBe(0);
+	});
+
+	it('still loads a registered library native, and records no miss', () => {
+		const misses: DlMisses = new Map();
+		const memory = new WebAssembly.Memory({ initial: 1 });
+		const registry = new Map([[sha256(SIDE), new WebAssembly.Module(SIDE)]]);
+		const process = new DlProcess(memory, registry, sha256, DATA_START, {
+			misses,
+			interpreter: true
+		});
+		process.exe = { hash: 'e'.repeat(64), name: 'prog' };
+		expect(process.prepare(SIDE)).toMatchObject({ hash: sha256(SIDE) });
+		expect(misses.size).toBe(0);
 	});
 
 	it('refuses an executable', () => {

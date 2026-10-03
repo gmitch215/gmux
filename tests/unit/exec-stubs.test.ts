@@ -165,3 +165,23 @@ describe('staging another katybug', () => {
 		);
 	});
 });
+
+describe('the data note', () => {
+	it("records the plain build's dylink.0 memory size in gmux.data, and nothing without one", () => {
+		const dir = mkdtempSync(join(tmpdir(), 'gmux-data-note-'));
+		const note = (plain: Uint8Array) => {
+			writeFileSync(join(dir, 'plain.wasm'), plain);
+			writeFileSync(join(dir, 'out.wasm'), PLAIN);
+			execFileSync('scripts/ts', [
+				'scripts/wasm/data-note.ts',
+				join(dir, 'plain.wasm'),
+				join(dir, 'out.wasm')
+			]);
+			const module = new WebAssembly.Module(readFileSync(join(dir, 'out.wasm')));
+			return WebAssembly.Module.customSections(module, 'gmux.data');
+		};
+		const [section] = note(PROGRAM);
+		expect(new DataView(section!).getUint32(0, true)).toBe(0x4000);
+		expect(note(PLAIN)).toHaveLength(0);
+	});
+});

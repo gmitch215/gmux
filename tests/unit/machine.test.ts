@@ -4,7 +4,14 @@ import { mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
-import { Machine, type MachineOptions, type SyncedFile } from '../../src/worker/machine/machine.ts';
+import { uleb } from '../../scripts/wasm/binary.ts';
+import { stub } from '../../scripts/wasm/exec-stubs.ts';
+import {
+	Machine,
+	stubHash,
+	type MachineOptions,
+	type SyncedFile
+} from '../../src/worker/machine/machine.ts';
 import {
 	MISS,
 	ROUTE_HOOK,
@@ -58,11 +65,14 @@ function parse(name: string) {
  * tests/fixtures/toy-user.wat ("u" on the toy kernel's console), toy-vfork.wat ("v"),
  * toy-fault.wat ("f"), toy-spin.wat ("i"), toy-overflow.wat ("o") or toy-mmu.wat ("m")
  */
-function toyUser(name = 'toy-user.wat', asyncify = false): WebAssembly.Module {
+function toyUser(name = 'toy-user.wat', asyncify = false, data?: number): WebAssembly.Module {
 	const module = parse(name);
 	module.setFeatures(
 		binaryen.Features.Atomics | binaryen.Features.MutableGlobals | binaryen.Features.MultiMemory
 	);
+	// instrument.sh's gmux.data note
+	if (data !== undefined)
+		module.addCustomSection('gmux.data', new Uint8Array(new Uint32Array([data]).buffer));
 	if (asyncify) {
 		binaryen.setPassArgument('asyncify-imports', 'env.__wasm_syscall_*');
 		module.runPasses(['asyncify']);
@@ -404,6 +414,129 @@ describe('Machine', () => {
 		machine.type('s');
 		await r.run(machine, () => r.output().includes('parent back ok'));
 		expect(machine.crashed).toBeNull();
+	});
+
+	describe('a recorded dlopen miss', () => {
+		const exec = async (options: Partial<MachineOptions>) => {
+			const r = rig({
+				sharedKernel: true,
+				registry: new Map([['U', toyUser()]]),
+				...options
+			});
+			const machine = new Machine(r.machineOptions);
+			await r.run(machine, () => r.output().includes('parent ok'));
+			machine.type('u');
+			const end = await r.run(machine, () => r.output().includes('handled'));
+			return { machine, end };
+		};
+
+		it('starts the next run of that executable on the interpreted tier', async () => {
+			const asked: [string, string[]][] = [];
+			const reach = new WebAssembly.Module(parse('toy-reach.wat').emitBinary());
+			const { machine } = await exec({
+				dlMisses: new Map([['U', new Set(['L'])]]),
+				interpret: (exe, libs) => {
+					asked.push([exe, libs]);
+					return reach;
+				}
+			});
+			expect(asked).toEqual([['U', ['L']]]);
+			expect(machine.stats.interpretedStarts).toEqual(['U']);
+			expect(String(machine.crashed)).toMatch(/LinkError.*fetch/);
+		});
+
+		it('leaves an executable with no miss, and one the tier cannot take, on the registry build', async () => {
+			let asked = 0;
+			const clean = await exec({
+				interpret: () => {
+					asked++;
+					return undefined;
+				}
+			});
+			expect(asked).toBe(0);
+			expect(clean.machine.stats.interpretedStarts).toEqual([]);
+			const refused = await exec({
+				dlMisses: new Map([['U', new Set(['L'])]]),
+				interpret: () => {
+					asked++;
+					return undefined;
+				}
+			});
+			expect(asked).toBe(1);
+			expect(refused.machine.stats.interpretedStarts).toEqual([]);
+			expect(refused.machine.crashed).toBeNull();
+			const none = await exec({ dlMisses: new Map([['U', new Set(['L'])]]) });
+			expect(none.machine.stats.interpretedStarts).toEqual([]);
+		});
+	});
+
+	describe('an exec whose module outgrows its stub', () => {
+		// a program whose dylink.0 names `memory` bytes of data, as an exec stub the kernel hands over
+		function stubOf(memory: number, tag: number): Uint8Array {
+			const info = [...uleb(memory), 2, 3, 0];
+			const name = [8, ...Buffer.from('dylink.0')];
+			const body = [...name, 1, info.length, ...info];
+			const program = new Uint8Array([
+				0,
+				0x61,
+				0x73,
+				0x6d,
+				1,
+				0,
+				0,
+				0,
+				0,
+				...uleb(body.length),
+				...body,
+				// a data section distinguishes the programs by hash
+				11,
+				3,
+				1,
+				0,
+				tag
+			]);
+			return stub(program)!;
+		}
+
+		function lookup(stubbed: Uint8Array, module: WebAssembly.Module) {
+			const r = rig({ registry: new Map([[stubHash(stubbed)!, module]]) });
+			const machine = new Machine(r.machineOptions);
+			const at = 0x20000;
+			new Uint8Array(machine.memory.buffer).set(stubbed, at);
+			const found = (machine as any).lookup(null, at, at + stubbed.length, 0x10000, 0);
+			return { found, machine };
+		}
+
+		it('refuses a module of 32,992 bytes under a stub that maps 31,664', () => {
+			const { found, machine } = lookup(
+				stubOf(31664, 1),
+				toyUser('toy-user.wat', false, 32992)
+			);
+			expect(found).toBeUndefined();
+			expect(machine.stats.unknownExecutables).toHaveLength(1);
+			expect(machine.stats.unknownExecutables[0]).toMatch(
+				/needs 32992 bytes of data, stub maps 31664/
+			);
+		});
+
+		it('runs a module its stub maps, the stub rounded up to whole pages', () => {
+			for (const [stubbed, data] of [
+				[31664, 31664],
+				[31664, 32768],
+				[32992, 32992]
+			] as const) {
+				const { found, machine } = lookup(
+					stubOf(stubbed, 2),
+					toyUser('toy-user.wat', false, data)
+				);
+				expect(found).toBeDefined();
+				expect(machine.stats.unknownExecutables).toEqual([]);
+			}
+		});
+
+		it('runs a module with no note, as an older build has none', () => {
+			expect(lookup(stubOf(100, 3), toyUser()).found).toBeDefined();
+		});
 	});
 
 	it("gives each machine its own memory, which another machine's tasks cannot reach", async () => {
@@ -916,6 +1049,20 @@ describe('Machine', () => {
 				});
 			});
 
+			it('leaves a buffer outside the memory to the kernel instead of throwing', async () => {
+				const { r, machine } = statxRig(true);
+				await r.run(machine, () => r.output().includes('parent ok'));
+				machine.type('t');
+				await r.run(machine, () => r.output().includes('handled'));
+				const me = [...(machine as any).runners.values()].find((x: any) => x.instance);
+				const ask = (buf: number) => (machine as any).statxCached(me, 0x750, 0, 0x7ff, buf);
+				const size = machine.memory.buffer.byteLength;
+				expect(ask(0x3000)).toBe(0);
+				expect(ask(size - 255)).toBe(MISS);
+				expect(ask(0xffffff80)).toBe(MISS);
+				expect(ask(size - 256)).toBe(0);
+			});
+
 			it('asks the kernel for a task whose view is not cacheable', async () => {
 				const { r, machine, set } = statxRig(true);
 				await r.run(machine, () => r.output().includes('parent ok'));
@@ -937,6 +1084,62 @@ describe('Machine', () => {
 				await r.run(machine, () => r.output().includes('user back'));
 				expect(machine.stats.statxHits).toBe(0);
 				expect(machine.stats.statxMismatches).toBe(1);
+			});
+		});
+
+		describe("a fork child's own memory", () => {
+			const childRig = () => {
+				const machine = new Machine(rig().machineOptions);
+				const child = new WebAssembly.Memory({ initial: 2, maximum: 64, shared: true });
+				// the toy kernel's current mm is 1
+				(machine as any).privateMemories.set(1, child);
+				const runner = { instance: { exports: { wasm_current_mm: () => 1 } } };
+				const imports = (machine as any).rawImports(() => runner);
+				return {
+					machine,
+					child: new Uint8Array(child.buffer),
+					kernel: new Uint8Array(machine.memory.buffer),
+					copy: imports.wasm_user_copy as (
+						k: number,
+						u: number,
+						n: number,
+						m: number
+					) => number,
+					atomic: imports.wasm_user_atomic as (...a: number[]) => number
+				};
+			};
+
+			it('copies to and from the kernel through the host and counts the crossings', () => {
+				const { machine, child, kernel, copy } = childRig();
+				kernel.set([1, 2, 3, 4, 5], 0x1000);
+				expect(copy(0x1000, 0x200, 5, 1)).toBe(0);
+				expect(child.subarray(0x200, 0x205)).toEqual(new Uint8Array([1, 2, 3, 4, 5]));
+				expect(kernel[0x200]).toBe(0);
+				expect(copy(0x2000, 0x200, 5, 0)).toBe(0);
+				expect(kernel.subarray(0x2000, 0x2005)).toEqual(new Uint8Array([1, 2, 3, 4, 5]));
+				expect(copy(0, 0x200, 3, 2)).toBe(0);
+				expect(child.subarray(0x200, 0x205)).toEqual(new Uint8Array([0, 0, 0, 4, 5]));
+				expect(machine.stats).toMatchObject({ userCopies: 3, userCopyBytes: 13 });
+			});
+
+			it('reports the bytes it could not reach for a span past the child memory', () => {
+				const { child, copy } = childRig();
+				const size = child.length;
+				for (const mode of [0, 1, 2]) {
+					expect(copy(0x1000, size - 4, 8, mode)).toBe(8);
+					expect(copy(0x1000, 0xfffffffc, 8, mode)).toBe(8);
+				}
+				expect(child.subarray(size - 4).every((b) => b === 0)).toBe(true);
+			});
+
+			it('refuses a futex word outside the child memory or unaligned with EFAULT', () => {
+				const { child, atomic } = childRig();
+				const at = (uaddr: number) => atomic(1, uaddr, 5, 0, 0x1000);
+				expect(at(0x100)).toBe(0);
+				expect(new Int32Array(child.buffer)[0x40]).toBe(5);
+				expect(at(child.length)).toBe(-14);
+				expect(at(child.length - 2)).toBe(-14);
+				expect(at(0x101)).toBe(-14);
 			});
 		});
 

@@ -74,7 +74,16 @@ int main(int argc, char** argv) {
                                          0,   0,   0,   0};
     fwrite(fake, 1, sizeof fake, f);
     fclose(f);
-    int ok = refused("/tmp/unknown.so", "not in the exec registry");
+    int ok = refused(
+        "/tmp/unknown.so", "/tmp/unknown.so: not in the exec registry (sha256 "
+    );
+    ok &= refused("/tmp/unknown.so", "dl (sha256 ");
+    ok &=
+        refused("/tmp/unknown.so", "a Worker cannot compile code at run time");
+    ok &= refused(
+        "/tmp/unknown.so",
+        "the interpreted tier is not available, so the next run"
+    );
     ok &= refused("/no/such.so", "No such file");
     ok &= refused("/bin/dl", "an executable, not a shared library");
     return ok ? 0 : 1;

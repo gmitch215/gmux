@@ -1,5 +1,14 @@
 import { readFileSync, writeFileSync } from 'node:fs';
-import { concat, customSection, readLeb, sections, skipImport, text, u32le } from './binary.ts';
+import {
+	concat,
+	customSection,
+	dylinkMemorySize,
+	readLeb,
+	sections,
+	skipImport,
+	text,
+	u32le
+} from './binary.ts';
 import { exportGlobals } from './export-globals.ts';
 
 /**
@@ -12,24 +21,9 @@ import { exportGlobals } from './export-globals.ts';
  * drops), so the host can copy a pristine data image to each new process.
  * `share.ts plain.wasm instrumented.wasm out.wasm`
  */
-function dataSize(plain: Uint8Array): number {
-	for (const [id, , start, end] of sections(plain)) {
-		if (id !== 0) continue;
-		const [n, k0] = readLeb(plain, start);
-		if (text.decode(plain.subarray(k0, k0 + n)) !== 'dylink.0') continue;
-		let k = k0 + n;
-		while (k < end) {
-			const kind = plain[k]!;
-			const [length, at] = readLeb(plain, k + 1);
-			if (kind === 1) return readLeb(plain, at)[0];
-			k = at + length;
-		}
-	}
-	throw new Error('no dylink.0 memory size in the plain build');
-}
-
 const [plain, src, dst] = process.argv.slice(2);
-const data = dataSize(readFileSync(plain!));
+const data = dylinkMemorySize(readFileSync(plain!));
+if (data === null) throw new Error('no dylink.0 memory size in the plain build');
 const b = new Uint8Array(readFileSync(src!));
 const flipped: string[] = [];
 for (const [id, , start] of sections(b)) {

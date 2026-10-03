@@ -2,15 +2,20 @@
 # prepares a user program for the host: fuel checks at every loop head, so one that never makes a
 # syscall still yields the host thread; a check on every stack pointer write, so an overflow is a
 # fault instead of a write into the mapping below; only the exports the host calls, since each
-# instance builds an exports object (BusyBox links 2,051); and a note of the table size it needs. The kernel finds a program by the hash of
+# instance builds an exports object (BusyBox links 2,051); and notes of the table size it needs and
+# the data size its dylink.0 names (read from the optional third file when the input has none, as a
+# guarded build has not). The kernel finds a program by the hash of
 # the file it reads, which stays unmodified; the host runs this output in its place
 set -euo pipefail
-in=${1:?usage: scripts/wasm/instrument.sh <program.wasm> <instrumented.wasm>}
+in=${1:?usage: scripts/wasm/instrument.sh <program.wasm> <instrumented.wasm> [plain.wasm]}
 out=${2:?}
 here=$(cd "$(dirname "$0")" && pwd)
 tmp=$(mktemp -d)
 wasm2wat --enable-threads --enable-exceptions --enable-multi-memory --generate-names "$in" -o "$tmp/in.wat"
-"$here/../ts" "$here/fuel-pass.ts" "$tmp/in.wat" "$tmp/fuel.wat" > /dev/null
+# GMUX_NO_FUEL=1 exists to measure the checks' cost, not to ship without them
+if [ "${GMUX_NO_FUEL:-}" = 1 ]; then cp "$tmp/in.wat" "$tmp/fuel.wat"; else
+	"$here/../ts" "$here/fuel-pass.ts" "$tmp/in.wat" "$tmp/fuel.wat" > /dev/null
+fi
 # GMUX_NO_STACK_CHECK=1 exists to measure the check's cost, not to ship without it
 if [ "${GMUX_NO_STACK_CHECK:-}" = 1 ]; then cp "$tmp/fuel.wat" "$tmp/stack.wat"; else
 	"$here/../ts" "$here/stack-pass.ts" "$tmp/fuel.wat" "$tmp/stack.wat" > /dev/null
@@ -30,3 +35,4 @@ fi
 wat2wasm --enable-threads --enable-exceptions --enable-multi-memory ${GMUX_NAMES:+--debug-names} \
 	"$tmp/out.wat" -o "$out"
 "$here/../ts" "$here/table-note.ts" "$tmp/out.wat" "$out" > /dev/null
+"$here/../ts" "$here/data-note.ts" "${3:-$in}" "$out" > /dev/null

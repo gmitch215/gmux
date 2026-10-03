@@ -127,10 +127,23 @@ export interface DlSaved {
 	slots: Slot[];
 }
 
+/** wasm side modules the registry did not hold, by the hash of the executable that asked for them */
+export type DlMisses = Map<string, Set<string>>;
+
+/** how a process records a refused library */
+export interface DlRecord {
+	misses: DlMisses;
+	/** whether an interpreted tier can take the recorded libraries on the next run */
+	interpreter: boolean;
+	onMiss?: (exe: string, lib: string) => void;
+}
+
 /** one process's side modules; each program instance of it (threads) gets a view */
 export class DlProcess {
 	readonly libs: Lib[] = [];
 	readonly slots: Slot[] = [];
+	/** the executable this process runs, named in a refusal and keyed in the miss record */
+	exe: { hash: string; name: string } | null = null;
 	private next = 1;
 	private error = '';
 
@@ -139,17 +152,20 @@ export class DlProcess {
 	private readonly sha256: (bytes: Uint8Array) => string;
 	/** the program's data start: its data exports are offsets from it */
 	private readonly dataStart: number;
+	private readonly record: DlRecord;
 
 	constructor(
 		memory: WebAssembly.Memory,
 		registry: Map<string, WebAssembly.Module>,
 		sha256: (bytes: Uint8Array) => string,
-		dataStart: number
+		dataStart: number,
+		record: DlRecord = { misses: new Map(), interpreter: false }
 	) {
 		this.memory = memory;
 		this.registry = registry;
 		this.sha256 = sha256;
 		this.dataStart = dataStart;
+		this.record = record;
 	}
 
 	save(): DlSaved {
@@ -200,8 +216,22 @@ export class DlProcess {
 		const hash = this.sha256(bytes);
 		const module = this.registry.get(hash);
 		if (!module) {
+			const { exe } = this;
+			const who = exe ? `${exe.name} (sha256 ${exe.hash})` : 'this process';
+			let next = 'the miss is not recorded (no executable)';
+			if (exe) {
+				next =
+					'the interpreted tier is not available, so the next run is refused the same way';
+				const libs = this.record.misses.get(exe.hash) ?? new Set<string>();
+				libs.add(hash);
+				this.record.misses.set(exe.hash, libs);
+				this.record.onMiss?.(exe.hash, hash);
+				if (this.record.interpreter)
+					next =
+						'the next run starts on the interpreted tier with this library interpreted';
+			}
 			this.fail(
-				`not in the exec registry (sha256 ${hash}); code cannot be compiled at run time, so side modules ship precompiled with the build`
+				`not in the exec registry (sha256 ${hash}); ${who} cannot load it because a Worker cannot compile code at run time, and side modules ship precompiled with the build; ${next}`
 			);
 			return null;
 		}

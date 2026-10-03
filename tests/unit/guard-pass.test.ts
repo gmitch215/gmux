@@ -76,10 +76,11 @@ const TOY = `(module
 const TABLE = 0x8000;
 const SET = 0x9000;
 const TAG = 5;
-// pages: 2 its own, 3 and 4 shared writable and read-only (region ids ran out), 5 another process's,
-// 6 a region it maps writable (id 1), 7 one it maps read-only (id 2), 8 one it does not map (id 3),
-// 10 read-only shared again, the rest the kernel's
-const OWNERS = [0, 0, TAG, 0xffff, 0xfffe, 7, 0x8001, 0x8002, 0x8003, 0, 0xfffe];
+// pages: 2 its own, 3 and 4 regions it maps writable and read-only (ids 4 and 5), 5 another
+// process's, 6 a region it maps writable (id 1), 7 one it maps read-only (id 2), 8 one it does not
+// map (id 3), 10 the highest id (4095), which it does not map, 11 the one below it (4094), which
+// it maps writable, the rest the kernel's
+const OWNERS = [0, 0, TAG, 0x8004, 0x8005, 7, 0x8001, 0x8002, 0x8003, 0, 0xffff, 0xfffe];
 
 type Mode = 'called' | 'inline';
 
@@ -105,8 +106,10 @@ function guarded(mode: Mode, set = SET, hooks: { yield?: () => void; fuel?: () =
 	const memory = new WebAssembly.Memory({ initial: 1 });
 	new Uint16Array(memory.buffer, TABLE, 16).set(OWNERS);
 	const bits = new Uint8Array(memory.buffer, SET, 1024);
-	// id 1 readable and writable, id 2 readable; id 4094 writable, which a 0xfffe page must not borrow
+	// id 1 readable and writable, id 2 readable, id 4 readable and writable, id 5 readable, id 4094
+	// readable and writable
 	bits[0] = (3 << 2) | (1 << 4);
+	bits[1] = 3 | (1 << 2);
 	bits[1023] = 3 << 4;
 	const denied: number[] = [];
 	const instance = new WebAssembly.Instance(new WebAssembly.Module(bytes), {
@@ -158,11 +161,13 @@ describe('guard-pass.ts', () => {
 				expect(view.getUint32(0x5004, true)).toBe(0);
 			});
 
-			it('never reads a read-only shared tag as a region', () => {
-				const { x, denied } = guarded(mode);
+			it('gives the highest region ids no pass beyond the set', () => {
+				const { x, view, denied } = guarded(mode);
 				expect(() => x.store!(0xa000, 1)).toThrow('denied');
-				expect(x.load!(0xa000)).toBe(0);
-				expect(denied).toEqual([0xa004]);
+				expect(() => x.load!(0xa000)).toThrow('denied');
+				x.store!(0xb000, 9);
+				expect(view.getUint32(0xb004, true)).toBe(9);
+				expect(denied).toEqual([0xa004, 0xa000]);
 			});
 
 			it('checks the last byte of a store that crosses into the next page', () => {

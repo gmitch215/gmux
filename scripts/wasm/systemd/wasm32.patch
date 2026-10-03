@@ -1,0 +1,72 @@
+--- a/src/basic/architecture.h	2026-09-22 09:12:10
++++ b/src/basic/architecture.h	2026-10-02 14:55:42
+@@ -41,6 +41,7 @@
+         ARCHITECTURE_SPARC,
+         ARCHITECTURE_SPARC64,
+         ARCHITECTURE_TILEGX,
++        ARCHITECTURE_WASM32,
+         ARCHITECTURE_X86,
+         ARCHITECTURE_X86_64,
+         _ARCHITECTURE_MAX,
+@@ -230,6 +231,9 @@
+ #  else
+ #    error "Unrecognized riscv architecture variant"
+ #  endif
++#elif defined(__wasm32__)
++#  define native_architecture() ARCHITECTURE_WASM32
++#  define LIB_ARCH_TUPLE "wasm32-linux-musl"
+ #elif defined(__arc__)
+ #  if __BYTE_ORDER == __BIG_ENDIAN
+ #    define native_architecture() ARCHITECTURE_ARC_BE
+--- a/src/basic/architecture.c	2026-09-22 09:12:10
++++ b/src/basic/architecture.c	2026-10-02 14:55:44
+@@ -116,6 +116,9 @@
+ #elif defined(__tilegx__)
+                 { "tilegx",     ARCHITECTURE_TILEGX   },
+ 
++#elif defined(__wasm32__)
++                { "wasm32",     ARCHITECTURE_WASM32   },
++
+ #else
+ #  error "Please register your architecture here!"
+ #endif
+@@ -172,6 +175,7 @@
+         [ARCHITECTURE_SPARC64]     = "sparc64",
+         [ARCHITECTURE_SPARC]       = "sparc",
+         [ARCHITECTURE_TILEGX]      = "tilegx",
++        [ARCHITECTURE_WASM32]      = "wasm32",
+ };
+ 
+ DEFINE_STRING_TABLE_LOOKUP(architecture, Architecture);
+--- a/src/basic/fd-util.h	2026-09-22 09:12:10
++++ b/src/basic/fd-util.h	2026-10-02 15:02:47
+@@ -55,7 +55,7 @@
+  * https://github.com/torvalds/linux/commit/eceea0b3df05ed262ae32e0c6340cc7a3626632d */
+ #define NR_OPEN_DEFAULT ((unsigned) (1024 * 1024))
+ #define NR_OPEN_MINIMUM ((unsigned) (sizeof(long) * 8))
+-#define NR_OPEN_MAXIMUM ((unsigned) (CONST_MIN((size_t) INT_MAX, SIZE_MAX / __SIZEOF_POINTER__) & ~(sizeof(long) * 8 - 1)))
++#define NR_OPEN_MAXIMUM ((unsigned) (CONST_MIN((size_t) INT_MAX, (size_t) SIZE_MAX / __SIZEOF_POINTER__) & ~(sizeof(long) * 8 - 1)))
+ 
+ /* A special fd that can be passed in various helpers instead of an fd indicating the root dir. Inspired by,
+  * and an alternative to AT_FDCWD. We use specific negative value that is outside of the negative errno
+--- a/src/basic/mempool.h
++++ b/src/basic/mempool.h
+@@ -22,6 +22,6 @@
+         .at_least = alloc_at_least, \
+ }
+ 
+-bool mempool_enabled(void) _weak_ _pure_;
++bool mempool_enabled(void) _pure_;
+ 
+ void mempool_trim(struct mempool *mp);
+--- a/src/basic/assert-util.h	2026-09-22 09:12:10
++++ b/src/basic/assert-util.h	2026-10-02 15:39:18
+@@ -5,7 +5,7 @@
+ 
+ /* Logging for various assertions */
+ 
+-bool log_get_assert_return_is_critical(void) _weak_ _pure_;
++bool log_get_assert_return_is_critical(void) _pure_;
+ 
+ void log_assert_failed_return(const char *text, const char *file, int line, const char *func);
+ 

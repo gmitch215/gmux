@@ -1,4 +1,5 @@
-import { DlProcess, type DlSaved, type DlView } from './dl.ts';
+import { DlProcess, dylinkInfo, type DlMisses, type DlSaved, type DlView } from './dl.ts';
+import { clear, copyIn, copyOut, Domain, EFAULT, READ, WRITE } from './domain.ts';
 import {
 	MISS,
 	ROUTE_HOOK,
@@ -111,6 +112,16 @@ export interface MachineOptions {
 	 * kernel. 'verify' asks the kernel every time and counts answers the cache would have got wrong
 	 */
 	syscallCache?: boolean | 'verify';
+	/**
+	 * wasm side modules a process asked for that the registry did not hold, by executable hash. Pass
+	 * the same map to the next machine to carry the record across runs
+	 */
+	dlMisses?: DlMisses;
+	/**
+	 * the interpreted tier: the module that runs `exe` with its recorded `libs` interpreted, or
+	 * undefined when it cannot take them. Absent, a recorded miss is refused again
+	 */
+	interpret?: (exe: string, libs: string[]) => WebAssembly.Module | undefined;
 }
 
 /**
@@ -544,6 +555,10 @@ export interface MachineStats {
 	consoleRaises: number;
 	/** executables the registry did not hold, by hash and size */
 	unknownExecutables: string[];
+	/** side modules a process asked dlopen for that the registry did not hold: library hash for executable hash */
+	dlMisses: string[];
+	/** executables started on the interpreted tier because an earlier run recorded a miss */
+	interpretedStarts: string[];
 	/** regular files handed to `fileSync` by an fsync, a synchronous write, an msync or a sync */
 	fileSyncs: number;
 	/** sync and syncfs calls, each a walk of the root filesystem */
@@ -556,6 +571,9 @@ export interface MachineStats {
 	statxFills: number;
 	/** with `syscallCache: 'verify'`: answers the cache held that the kernel then contradicted */
 	statxMismatches: number;
+	/** host crossings into a fork child's own memory, and the bytes they moved */
+	userCopies: number;
+	userCopyBytes: number;
 	/** files a sync found gone since they were synced, handed to `fileSync` as removed */
 	fileRemovals: number;
 	/** the bytes those handed over */
@@ -610,6 +628,8 @@ export class Machine {
 		consoleReads: 0,
 		consoleRaises: 0,
 		unknownExecutables: [],
+		dlMisses: [],
+		interpretedStarts: [],
 		fileSyncs: 0,
 		syncWalks: 0,
 		abandonedStacks: 0,
@@ -617,6 +637,8 @@ export class Machine {
 		statxMisses: 0,
 		statxFills: 0,
 		statxMismatches: 0,
+		userCopies: 0,
+		userCopyBytes: 0,
 		fileRemovals: 0,
 		fileSyncBytes: 0,
 		fileSyncsSkipped: 0,
@@ -656,6 +678,7 @@ export class Machine {
 	 */
 	constructor(options: MachineOptions, initialPages = 15, keep = false) {
 		this.options = options;
+		this.dlMisses = options.dlMisses ?? new Map();
 		// the kernel's static memory, recorded at build time (scripts/wasm/memory-note.ts)
 		const note = WebAssembly.Module.customSections(options.vmlinux, 'gmux.memory')[0];
 		const kernelPages = note ? new DataView(note).getUint32(0, true) : 0;
@@ -943,13 +966,13 @@ export class Machine {
 			wasm_user_copy: (kaddr: number, uaddr: number, n: number, mode: number) => {
 				const mem = self.userMemory(owner());
 				const [k, u, len] = [kaddr >>> 0, uaddr >>> 0, n >>> 0];
-				const user = new Uint8Array(mem.buffer);
-				if (mem === self.memory || u + len > user.length) return len;
-				if (mode === 0)
-					new Uint8Array(self.memory.buffer).set(user.subarray(u, u + len), k);
-				else if (mode === 1) user.set(new Uint8Array(self.memory.buffer, k, len), u);
-				else user.fill(0, u, u + len);
-				return 0;
+				if (mem === self.memory) return len;
+				self.stats.userCopies++;
+				self.stats.userCopyBytes += len;
+				const domain = self.domain(mem);
+				if (mode === 0) return copyIn(domain, k, u, len);
+				if (mode === 1) return copyOut(domain, k, u, len);
+				return clear(domain, u, len);
 			},
 			// futex atomics there: FUTEX_OP_SET, ADD, OR, ANDN, XOR, and 5 for compare-exchange
 			wasm_user_atomic: (
@@ -961,7 +984,8 @@ export class Machine {
 			) => {
 				const mem = self.userMemory(owner());
 				const u = uaddr >>> 0;
-				if (mem === self.memory || u & 3 || u + 4 > mem.buffer.byteLength) return -14;
+				if (mem === self.memory || u & 3 || !self.domain(mem).span(u, 4, READ | WRITE))
+					return EFAULT;
 				const word = new Int32Array(mem.buffer);
 				const at = u >> 2;
 				const old =
@@ -1040,6 +1064,26 @@ export class Machine {
 				);
 		} else if (!module) this.stats.unknownExecutables.push(`${hash} (${bytes.length} bytes)`);
 		if (!module) return undefined;
+		const missed = this.dlMisses.get(hash);
+		if (missed?.size) {
+			const interpreted = this.options.interpret?.(hash, [...missed]);
+			if (interpreted) {
+				this.stats.interpretedStarts.push(hash);
+				module = interpreted;
+			}
+		}
+		const needs = WebAssembly.Module.customSections(module, 'gmux.data')[0];
+		const mapped = dylinkInfo(bytes)?.memorySize;
+		if (needs && mapped !== undefined) {
+			const size = new DataView(needs).getUint32(0, true);
+			// the kernel maps the stub's size by whole pages (binfmt_wasm)
+			if (size > Math.ceil(mapped / 0x1000) * 0x1000) {
+				this.stats.unknownExecutables.push(
+					`${hash} (needs ${size} bytes of data, stub maps ${mapped})`
+				);
+				return undefined;
+			}
+		}
 		return { module, hash, dataStart, tableStart };
 	}
 
@@ -1191,7 +1235,9 @@ export class Machine {
 		// a shareable program imports its memory base mutable, and runs alone just as well
 		const memoryBase = base(user.dataStart, shareable(user.module));
 		const env = this.userEnv(runner, global, memoryBase, base(user.tableStart));
-		const dl = this.dlProcess(user.dataStart).view();
+		const loader = this.dlProcess(user.dataStart);
+		loader.exe = { hash: user.hash, name: runner.name };
+		const dl = loader.view();
 		Object.assign(env, dl.imports());
 		const instance = this.instantiateUser(runner, env);
 		dl.attach({
@@ -1521,7 +1567,8 @@ export class Machine {
 	): number {
 		const kernel = this.exp(me);
 		const view = kernel.wasm_fs_view() >>> 0;
-		const mem = this.userBytes(me);
+		const domain = this.domain(this.userMemory(me));
+		const mem = domain.bytes();
 		const at = path >>> 0;
 		const hash = view ? statxHash(mem, at, view, flags, mask) : null;
 		const held = hash === null ? undefined : this.fsCache!.get(hash);
@@ -1537,22 +1584,20 @@ export class Machine {
 			this.stats.statxMisses++;
 			return MISS;
 		}
-		if (held.bytes) mem.set(held.bytes, buf >>> 0);
+		if (held.bytes) {
+			// a buffer outside the memory is the kernel's to refuse with EFAULT
+			if (!domain.holds(buf, held.bytes.length, WRITE)) {
+				this.stats.statxMisses++;
+				return MISS;
+			}
+			mem.set(held.bytes, buf >>> 0);
+		}
 		this.stats.statxHits++;
 		return held.ret;
 	}
 
-	private userBytesCache: Uint8Array | null = null;
 	/** the mount id of each view's "/" */
 	private readonly rootMounts = new Map<number, number | null>();
-
-	/** the task's memory as bytes, the view kept until the memory grows or differs */
-	private userBytes(me: Runner): Uint8Array {
-		const buffer = this.userMemory(me).buffer;
-		const held = this.userBytesCache;
-		if (held && held.buffer === buffer) return held;
-		return (this.userBytesCache = new Uint8Array(buffer));
-	}
 
 	/**
 	 * keeps the kernel's answer to a statx when nothing changed while it was asked and the lookup
@@ -2551,6 +2596,7 @@ export class Machine {
 	private stacks = new Map<Runner, { kernel: Uint8Array | null; user: Uint8Array | null }>();
 	/** each process's side modules (dlopen), by the data start of its program */
 	private dls = new Map<number, DlProcess>();
+	private dlMisses: DlMisses;
 	/** shared instances, by program hash */
 	private sharedPrograms = new Map<string, SharedProgram>();
 	/** pages a lazy restore has not written yet, by owner tag, and where they come from */
@@ -2616,6 +2662,18 @@ export class Machine {
 	/** each process's spill mapping for fork frames, by mm */
 	private forkSpills = new Map<number, number>();
 
+	private lastDomain: Domain | null = null;
+	private readonly domains = new WeakMap<WebAssembly.Memory, Domain>();
+
+	/** the domain over a memory, the last one used kept at hand for the next crossing */
+	private domain(memory: WebAssembly.Memory): Domain {
+		if (this.lastDomain?.memory === memory) return this.lastDomain;
+		let domain = this.domains.get(memory);
+		if (!domain)
+			this.domains.set(memory, (domain = new Domain(memory, READ | WRITE, this.memory)));
+		return (this.lastDomain = domain);
+	}
+
 	/** the memory a task's program runs on: its own after a fork, else the machine's */
 	private userMemory(runner: Runner): WebAssembly.Memory {
 		if (!this.privateMemories.size) return this.memory;
@@ -2626,7 +2684,11 @@ export class Machine {
 	private dlProcess(dataStart: number): DlProcess {
 		let dl = this.dls.get(dataStart);
 		if (!dl) {
-			dl = new DlProcess(this.memory, this.options.registry, this.options.sha256, dataStart);
+			dl = new DlProcess(this.memory, this.options.registry, this.options.sha256, dataStart, {
+				misses: this.dlMisses,
+				interpreter: !!this.options.interpret,
+				onMiss: (exe, lib) => this.stats.dlMisses.push(`${lib} for ${exe}`)
+			});
 			this.dls.set(dataStart, dl);
 		}
 		return dl;
@@ -2814,7 +2876,12 @@ export class Machine {
 			readyAt: this.ready.map((r) => all.indexOf(r)),
 			cpuZero: this.cpuZero.id,
 			runners,
-			stats: { ...this.stats, unknownExecutables: [...this.stats.unknownExecutables] },
+			stats: {
+				...this.stats,
+				unknownExecutables: [...this.stats.unknownExecutables],
+				dlMisses: [...this.stats.dlMisses],
+				interpretedStarts: [...this.stats.interpretedStarts]
+			},
 			dl: [...this.dls.values()]
 				.filter((d) => d.libs.length || d.slots.length)
 				.map((d) => d.save()),
@@ -2877,7 +2944,7 @@ export class Machine {
 		// own pages when one of its tasks is about to run
 		const owners = lazy && snapshot.owners;
 		const tags = new Set(
-			owners ? snapshot.runners.map((r) => r.tag ?? 0).filter((t) => t > 0 && t < 0xfffe) : []
+			owners ? snapshot.runners.map((r) => r.tag ?? 0).filter((t) => t > 0 && t < 0x8000) : []
 		);
 		if (owners && tags.size) {
 			for (let page = 0; page < owners.length; page++) {

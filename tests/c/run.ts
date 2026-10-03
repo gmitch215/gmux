@@ -1,6 +1,6 @@
 import { execFileSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { mkdtempSync, readFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, readdirSync, readFileSync, statSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { appendCpio } from '../../scripts/wasm/cpio-append.ts';
@@ -22,19 +22,24 @@ interface Probe {
 	    and the command when not its name */
 	program?: string | null;
 	cmd?: string;
+	/** more programs, registered like `program`: path in the machine -> path under build/ */
+	programs?: Record<string, string>;
 	/** more initramfs files: path in the machine -> path under build/ */
 	files?: Record<string, string>;
 	/** wasm side modules under build/ that dlopen may load: registered by the hash of the file */
 	side?: string[];
-	/** build it with resumable frames (experiments/evacuation/scripts/evacuate.ts), as fork needs */
-	evacuate?: boolean;
+	/** build it with resumable frames (experiments/evacuation/scripts/evacuate.ts), as fork needs; a list names the programs that fork */
+	evacuate?: boolean | string[];
+	/** the machine's memory in 64 KiB pages: a probe that sets it boots a machine of its own */
+	pages?: number;
 }
 const probes: Record<string, Probe> = {
 	// SECURITY.md: root is trusted with the machine; a non-root task runs its guarded build, which
-	// checks loads and stores, and reaches a shared segment only once it attaches it
+	// checks loads and stores, and reaches a shared mapping (System V, POSIX, a file, anonymous)
+	// only while it holds it; past 4,095 regions a mapping is refused
 	isolation: {
 		lines: ['TRUST kernel-address write accepted'],
-		passes: 27
+		passes: 90
 	},
 	// SECURITY.md's authority domains: root looks through all of the machine's memory for what the
 	// host holds (a Worker env's secret, a host secret, the owner token), and for a device or a
@@ -140,7 +145,7 @@ const probes: Record<string, Probe> = {
 		setup: 'ifconfig lo 127.0.0.1 up',
 		evacuate: true,
 		lines: ['exec from a fork child'],
-		passes: 5
+		passes: 7
 	},
 	// zlib as a side module (dlopen/dlsym); the first lines are the same program's native output
 	// against the same zlib
@@ -153,20 +158,104 @@ const probes: Record<string, Probe> = {
 			'compressed 639 bytes (rc 0), adler32 99df58be',
 			'round trip same (rc 0)'
 		],
-		passes: 5
+		passes: 8
 	},
 	posix: {
 		setup: 'ifconfig lo 127.0.0.1 up; mkdir -p /lua-tests',
 		lines: [],
 		passes: 25
+	},
+	// perl's core XS modules as side modules: every extension loads through dlopen, and the script
+	// prints what the same perl prints natively (perl-xs.out)
+	perl: {
+		program: 'perl/perl',
+		files: { '/usr/lib/perl5/': 'perl/lib/', '/perl-xs.pl': 'tests/c/perl-xs.pl' },
+		side: ['perl/lib/auto/'],
+		cmd: 'perl -I/usr/lib/perl5 /perl-xs.pl',
+		lines: readFileSync(new URL('./perl-xs.out', import.meta.url), 'utf8')
+			.split('\n')
+			.filter(Boolean)
+	},
+	// curl's own test suite: runtests.pl starts its HTTP server and runs the first test
+	'curl-suite': {
+		program: null,
+		programs: {
+			'/bin/perl': 'perl/perl',
+			'/curl/src/curl': 'curl/src/curl',
+			'/curl/tests/server/disabled': 'curl/tests/server/disabled',
+			'/curl/tests/server/sws': 'curl/tests/server/sws',
+			'/curl/tests/server/sockfilt': 'curl/tests/server/sockfilt'
+		},
+		files: {
+			'/usr/lib/perl5/': 'perl/lib/',
+			...Object.fromEntries(
+				[
+					'runtests.pl',
+					'http-server.pl',
+					...['getpart', 'globalconfig', 'directories', 'runner', 'servers', 'serverhelp']
+						.concat([
+							'pathhelp',
+							'processhelp',
+							'sshhelp',
+							'testutil',
+							'valgrind',
+							'azure'
+						])
+						.concat(['appveyor', 'configurehelp'])
+						.map((name) => `${name}.pm`),
+					'data/test1'
+				].map((file) => [`/curl/tests/${file}`, `curl/tests/${file}`])
+			),
+			'/curl/tests/data/DISABLED': 'tests/c/curl-disabled'
+		},
+		side: ['perl/lib/auto/'],
+		evacuate: ['/bin/perl'],
+		setup: 'ifconfig lo 127.0.0.1 up',
+		cmd: 'export PERL5LIB=/usr/lib/perl5; cd /curl/tests && perl -I. runtests.pl -c /curl/src/curl 1',
+		lines: ['test 0001...[HTTP GET]', '1 tests out of 1 reported OK: 100%']
+	},
+	// an 800-page machine (what a Free isolate holds) with 10 MB of files in memory runs 106 execs, as
+	// a coreutils run's link loop does; each exec maps a stack and a data block of its own, and blocks
+	// of 64 pages must still be free after them
+	exec: {
+		program: null,
+		pages: 800,
+		setup: 'dd if=/dev/zero of=/tmp/fill bs=1M count=10 2> /dev/null',
+		cmd:
+			'i=0; n=0; while [ $i -lt 106 ]; do ln -s x /tmp/l$i && n=$((n+1)); i=$((i+1)); done; ' +
+			'echo "linked $n"; ' +
+			'awk \'{ for (i = 11; i <= 19; i++) if ($i > 0) big += $i } END { print big ? "order 6 free" : "no order 6" }\' /proc/buddyinfo',
+		lines: ['linked 106', 'order 6 free']
 	}
 };
 
 const root = new URL('../../', import.meta.url).pathname;
-const names = process.argv.slice(2).length ? process.argv.slice(2) : Object.keys(probes);
-const sha256 = (bytes: Uint8Array) => createHash('sha256').update(bytes).digest('hex');
 const build = process.env.GMUX_BUILD ?? join(root, 'build');
+// scripts/census.sh builds these, not the pipeline: a run of every probe skips them without the build
+const census: Record<string, string> = { perl: 'perl/perl', 'curl-suite': 'curl/src/curl' };
+const names = process.argv.slice(2).length
+	? process.argv.slice(2)
+	: Object.keys(probes).filter((name) => !census[name] || existsSync(join(build, census[name]!)));
+const sha256 = (bytes: Uint8Array) => createHash('sha256').update(bytes).digest('hex');
 const read = (path: string) => new Uint8Array(readFileSync(join(build, path)));
+// a path ending in / stands for the library files under it (pod and unicore stay out); one
+// under tests/ is read from the repo
+const under = (dir: string, keep: RegExp) =>
+	(readdirSync(join(build, dir), { recursive: true }) as string[])
+		.filter((rel) => keep.test(rel) && statSync(join(build, dir, rel)).isFile())
+		.map((rel) => rel.toString());
+const library = /^(?!unicore\/|pod\/|Pod\/).*\.(pm|pl|so|ph)$/;
+const sideModules = (paths: string[]) =>
+	paths.flatMap((path) =>
+		path.endsWith('/') ? under(path, /\.so$/).map((rel) => path + rel) : [path]
+	);
+const source = (path: string) => (path.startsWith('tests/') ? join(root, path) : join(build, path));
+const fileEntries = (name: string) =>
+	Object.entries(probes[name]!.files ?? {}).flatMap(([to, from]) =>
+		from.endsWith('/')
+			? under(from, library).map((rel) => `${to}${rel}=${join(build, from, rel)}`)
+			: [`${to}=${source(from)}`]
+	);
 
 // SHARE=1: every program that can be shared runs each of its processes on one instance
 const share = !!process.env.SHARE;
@@ -189,13 +278,25 @@ if (manifest.katybug)
 const scratch = mkdtempSync(join(tmpdir(), 'gmux-probes-'));
 const program = (name: string) =>
 	probes[name]!.program === null ? null : (probes[name]!.program ?? `probes/${name}.wasm`);
-const added = names.filter((name) => program(name) !== null);
-for (const name of added) {
+// [path in the machine, path under build/, probe]
+const added = names.flatMap((name): [string, string, string][] => [
+	...(program(name) === null
+		? []
+		: [[`/bin/${name}`, program(name)!, name] as [string, string, string]]),
+	...Object.entries(probes[name]!.programs ?? {}).map(([to, from]): [string, string, string] => [
+		to,
+		from,
+		name
+	])
+]);
+for (const [to, path, name] of added) {
 	// the kernel reads the plain file; the host runs the fueled module registered under its hash
-	const fueled = join(scratch, `${name}.wasm`);
-	execFileSync(join(root, 'scripts/wasm/instrument.sh'), [join(build, program(name)!), fueled]);
+	const fueled = join(scratch, `${to.replace(/\W/g, '_')}.wasm`);
+	execFileSync(join(root, 'scripts/wasm/instrument.sh'), [join(build, path), fueled]);
 	let runs = fueled;
-	if (probes[name]!.evacuate) {
+	const forks = probes[name]!.evacuate;
+	const evacuated = Array.isArray(forks) ? forks.includes(to) : !!forks;
+	if (evacuated) {
 		execFileSync(
 			join(root, 'scripts/ts'),
 			[join(root, 'scripts/wasm/export-globals.ts'), fueled, `${fueled}.g`, '--all-mutable'],
@@ -215,26 +316,21 @@ for (const name of added) {
 		);
 		runs = `${fueled}.evac`;
 	}
-	if (share && !probes[name]!.evacuate) {
+	if (share && !evacuated) {
 		// share.ts refuses programs that call dlopen, and a forking program's frames are its own
 		// instance's; those keep an instance each
 		try {
 			execFileSync(
 				join(root, 'scripts/ts'),
-				[
-					join(root, 'scripts/wasm/share.ts'),
-					join(build, program(name)!),
-					fueled,
-					`${fueled}.share`
-				],
+				[join(root, 'scripts/wasm/share.ts'), join(build, path), fueled, `${fueled}.share`],
 				{ stdio: 'ignore' }
 			);
 			runs = `${fueled}.share`;
 		} catch {}
 	}
-	registry.set(sha256(read(program(name)!)), new WebAssembly.Module(readFileSync(runs)));
+	registry.set(sha256(read(path)), new WebAssembly.Module(readFileSync(runs)));
 }
-for (const path of names.flatMap((name) => probes[name]!.side ?? [])) {
+for (const path of sideModules(names.flatMap((name) => probes[name]!.side ?? []))) {
 	const fueled = join(scratch, `${path.replace(/\W/g, '_')}.wasm`);
 	execFileSync(join(root, 'scripts/wasm/instrument.sh'), [join(build, path), fueled]);
 	registry.set(sha256(read(path)), new WebAssembly.Module(readFileSync(fueled)));
@@ -276,56 +372,67 @@ if (names.includes('isolation')) {
 }
 const initrd = join(scratch, 'initramfs.cpio');
 appendCpio(join(build, 'kernel/initramfs.bin'), initrd, [
-	...added.map((name) => `/bin/${name}=${join(build, program(name)!)}`),
-	...names.flatMap((name) =>
-		Object.entries(probes[name]!.files ?? {}).map(([to, from]) => `${to}=${join(build, from)}`)
-	)
+	...added.map(([to, path]) => `${to}=${join(build, path)}`),
+	...names.flatMap(fileEntries)
 ]);
 
 // one line per probe: the tty cuts a canonical line at 4095 bytes; stdin stays off the typed lines
-const script = names
-	.map(
-		(name) =>
-			`{ ${probes[name]!.setup ? `${probes[name]!.setup}; ` : ''}echo "== ${name}"; ${probes[name]!.cmd ?? name}; echo "== end $?"; } < /dev/null`
-	)
-	.join('\n');
-let output = '';
-const hostLog: string[] = [];
-let typed = false;
+async function boot(group: string[], maximumPages: number) {
+	const script = group
+		.map(
+			(name) =>
+				`{ ${probes[name]!.setup ? `${probes[name]!.setup}; ` : ''}echo "== ${name}"; ${probes[name]!.cmd ?? name}; echo "== end $?"; } < /dev/null`
+		)
+		.join('\n');
+	let output = '';
+	const hostLog: string[] = [];
+	let typed = false;
+	const machine = new Machine({
+		vmlinux: new WebAssembly.Module(read('kernel/vmlinux.wasm')),
+		initrd: new Uint8Array(readFileSync(initrd)),
+		cmdline: 'maxcpus=3 root=/dev/ram0 rootfstype=ramfs init=/init console=hvc console=ttyS0',
+		registry,
+		maximumPages,
+		sha256,
+		sharedKernel: true,
+		shareInstances: share,
+		guarded,
+		// FROZEN=1: a host clock that never moves, as a deployed Worker's while code runs
+		...(process.env.FROZEN ? { now: () => 0n } : {}),
+		log: (line) => hostLog.push(line),
+		write: (text) => {
+			output += text;
+			if (!typed && output.includes('# ')) {
+				typed = true;
+				machine.type(`${script}\necho "== DONE-$((6*7))"\n`);
+			}
+		}
+	});
+	const started = Date.now();
+	await machine.run(
+		() => output.includes('== DONE-42') || Date.now() - started > 120_000,
+		(ms) => new Promise((r) => setTimeout(r, Math.min(ms, 50)))
+	);
+	return { machine, output, hostLog };
+}
 const authority = names.includes('authority');
 const planted = authority ? await hostOnly() : [];
 const seen = authority ? watch() : null;
-const machine = new Machine({
-	vmlinux: new WebAssembly.Module(read('kernel/vmlinux.wasm')),
-	initrd: new Uint8Array(readFileSync(initrd)),
-	cmdline: 'maxcpus=3 root=/dev/ram0 rootfstype=ramfs init=/init console=hvc console=ttyS0',
-	registry,
-	maximumPages: 4096,
-	sha256,
-	sharedKernel: true,
-	shareInstances: share,
-	guarded,
-	// FROZEN=1: a host clock that never moves, as a deployed Worker's while code runs
-	...(process.env.FROZEN ? { now: () => 0n } : {}),
-	log: (line) => hostLog.push(line),
-	write: (text) => {
-		output += text;
-		if (!typed && output.includes('# ')) {
-			typed = true;
-			machine.type(`${script}\necho "== DONE-$((6*7))"\n`);
-		}
-	}
-});
-const started = Date.now();
-await machine.run(
-	() => output.includes('== DONE-42') || Date.now() - started > 120_000,
-	(ms) => new Promise((r) => setTimeout(r, Math.min(ms, 50)))
-);
+const shared = names.filter((name) => !probes[name]!.pages);
+const own = names.filter((name) => probes[name]!.pages);
+const boots = new Map<string, Awaited<ReturnType<typeof boot>>>();
+if (shared.length) {
+	const main = await boot(shared, 4096);
+	for (const name of shared) boots.set(name, main);
+}
+for (const name of own) boots.set(name, await boot([name], probes[name]!.pages!));
+const machine = [...boots.values()].at(-1)!.machine;
+const mainMachine = shared.length ? boots.get(shared[0]!)!.machine : machine;
 
 seen?.stop();
 const hostSide: string[] = [];
 if (seen) {
-	const buffers = [...new Set([machine.memory, ...seen.memories])].map((m) => m.buffer);
+	const buffers = [...new Set([mainMachine.memory, ...seen.memories])].map((m) => m.buffer);
 	const bytes = buffers.reduce((n, b) => n + b.byteLength, 0);
 	const off = [...seen.imports].filter((i) => !SURFACE.test(i));
 	hostSide.push(...leaks(planted, buffers).map((l) => `host-only ${l}`));
@@ -342,6 +449,7 @@ if (seen) {
 
 let failed = 0;
 for (const name of names) {
+	const { output, hostLog } = boots.get(name)!;
 	const at = output.lastIndexOf(`\n== ${name}`);
 	const section = at < 0 ? '' : output.slice(at, output.indexOf('== end', at));
 	const { lines, passes = 0, host } = probes[name]!;
@@ -363,4 +471,5 @@ for (const name of names) {
 	if (process.env.SHOW) console.log(section.replace(/\r/g, ''));
 	if (problems.length && process.env.HOSTLOG) console.log(hostLog.slice(-20).join('\n'));
 }
+if (process.env.STATS) console.log(JSON.stringify(machine.stats));
 process.exit(failed ? 1 : 0);

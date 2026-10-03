@@ -46,6 +46,8 @@ export function watch(): Watch {
 	const exported = new WeakSet<object>();
 	const note = (module: WebAssembly.Module, i?: WebAssembly.Imports) => {
 		for (const d of WebAssembly.Module.imports(module)) {
+			// the host's copy module imports two memories; the scan of every memory covers those
+			if (d.kind === 'memory') continue;
 			const value = (i?.[d.module] as Record<string, unknown> | undefined)?.[d.name];
 			if (typeof value !== 'function' || !exported.has(value))
 				imports.add(`${d.module}.${d.name}`);

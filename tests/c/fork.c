@@ -3,10 +3,13 @@
 // copy of the parent's memory and the parent's frames, which resume in both
 #include <arpa/inet.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <netinet/in.h>
 #include <stdio.h>
 #include <string.h>
+#include <sys/mman.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
 #include <sys/wait.h>
 #include <unistd.h>
 #define CHECK(name, ok) printf("%s %s\n", (ok) ? "PASS" : "FAIL", name)
@@ -53,7 +56,94 @@ static int serve(int listener) {
     return 0;
 }
 
-int main(void) {
+enum
+{
+    HELD = 4000,
+    CYCLES = 150
+};
+
+static char* map_file(const char* stem, int i) {
+    char path[48];
+    snprintf(path, sizeof path, "/tmp/%s-%d", stem, i);
+    int fd = open(path, O_CREAT | O_RDWR | O_TRUNC, 0666);
+    char* p = MAP_FAILED;
+    if (fd >= 0 && !ftruncate(fd, 4096))
+        p = mmap(0, 4096, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    if (fd >= 0) close(fd);
+    return p;
+}
+
+/* `fork hold`: maps 4,000 files shared, says so, and waits for stdin to close,
+ * which leaves the machine about a hundred region ids */
+static int hold(void) {
+    for (int i = 0; i < HELD; i++)
+        if (map_file("fork-held", i) == MAP_FAILED) return 2;
+    write(1, "r", 1);
+    char c;
+    while (read(0, &c, 1) > 0);
+    return 0;
+}
+
+/* a shared mapping's region id is free again once its holders have dropped it,
+ * even when a fork child holds a copy of the mapping longer than the parent:
+ * more cycles than ids left would run out */
+static int ids_after_fork(void) {
+    int up[2], down[2];
+    if (pipe(up) || pipe(down)) return 0;
+    pid_t holder = fork();
+    if (holder == 0) {
+        close(down[1]);
+        close(up[0]);
+        dup2(down[0], 0);
+        dup2(up[1], 1);
+        execl("/bin/fork", "fork", "hold", (char*) 0);
+        _exit(127);
+    }
+    char c = 0;
+    int ok = read(up[0], &c, 1) == 1;
+    for (int i = 0; ok && i < CYCLES; i++) {
+        char* p = map_file("fork-spare", i);
+        int gate[2];
+        ok = p != MAP_FAILED && !pipe(gate);
+        if (!ok) break;
+        pid_t child = fork();
+        if (child == 0) {
+            close(gate[1]);
+            char b;
+            while (read(gate[0], &b, 1) > 0);
+            _exit(0);
+        }
+        munmap(p, 4096);
+        close(gate[1]);
+        close(gate[0]);
+        ok = status_of(child) == 0;
+    }
+    close(down[1]);
+    ok = status_of(holder) == 0 && ok;
+    return ok;
+}
+
+/* a fork child's memory is its own: it starts with the parent's bytes of a
+ * shared mapping and its stores to it stay with it */
+static int shared_across_fork(void) {
+    volatile char* p = mmap(
+        0, 4096, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS, -1, 0
+    );
+    if (p == MAP_FAILED) return 0;
+    p[0] = 'p';
+    pid_t child = fork();
+    if (child == 0) {
+        int saw = p[0] == 'p';
+        p[0] = 'c';
+        _exit(saw && p[0] == 'c' ? 0 : 1);
+    }
+    int ok = child > 0 && status_of(child) == 0 && p[0] == 'p';
+    munmap((char*) p, 4096);
+    return ok;
+}
+
+int main(int argc, char** argv) {
+    if (argc == 2 && !strcmp(argv[1], "hold")) return hold();
     int local = 10;
     pid_t p = fork();
     if (p < 0) {
@@ -125,5 +215,14 @@ int main(void) {
         close(c);
     }
     CHECK("forking server", echoed == 3 && status_of(server) == 0);
+    CHECK(
+        "a region id is free again after a fork child outlives the mapping's "
+        "holder",
+        ids_after_fork()
+    );
+    CHECK(
+        "a fork child's stores to a shared mapping stay in its own memory",
+        shared_across_fork()
+    );
     return 0;
 }

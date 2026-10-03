@@ -9,13 +9,16 @@ import { Machine } from '../../../src/worker/machine/machine.ts';
 /**
  * the cost of a code transform on census programs, all arms instrumented as the host runs them, on
  * build/kernel in Node, arms interleaved and timed by the host between output markers. ARMS picks them:
- * plain, mmu and inline (the software MMU, the lookup as a call and inlined), flat, eh and ehr (evacuation:
- * binaryen's flatten and -O2, the same with a checkpoint handler around every call, and with resume
- * variants too), ehf (the handlers with resume folded into each function), eh1, ehn, eha and ehs (one try
+ * plain, mmu and inline (the software MMU, the lookup as a call and inlined), o2 (binaryen's -O2 alone), flat,
+ * eh and ehr (evacuation: binaryen's flatten and -O2, the same with a checkpoint handler around every call
+ * that reaches a safepoint, and with resume variants too; a host import's site spills inline), eht and ehrt
+ * (the same with a handler at every host import site), ehrn and ehrs (ehr with handlers that save nothing,
+ * and with none at fuel yields), ehrp (ehr over the peek build's fuel checks), emit (the module read and
+ * written back with no pass), ehf (the handlers with resume folded into each function), eh1, ehn, eha and ehs (one try
  * per function, handlers that save nothing, every local saved, no handlers at fuel yields), guard and guardi (every load and store checked against a page owner table, the
  * check called and inlined), guardsi (the guard pass at GUARD_STORES inlined, to price loads), count
  * (provable.ts: which checked accesses a check outside the access could cover, counts printed), nostack
- * (plain without the stack pointer check, to price it), simd (the program from SIMD_CENSUS, a census
+ * (plain without the stack pointer check, to price it), nofuel (plain without the loop-head fuel checks), peek (plain whose loop-head check only reads the budget, never yields), simd (the program from SIMD_CENSUS, a census
  * built with EXTRA_CFLAGS=-msimd128).
  * `node --experimental-strip-types experiments/mmu/scripts/bench.ts <census dir> [rounds]`; with
  * WORK=<dir>, arms already built there are reused, so a machine without the toolchain can time them
@@ -27,7 +30,8 @@ const work = process.env.WORK ?? join(tmpdir(), `gmux-g1-${process.pid}`);
 const built = (file: string) => !!process.env.WORK && existsSync(file);
 mkdirSync(work, { recursive: true });
 const sha256 = (bytes: Uint8Array) => createHash('sha256').update(bytes).digest('hex');
-const sh = (cmd: string, args: string[]) => execFileSync(cmd, args, { stdio: ['ignore', 'ignore', 'inherit'] });
+const sh = (cmd: string, args: string[], env?: Record<string, string>) =>
+	execFileSync(cmd, args, { stdio: ['ignore', 'ignore', 'inherit'], ...(env && { env: { ...process.env, ...env } }) });
 
 const all: Record<string, string> = {
 	lua: `lua -e "local t={} for i=1,300000 do t[i]=i*2 end local s=0 for r=1,5 do for i=1,#t do s=s+t[i]%7 end end print(s)"`,
@@ -72,13 +76,13 @@ for (const name of Object.keys(workloads)) {
 		writeFileSync(image, arm === 'plain' || arm === 'simd' ? readFileSync(source) : tagged(readFileSync(plain), arm));
 		const file = join(work, `${name}.${arm}.wasm`);
 		const fueled = join(work, `${name}.${arm}.fuel.wasm`);
-		const evacuation = { flat: ['--no-handlers'], eh: [], ehr: ['--resume'], ehf: ['--fold'], eh1: ['--one-try'], ehn: ['--no-spill'], eha: ['--all-locals'], ehs: ['--no-fuel-sites'] }[arm];
+		const evacuation = { o2: ['--no-handlers', '--no-flatten'], emit: ['--no-handlers', '--no-flatten', '--no-opt'], flat: ['--no-handlers'], eh: [], ehr: ['--resume'], ehrp: ['--resume'], ehrn: ['--resume', '--no-spill'], ehrs: ['--resume', '--no-fuel-sites'], ehrt: ['--resume', '--try-sites'], eht: ['--try-sites'], ehf: ['--fold'], eh1: ['--one-try'], ehn: ['--no-spill'], eha: ['--all-locals'], ehs: ['--no-fuel-sites'] }[arm];
 		if (!built(fueled)) {
-			if (arm === 'plain' || arm === 'nostack' || arm === 'simd') writeFileSync(file, readFileSync(source));
+			if (arm === 'plain' || arm === 'nostack' || arm === 'nofuel' || arm === 'peek' || arm === 'simd') writeFileSync(file, readFileSync(source));
 			else if (evacuation) {
 				// as the host builds an evacuable program: instrumented first, so the fuel yields at loop
 				// heads are safepoints too
-				sh(join(root, 'scripts/wasm/instrument.sh'), [plain, file]);
+				sh(join(root, 'scripts/wasm/instrument.sh'), [plain, file], { GMUX_FUEL_PEEK: arm === 'ehrp' ? '1' : '' });
 				sh(join(root, 'scripts/ts'), [join(root, 'scripts/wasm/export-globals.ts'), file, `${file}.g`, '--all-mutable']);
 				sh('node', [join(root, 'experiments/evacuation/scripts/evacuate.ts'), `${file}.g`, fueled, ...evacuation]);
 			} else if (arm === 'count') {
@@ -99,6 +103,8 @@ for (const name of Object.keys(workloads)) {
 				env: {
 					...process.env,
 					GMUX_NO_STACK_CHECK: arm === 'nostack' ? '1' : '',
+					GMUX_NO_FUEL: arm === 'nofuel' ? '1' : '',
+					GMUX_FUEL_PEEK: arm === 'peek' ? '1' : '',
 					GMUX_KEEP_EXPORTS:
 						arm === 'count'
 							? WebAssembly.Module.exports(new WebAssembly.Module(readFileSync(file)))

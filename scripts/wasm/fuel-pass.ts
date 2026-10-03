@@ -17,17 +17,22 @@ text =
 const func = text.search(/\n {2}\(func /);
 text =
 	text.slice(0, func) +
-	'\n  (global $gmux.budget (mut i32) (i32.const 100000))' +
+	`\n  (global $gmux.budget (mut i32) (i32.const ${process.env.GMUX_FUEL_PEEK ? 0 : 100000}))` +
 	text.slice(func);
+// GMUX_FUEL_PEEK=1 (a measurement) reads the budget global without counting, and never yields
+const peek = !!process.env.GMUX_FUEL_PEEK;
+const counting = [
+	'global.get $gmux.budget',
+	'i32.const 1',
+	'i32.sub',
+	'global.set $gmux.budget',
+	'global.get $gmux.budget',
+	'i32.const 0',
+	'i32.lt_s'
+];
 const check = (ind: string) =>
 	[
-		'global.get $gmux.budget',
-		'i32.const 1',
-		'i32.sub',
-		'global.set $gmux.budget',
-		'global.get $gmux.budget',
-		'i32.const 0',
-		'i32.lt_s',
+		...(peek ? ['global.get $gmux.budget'] : counting),
 		'if',
 		'  call $gmux.fuel',
 		'  global.set $gmux.budget',

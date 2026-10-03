@@ -45,6 +45,23 @@ export function skipImport(b: Uint8Array, kind: number, k: number): number {
 	throw new Error(`unknown import kind ${kind}`);
 }
 
+/** the memory size in a binary's dylink.0, which instrumenting drops; null without one */
+export function dylinkMemorySize(b: Uint8Array): number | null {
+	for (const [id, , start, end] of sections(b)) {
+		if (id !== 0) continue;
+		const [n, k0] = readLeb(b, start);
+		if (text.decode(b.subarray(k0, k0 + n)) !== 'dylink.0') continue;
+		let k = k0 + n;
+		while (k < end) {
+			const kind = b[k]!;
+			const [length, at] = readLeb(b, k + 1);
+			if (kind === 1) return readLeb(b, at)[0];
+			k = at + length;
+		}
+	}
+	return null;
+}
+
 export const utf8 = new TextEncoder();
 export const text = new TextDecoder();
 

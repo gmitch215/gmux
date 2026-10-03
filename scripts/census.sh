@@ -148,6 +148,7 @@ STATIC_ARGS="" prog dash http://gondor.apana.org.au/~herbert/dash/files/dash-0.5
 prog xz https://github.com/tukaani-project/xz/releases/download/v5.6.3/xz-5.6.3.tar.gz xz.tgz src/xz/xz --disable-nls --disable-threads --disable-doc --disable-sandbox
 prog curl https://curl.se/download/curl-8.10.1.tar.gz curl.tgz src/curl --with-mbedtls=$P --without-libpsl --disable-threaded-resolver \
 	--with-zlib=$P --without-brotli --without-zstd --without-nghttp2 --without-libidn2 --disable-ldap --disable-shared ac_cv_func_socket=yes
+(cd $B/curl/*/tests/server && mk curl-server sws sockfilt && checkwasm curl-sws sws && checkwasm curl-sockfilt sockfilt)
 (unpack lighttpd https://download.lighttpd.net/lighttpd/releases-1.4.x/lighttpd-1.4.76.tar.gz lighttpd.tgz \
 	&& cmake -S . -B build -DCMAKE_TOOLCHAIN_FILE=/rig/repo/scripts/wasm/toolchain.cmake -DCMAKE_C_FLAGS="$CFLAGS" \
 		-DCMAKE_EXE_LINKER_FLAGS="$LDFLAGS" -DBUILD_STATIC=ON -DWITH_PCRE2=OFF -DWITH_ZLIB=OFF -DWITH_BZIP=OFF > $D/logs$ROUND/lighttpd.configure.log 2>&1 \
@@ -197,7 +198,8 @@ prog openssh https://cdn.openbsd.org/pub/OpenBSD/OpenSSH/portable/openssh-9.9p1.
 	&& mkdir -p $B/perl-target \
 	&& { PATH=/rig/repo/scripts/wasm/target:$PATH GMUX_TARGET_RUN=$TARGET_RUN ./Configure -des -Dusecrosscompile \
 		-Dtargethost=localhost -Dtargetdir=$B/perl-target -Dtargetarch=wasm32-linux -Dcc=$CC \
-		-Dnm=$REAL_LLVM/llvm-nm -Dar=$AR -Dranlib=$RANLIB -Dccflags="$CFLAGS -D_GNU_SOURCE" -Dldflags="$LDFLAGS" -Dprefix=/usr \
+		-Dnm=$REAL_LLVM/llvm-nm -Dar=$AR -Dranlib=$RANLIB -Dccflags="$CFLAGS -D_GNU_SOURCE" -Dldflags="$LDFLAGS $(sed 's/^/-Wl,-u,/' /rig/repo/scripts/wasm/perl-libc.txt | tr '\n' ' ')" -Dprefix=/usr \
+		-Dld=$LINUX_WASM/tools/fake-llvm/ld.lld -Dlddlflags="-shared -Bsymbolic -L$SYSROOT/lib" \
 		> $D/logs$ROUND/perl.configure.log 2>&1 || {
 		record perl configure-failed "$(tail -2 $D/logs$ROUND/perl.configure.log | tr '\n' ' ' | cut -c1-160)"
 		exit
@@ -206,5 +208,58 @@ prog openssh https://cdn.openbsd.org/pub/OpenBSD/OpenSSH/portable/openssh-9.9p1.
 (unpack python https://www.python.org/ftp/python/3.8.20/Python-3.8.20.tar.xz python.txz \
 	&& READELF=$LINUX_WASM/tools/fake-llvm/llvm-readelf conf python --with-build-python=python3 --disable-ipv6 --without-ensurepip --disable-shared \
 	&& mk python python && checkwasm python python)
+# #endregion
+
+# #region systemd
+# PID 1 as a static program: needs the gmux-systemd image (docker/systemd.Dockerfile) for meson
+(
+	command -v meson > /dev/null || {
+		record systemd no-meson "run in the gmux-systemd image"
+		exit
+	}
+	SD=/rig/repo/scripts/wasm/systemd
+	MUSL126=$B/musl-1.2.6
+	SYSTEMD_CC=$CC
+	export HDRS MUSL126 SYSTEMD_CC
+	# the pinned musl is 1.2.5 and systemd needs the 1.2.6 statx and renameat2 declarations
+	mkdir -p $MUSL126/sys \
+		&& fetch "https://git.musl-libc.org/cgit/musl/plain/include/sys/stat.h?h=v1.2.6" musl126-stat.h && cp $D/src/musl126-stat.h $MUSL126/sys/stat.h \
+		&& fetch "https://git.musl-libc.org/cgit/musl/plain/include/stdio.h?h=v1.2.6" musl126-stdio.h && cp $D/src/musl126-stdio.h $MUSL126/stdio.h \
+		&& unpack systemd https://github.com/systemd/systemd/archive/refs/tags/v262.tar.gz systemd.tgz \
+		&& patch -p1 -s < $SD/wasm32.patch \
+		&& mkdir -p $P/lib/pkgconfig \
+		&& $CC $CFLAGS -c $SD/compat.c -o $B/compat.o && $AR rcs $P/lib/libucontext.a $B/compat.o \
+		&& printf 'Name: libucontext\nDescription: stubs\nVersion: 1.3\nLibs: -L%s -lucontext\n' $P/lib > $P/lib/pkgconfig/libucontext.pc \
+		&& cat > $B/systemd.cross << EOF
+[binaries]
+c = '$SD/cc.sh'
+c_ld = '$LINUX_WASM/tools/fake-llvm/ld.lld'
+ar = '$AR'
+ranlib = '$RANLIB'
+strip = '$LINUX_WASM/tools/fake-llvm/llvm-strip'
+pkg-config = 'pkg-config'
+[host_machine]
+system = 'linux'
+cpu_family = 'wasm32'
+cpu = 'wasm32'
+endian = 'little'
+[properties]
+needs_exe_wrapper = true
+[built-in options]
+c_args = [$(for a in $CFLAGS $CPPFLAGS; do printf "'%s'," "$a"; done)]
+c_link_args = [$(for a in $LDFLAGS; do printf "'%s'," "$a"; done)]
+EOF
+	[ -f $B/systemd.cross ] || exit
+	meson setup $B/systemd-build --cross-file $B/systemd.cross --prefix=/usr --buildtype=plain --default-library=static \
+		-Dlibc=musl -Dmode=release -Dbuild-static=true -Dsystemd-multicall-binary=true --prefer-static -Dtests=false \
+		-Dman=disabled -Dhtml=disabled -Dtranslations=false -Dbootloader=disabled -Defi=false -Dukify=disabled \
+		-Dbpf-framework=disabled -Dlibmount=disabled -Dpam=disabled -Dseccomp=disabled -Dselinux=disabled \
+		-Dapparmor=disabled -Daudit=disabled > $D/logs$ROUND/systemd.configure.log 2>&1 || {
+		record systemd configure-failed "$(grep -m1 -E 'ERROR|error' $D/logs$ROUND/systemd.configure.log | cut -c1-160)"
+		exit
+	}
+	ninja -C $B/systemd-build -k 0 systemd > $D/logs$ROUND/systemd.make.log 2>&1
+	checkwasm systemd $B/systemd-build/systemd
+)
 # #endregion
 echo "CENSUS6-DONE $(($(date +%s) - T0))s results=$RESULTS"

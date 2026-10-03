@@ -26,7 +26,7 @@ wat2wasm --enable-threads "$tmp/vmlinux.min.wat" -o "$tmp/vmlinux.min.wasm"
 wasm2wat --enable-threads --enable-exceptions --generate-names "$in/busybox.wasm" -o "$tmp/busybox.wat"
 "$root/scripts/ts" "$root/scripts/wasm/guard-pass.ts" "$tmp/busybox.wat" "$tmp/busybox.guard.wat" --inline > /dev/null
 wat2wasm --enable-threads --enable-exceptions --enable-multi-memory "$tmp/busybox.guard.wat" -o "$tmp/busybox.guard.wasm"
-"$root/scripts/wasm/instrument.sh" "$tmp/busybox.guard.wasm" "$out/busybox.guard.wasm"
+"$root/scripts/wasm/instrument.sh" "$tmp/busybox.guard.wasm" "$out/busybox.guard.wasm" "$in/busybox.wasm"
 "$root/scripts/ts" "$root/scripts/wasm/exec-stubs.ts" "$in/initramfs.cpio.gz" "$out/initramfs.bin"
 # the registry keys: the hashes of the unfueled busybox and katybug the stubs carry
 sum=$(shasum -a 256 "$in/busybox.wasm" | cut -d' ' -f1)

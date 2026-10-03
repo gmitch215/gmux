@@ -12,7 +12,7 @@ import { Machine, type MachineOptions } from '../../../src/worker/machine/machin
  * to the end; the plain and the evacuable builds are timed uninterrupted from the same yield. warm
  * restores into the modules the run already used, cold into freshly compiled ones (as a new
  * isolate would), against a plain run on freshly compiled bytes. ARMS picks the evacuate.ts flags
- * (resume, fold), ONLY the programs, REENTER=ms the cold restores' `reenterAfterRestore`. Ratios are
+ * (resume, fold; several joined by +, resume+try-sites), ONLY the programs, REENTER=ms the cold restores' `reenterAfterRestore`. Ratios are
  * medians over rounds against plain from the same yield, warm or cold. Every run's output is checked
  * against the plain run's.
  * `node --experimental-strip-types experiments/evacuation/scripts/restore-bench.ts <census dir> [rounds]`
@@ -83,7 +83,7 @@ for (const [name, cmd] of workloads) {
 		writeFileSync(image, arm === 'plain' ? readFileSync(plain) : tagged(readFileSync(plain), arm));
 		const out = join(work, `${name}.${arm}.wasm`);
 		if (arm === 'plain') writeFileSync(out, readFileSync(fueled));
-		else if (!built(out)) sh('node', [evacuate, `${fueled}.g`, out, `--${arm}`]);
+		else if (!built(out)) sh('node', [evacuate, `${fueled}.g`, out, ...arm.split('+').map((flag) => `--${flag}`)]);
 		programs.push({ arm, image, hash: sha256(readFileSync(image)), bytes: new Uint8Array(readFileSync(out)) });
 	}
 	const registry = new Map<string, WebAssembly.Module>([[manifest.busybox, new WebAssembly.Module(readFileSync(kernel('busybox.async.wasm')))]]);

@@ -2,11 +2,10 @@ import { readFileSync, writeFileSync } from 'node:fs';
 
 /**
  * Checks every load and store of a --generate-names wat against the kernel's page owner table (kernel
- * patch 0014): a u16 per 4 KiB page at gmux.table, the owning process's tag, a shared region's tag
- * (0x8000 | its id), or 0xffff / 0xfffe for a writable / read-only shared page when region ids ran
- * out. A page with the process's own tag (gmux.tag) passes at once; a region passes when the
- * process's set (gmux.set, two bits per region id: readable, writable) allows the access; anything
- * else calls env.__gmux_denied, which faults. A store (atomic read-modify-writes included) needs
+ * patch 0014): a u16 per 4 KiB page at gmux.table, the owning process's tag or a shared region's tag
+ * (0x8000 | its id). A page with the process's own tag (gmux.tag) passes at once; a region passes
+ * when the process's set (gmux.set, two bits per region id: readable, writable) allows the access;
+ * anything else calls env.__gmux_denied, which faults. A store (atomic read-modify-writes included) needs
  * writable, a load readable. An access that crosses a page is also checked at its last byte;
  * memory.fill and memory.copy check every page they write, and memory.copy every page it reads. The
  * access keeps its own address and offset. `guard-pass.ts in.wat out.wat [--inline]`
@@ -126,26 +125,10 @@ const HELPERS =
 	`  (func $gmux.slow (param $a i32) (param $t i32) (param $bit i32)
     block $ok
       local.get $t
-      i32.const 65535
-      i32.eq
-      br_if $ok
-      local.get $t
-      i32.const 65534
-      i32.eq
-      local.get $bit
-      i32.const 1
-      i32.eq
-      i32.and
-      br_if $ok
-      local.get $t
       i32.const 32768
       i32.and
       i32.const 0
       i32.ne
-      local.get $t
-      i32.const 65534
-      i32.lt_u
-      i32.and
       global.get $gmux.set
       i32.const 0
       i32.ne
