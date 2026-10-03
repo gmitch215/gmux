@@ -49,6 +49,14 @@ vfork=$(rt vfork.c) || exit 1
 dlo=$(rt dl.c) || exit 1
 dl=${dlo%.o}.a
 [ -f "$dl" ] || "${LINUX_WASM:-/rig/linux-wasm}/tools/fake-llvm/llvm-ar" rcs "$dl" "$dlo" || exit 1
+# fork the same way when the sysroot's musl lacks the host fork (musl patch 0008): its own fork()
+# makes a child with no stack
+fk=()
+if ! grep -qa __gmux_fork "$w/musl-wasm32_nommu/lib/libc.a"; then
+	fko=$(rt fork.c) || exit 1
+	fk=("${fko%.o}.a")
+	[ -f "${fk[0]}" ] || "${LINUX_WASM:-/rig/linux-wasm}/tools/fake-llvm/llvm-ar" rcs "${fk[0]}" "$fko" || exit 1
+fi
 # the module reader, built once with the host's cc (renamed into place: make runs links in parallel)
 imports=${TMPDIR:-/tmp}/gmux-wasm-imports-$(cksum < "$here/wasm-imports.c" | cut -d' ' -f1)
 if [ ! -x "$imports" ]; then
@@ -57,7 +65,7 @@ fi
 printf 'int __gmux_main(int c, char **v, char **e) { return 0; }\n' > "$tmp/probe.c"
 "$REAL" $TARGET -c "$tmp/probe.c" -o "$tmp/probe.o" || exit 1
 # a first link shows which main the program defines (--export-all exports every function)
-"$REAL" $SJLJ "${sys[@]}" -nostartfiles "$crt" "$sjlj" "$tag" "$vfork" "$dl" "${args[@]}" "$tmp/probe.o" -lc -o "$tmp/probe.wasm" 2> "$tmp/probe.log" || {
+"$REAL" $SJLJ "${sys[@]}" -nostartfiles "$crt" "$sjlj" "$tag" "$vfork" "$dl" "${fk[@]}" "${args[@]}" "$tmp/probe.o" -lc -o "$tmp/probe.wasm" 2> "$tmp/probe.log" || {
 	cat "$tmp/probe.log" >&2
 	exit 1
 }
@@ -74,7 +82,7 @@ else
 fi
 printf 'int __gmux_main(int c, char **v, char **e) { %s }\n' "$call" > "$tmp/main.c"
 "$REAL" $TARGET -c "$tmp/main.c" -o "$tmp/main.o" || exit 1
-"$REAL" $SJLJ "${sys[@]}" -nostartfiles "$crt" "$sjlj" "$tag" "$vfork" "$dl" "$@" "$tmp/main.o" -lc || exit $?
+"$REAL" $SJLJ "${sys[@]}" -nostartfiles "$crt" "$sjlj" "$tag" "$vfork" "$dl" "${fk[@]}" "$@" "$tmp/main.o" -lc || exit $?
 [ -f "$out" ] || exit 0
 allowed='^(__wasm_syscall_[0-6]|__wasm_abort|__gmux_vfork|__gmux_vfork_exec|__gmux_vfork_exit|__gmux_fork|__gmux_dl(prep|open|sym|close|error)|__stack_pointer|__memory_base|__table_base|__indirect_function_table|memory)$'
 bad=$("$imports" "$out" | grep -v -E "$allowed")
