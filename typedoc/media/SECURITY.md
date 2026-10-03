@@ -10,8 +10,8 @@ and the steps that reproduce it.
 ## Trust Model
 
 A gmux machine is one Linux kernel and its processes inside one Durable Object. The kernel and every
-process share one WebAssembly linear memory, and WebAssembly gives no protection inside a memory, so
-gmux enforces isolation itself:
+process except a forked child share one WebAssembly linear memory, and WebAssembly gives no
+protection inside a memory, so gmux enforces isolation itself:
 
 - **Root is trusted with the machine.** A process with effective uid 0 can read and write the
   kernel's memory and every other process's.
@@ -22,7 +22,15 @@ gmux enforces isolation itself:
   checks every load and store against that table and ends the process with `SIGSEGV` on a refused
   one, and the kernel refuses its syscall buffers outside its own pages and its regions with
   `EFAULT`. A non-root process cannot run a program that has no such build.
-- **Past 4,095 shared regions at once**, a new shared mapping is open to every process.
+- **A forked process runs in a WebAssembly memory of its own.** The child's bytes are not in the
+  machine's shared memory, so no load or store of another process reaches them and none of the
+  child's reaches the kernel or its parent, whatever its uid. The kernel reaches the child only
+  through host copies. Each copy is checked once against the size of that memory and refused when it
+  leaves it: the syscall returns `EFAULT` and nothing outside the memory is read or written.
+- **Past 4,095 shared regions at once**, a new shared mapping is refused with `ENOMEM` (`shmat`
+  leaves the segment unattached); it is never opened to every process. A region's id and the tags of
+  every page it covered return when its last mapping goes, however much of the region that mapping
+  covered.
 
 Run only software you trust with the whole machine as root, and do not keep secrets in a machine
 that runs code you do not trust.
@@ -80,26 +88,29 @@ act only on that memory and that machine's host state.
 
 ## Threat Matrix
 
-| threat                                                                                                     | status                                                                                                                                                        |
-| ---------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| a non-root process alters the kernel or another process in the same machine                                | refused: every store and syscall buffer is checked against the kernel's page owner table                                                                      |
-| a non-root process reads the kernel or another process in the same machine                                 | refused: every load is checked against the same table                                                                                                         |
-| a non-root process reaches memory another process maps shared                                              | refused unless it maps the same segment or file itself                                                                                                        |
-| a non-root process keeps reaching a page after it is unmapped or detached                                  | refused: the next load or store faults, whether it was parked in a syscall or at a fuel yield                                                                 |
-| a non-root process writes a region it mapped read-only, through a syscall                                  | possible: syscall buffers are checked for access to the region, not for its write permission                                                                  |
-| a root process alters the kernel or another process                                                        | possible; root is trusted with the machine                                                                                                                    |
-| a process loads code the build did not compile                                                             | refused: `dlopen` and `exec` take only registered modules; a refused `exec` ends the process with `SIGSEGV`                                                   |
-| a process reaches a Worker binding, secret or Durable Object storage directly                              | refused: no import exposes them                                                                                                                               |
-| guest root reads a Worker secret, the host's environment or the owner token                                | refused: none of them is ever in the machine's memory, which root can read whole                                                                              |
-| guest root writes the Durable Object's storage                                                             | refused: the machine holds no storage handle; the object stores only the owner hash and placement records                                                     |
-| guest root publishes a site or deploys a Worker                                                            | refused: paths outside `/_gmux/` answer 503, and the machine has no route to the Cloudflare API                                                               |
-| guest root opens a connection outside the machine                                                          | refused: its only network devices are loopback and IP tunnels over it                                                                                         |
-| a process reads another machine's memory                                                                   | refused: separate memories, no shared host state                                                                                                              |
-| a process instantiates a module with an unlisted import                                                    | refused at link time and at instantiation                                                                                                                     |
-| a visitor opens the terminal without the owner token                                                       | refused                                                                                                                                                       |
-| a process exhausts its machine's CPU or memory                                                             | bounded by fuel, invocation quanta and the machine's memory maximum; the machine, not the deployment, degrades                                                |
-| two machines started from the bootstrap image, or from one copied checkpoint, draw the same random numbers | refused: after every restore the kernel mixes 32 fresh host bytes into its entropy pool and reseeds its crng before a process runs                            |
-| two machines started from the bootstrap image share values the kernel chose at boot                        | possible: hash-table keys, the TCP sequence-number secret and the boot id come from the image; the crng and everything drawn from it after the restore do not |
-| anyone reads the bootstrap image                                                                           | open: it is a static asset of the deployment, taken from the public build before any claim, and holds no owner token, secret or user data                     |
-| a process escapes the V8 WebAssembly sandbox                                                               | out of scope for gmux; report it to the engine's maintainers                                                                                                  |
-| timing side channels between machines                                                                      | not addressed                                                                                                                                                 |
+| threat                                                                                                     | status                                                                                                                                                                         |
+| ---------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| a non-root process alters the kernel or another process in the same machine                                | refused: every store and syscall buffer is checked against the kernel's page owner table                                                                                       |
+| a non-root process reads the kernel or another process in the same machine                                 | refused: every load is checked against the same table                                                                                                                          |
+| a non-root process reaches memory another process maps shared                                              | refused unless it maps the same segment, file or anonymous region itself (a vfork child and a thread share their parent's; a program the child execs does not)                 |
+| a non-root process uses up the region ids to get an open mapping                                           | refused: past 4,095 regions a mapping fails with `ENOMEM`                                                                                                                      |
+| a forked process passes a syscall buffer, length or iovec that leaves its own memory                       | refused: the host copy is bounded by the memory's size with no 32-bit wrap, and the syscall returns `EFAULT`                                                                   |
+| a non-root process keeps reaching a page after it is unmapped or detached                                  | refused: the next load or store faults, whether it was parked in a syscall or at a fuel yield                                                                                  |
+| a non-root process writes a region it mapped read-only, through a syscall                                  | possible: syscall buffers are checked for access to the region, not for its write permission                                                                                   |
+| a root process alters the kernel or another process                                                        | possible; root is trusted with the machine                                                                                                                                     |
+| a process loads code the build did not compile                                                             | refused: `dlopen` and `exec` take only registered modules; a refused `exec` ends the process with `SIGSEGV`                                                                    |
+| an exec runs a module whose data is larger than the mapping its stub asked the kernel for                  | refused: the build records the module's data size and the host refuses the exec when it exceeds the stub's page-rounded size; a module built before that record is not checked |
+| a process reaches a Worker binding, secret or Durable Object storage directly                              | refused: no import exposes them                                                                                                                                                |
+| guest root reads a Worker secret, the host's environment or the owner token                                | refused: none of them is ever in the machine's memory, which root can read whole                                                                                               |
+| guest root writes the Durable Object's storage                                                             | refused: the machine holds no storage handle; the object stores only the owner hash and placement records                                                                      |
+| guest root publishes a site or deploys a Worker                                                            | refused: paths outside `/_gmux/` answer 503, and the machine has no route to the Cloudflare API                                                                                |
+| guest root opens a connection outside the machine                                                          | refused: its only network devices are loopback and IP tunnels over it                                                                                                          |
+| a process reads another machine's memory                                                                   | refused: separate memories, no shared host state                                                                                                                               |
+| a process instantiates a module with an unlisted import                                                    | refused at link time and at instantiation                                                                                                                                      |
+| a visitor opens the terminal without the owner token                                                       | refused                                                                                                                                                                        |
+| a process exhausts its machine's CPU or memory                                                             | bounded by fuel, invocation quanta and the machine's memory maximum; the machine, not the deployment, degrades                                                                 |
+| two machines started from the bootstrap image, or from one copied checkpoint, draw the same random numbers | refused: after every restore the kernel mixes 32 fresh host bytes into its entropy pool and reseeds its crng before a process runs                                             |
+| two machines started from the bootstrap image share values the kernel chose at boot                        | possible: hash-table keys, the TCP sequence-number secret and the boot id come from the image; the crng and everything drawn from it after the restore do not                  |
+| anyone reads the bootstrap image                                                                           | open: it is a static asset of the deployment, taken from the public build before any claim, and holds no owner token, secret or user data                                      |
+| a process escapes the V8 WebAssembly sandbox                                                               | out of scope for gmux; report it to the engine's maintainers                                                                                                                   |
+| timing side channels between machines                                                                      | not addressed                                                                                                                                                                  |

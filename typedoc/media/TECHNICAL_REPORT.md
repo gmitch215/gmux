@@ -84,13 +84,16 @@ plain build. Only the kernel stays asyncified.
 
 ### What Is Not Yet Measured
 
-Root processes share one trust domain, and non-root processes are isolated for writes only: they
-can still read the kernel's and other processes' memory (`SECURITY.md`). A forked child copies its
-parent's memory eagerly and cannot share memory with other processes. Checkpoints do not save
-shared instances or a fork child's own memory, and the terminal site's rows and CPU per idle day
-are not read. Also unmeasured: any serving workload, execution memoization, publication of
-proven responses, energy, and a deployed run of the latest kernel (console interrupt, scheduler
-clock, exec stubs). None of it has a number, and no figure here stands in for one.
+Root processes share one trust domain; non-root processes are isolated for reads and writes
+(Isolation, below), at the cost measured there. A non-root process cannot fork (`ENOSYS`), and a
+forked child copies its parent's memory eagerly, so a shared mapping across `fork` is a copy.
+Checkpoints do not save shared instances or a fork child's own memory. The deployed machine has
+run the whole kernel patch set (25 patches) once, on Free: the staged start, a survive across a
+redeploy and the isolation, fork and posix probes pass there, and coreutils at 800 pages does not
+(0 of 20 tests). The idle-day figures for the new keeper defaults are read for four hours, not a
+day. Also unmeasured: any serving workload, execution memoization, publication of proven
+responses, and energy per job (a rig exists, its table is unusable). None of it has a number, and
+no figure here stands in for one.
 
 ---
 
@@ -450,7 +453,9 @@ it maps and whether it may write them. A non-root process runs a build of its pr
 each load and store against both (`scripts/wasm/guard-pass.ts`), and `access_ok` refuses a non-root
 task's syscall buffers outside its own pages and regions. A non-root process that reads or writes the
 kernel's memory, another process's, or a shared segment it never attached gets `SIGSEGV`, and
-`EFAULT` from a syscall (`tests/c/isolation.c`, 27 checks, in Node and on Free). Root processes run
+`EFAULT` from a syscall (`tests/c/isolation.c`, 90 checks, in Node and on Free). A shared mapping
+with no region id left fails with `ENOMEM` (patch 0025); before it took a tag open to every non-root
+task once 4,095 regions were live. Root processes run
 the plain build. Four of the checks take a page away while the reader is parked: a sibling thread
 unmaps it (the reader at a fuel yield, or in `sched_yield`) or detaches its segment, and the reader's
 next load of it must end with `SIGSEGV`. nommu refuses `MAP_FIXED`, so a page reaches another owner
@@ -825,6 +830,35 @@ on x86-64 and by 15.3% on AArch64. Alone, memcmp gives -5.7%, strcmp -6.6%, memc
 spread is 0.5-2.5% (`nl` 9.7%). The 5.3 million recognized calls in `sort` buy about 1.3 s of 7.97
 s, roughly 0.25 us each. A kernel does not pay when calls are few or operands short. glibc's
 versions are ifunc variants with other bytes, so a Debian guest recognizes none.
+
+`memcpy`, `memmove` and `memset` in a dynamically linked guest run as host kernels too, found by
+the dynamic symbol (glibc and musl, x86-64 and AArch64, lazy and `-z now`). Output equals native on
+both libcs; on musl a fault's signal, address, `rip` offset and partial-write checksum equal native
+too, and on glibc they differ in the address, `rip` and checksum because the variant its cpuid
+selects is another function (`tests/c/katybug/thunk.sh`; `dynamic.sh` 29 of 29 on Debian and on
+Alpine, both arches). The thunk beats the guest's own copy at every size
+measured, from 1 byte (-11% to -41% of the loop's time at 1-8 bytes) to 64 KiB (-99%), so there is
+no size below which it should stay in the interpreter; over a long run `r` is 2-12 with the thunk
+against 284-668 without (3 samples per arm). A libm thunk is not shipped: against musl's results
+`exp`, `log` and `pow` differ in 0 of 1M inputs and `sin` and `cos` in 3.1%, and glibc's FMA
+variants of `exp` and `pow` differ from its non-FMA ones in 0.06-0.07% of results.
+
+An interpreter block guards what it assumed with one epoch compare instead of a check per access:
+the mapping generation, the code generation and the signal state. Assumption checks per 1,000 guest
+instructions fall from 309 / 510 / 588 / 478 / 122 / 413 to 73 / 88 / 101 / 51 / 15 / 62 on factor,
+gzip, bzip2, sqlite, sha256 and bash (76-89% fewer; the load and store range compare stays). Native
+time with epochs is -3.2% (bash) to +1.4% (sha256, outside its spread) of without; no V8 timing
+exists. Fourteen tests equal native Linux on both arches and each of six deliberate breakages of an
+epoch is caught by one of them.
+
+Lifted regions carry state in wasm locals only where it is exact. Registers moved through helpers
+fall 44% on factor, 41% on sqlite, 22% on bash and 10% on bzip2 in words per 1,000 guest
+instructions, and stack slots kept in locals, written through to guest memory, remove 46% of
+sha256's loads and 30% of gzip's; neither moves V8 time against the plain form (geomean 1.0029 and
+1.0101). One gzip function and its two hot callees, lifted as a closed region, run 88.0% of the
+guest's instructions at `r` 11.66-12.43 on x86 and 18.67-21.38 under V8, against 70.60 and 102.14
+interpreted; two thirds of the V8 figure is the 12% still interpreted. All forms equal the
+interpreter's output, and no shipped build holds a lifted region.
 
 Three changes cut dispatch. Block fusion decodes through direct jumps into one block; each block
 links the two successors it last saw, so most transitions skip the block hash; and a block run 64
@@ -1510,8 +1544,12 @@ the other crossing cost. Caller-with-callees closure is worse on zstd (`r` 5.22 
 10% budget), and cutting at strongly connected components equals hottest. The crossings a run makes
 equal the predicted count in all 96 measured rows. Under a byte budget min-cut is a heuristic, since
 the problem contains knapsack; with no budget it equals enumeration on 200 random graphs. zstd's
-`i64` and float functions cannot cross burrow's `i32` imports, so 22 of its 265 functions (3.64% of
-its instructions) stay interpreted, and `r` is 1.65 at the largest budget against 1.10 fully native.
+`i64` and float functions cannot cross burrow's `i32` imports, so a wide function is promoted only
+together with every caller of it. Under the first rule 22 of its 265 functions (3.64% of its
+instructions) stayed interpreted and `r` was 1.65 at the largest budget against 1.10 fully native;
+promoted with their callers they are all native, the round-trip checksum matches V8 on every rung,
+and `r` at the largest budget is 1.09 (spread 3%) and 1.27 (12%) in two sessions against native 1.10
+and 1.08, where the old rule measured 1.57-1.69 in the same sessions.
 
 The crossing cost is the number the planner leans on, and it reads three ways. The isolated
 native-to-burrow thunk costs 125 ns on the M2 Pro (149-195 ns at the guest's argument count, 100-138
@@ -1533,7 +1571,12 @@ pipeline against cached load, median of three (spread): zlib 16,575 ms (2%) agai
 16,139 ms (2%) against 1.0 ms, zstd 12,587 ms (1%) against 1.7 ms, 7,356 to 15,908 times. Timing
 the two ends and mining the catalog is 87-97% of a cold profile. Every cached file equals the cold
 run's byte for byte, and the plan derived again from the cached graph equals the cached plan. What
-is left of a restart is rebuilding the promoted rungs from the cached sets, 228-747 ms.
+is left of a restart was rebuilding the promoted rungs from the cached sets, 228-747 ms; they are
+now cached by module and set hash beside the record, under the same provenance check plus file
+size and sha256. The rungs phase takes 9-13 ms from the cache against 360-1,634 ms rebuilt
+(medians), every cached rung ran exact against V8, and process start to the first promoted call is
+102-419 ms against 571-1,731 ms with only the record cached. The Mac was at load average 8-21, so
+whole-run spreads are 31-384%; only the rungs phase is a clean signal.
 
 A wasm-to-wasm planner (constant propagation and folding, branch pruning, unreachable code, dead
 locals, fixed globals, unused blocks and functions) is exact and has nothing to do on compiler
@@ -1580,7 +1623,8 @@ compressed bytes once, and its cpio is the same.
 | `delay` calls `wasm_delay`; reboot calls `wasm_halt` | no busy delay, a clean stop |
 | `head.S` memory-grow retry shrinks by a page on failure | upstream retried the same size forever |
 | `CONFIG_BOOT_MEM_PAGES` 512 MiB to 64 MiB | 512 MiB cannot be allocated in an object |
-| `binfmt_wasm`'s program stack 8 KiB to 128 KiB | brk, and with it mallocng's metadata, starts at the bottom of the same mapping; 128 KiB is `binfmt_elf_fdpic`'s default |
+| `binfmt_wasm`'s program stack 8 KiB to 128 KiB, the argument page inside that mapping | brk, and with it mallocng's metadata, starts at the bottom of the same mapping; 128 KiB is `binfmt_elf_fdpic`'s default; the stack and the argument page are one 32-page block (order 5) because a 33-page mapping rounds to order 6, and a machine of 800 pages ran out of order-6 blocks (12 of 12 106-exec runs now finish, 1 of 4 before) |
+| `__alloc_pages_slowpath` calls `cpu_relax` when the OOM killer made progress | every cpu shares one host thread, so the retrying task never gave the victim the thread: at 1,200 pages the kernel spun at 100% cpu after its OOM kills until a test timed out |
 | `binfmt_wasm` leaves brk no room | brk could grow to the top of the stack mapping, through the live stack |
 | `ARCH_FORCE_MAX_ORDER` 14 | without an MMU an anonymous mmap is one contiguous block; order 10 capped allocations at 4 MiB |
 | every syscall called at its built type | the dispatch cast handlers to the caller's argument count, and `call_indirect` traps on a mismatch |
@@ -1705,13 +1749,18 @@ other processes.
 the precompiled side module registered under their hash into the calling process: data in memory the
 process allocated, functions on its table, imports from the program's exports. zlib 1.3.1 built with
 `-shared` loads through `dlopen` and prints what the same program prints natively against the same
-zlib (`tests/c/dl.c`), in Node and deployed on Free. An unregistered library is refused with the
-reason, since a Worker cannot compile code at run time, and so are ELF objects and executables.
+zlib (`tests/c/dl.c`), in Node and deployed on Free. perl's 51 core XS extensions build as side
+modules, 34 of 34 probed ones load and print what native perl prints, and curl's `runtests.pl`
+runs its first test against `sws` and reports 1 of 1 OK (Node only). An unregistered library is
+refused with the library, the process and the reason, since a Worker cannot compile code at
+run time, and so are ELF objects and executables; the refusal is recorded, and nothing interprets
+a recorded miss yet.
 Threads created after `dlopen` see the library, and snapshots carry it.
 
 ### Stacks
 
-A process starts on a 128 KiB stack and grows in 1 MiB segments up to `RLIMIT_STACK`, where an
+A process starts on a stack of 124 KiB (a 128 KiB mapping whose top page holds the arguments) and
+grows in 1 MiB segments up to `RLIMIT_STACK`, where an
 overflow is `SIGSEGV` instead of a write into the heap below. Each frame allocation is checked by one
 unsigned compare, which costs 2.4% on gawk, 1.8% on sed and nothing measurable on Lua (11 rounds); a
 first form that checked every stack pointer write cost up to 7.6%.
@@ -1809,8 +1858,10 @@ check, libraries installed into a per-run prefix so later packages link against 
 | redis's `__attribute__((__common__))` crashes clang's wasm backend; the recipe declares those pointers weak | redis |
 
 `scripts/wasm/config.site` holds the autoconf answers that recipes used to carry, and
-`scripts/wasm/toolchain.cmake` builds lighttpd. perl's interpreter builds (3.5 MB) and its dynamic XS
-extensions do not yet. nano and tmux now configure and stop at unresolved ncurses data symbols.
+`scripts/wasm/toolchain.cmake` builds lighttpd. perl's interpreter builds (3.5 MB) and keeps 96 libc
+symbols for its extensions, 51 of which build as side modules (see dlopen). systemd v262
+builds as one static wasm32 module of 6,560,522 bytes and has not been started: its cgroup2 mount
+is fatal on a kernel without `CONFIG_CGROUPS`, and its fibers need `swapcontext`. nano and tmux now configure and stop at unresolved ncurses data symbols.
 
 | result | packages |
 | --- | --- |
@@ -1836,6 +1887,14 @@ native musl 29 of 32, and the two agree on 31 files: `big` and `literals` fail o
 `heavy.lua` fails natively under the container's 2 GB cap. The suite found three defects on the way:
 the 128 KiB stack overflowing into the heap, a wall clock stuck in 1970, and a missing `/tmp`.
 libc-test's pthread suite is under Threads.
+
+GNU coreutils 9.5's own suite (516 tests, `tests/suites/coreutils-gmux.ts`) passes 329 of 510 under
+Katybug in a machine of 1,200 pages, where native passes 353 of 516; the 45 tests that differ are
+a missing name for uid 0, four syscalls Katybug does not map (`getpriority`, `setpriority`,
+`mknod`, `mknodat`), `uname -m` reporting `wasm`, one file system where 14 tests need two, and
+order-3 allocation failures that end in a timeout. At 800 pages no test passes (0 of the 155 and 38
+tests that ran before the runs were stopped): small kernel allocations of Katybug processes fail
+there.
 
 ---
 
