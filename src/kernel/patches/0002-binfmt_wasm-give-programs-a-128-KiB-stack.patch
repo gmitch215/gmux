@@ -10,11 +10,17 @@ middle: Lua aborted in free() after an error raised inside a coroutine
 under pcall, and in malloc() building a long list. The stack is now 128
 KiB, what binfmt_elf_fdpic gives a nommu program that does not ask for a
 size, and brk has no room, so musl's malloc takes its metadata from mmap.
+
+The argument page is the top page of those 128 KiB, so an exec maps 32
+pages. With the page on top of them an exec asked for 33, which the page
+allocator serves from a 64-page block and gives back the rest of; an
+800-page machine had no such block left after 104 execs.
 ---
- fs/binfmt_wasm.c | 6 ++++--
- 1 file changed, 4 insertions(+), 2 deletions(-)
+ fs/binfmt_wasm.c | 12 ++++++++----
+ 1 file changed, 8 insertions(+), 4 deletions(-)
 
 diff --git a/fs/binfmt_wasm.c b/fs/binfmt_wasm.c
+index ccc48e9d3..4d67dbf30 100644
 --- a/fs/binfmt_wasm.c
 +++ b/fs/binfmt_wasm.c
 @@ -20,7 +20,8 @@
@@ -27,7 +33,21 @@ diff --git a/fs/binfmt_wasm.c b/fs/binfmt_wasm.c
  
  /*
   * Userland expects the stack to be page aligned as of now, which allows it to
-@@ -368,7 +369,8 @@
+@@ -353,9 +354,11 @@ static int load_wasm_file(struct linux_binprm *bprm, unsigned long extra_stack)
+ 	}
+ 
+ 	/*
+-	 * Create a stack, and put the brk at the start of this area.
++	 * Create a stack, and put the brk at the start of this area. The argument page is the stack's
++	 * top page: a mapping of 33 pages needs a 64-page block from the allocator, and a small machine
++	 * runs out of those after a hundred execs, where 32 pages stay available.
+ 	*/
+-	stack_size = PAGE_ALIGN(WASM_STACK_SIZE + extra_stack);
++	stack_size = PAGE_ALIGN(WASM_STACK_SIZE - WASM_STACK_ALIGN + extra_stack);
+ 	current->mm->start_brk = vm_mmap(NULL, 0, stack_size,
+ 			PROT_READ|PROT_WRITE,
+ 			MAP_PRIVATE|MAP_ANONYMOUS|MAP_GROWSDOWN, 0);
+@@ -368,7 +371,8 @@ static int load_wasm_file(struct linux_binprm *bprm, unsigned long extra_stack)
  	}
  	current->mm->brk = current->mm->start_brk; /* Already page aligned... */
  #ifndef CONFIG_MMU

@@ -1,7 +1,8 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Gregory Mitchell <me@gmitch215.xyz>
 Date: Fri, 25 Sep 2026 23:30:00 -0400
-Subject: [PATCH] wasm: give the host the stack's bounds and recover unwound syscalls
+Subject: [PATCH] wasm: give the host the stack's bounds and recover unwound
+ syscalls
 
 A program's 128 KiB stack sat directly above other mappings with no
 guard page, so a deep recursion wrote into whatever lay below: Lua's
@@ -17,51 +18,30 @@ when a trap in the task unwound the syscall and skipped _exception_exit;
 otherwise the next syscall panicked with "Syscall called when in kernel
 mode". The functions the host calls are declared in asm/wasm.h.
 ---
---- a/fs/binfmt_wasm.c
-+++ b/fs/binfmt_wasm.c
-@@ -20,7 +20,10 @@
- #include <linux/uaccess.h>
- #include <linux/vmalloc.h>
+ arch/wasm/include/asm/wasm.h |  6 ++++++
+ arch/wasm/kernel/process.c   | 30 ++++++++++++++++++++++++++++++
+ arch/wasm/kernel/signal.c    |  1 +
+ arch/wasm/kernel/traps.c     | 15 +++++++++++++++
+ fs/binfmt_wasm.c             |  7 ++++++-
+ 5 files changed, 58 insertions(+), 1 deletion(-)
+
+diff --git a/arch/wasm/include/asm/wasm.h b/arch/wasm/include/asm/wasm.h
+index a70785bba..573ad05f0 100644
+--- a/arch/wasm/include/asm/wasm.h
++++ b/arch/wasm/include/asm/wasm.h
+@@ -30,4 +30,10 @@ extern void wasm_idle_wait(void *raised_irqs, long long timeout_ns);
+ extern void wasm_delay(unsigned long ns);
+ extern void wasm_halt(void);
  
--/* 128 KiB, the default binfmt_elf_fdpic gives nommu programs */
-+/*
-+ * 128 KiB, binfmt_elf_fdpic's default for nommu programs. Without an MMU a stack is committed memory,
-+ * so the host grows it in segments up to RLIMIT_STACK as the program needs them (split stacks).
-+ */
- #define WASM_STACK_SIZE		(128UL * 1024)
- 
- /*
---- a/arch/wasm/kernel/traps.c
-+++ b/arch/wasm/kernel/traps.c
-@@ -7,6 +7,7 @@
- #include <asm/processor.h>
- #include <asm/ptrace.h>
- #include <asm/syscall.h>
-+#include <asm/wasm.h>
- 
- static inline void _exception_enter(struct pt_regs *regs)
- {
-@@ -19,6 +20,20 @@
- 	cpuflags_overwrite(regs->cpuflags);
- }
- 
-+/*
-+ * For the host after a trap in a task: a trap that unwound a syscall skipped its _exception_exit,
-+ * so the cpu still says kernel mode and the next syscall would panic. Put back the flags the syscall
-+ * entered with, as an oops continues after killing the task, and say whether that was needed.
-+ */
-+__visible int wasm_trap_unwound_kernel(void)
-+{
-+	if (cpuflags_load() & CPUFLAGS_USER_MODE)
-+		return 0;
-+	pr_warn("wasm: a trap unwound a syscall in %s[%d]\n", current->comm, task_pid_nr(current));
-+	_exception_exit(current_pt_regs());
-+	return 1;
-+}
++/* gmux: kernel functions the host calls */
++unsigned long wasm_user_work_pending(void);
++unsigned long wasm_user_stack_low(unsigned long sp);
++unsigned long wasm_user_stack_high(unsigned long sp);
++int wasm_trap_unwound_kernel(void);
 +
- #define WASM_SYSCALL_N(x, args, cast_args, ...)					\
- 	__visible long __wasm_syscall_##x args;					\
- 	__visible long __wasm_syscall_##x args					\
+ #endif /* _ASM_WASM_WASM_H */
+diff --git a/arch/wasm/kernel/process.c b/arch/wasm/kernel/process.c
+index 2f7a4df6a..ee5bee34e 100644
 --- a/arch/wasm/kernel/process.c
 +++ b/arch/wasm/kernel/process.c
 @@ -9,6 +9,36 @@
@@ -101,6 +81,8 @@ mode". The functions the host calls are declared in asm/wasm.h.
  
  static cpumask_t user_cpus = CPU_MASK_NONE;
  
+diff --git a/arch/wasm/kernel/signal.c b/arch/wasm/kernel/signal.c
+index dc928068f..d6dfa1c11 100644
 --- a/arch/wasm/kernel/signal.c
 +++ b/arch/wasm/kernel/signal.c
 @@ -2,6 +2,7 @@
@@ -111,16 +93,57 @@ mode". The functions the host calls are declared in asm/wasm.h.
  
  struct rt_sigframe {
  	int sig_param;
---- a/arch/wasm/include/asm/wasm.h
-+++ b/arch/wasm/include/asm/wasm.h
-@@ -30,4 +30,10 @@
- extern void wasm_delay(unsigned long ns);
- extern void wasm_halt(void);
+diff --git a/arch/wasm/kernel/traps.c b/arch/wasm/kernel/traps.c
+index bf2270ad7..740c27bfd 100644
+--- a/arch/wasm/kernel/traps.c
++++ b/arch/wasm/kernel/traps.c
+@@ -7,6 +7,7 @@
+ #include <asm/processor.h>
+ #include <asm/ptrace.h>
+ #include <asm/syscall.h>
++#include <asm/wasm.h>
  
-+/* gmux: kernel functions the host calls */
-+unsigned long wasm_user_work_pending(void);
-+unsigned long wasm_user_stack_low(unsigned long sp);
-+unsigned long wasm_user_stack_high(unsigned long sp);
-+int wasm_trap_unwound_kernel(void);
+ static inline void _exception_enter(struct pt_regs *regs)
+ {
+@@ -19,6 +20,20 @@ static inline void _exception_exit(struct pt_regs *regs)
+ 	cpuflags_overwrite(regs->cpuflags);
+ }
+ 
++/*
++ * For the host after a trap in a task: a trap that unwound a syscall skipped its _exception_exit,
++ * so the cpu still says kernel mode and the next syscall would panic. Put back the flags the syscall
++ * entered with, as an oops continues after killing the task, and say whether that was needed.
++ */
++__visible int wasm_trap_unwound_kernel(void)
++{
++	if (cpuflags_load() & CPUFLAGS_USER_MODE)
++		return 0;
++	pr_warn("wasm: a trap unwound a syscall in %s[%d]\n", current->comm, task_pid_nr(current));
++	_exception_exit(current_pt_regs());
++	return 1;
++}
 +
- #endif /* _ASM_WASM_WASM_H */
+ #define WASM_SYSCALL_N(x, args, cast_args, ...)					\
+ 	__visible long __wasm_syscall_##x args;					\
+ 	__visible long __wasm_syscall_##x args					\
+diff --git a/fs/binfmt_wasm.c b/fs/binfmt_wasm.c
+index 4d67dbf30..508c953b2 100644
+--- a/fs/binfmt_wasm.c
++++ b/fs/binfmt_wasm.c
+@@ -20,7 +20,12 @@
+ #include <linux/uaccess.h>
+ #include <linux/vmalloc.h>
+ 
+-/* 128 KiB, the default binfmt_elf_fdpic gives nommu programs */
++/*
++ * 128 KiB with the argument page, binfmt_elf_fdpic's default for nommu programs. Without an MMU a
++ * stack is committed memory, so the host grows it in segments up to RLIMIT_STACK as the program
++ * needs them (split stacks): a program that uses all of the 124 KiB below its arguments moves on to
++ * a second segment, mapped when it first needs one.
++ */
+ #define WASM_STACK_SIZE		(128UL * 1024)
+ 
+ /*
+-- 
+2.43.0
+

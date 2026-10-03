@@ -1,0 +1,31 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Gregory Mitchell <me@gmitch215.xyz>
+Date: Fri, 2 Oct 2026 16:21:35 +0000
+Subject: [PATCH] mm/page_alloc: yield to the other cpus after an OOM kill
+
+The allocator retries after the OOM killer has picked a victim and
+leaves it to run and exit on another cpu. Every cpu shares one host
+thread here, so the retrying task never gave the victim the thread:
+at 1,200 pages the kernel logged its OOM kills and then spun at 100%
+cpu in try_to_free_pages and out_of_memory until the host stopped it.
+The retry now calls cpu_relax, which yields to the other cpus.
+---
+ mm/page_alloc.c | 2 ++
+ 1 file changed, 2 insertions(+)
+
+diff --git a/mm/page_alloc.c b/mm/page_alloc.c
+index 2d4b6f1a5..33bb60dec 100644
+--- a/mm/page_alloc.c
++++ b/mm/page_alloc.c
+@@ -4947,6 +4947,8 @@ __alloc_pages_slowpath(gfp_t gfp_mask, unsigned int order,
+ 	/* Retry as long as the OOM killer is making progress */
+ 	if (did_some_progress) {
+ 		no_progress_loops = 0;
++		/* the cpus share one host thread: yield so the victim can run and exit */
++		cpu_relax();
+ 		goto retry;
+ 	}
+ 
+-- 
+2.43.0
+
