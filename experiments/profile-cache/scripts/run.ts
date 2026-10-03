@@ -2,7 +2,8 @@ import { execFileSync } from 'node:child_process';
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { basename, join } from 'node:path';
-import { hashFiles, load, save, type ProfileRecord, type Provenance } from './cache.ts';
+import { load, loadRungs, save, saveRungs, type ProfileRecord } from './cache.ts';
+import { graphTs, ladder, node, planTs, prepareRungs, provenanceOf, repo } from './pipeline.ts';
 
 /**
  * Time to a ready profile for each guest, cold against from the cache: what a fresh process spends
@@ -20,13 +21,7 @@ if (!root || !dist || !cacheDir || !outDir || !tau || !fractions || !repeatsArg 
 	throw new Error('usage: BURROW_ROOT=<dir> BURROW_DIST=<dir> run.ts <cache dir> <out dir> <tau ns> <fractions> <repeats> <guest.wasm>...');
 const repeats = Number(repeatsArg);
 
-const here = new URL('.', import.meta.url).pathname;
-const repo = join(here, '../../..');
 const lock = process.env.BENCH_LOCK ?? join(repo, 'build/batch/mac-bench.lock');
-const node = [process.execPath, '--no-warnings', '--experimental-strip-types'];
-const ladder = join(repo, 'experiments/promotion-ladder/scripts/ladder.ts');
-const graphTs = join(repo, 'experiments/promotion-cut/scripts/graph.ts');
-const planTs = join(repo, 'experiments/promotion-cut/scripts/plan.ts');
 const mine = join(root, 'tools/interp/mine-catalog.sh');
 
 const run = (cmd: string, args: string[], env: Record<string, string> = {}) =>
@@ -39,22 +34,9 @@ const time = <T>(f: () => T) => {
 };
 const read = (...p: string[]) => readFileSync(join(...p), 'utf8');
 
-const { provenance: burrowProvenance } = (await import(join(root, 'tools/interp/artifact.ts'))) as {
-	provenance: (root: string) => { burrow: string; wasm3: string; tools: string };
-};
-const current = (): Provenance => {
-	const b = burrowProvenance(root);
-	return {
-		format: 1,
-		burrow: b.burrow,
-		wasm3: b.wasm3,
-		burrowTools: b.tools,
-		tools: hashFiles([ladder, graphTs, planTs, mine, join(here, 'cache.ts')]),
-		params: `${tau}:${fractions}`
-	};
-};
+const { record: current, rungs: currentRungs } = await provenanceOf(root, tau, fractions);
 
-const fresh = (guest: string, dir: string): { ms: Record<string, number>; record: ProfileRecord } => {
+const fresh = (guest: string, dir: string): { ms: Record<string, number>; record: ProfileRecord; rungs: Record<string, Uint8Array> } => {
 	mkdirSync(dir, { recursive: true });
 	const ms: Record<string, number> = {};
 	ms.graph = time(() => nodeRun(graphTs, [guest, join(dir, 'graph.json')])).ms;
@@ -63,8 +45,11 @@ const fresh = (guest: string, dir: string): { ms: Record<string, number>; record
 	ms.ends = time(() => nodeRun(ladder, ['run', join(dir, 'ends'), dist, '5'], { LADDER_JSON: join(dir, 'ends.json') })).ms;
 	ms.plan = time(() => nodeRun(planTs, [join(dir, 'graph.json'), join(dir, 'ends.json'), join(dir, 'plan'), tau, ...fractions.split(',')])).ms;
 	ms.catalog = time(() => run('bash', [mine, join(dir, 'catalog.json'), `${guest}:run:1`])).ms;
+	let rungs: Record<string, Uint8Array> = {};
+	ms.rungs = time(() => (rungs = prepareRungs(guest, read(dir, 'plan/sets.json'), join(dir, 'rungs')))).ms;
 	return {
 		ms,
+		rungs,
 		record: { graph: read(dir, 'graph.json'), ends: read(dir, 'ends.json'), plan: read(dir, 'plan/plan.json'), sets: read(dir, 'plan/sets.json'), catalog: read(dir, 'catalog.json') }
 	};
 };
@@ -93,8 +78,10 @@ mkdirSync(outDir, { recursive: true });
 for (const guest of guests) {
 	const name = basename(guest, '.wasm');
 	const bytes = readFileSync(guest);
-	const cold: Record<string, number[]> = { graph: [], prepare: [], ends: [], plan: [], catalog: [], total: [] };
+	const cold: Record<string, number[]> = { graph: [], prepare: [], ends: [], plan: [], catalog: [], rungs: [], total: [] };
 	const warm: number[] = [];
+	const rungsWarm: number[] = [];
+	let rungBytes = 0;
 	const mismatches: string[] = [];
 	for (let k = 0; k < repeats; k++) {
 		const dir = join(outDir, `${name}.cold${k}`);
@@ -116,9 +103,17 @@ for (const guest of guests) {
 		for (const [p, v] of Object.entries(f.ms)) cold[p]!.push(v);
 		cold.total!.push(Object.values(f.ms).reduce((s, x) => s + x, 0));
 		save(cacheDir, bytes, f.record, current());
+		saveRungs(cacheDir, bytes, f.record.sets, f.rungs, currentRungs());
 
 		const c = cached(guest, join(outDir, `${name}.warm${k}`));
 		warm.push(c.ms);
+		const rw = time(() => loadRungs(cacheDir, bytes, f.record.sets, currentRungs()));
+		if (!('files' in rw.v)) mismatches.push(`${name} run ${k}: rungs refused: ${rw.v.refused}`);
+		else {
+			rungsWarm.push(rw.ms);
+			rungBytes = Object.values(rw.v.files).reduce((s, b) => s + b.length, 0);
+			for (const [file, b] of Object.entries(f.rungs)) if (!Buffer.from(b).equals(rw.v.files[file] ?? new Uint8Array())) mismatches.push(`${name} run ${k}: cached ${file} differs from the cold run's`);
+		}
 		for (const key of ['graph', 'ends', 'plan', 'sets', 'catalog'] as const) if (c.v[key] !== f.record[key]) mismatches.push(`${name} run ${k}: cached ${key} differs from the cold run's`);
 		const again = mkdtempSync(join(tmpdir(), 'profile-cache-plan-'));
 		nodeRun(planTs, [join(outDir, `${name}.warm${k}`, 'graph.json'), join(outDir, `${name}.warm${k}`, 'ends.json'), again, tau, ...fractions.split(',')]);
@@ -126,10 +121,12 @@ for (const guest of guests) {
 		rmSync(again, { recursive: true });
 	}
 	const m = (xs: number[]) => `${median(xs).toFixed(1)} [${(100 * spread(xs)).toFixed(0)}%]`;
-	rows.push(`| ${name} | ${m(cold.graph!)} | ${m(cold.prepare!)} | ${m(cold.ends!)} | ${m(cold.plan!)} | ${m(cold.catalog!)} | ${m(cold.total!)} | ${m(warm)} | ${(median(cold.total!) / median(warm)).toFixed(0)}x |`);
+	rows.push(
+		`| ${name} | ${m(cold.graph!)} | ${m(cold.prepare!)} | ${m(cold.ends!)} | ${m(cold.plan!)} | ${m(cold.catalog!)} | ${m(cold.rungs!)} | ${m(cold.total!)} | ${m(warm)} | ${m(rungsWarm)} | ${(rungBytes / 1024).toFixed(0)} KB |`
+	);
 	for (const x of mismatches) console.error(`MISMATCH ${x}`);
-	writeFileSync(join(outDir, `${name}.json`), JSON.stringify({ cold, warm, mismatches }, null, '\t'));
+	writeFileSync(join(outDir, `${name}.json`), JSON.stringify({ cold, warm, rungsWarm, rungBytes, mismatches }, null, '\t'));
 }
-console.log('| guest | graph | prepare | ends | plan | catalog | cold total | cached | cold / cached |');
-console.log('| --- | --- | --- | --- | --- | --- | --- | --- | --- |');
+console.log('| guest | graph | prepare | ends | plan | catalog | planned rungs | cold total | cached record | cached rungs | rung bytes |');
+console.log('| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |');
 for (const r of rows) console.log(r);
