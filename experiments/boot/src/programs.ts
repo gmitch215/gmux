@@ -4,61 +4,65 @@ import program1 from '../vendor/programs/control-flow.wasm';
 import program2 from '../vendor/programs/dl.wasm';
 import program3 from '../vendor/programs/fork.wasm';
 import program4 from '../vendor/programs/g3.wasm';
-import program5 from '../vendor/programs/isolation.wasm';
-import program6 from '../vendor/programs/posix.wasm';
-import program7 from '../vendor/programs/sig.wasm';
-import program8 from '../vendor/programs/spin.wasm';
-import program9 from '../vendor/programs/stack.wasm';
-import program10 from '../vendor/programs/thr.wasm';
-import program11 from '../vendor/programs/time.wasm';
-import program12 from '../vendor/programs/vf.wasm';
-import program13 from '../vendor/programs/libcallback.so.wasm';
-import program14 from '../vendor/programs/libz.so.wasm';
+import program5 from '../vendor/programs/gens.wasm';
+import program6 from '../vendor/programs/isolation.wasm';
+import program7 from '../vendor/programs/posix.wasm';
+import program8 from '../vendor/programs/sig.wasm';
+import program9 from '../vendor/programs/spin.wasm';
+import program10 from '../vendor/programs/stack.wasm';
+import program11 from '../vendor/programs/thr.wasm';
+import program12 from '../vendor/programs/time.wasm';
+import program13 from '../vendor/programs/vf.wasm';
+import program14 from '../vendor/programs/libcallback.so.wasm';
+import program15 from '../vendor/programs/libz.so.wasm';
 import katybug from '../vendor/programs/katybug.build.wasm';
 import guarded0 from '../vendor/programs/authority.guard.wasm';
 import guarded1 from '../vendor/programs/control-flow.guard.wasm';
 import guarded2 from '../vendor/programs/dl.guard.wasm';
 import guarded3 from '../vendor/programs/fork.guard.wasm';
 import guarded4 from '../vendor/programs/g3.guard.wasm';
-import guarded5 from '../vendor/programs/isolation.guard.wasm';
-import guarded6 from '../vendor/programs/posix.guard.wasm';
-import guarded7 from '../vendor/programs/sig.guard.wasm';
-import guarded8 from '../vendor/programs/spin.guard.wasm';
-import guarded9 from '../vendor/programs/stack.guard.wasm';
-import guarded10 from '../vendor/programs/thr.guard.wasm';
-import guarded11 from '../vendor/programs/time.guard.wasm';
-import guarded12 from '../vendor/programs/vf.guard.wasm';
-export const BUSYBOX_SHA256 = '2bdbe4c2529dcb050d709844a5a86377abe0533f73107f4a8c2a60411bed4b50';
+import guarded5 from '../vendor/programs/gens.guard.wasm';
+import guarded6 from '../vendor/programs/isolation.guard.wasm';
+import guarded7 from '../vendor/programs/posix.guard.wasm';
+import guarded8 from '../vendor/programs/sig.guard.wasm';
+import guarded9 from '../vendor/programs/spin.guard.wasm';
+import guarded10 from '../vendor/programs/stack.guard.wasm';
+import guarded11 from '../vendor/programs/thr.guard.wasm';
+import guarded12 from '../vendor/programs/time.guard.wasm';
+import guarded13 from '../vendor/programs/vf.guard.wasm';
+export const BUSYBOX_SHA256 = '952836934b75ff31a49bc70c068be2afc0c296aab098484643dd358cce2b6c43';
 export const PROGRAMS: [string, WebAssembly.Module][] = [
-	['3c7fd5742800e5f9f0ea1c4f4c5bcb432d0a17ac7e870de13caf9d9e1e86e617', program0],
-	['e4c18c9c59ca7f649204f8c509d06b3e9e718802e197b9d4a56cd158d03f8661', program1],
-	['d744ebea89ffb953cabc62e00a04cf65b3ab0d0de75f1206c6cfc3600f202617', program2],
-	['e511f0c77c314c895e4e86ffa5aa5c12784a51f27702f91c3c9df92070ff76fd', program3],
+	['6be7513ffde170436498305ec82e0ae781535ad20a135c0f4c319509b1e38e63', program0],
+	['8f580eb02bc886a6af548b8f5f59cc83a4b5876b8c0be30b6ae43fe5cb690074', program1],
+	['e9fb05a87347dc88cef92d766747a3160fbee2469d1ecadbc7dfd84b37f2665c', program2],
+	['24c4f316abf5c8595b7c81b08baab5129829962fab18911a04581f07250a473f', program3],
 	['0127265c95a534c966368183d48984adfda8a9b6972a432ff78bb04bcf87f35b', program4],
-	['ecf45f1278545c168e6132b2fc1eb11bd63557cf8e899e4c67ba68a996e91729', program5],
-	['207245a52f5bcbc0b86bd55b2be745f4a336fb971d98a984302eec9948ac8ada', program6],
-	['c98ea06175a79dacb8a1bc0f9c3c5c8536051293aa3191dacdf0e43345997dd0', program7],
-	['f0b6a88dac7c3fec6ba64a55fd5f72cad15a7abfb9a833fdfd9dcb535414e80b', program8],
-	['be9568e3ffcce0c31f1fc6408a1ce82df22bf834532675c6cee30bdefaff619c', program9],
-	['325f4b7c9d33a765dc0a49305c441de1e63a35fb21ce32996dd4b199a86a5252', program10],
-	['1df51fce020c1bb31a056df35cea5a2bda02113a6a7a3c80e2278f1a157afb57', program11],
-	['6955880568300b4d3e0e3d487d5cdd90230df218b3eff14f9bb1e2dfff1e44fd', program12],
-	['4dda0b934734a3b0c2106687adb00a7a438e07bb422e65ec4538005c38c83b15', program13],
-	['2e32baa636fb6b3125d8bacb8ea887d97222d3cfe85aeb8ede499efe93d3f0e6', program14],
-	['79f04da6cced0f4241f0db68ca9bd9a208589cb710f41093860a9aa1e8a22cd1', katybug],
+	['3fd09515070e129d062f880bdeddb4e7f875d34b6d2c6a1bd5c74c0507d61195', program5],
+	['d19144ec702630de04ceec845dade06d63718920b2e03d57636312000801c4c2', program6],
+	['cd0bfa99e04816071dfa9ef816815335ed0aff0c71d471f9187ad86c7c356037', program7],
+	['cb3433f258647cf64e7e7745410e5a8f526aa2f010d55688a110d1fba3ea3e88', program8],
+	['567ac37418a0ab9242f143b3d2a7e6e46d025e31692b6ca154f5431788837b39', program9],
+	['ebbb1df1d67e2fded52b5b8014de9751e156ceac68a9a95ec077ffb02522bbac', program10],
+	['db09d43d8f0e901e253a50fc437be10f87463b0d169198a221fdad60aceb37d3', program11],
+	['4723d95e857cbc85b048b121d64429831f9043c4d94d95eda4b689134eb9af05', program12],
+	['d2b6ceb9d1db27d26d755a2eb7bce253df1ab4d47d9e9fc5b5764b686e91221d', program13],
+	['4dda0b934734a3b0c2106687adb00a7a438e07bb422e65ec4538005c38c83b15', program14],
+	['2e32baa636fb6b3125d8bacb8ea887d97222d3cfe85aeb8ede499efe93d3f0e6', program15],
+	['e2a9e2a8f39ca08f7dbb00fbce75091a2569754890756184a8140bc3ea010ee7', katybug],
 ];
 export const GUARDED: [string, WebAssembly.Module][] = [
-	['3c7fd5742800e5f9f0ea1c4f4c5bcb432d0a17ac7e870de13caf9d9e1e86e617', guarded0],
-	['e4c18c9c59ca7f649204f8c509d06b3e9e718802e197b9d4a56cd158d03f8661', guarded1],
-	['d744ebea89ffb953cabc62e00a04cf65b3ab0d0de75f1206c6cfc3600f202617', guarded2],
-	['e511f0c77c314c895e4e86ffa5aa5c12784a51f27702f91c3c9df92070ff76fd', guarded3],
+	['6be7513ffde170436498305ec82e0ae781535ad20a135c0f4c319509b1e38e63', guarded0],
+	['8f580eb02bc886a6af548b8f5f59cc83a4b5876b8c0be30b6ae43fe5cb690074', guarded1],
+	['e9fb05a87347dc88cef92d766747a3160fbee2469d1ecadbc7dfd84b37f2665c', guarded2],
+	['24c4f316abf5c8595b7c81b08baab5129829962fab18911a04581f07250a473f', guarded3],
 	['0127265c95a534c966368183d48984adfda8a9b6972a432ff78bb04bcf87f35b', guarded4],
-	['ecf45f1278545c168e6132b2fc1eb11bd63557cf8e899e4c67ba68a996e91729', guarded5],
-	['207245a52f5bcbc0b86bd55b2be745f4a336fb971d98a984302eec9948ac8ada', guarded6],
-	['c98ea06175a79dacb8a1bc0f9c3c5c8536051293aa3191dacdf0e43345997dd0', guarded7],
-	['f0b6a88dac7c3fec6ba64a55fd5f72cad15a7abfb9a833fdfd9dcb535414e80b', guarded8],
-	['be9568e3ffcce0c31f1fc6408a1ce82df22bf834532675c6cee30bdefaff619c', guarded9],
-	['325f4b7c9d33a765dc0a49305c441de1e63a35fb21ce32996dd4b199a86a5252', guarded10],
-	['1df51fce020c1bb31a056df35cea5a2bda02113a6a7a3c80e2278f1a157afb57', guarded11],
-	['6955880568300b4d3e0e3d487d5cdd90230df218b3eff14f9bb1e2dfff1e44fd', guarded12],
+	['3fd09515070e129d062f880bdeddb4e7f875d34b6d2c6a1bd5c74c0507d61195', guarded5],
+	['d19144ec702630de04ceec845dade06d63718920b2e03d57636312000801c4c2', guarded6],
+	['cd0bfa99e04816071dfa9ef816815335ed0aff0c71d471f9187ad86c7c356037', guarded7],
+	['cb3433f258647cf64e7e7745410e5a8f526aa2f010d55688a110d1fba3ea3e88', guarded8],
+	['567ac37418a0ab9242f143b3d2a7e6e46d025e31692b6ca154f5431788837b39', guarded9],
+	['ebbb1df1d67e2fded52b5b8014de9751e156ceac68a9a95ec077ffb02522bbac', guarded10],
+	['db09d43d8f0e901e253a50fc437be10f87463b0d169198a221fdad60aceb37d3', guarded11],
+	['4723d95e857cbc85b048b121d64429831f9043c4d94d95eda4b689134eb9af05', guarded12],
+	['d2b6ceb9d1db27d26d755a2eb7bce253df1ab4d47d9e9fc5b5764b686e91221d', guarded13],
 ];
