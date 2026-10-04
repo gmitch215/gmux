@@ -77,7 +77,7 @@ int main(int argc, char** argv) {
     int ok = refused(
         "/tmp/unknown.so", "/tmp/unknown.so: not in the exec registry (sha256 "
     );
-    ok &= refused("/tmp/unknown.so", "dl (sha256 ");
+    ok &= refused("/tmp/unknown.so", "executable (sha256 ");
     ok &=
         refused("/tmp/unknown.so", "a Worker cannot compile code at run time");
     ok &= refused(

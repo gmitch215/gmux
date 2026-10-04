@@ -143,7 +143,7 @@ export class DlProcess {
 	readonly libs: Lib[] = [];
 	readonly slots: Slot[] = [];
 	/** the executable this process runs, named in a refusal and keyed in the miss record */
-	exe: { hash: string; name: string } | null = null;
+	exe: { hash: string; name?: string } | null = null;
 	private next = 1;
 	private error = '';
 
@@ -217,7 +217,7 @@ export class DlProcess {
 		const module = this.registry.get(hash);
 		if (!module) {
 			const { exe } = this;
-			const who = exe ? `${exe.name} (sha256 ${exe.hash})` : 'this process';
+			const who = exe ? `${exe.name ?? 'executable'} (sha256 ${exe.hash})` : 'this process';
 			let next = 'the miss is not recorded (no executable)';
 			if (exe) {
 				next =

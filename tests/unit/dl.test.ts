@@ -165,6 +165,17 @@ describe('dlopen', () => {
 		expect(error()).toMatch(/no dylink.0 section/);
 	});
 
+	it('names an executable with no name as "executable"', () => {
+		const other = build('(module (func (export "f")))', [0, 0, 0, 0]);
+		const memory = new WebAssembly.Memory({ initial: 1 });
+		const process = new DlProcess(memory, new Map(), sha256, DATA_START, { misses: new Map() });
+		process.exe = { hash: 'e'.repeat(64) };
+		expect(process.prepare(other)).toBeNull();
+		expect(process.lastError()).toContain(
+			`executable (sha256 ${'e'.repeat(64)}) cannot load it`
+		);
+	});
+
 	it('records the miss against the executable and says what the next run gets', () => {
 		const other = build('(module (func (export "f")))', [0, 0, 0, 0]);
 		const exe = { hash: 'e'.repeat(64), name: 'prog' };
