@@ -77,6 +77,7 @@ for arch in ${ARCHES:-x86_64 aarch64}; do
 		for ((r = 0; r < ${ROUNDS:-2}; r++)); do
 			for ((l = 0; l < layouts; l++)); do
 				for n in "${names[@]}"; do
+					[ -n "${LOADLOG:-}" ] && echo "$arch $wl $n $l $r $(sysctl -n vm.loadavg)" >> "$LOADLOG"
 					# wall, then user + sys of the run's processes (another job on the host moves the first)
 					t=$(perl -MTime::HiRes=time -e '$s = time; system(@ARGV);
 						@c = times; printf "%.3f %.3f", time - $s, $c[2] + $c[3]' \

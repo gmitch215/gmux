@@ -96,6 +96,46 @@ static unsigned char pat[256];
 BRANCH(br4, R4)
 BRANCH(br16, R16)
 
+/* a segment: work, then a branch on pat that never leaves (the cold arm sits
+ * out of line) */
+#define SEG(reps)                                                              \
+    reps(x, y) if (__builtin_expect(!pat[(i + __COUNTER__) & 255], 0)) {       \
+        x += 7;                                                                \
+        __asm__ volatile("" : "+r"(x));                                        \
+    }
+#define S1(r) SEG(r)
+#define S2(r) S1(r) S1(r)
+#define S4(r) S2(r) S2(r)
+#define S8(r) S4(r) S4(r)
+#define S16(r) S8(r) S8(r)
+#define S32(r) S16(r) S16(r)
+#define S64(r) S32(r) S32(r)
+
+#define TL(name, segs, reps)                                                   \
+    __attribute__((noinline)) static unsigned long name(unsigned long n) {     \
+        unsigned long x = 1, y = n;                                            \
+        __asm__ volatile("" : "+r"(y));                                        \
+        _Pragma("clang loop unroll(disable)") for (unsigned long i = 0; i < n; \
+                                                   i++) {                      \
+            segs(reps)                                                         \
+        }                                                                      \
+        return x + y;                                                          \
+    }
+TL(tl1_4, S1, R4)
+TL(tl2_4, S2, R4)
+TL(tl4_4, S4, R4)
+TL(tl8_4, S8, R4)
+TL(tl16_4, S16, R4)
+TL(tl32_4, S32, R4)
+TL(tl64_4, S64, R4)
+TL(tl1_16, S1, R16)
+TL(tl2_16, S2, R16)
+TL(tl4_16, S4, R16)
+TL(tl8_16, S8, R16)
+TL(tl16_16, S16, R16)
+TL(tl32_16, S32, R16)
+TL(tl64_16, S64, R16)
+
 static unsigned long spin(unsigned long n, unsigned long* a, unsigned long* b) {
     unsigned long s = 0;
 #pragma clang loop unroll(disable)
@@ -136,8 +176,27 @@ static void hex(unsigned long v) {
     sys3(NR_WRITE, 1, (long) out, 18);
 }
 
+static unsigned long tl(unsigned long s, unsigned long k, unsigned long n) {
+    for (unsigned long j = 0; j < 256; j++) pat[j] = 1;
+    if (k == 4)
+        return s == 1    ? tl1_4(n)
+               : s == 2  ? tl2_4(n)
+               : s == 4  ? tl4_4(n)
+               : s == 8  ? tl8_4(n)
+               : s == 16 ? tl16_4(n)
+               : s == 32 ? tl32_4(n)
+                         : tl64_4(n);
+    return s == 1    ? tl1_16(n)
+           : s == 2  ? tl2_16(n)
+           : s == 4  ? tl4_16(n)
+           : s == 8  ? tl8_16(n)
+           : s == 16 ? tl16_16(n)
+           : s == 32 ? tl32_16(n)
+                     : tl64_16(n);
+}
+
 /* alu <reps 1|4|16|64> <n> | br <reps 4|16> <every> <n> | map <miss 0|1>
- * <extra> <n> | null */
+ * <extra> <n> | t <segments 1..64 doubling> <reps 4|16> <n> | null */
 void guest_main(long* sp) {
     long argc = sp[0];
     char** argv = (char**) (sp + 1);
@@ -156,6 +215,8 @@ void guest_main(long* sp) {
             pat[j] = !every || j % every != 0;
         v += r == 4 ? br4(n) : br16(n);
     }
+    else if (argc >= 5 && argv[1][0] == 't')
+        v = tl(num(argv[2]), num(argv[3]), num(argv[4]));
     else if (argc >= 5 && argv[1][0] == 'm')
         v = map(num(argv[4]), (int) num(argv[2]), (int) num(argv[3]));
     hex(v);
