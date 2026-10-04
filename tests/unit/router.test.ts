@@ -1,5 +1,7 @@
+import { readFileSync } from 'node:fs';
+import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
-import { routerModules } from '../../scripts/wasm/router-modules.ts';
+import { ROUTER_BUILD, routerModules } from '../../scripts/wasm/router-modules.ts';
 import { statxHash } from '../../src/worker/machine/machine.ts';
 import {
 	MISS,
@@ -23,6 +25,24 @@ const O_DSYNC = 0o10000;
 const SYS_OPENAT = 56;
 
 describe('syscall router', () => {
+	it('places nothing in the task memory it imports', () => {
+		const bytes = readFileSync(join(ROUTER_BUILD, 'router.wasm'));
+		const ids: number[] = [];
+		for (let at = 8; at < bytes.length;) {
+			ids.push(bytes[at++]!);
+			let size = 0;
+			for (let shift = 0; ; shift += 7) {
+				const b = bytes[at++]!;
+				size |= (b & 0x7f) << shift;
+				if (b < 0x80) break;
+			}
+			at += size;
+		}
+		// 11 is the data section, 12 its count
+		expect(ids).not.toContain(11);
+		expect(ids).not.toContain(12);
+	});
+
 	// where a call goes, from the rules router.ts documents
 	const goes = (route: number, nr: number, flags: number, arity: number) => {
 		if (route === ROUTE_KERNEL) return 'k';
