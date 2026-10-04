@@ -1,4 +1,6 @@
 #!/bin/sh
+# the machine's own address, which the site's relay connects to
+/sbin/ifconfig lo 127.0.0.1 up
 # x86-64 and AArch64 ELF executables (ET_EXEC or ET_DYN) run through katybug when exec'd
 if [ -x /bin/katybug ] && mount -t binfmt_misc none /proc/sys/fs/binfmt_misc 2> /dev/null; then
 	mask='\xff\xff\xff\xff\xff\xfe\xfe\x00\xff\xff\xff\xff\xff\xff\xff\xff\xfe\xff\xff\xff'
