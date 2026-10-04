@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { loop } from '../../experiments/energy/src/drive.ts';
-import { delta, net, span, type Snap } from '../../experiments/energy/src/rapl.ts';
+import { delta, net, quantile, span, wants, type Snap } from '../../experiments/energy/src/rapl.ts';
 
 const WRAP = 65_532_610_987;
 const snap = (t: number, uj: number, busy: number, own: number): Snap => ({ t, uj, busy, own });
@@ -26,6 +26,20 @@ describe('energy rig counters', () => {
 
 	it('subtracts idle power over the window', () => {
 		expect(net(100, 3, 16)).toBe(52);
+	});
+
+	it('takes nearest-rank quantiles', () => {
+		const xs = [5, 1, 4, 2, 3, 10, 9, 8, 7, 6];
+		expect(quantile(xs, 0.5)).toBe(5);
+		expect(quantile(xs, 0.9)).toBe(9);
+		expect(quantile(xs, 1)).toBe(10);
+		expect(quantile([7], 0.9)).toBe(7);
+	});
+
+	it('keeps sampling a cell until it holds enough kept samples or runs out of attempts', () => {
+		expect(wants({ kept: 4, tried: 14 }, 5, 15)).toBe(true);
+		expect(wants({ kept: 5, tried: 5 }, 5, 15)).toBe(false);
+		expect(wants({ kept: 2, tried: 15 }, 5, 15)).toBe(false);
 	});
 
 	it('wraps k runs of a command with its input substituted and its output sunk', () => {
