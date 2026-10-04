@@ -6,6 +6,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/mman.h>
 #include <sys/stat.h>
 #include <sys/syscall.h>
 #include <time.h>
@@ -57,6 +58,18 @@ int main(int argc, char** argv) {
         int fd = open("/init", O_RDONLY);
         sink += read(fd, buf, 4096);
         close(fd);
+    }
+    mark("end", sink & 1);
+
+    // capped: freed vmas wait for an rcu grace period, and ~100000 of them
+    // outrun the 58 MiB machine
+    long maps = n < 20000 ? n : 20000;
+    mark("mmap-munmap", maps);
+    for (long i = 0; i < maps; i++) {
+        void* p = mmap(
+            0, 65536, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0
+        );
+        sink += munmap(p, 65536);
     }
     mark("end", sink & 1);
 

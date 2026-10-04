@@ -1,10 +1,11 @@
 import { execFileSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { mkdtempSync, readFileSync } from 'node:fs';
+import { copyFileSync, mkdtempSync, readFileSync } from 'node:fs';
 import { Session } from 'node:inspector/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { appendCpio } from '../../../scripts/wasm/cpio-append.ts';
+import { routerModules } from '../../../scripts/wasm/router-modules.ts';
 import { Machine } from '../../../src/worker/machine/machine.ts';
 
 /**
@@ -23,10 +24,13 @@ const kernel = join(process.env.GMUX_BUILD ?? join(root, 'build'), 'kernel');
 const work = mkdtempSync(join(tmpdir(), 'gmux-syscall-cost-'));
 const sha256 = (bytes: Uint8Array) => createHash('sha256').update(bytes).digest('hex');
 const manifest = JSON.parse(readFileSync(join(kernel, 'manifest.json'), 'utf8'));
-execFileSync(join(root, 'scripts/wasm/instrument.sh'), [plain, join(work, 'cost.fuel.wasm')]);
+// INSTRUMENTED names an instrument.sh output made elsewhere, for a host without wabt
+if (process.env.INSTRUMENTED) copyFileSync(process.env.INSTRUMENTED, join(work, 'cost.fuel.wasm'));
+else execFileSync(join(root, 'scripts/wasm/instrument.sh'), [plain, join(work, 'cost.fuel.wasm')]);
 appendCpio(join(kernel, 'initramfs.bin'), join(work, 'initramfs.cpio'), [`/bin/cost=${plain}`]);
 
 let output = '';
+let pending = '';
 const marks: [string, number, number][] = [];
 const machine = new Machine({
 	vmlinux: new WebAssembly.Module(readFileSync(process.env.VMLINUX ?? join(kernel, 'vmlinux.wasm'))),
@@ -40,11 +44,18 @@ const machine = new Machine({
 	maximumPages: 1024,
 	sha256,
 	sharedKernel: true,
+	router: routerModules(),
 	syscallCache: process.env.CACHE === "verify" ? "verify" : process.env.CACHE === "1",
 	write: (text) => {
 		const at = performance.now();
 		output += text;
-		for (const m of text.matchAll(/mark (\S+) (\d+)/g)) marks.push([m[1]!, Number(m[2]), at]);
+		// the console may deliver a line in pieces; a mark counts when its line is whole
+		pending += text;
+		for (let nl = pending.indexOf('\n'); nl >= 0; nl = pending.indexOf('\n')) {
+			const m = /mark (\S+) (\d+)/.exec(pending.slice(0, nl));
+			if (m) marks.push([m[1]!, Number(m[2]), at]);
+			pending = pending.slice(nl + 1);
+		}
 	}
 });
 const run = async (until: () => boolean) => {

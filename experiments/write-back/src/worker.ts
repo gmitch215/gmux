@@ -4,6 +4,8 @@ import busyboxAsync from '../../boot/vendor/busybox.async.wasm';
 import initrd from '../../boot/vendor/initramfs.bin';
 import vmlinuxAsync from '../../boot/vendor/vmlinux.async.wasm';
 import manifest from '../../../build/kernel/manifest.json';
+import router from '../../../build/router/router.wasm';
+import statx from '../../../build/router/statx.wasm';
 import {
 	decodeSnapshot,
 	DurableStore,
@@ -92,6 +94,7 @@ export class MachineDO extends DurableObject<Env> {
 			maximumPages: this.pages,
 			sharedKernel: true,
 			asyncify: true,
+			router: { route: router, statx },
 			sha256: (bytes) => createHash('sha256').update(bytes).digest('hex'),
 			write: (text) => (this.output = (this.output + text).slice(-4000)),
 			fileSync:
