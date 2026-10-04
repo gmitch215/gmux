@@ -1,4 +1,16 @@
+import { execFileSync } from 'node:child_process';
+import { mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
+import {
+	FALLBACK_NS,
+	fitCalibration,
+	hostLabel,
+	hottestLeaf,
+	resolveTau,
+	type Calibration
+} from '../../experiments/promotion-cut/scripts/calibration.ts';
 import {
 	bruteForce,
 	callees,
@@ -219,5 +231,145 @@ describe('promotion cut planner', () => {
 				6
 			);
 		}
+	});
+});
+
+describe('crossing cost from a calibration', () => {
+	const host = 'local-26.8';
+	const cal: Calibration = {
+		tau_ns: 333,
+		rung: 'longest_match',
+		crossings: 91105,
+		rounds: 3,
+		spread: 0.05,
+		host,
+		node: 'v26.8.2',
+		module: 'aa'
+	};
+
+	it('uses a calibration from this host and module', () => {
+		expect(resolveTau('auto', cal, host, 'aa')).toEqual({ ns: 333, source: 'calibrated' });
+	});
+
+	it('falls back to 270 ns without a calibration, on another host or module, or when refused', () => {
+		const fallback = (why: RegExp, c?: Calibration, h = host, m = 'aa') => {
+			const got = resolveTau('auto', c, h, m);
+			expect(got).toMatchObject({ ns: FALLBACK_NS, source: 'fallback' });
+			expect(got.refused).toMatch(why);
+		};
+		expect(FALLBACK_NS).toBe(270);
+		fallback(/no calibration/);
+		fallback(/deployed-x/, { ...cal, host: 'deployed-x' });
+		fallback(/another module/, cal, host, 'bb');
+		fallback(/under 1000/, { ...cal, crossings: 999 });
+		fallback(/spread 21%/, { ...cal, spread: 0.21 });
+		fallback(/not positive/, { ...cal, tau_ns: -1 });
+		fallback(/too few/, { ...cal, tau_ns: null, refused: 'too few' });
+	});
+
+	it('lets an explicit tau win and rejects a bad one', () => {
+		expect(resolveTau('125.44', cal, host, 'aa')).toEqual({ ns: 125.44, source: 'argument' });
+		expect(() => resolveTau('fast')).toThrow(/positive number/);
+	});
+
+	it('labels the host from HOST_LABEL or the node version, never a url', () => {
+		expect(hostLabel({}, '26.8.2')).toBe('local-26.8');
+		expect(hostLabel({ HOST_LABEL: 'student-1' }, '26.8.2')).toBe('deployed-student-1');
+	});
+
+	it('picks the hottest executed leaf with an i32 signature', () => {
+		const g: Graph = {
+			nodes: [
+				{ ...node('main', 10), count: 10 },
+				{ ...node('hot', 900), wide: true },
+				{ ...node('leaf', 500) },
+				{ ...node('cold', 400) },
+				{ ...node('mid', 800) },
+				{ ...node('never', 0) }
+			],
+			edges: [
+				{ from: 'main', to: 'hot', count: 1 },
+				{ from: 'main', to: 'leaf', count: 5 },
+				{ from: 'main', to: 'mid', count: 5 },
+				{ from: 'mid', to: 'cold', count: 3 },
+				{ from: 'mid', to: 'mid', count: 3 }
+			]
+		};
+		expect(hottestLeaf(g)).toBe('leaf');
+		expect(hottestLeaf({ nodes: [], edges: [] })).toBeUndefined();
+	});
+
+	it('fits one rung to the residual per crossing, and refuses few crossings or a wide spread', () => {
+		// ends: 100 ms interpreted, 10 ms native per unit; half the instructions native, so 55 ms of
+		// work plus 5 ms of crossing over 10,000 crossings is 500 ns each
+		const run = (resid: number, crossings = 10000) => ({
+			n: 2,
+			rows: [
+				{ ms: 200, crossings: 0 },
+				{ ms: 2 * (55 + resid), crossings: 2 * crossings },
+				{ ms: 20, crossings: 0 }
+			]
+		});
+		const fit = fitCalibration([run(5), run(5.2)], 1000, 0.5);
+		expect(fit.tau_ns).toBeCloseTo(520, 5);
+		expect(fit.crossings).toBe(10000);
+		expect(fit.spread).toBeCloseTo(0.0385, 3);
+		expect(fit.refused).toBeUndefined();
+		expect(fitCalibration([run(5, 500)], 1000, 0.5)).toMatchObject({
+			tau_ns: null,
+			refused: expect.stringMatching(/under 1000/)
+		});
+		expect(fitCalibration([run(5), run(8)], 1000, 0.5)).toMatchObject({
+			tau_ns: null,
+			refused: expect.stringMatching(/spread/)
+		});
+	});
+
+	it('records where tau came from in plan.json', () => {
+		const d = mkdtempSync(join(tmpdir(), 'promotion-cut-'));
+		const graph = { total: 1500, bytes: 400, nodes: hand.nodes, edges: hand.edges };
+		writeFileSync(join(d, 'graph.json'), JSON.stringify(graph));
+		writeFileSync(
+			join(d, 'ends.json'),
+			JSON.stringify({ n: 1, rows: [{ ms: 1000 }, { ms: 100 }] })
+		);
+		const calFile = join(d, 'cal.json');
+		const source = (tau: string, c?: Calibration) => {
+			if (c) writeFileSync(calFile, JSON.stringify(c));
+			execFileSync(
+				process.execPath,
+				[
+					'--no-warnings',
+					'--experimental-strip-types',
+					'experiments/promotion-cut/scripts/plan.ts',
+					join(d, 'graph.json'),
+					join(d, 'ends.json'),
+					join(d, 'out'),
+					tau,
+					'1'
+				],
+				{ stdio: 'ignore', env: { ...process.env, HOST_LABEL: '' } }
+			);
+			const params = JSON.parse(readFileSync(join(d, 'out/plan.json'), 'utf8')).params;
+			return { ...params, tauNs: params.tau * 1e9 };
+		};
+		const here = hostLabel({});
+		expect(source('125.44')).toMatchObject({
+			tauNs: expect.closeTo(125.44, 6),
+			tauSource: 'argument'
+		});
+		expect(source(`auto:${calFile}`, { ...cal, host: here, module: undefined })).toMatchObject({
+			tauNs: expect.closeTo(333, 6),
+			tauSource: 'calibrated'
+		});
+		expect(source(`auto:${calFile}`, { ...cal, host: 'deployed-x' })).toMatchObject({
+			tauNs: expect.closeTo(270, 6),
+			tauSource: 'fallback',
+			tauRefused: expect.stringContaining('deployed-x')
+		});
+		expect(source('auto')).toMatchObject({
+			tauNs: expect.closeTo(270, 6),
+			tauSource: 'fallback'
+		});
 	});
 });

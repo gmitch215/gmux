@@ -1,5 +1,6 @@
-import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
+import { hostLabel, resolveTau, sha256, type Calibration } from './calibration.ts';
 
 /**
  * The promotion cut planner. A native set P over the dynamic call graph costs
@@ -12,9 +13,10 @@ import { join } from 'node:path';
  * budget is met by the smallest lambda whose cut fits, then repaired (see mincut). The other policies build a chain of closed sets
  * and stop where J is lowest inside the budget.
  *
- * `plan.ts <graph.json> <ends.json> <out dir> <tau ns> <budget fraction>...` writes `plan.json` (every
- * policy and budget with its predicted cost split) and `sets.json` (the distinct sets, for
- * `ladder.ts prepare`).
+ * `plan.ts <graph.json> <ends.json> <out dir> <tau ns | auto | auto:<calibration.json>> <budget fraction>...`
+ * writes `plan.json` (every policy and budget with its predicted cost split, and where tau came from)
+ * and `sets.json` (the distinct sets, for `ladder.ts prepare`). `auto` is the calibration `tau.ts
+ * calibrate` wrote when it is whole and from this host, else 270 ns.
  */
 export interface Graph {
 	nodes: { name: string; count: number; bytes: number; params: number; result: boolean; pinned?: boolean; wide?: boolean }[];
@@ -318,13 +320,17 @@ export function bruteForce(g: Graph, p: Params, budget: number): { set: Set<numb
 }
 
 if (import.meta.main ?? process.argv[1]?.endsWith('plan.ts')) {
-	const [graphPath, endsPath, out, tauNs, ...fractions] = process.argv.slice(2);
-	if (!graphPath || !endsPath || !out || !tauNs || !fractions.length) throw new Error('usage: plan.ts <graph.json> <ends.json> <out dir> <tau ns> <budget fraction>...');
-	const g = JSON.parse(readFileSync(graphPath, "utf8")) as Graph & { total: number; bytes: number; nodes: { wide?: boolean }[] };
+	const [graphPath, endsPath, out, tauArg, ...fractions] = process.argv.slice(2);
+	if (!graphPath || !endsPath || !out || !tauArg || !fractions.length) throw new Error('usage: plan.ts <graph.json> <ends.json> <out dir> <tau ns | auto | auto:<calibration.json>> <budget fraction>...');
+	const g = JSON.parse(readFileSync(graphPath, "utf8")) as Graph & { guest?: string; total: number; bytes: number; nodes: { wide?: boolean }[] };
+	const [tauMode, calibrationPath] = tauArg.split(/:(.*)/s);
+	const cal = calibrationPath && existsSync(calibrationPath) ? (JSON.parse(readFileSync(calibrationPath, 'utf8')) as Calibration) : undefined;
+	const module = g.guest && existsSync(g.guest) ? sha256(readFileSync(g.guest)) : undefined;
+	const tau = resolveTau(tauMode!, cal, hostLabel(), module);
 	// ends.json is a `ladder.ts run` LADDER_JSON of the empty and the all-native rungs: ms per n units
 	const ends = JSON.parse(readFileSync(endsPath, 'utf8')) as { n: number; rows: { ms: number }[] };
 	const perUnit = (ms: number) => ms / 1e3 / ends.n;
-	const p: Params = { sI: perUnit(ends.rows[0]!.ms) / g.total, sN: perUnit(ends.rows.at(-1)!.ms) / g.total, tau: Number(tauNs) * 1e-9, lambda: 0 };
+	const p: Params = { sI: perUnit(ends.rows[0]!.ms) / g.total, sN: perUnit(ends.rows.at(-1)!.ms) / g.total, tau: tau.ns * 1e-9, lambda: 0 };
 	const plans = fractions.flatMap((f) =>
 		policies.map((policy) => {
 			const budget = Number(f) * g.bytes;
@@ -348,7 +354,7 @@ if (import.meta.main ?? process.argv[1]?.endsWith('plan.ts')) {
 		return { ...pl, rung: rungOf.get(key)! };
 	});
 	writeFileSync(join(out, "sets.json"), JSON.stringify(sets, null, "\t"));
-	writeFileSync(join(out, "plan.json"), JSON.stringify({ params: p, total: g.total, bytes: g.bytes, plans: planned }, null, "\t"));
+	writeFileSync(join(out, "plan.json"), JSON.stringify({ params: { ...p, tauSource: tau.source, ...(tau.refused ? { tauRefused: tau.refused } : {}) }, total: g.total, bytes: g.bytes, plans: planned }, null, "\t"));
 	for (const pl of planned)
 		console.log(`${pl.policy} @${pl.budget}: ${pl.set.length} functions, ${pl.predicted.bytes} bytes, ${pl.predicted.crossings} crossings, predicted ${(pl.predicted.seconds * 1e3).toFixed(2)} ms a unit`);
 }

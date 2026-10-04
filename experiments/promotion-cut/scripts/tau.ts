@@ -1,6 +1,8 @@
 import { execFileSync } from 'node:child_process';
-import { readFileSync, writeFileSync } from 'node:fs';
+import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
+import { fitCalibration, hostLabel, hottestLeaf, sha256, type Calibration } from './calibration.ts';
+import type { Graph } from './plan.ts';
 
 /**
  * What one crossing from wasm3 to a native function costs, measured three ways.
@@ -14,6 +16,9 @@ import { join } from 'node:path';
  *   dummy thunk first (needs wasm-tools)
  * - `marginal <rungs dir> <rung label> <dbl.wasm> <burrow dist> [rounds]`: the rung against its doubled copy in
  *   one process; the difference over the crossings is what one more crossing costs inside that run
+ * - `calibrate <guest.wasm> <graph.json> <out dir> <burrow dist> [rounds] [repeats]`: the one rung that promotes the
+ *   guest's hottest leaf, run `repeats` times, tau as its residual per crossing (median) with the spread over the
+ *   repeats; writes `<out dir>/calibration.json` for `plan.ts auto:<file>`
  * - `fit <graph.json> <rungs.json> <iso.json | -> <run.json>...`: each rung's residual per crossing from the
  *   ladder's own runs (the ends price the interpreted and native instructions), the through-origin fit over
  *   the rungs with 1,000 or more crossings, and each rung's crossing mix priced with the isolated table
@@ -236,6 +241,48 @@ if (mode === 'marginal') {
 	if (plain.guest.call('run', 2) !== doubled.guest.call('run', 2)) throw new Error('the doubled module answers differently');
 	const marginal = rows.map((x) => ((x.doubled - x.plain) * 1e6) / x.crossings);
 	console.log(JSON.stringify({ node: process.version, v8: process.versions.v8, label, n, rounds, unit: 'ns per added crossing, (doubled - plain) ms per unit over crossings per unit', crossingsPerUnit: median(rows.map((x) => x.crossings)), plainMs: summary(rows.map((x) => x.plain)), doubledMs: summary(rows.map((x) => x.doubled)), marginal: summary(marginal), rows }, null, '\t'));
+}
+// #endregion
+
+// #region calibrate
+if (mode === 'calibrate') {
+	const [guest = '', graphPath = '', out = '', dist = '', roundsArg = '3', repeatsArg = '2'] = args;
+	if (!guest || !graphPath || !out || !dist) throw new Error('usage: tau.ts calibrate <guest.wasm> <graph.json> <out dir> <burrow dist> [rounds] [repeats]');
+	const started = performance.now();
+	const graph = JSON.parse(readFileSync(graphPath, 'utf8')) as Graph;
+	const leaf = hottestLeaf(graph);
+	if (!leaf) throw new Error('the graph has no executed leaf with an all-i32 signature');
+	mkdirSync(out, { recursive: true });
+	const ladder = new URL('../../promotion-ladder/scripts/ladder.ts', import.meta.url).pathname;
+	const node = [process.execPath, '--no-warnings', '--experimental-strip-types'];
+	writeFileSync(join(out, 'sets.json'), JSON.stringify({ [leaf]: [leaf] }));
+	// wasm-tools parse over a pipe has hung at 0% cpu, so a prepare gets a deadline and two retries
+	for (let try_ = 0; ; try_++) {
+		try {
+			execFileSync(node[0]!, [...node.slice(1), ladder, 'prepare', guest, join(out, 'rungs'), join(out, 'sets.json')], { stdio: ['ignore', 'ignore', 'inherit'], timeout: 60_000 });
+			break;
+		} catch (e) {
+			if (try_ === 2) throw e;
+		}
+	}
+	const { total, rungs } = JSON.parse(readFileSync(join(out, 'rungs', 'rungs.json'), 'utf8')) as { total: number; rungs: { label: string; share: number }[] };
+	const rung = rungs.find((r) => r.label === leaf)!;
+	const runs = Array.from({ length: Number(repeatsArg) }, (_, k) => {
+		const file = join(out, `run${k}.json`);
+		execFileSync(node[0]!, [...node.slice(1), ladder, 'run', join(out, 'rungs'), dist, roundsArg], { env: { ...process.env, LADDER_JSON: file }, stdio: ['ignore', 'ignore', 'inherit'] });
+		return JSON.parse(readFileSync(file, 'utf8')) as { n: number; rows: { ms: number; crossings: number }[] };
+	});
+	const calibration: Calibration = {
+		...fitCalibration(runs, total, rung.share),
+		rung: leaf,
+		rounds: Number(roundsArg),
+		host: hostLabel(),
+		node: process.version,
+		module: sha256(readFileSync(guest)),
+		seconds: (performance.now() - started) / 1e3
+	};
+	writeFileSync(join(out, 'calibration.json'), `${JSON.stringify(calibration, null, '\t')}\n`);
+	console.log(JSON.stringify(calibration, null, '\t'));
 }
 // #endregion
 

@@ -15,6 +15,10 @@ import {
 	type Provenance,
 	type RungProvenance
 } from '../../experiments/profile-cache/scripts/cache.ts';
+import {
+	resolveTau,
+	type Calibration
+} from '../../experiments/promotion-cut/scripts/calibration.ts';
 
 const prov: Provenance = {
 	format: 1,
@@ -49,6 +53,39 @@ describe('profile cache', () => {
 			refused: 'none for this module'
 		});
 		expect(moduleKey(wasm)).toHaveLength(64);
+	});
+
+	it('keeps a calibration with the record; it is used on its host and not under another provenance', () => {
+		const calibration: Calibration = {
+			tau_ns: 310,
+			rung: 'longest_match',
+			crossings: 5000,
+			rounds: 3,
+			spread: 0.04,
+			host: 'local-26.8',
+			node: 'v26.8.2'
+		};
+		const d = dir();
+		save(d, wasm, { ...record, calibration }, prov);
+		const got = load(d, wasm, prov);
+		if ('refused' in got) throw new Error(got.refused);
+		expect(resolveTau('auto', got.record.calibration, 'local-26.8')).toEqual({
+			ns: 310,
+			source: 'calibrated'
+		});
+		expect(resolveTau('auto', got.record.calibration, 'deployed-x')).toMatchObject({
+			ns: 270,
+			source: 'fallback'
+		});
+		const other = load(d, wasm, { ...prov, tools: 'u'.repeat(64) });
+		expect(other).toEqual({ refused: 'tools' });
+		expect(
+			resolveTau(
+				'auto',
+				'record' in other ? other.record.calibration : undefined,
+				'local-26.8'
+			)
+		).toMatchObject({ ns: 270, source: 'fallback' });
 	});
 
 	it.each(Object.keys(prov) as (keyof Provenance)[])('refuses when %s changes', (key) => {

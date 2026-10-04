@@ -1,6 +1,7 @@
 import { createHash } from 'node:crypto';
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
+import type { Calibration } from '../../promotion-cut/scripts/calibration.ts';
 
 /**
  * A guest's profile record: the heat (weighted call graph), the timing of its two ends, the plan and
@@ -27,6 +28,8 @@ export interface ProfileRecord {
 	plan: string;
 	sets: string;
 	catalog?: string;
+	/** the guest's crossing cost on the host that fitted it; used only on that host */
+	calibration?: Calibration;
 }
 
 interface Stored {

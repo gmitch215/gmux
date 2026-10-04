@@ -2,8 +2,9 @@ import { execFileSync } from 'node:child_process';
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { basename, join } from 'node:path';
+import type { Calibration } from '../../promotion-cut/scripts/calibration.ts';
 import { load, loadRungs, save, saveRungs, type ProfileRecord } from './cache.ts';
-import { graphTs, ladder, node, planTs, prepareRungs, provenanceOf, repo } from './pipeline.ts';
+import { graphTs, ladder, node, planTs, prepareRungs, provenanceOf, repo, tauTs } from './pipeline.ts';
 
 /**
  * Time to a ready profile for each guest, cold against from the cache: what a fresh process spends
@@ -11,7 +12,7 @@ import { graphTs, ladder, node, planTs, prepareRungs, provenanceOf, repo } from 
  * mined fusion catalog, against what one spends loading them. Each cold run saves its record; the cached
  * run loads it back, and the plan derived again from the cached graph and ends must equal the cached plan.
  *
- * `BURROW_ROOT=<burrow tree> BURROW_DIST=<burrow dist> run.ts <cache dir> <out dir> <tau ns> <budget
+ * `BURROW_ROOT=<burrow tree> BURROW_DIST=<burrow dist> run.ts <cache dir> <out dir> <tau ns | auto> <budget
  * fractions, comma separated> <repeats> <guest.wasm>...` (needs wasm-tools, bun for burrow's miner)
  */
 const [cacheDir = '', outDir = '', tau = '', fractions = '', repeatsArg = '', ...guests] = process.argv.slice(2);
@@ -43,14 +44,21 @@ const fresh = (guest: string, dir: string): { ms: Record<string, number>; record
 	writeFileSync(join(dir, 'empty.json'), '{}');
 	ms.prepare = time(() => nodeRun(ladder, ['prepare', guest, join(dir, 'ends'), join(dir, 'empty.json')])).ms;
 	ms.ends = time(() => nodeRun(ladder, ['run', join(dir, 'ends'), dist, '5'], { LADDER_JSON: join(dir, 'ends.json') })).ms;
-	ms.plan = time(() => nodeRun(planTs, [join(dir, 'graph.json'), join(dir, 'ends.json'), join(dir, 'plan'), tau, ...fractions.split(',')])).ms;
+	let tauArg = tau;
+	let calibration: Calibration | undefined;
+	if (tau === 'auto') {
+		ms.calibrate = time(() => nodeRun(tauTs, ['calibrate', guest, join(dir, 'graph.json'), join(dir, 'cal'), dist])).ms;
+		calibration = JSON.parse(read(dir, 'cal/calibration.json')) as Calibration;
+		tauArg = `auto:${join(dir, 'cal/calibration.json')}`;
+	}
+	ms.plan = time(() => nodeRun(planTs, [join(dir, 'graph.json'), join(dir, 'ends.json'), join(dir, 'plan'), tauArg, ...fractions.split(',')])).ms;
 	ms.catalog = time(() => run('bash', [mine, join(dir, 'catalog.json'), `${guest}:run:1`])).ms;
 	let rungs: Record<string, Uint8Array> = {};
 	ms.rungs = time(() => (rungs = prepareRungs(guest, read(dir, 'plan/sets.json'), join(dir, 'rungs')))).ms;
 	return {
 		ms,
 		rungs,
-		record: { graph: read(dir, 'graph.json'), ends: read(dir, 'ends.json'), plan: read(dir, 'plan/plan.json'), sets: read(dir, 'plan/sets.json'), catalog: read(dir, 'catalog.json') }
+		record: { graph: read(dir, 'graph.json'), ends: read(dir, 'ends.json'), plan: read(dir, 'plan/plan.json'), sets: read(dir, 'plan/sets.json'), catalog: read(dir, 'catalog.json'), ...(calibration ? { calibration } : {}) }
 	};
 };
 
@@ -66,6 +74,10 @@ const cached = (guest: string, dir: string) => {
 		writeFileSync(join(dir, 'plan/plan.json'), r.plan);
 		writeFileSync(join(dir, 'plan/sets.json'), r.sets);
 		writeFileSync(join(dir, 'catalog.json'), r.catalog!);
+		if (r.calibration) {
+			mkdirSync(join(dir, 'cal'), { recursive: true });
+			writeFileSync(join(dir, 'cal/calibration.json'), JSON.stringify(r.calibration));
+		}
 		return r;
 	});
 };
@@ -78,7 +90,7 @@ mkdirSync(outDir, { recursive: true });
 for (const guest of guests) {
 	const name = basename(guest, '.wasm');
 	const bytes = readFileSync(guest);
-	const cold: Record<string, number[]> = { graph: [], prepare: [], ends: [], plan: [], catalog: [], rungs: [], total: [] };
+	const cold: Record<string, number[]> = { graph: [], prepare: [], ends: [], calibrate: [], plan: [], catalog: [], rungs: [], total: [] };
 	const warm: number[] = [];
 	const rungsWarm: number[] = [];
 	let rungBytes = 0;
@@ -116,17 +128,18 @@ for (const guest of guests) {
 		}
 		for (const key of ['graph', 'ends', 'plan', 'sets', 'catalog'] as const) if (c.v[key] !== f.record[key]) mismatches.push(`${name} run ${k}: cached ${key} differs from the cold run's`);
 		const again = mkdtempSync(join(tmpdir(), 'profile-cache-plan-'));
-		nodeRun(planTs, [join(outDir, `${name}.warm${k}`, 'graph.json'), join(outDir, `${name}.warm${k}`, 'ends.json'), again, tau, ...fractions.split(',')]);
+		const warmDir = join(outDir, `${name}.warm${k}`);
+		nodeRun(planTs, [join(warmDir, 'graph.json'), join(warmDir, 'ends.json'), again, tau === 'auto' ? `auto:${join(warmDir, 'cal/calibration.json')}` : tau, ...fractions.split(',')]);
 		if (read(again, 'plan.json') !== c.v.plan || read(again, 'sets.json') !== c.v.sets) mismatches.push(`${name} run ${k}: plan derived again from the cached graph and ends differs`);
 		rmSync(again, { recursive: true });
 	}
 	const m = (xs: number[]) => `${median(xs).toFixed(1)} [${(100 * spread(xs)).toFixed(0)}%]`;
 	rows.push(
-		`| ${name} | ${m(cold.graph!)} | ${m(cold.prepare!)} | ${m(cold.ends!)} | ${m(cold.plan!)} | ${m(cold.catalog!)} | ${m(cold.rungs!)} | ${m(cold.total!)} | ${m(warm)} | ${m(rungsWarm)} | ${(rungBytes / 1024).toFixed(0)} KB |`
+		`| ${name} | ${m(cold.graph!)} | ${m(cold.prepare!)} | ${m(cold.ends!)} | ${m(cold.calibrate!)} | ${m(cold.plan!)} | ${m(cold.catalog!)} | ${m(cold.rungs!)} | ${m(cold.total!)} | ${m(warm)} | ${m(rungsWarm)} | ${(rungBytes / 1024).toFixed(0)} KB |`
 	);
 	for (const x of mismatches) console.error(`MISMATCH ${x}`);
 	writeFileSync(join(outDir, `${name}.json`), JSON.stringify({ cold, warm, rungsWarm, rungBytes, mismatches }, null, '\t'));
 }
-console.log('| guest | graph | prepare | ends | plan | catalog | planned rungs | cold total | cached record | cached rungs | rung bytes |');
-console.log('| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |');
+console.log('| guest | graph | prepare | ends | calibrate | plan | catalog | planned rungs | cold total | cached record | cached rungs | rung bytes |');
+console.log('| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |');
 for (const r of rows) console.log(r);

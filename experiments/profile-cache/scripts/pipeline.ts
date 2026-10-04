@@ -9,6 +9,7 @@ export const node = [process.execPath, '--no-warnings', '--experimental-strip-ty
 export const ladder = join(repo, 'experiments/promotion-ladder/scripts/ladder.ts');
 export const graphTs = join(repo, 'experiments/promotion-cut/scripts/graph.ts');
 export const planTs = join(repo, 'experiments/promotion-cut/scripts/plan.ts');
+export const tauTs = join(repo, 'experiments/promotion-cut/scripts/tau.ts');
 
 /** recomputes the provenance on each call, so a load pays for the check */
 export async function provenanceOf(root: string, tau: string, fractions: string) {
@@ -22,7 +23,7 @@ export async function provenanceOf(root: string, tau: string, fractions: string)
 			burrow: b.burrow,
 			wasm3: b.wasm3,
 			burrowTools: b.tools,
-			tools: hashFiles([ladder, graphTs, planTs, join(root, 'tools/interp/mine-catalog.sh'), join(here, 'cache.ts'), join(here, 'pipeline.ts')]),
+			tools: hashFiles([ladder, graphTs, planTs, tauTs, join(here, '../../promotion-cut/scripts/calibration.ts'), join(root, 'tools/interp/mine-catalog.sh'), join(here, 'cache.ts'), join(here, 'pipeline.ts')]),
 			params: `${tau}:${fractions}`
 		};
 	};
