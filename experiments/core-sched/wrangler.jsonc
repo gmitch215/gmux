@@ -1,0 +1,6 @@
+{
+	"name": "gmux-core-sched",
+	"main": "src/worker.ts",
+	"compatibility_date": "2026-09-20",
+	"workers_dev": true
+}
