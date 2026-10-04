@@ -15,7 +15,7 @@
 </div></section>
 <div class="tsd-signature"><span class="tsd-signature-keyword">interface</span> <span class="tsd-kind-interface">MachineOptions</span> <span class="tsd-signature-symbol">{</span><br/>    <a class="tsd-kind-property" href="#asyncify">asyncify</a><span class="tsd-signature-symbol">?:</span> <span class="tsd-signature-type">boolean</span><span class="tsd-signature-symbol">;</span><br/>    <a class="tsd-kind-property" href="#cmdline">cmdline</a><span class="tsd-signature-symbol">:</span> <span class="tsd-signature-type">string</span><span class="tsd-signature-symbol">;</span><br/>    <a class="tsd-kind-property" href="#core">core</a><span class="tsd-signature-symbol">?:</span> <span class="tsd-signature-type">Module</span><span class="tsd-signature-symbol">;</span><br/>    <a class="tsd-kind-property" href="#countsyscalls">countSyscalls</a><span class="tsd-signature-symbol">?:</span> <span class="tsd-signature-type">boolean</span> <span class="tsd-signature-symbol">|</span> (<span class="tsd-signature-symbol">(</span><span class="tsd-kind-parameter">call</span><span class="tsd-signature-symbol">:</span> <span class="tsd-signature-type">SyscallCall</span><span class="tsd-signature-symbol">)</span> <span class="tsd-signature-symbol">=&gt;</span> <span class="tsd-signature-type">void</span>)<span class="tsd-signature-symbol">;</span><br/>    <a class="tsd-kind-property" href="#dlmisses">dlMisses</a><span class="tsd-signature-symbol">?:</span> <span class="tsd-signature-type">DlMisses</span><span class="tsd-signature-symbol">;</span><br/>    <a class="tsd-kind-property" href="#filesync">fileSync</a><span class="tsd-signature-symbol">?:</span> <span class="tsd-signature-symbol">(</span><span class="tsd-kind-parameter">file</span><span class="tsd-signature-symbol">:</span> <span class="tsd-signature-type">SyncedFile</span><span class="tsd-signature-symbol">)</span> <span class="tsd-signature-symbol">=&gt;</span> <span class="tsd-signature-type">Promise</span><span class="tsd-signature-symbol">&lt;</span><span class="tsd-signature-type">void</span><span class="tsd-signature-symbol">&gt;</span><span class="tsd-signature-symbol">;</span><br/>    <a class="tsd-kind-property" href="#fuelbudget">fuelBudget</a><span class="tsd-signature-symbol">?:</span> <span class="tsd-signature-type">number</span><span class="tsd-signature-symbol">;</span><br/>    <a class="tsd-kind-property" href="#guarded">guarded</a><span class="tsd-signature-symbol">?:</span> <span class="tsd-signature-type">Map</span><span class="tsd-signature-symbol">&lt;</span><span class="tsd-signature-type">string</span><span class="tsd-signature-symbol">,</span> <span class="tsd-signature-type">Module</span><span class="tsd-signature-symbol">&gt;</span><span class="tsd-signature-symbol">;</span><br/>    <a class="tsd-kind-property" href="#initrd">initrd</a><span class="tsd-signature-symbol">:</span> <span class="tsd-signature-type">Uint8Array</span><span class="tsd-signature-symbol">;</span><br/>    <a class="tsd-kind-property" href="#interpret">interpret</a><span class="tsd-signature-symbol">?:</span> <span class="tsd-signature-symbol">(</span><span class="tsd-kind-parameter">exe</span><span class="tsd-signature-symbol">:</span> <span class="tsd-signature-type">string</span><span class="tsd-signature-symbol">,</span> <span class="tsd-kind-parameter">libs</span><span class="tsd-signature-symbol">:</span> <span class="tsd-signature-type">string</span><span class="tsd-signature-symbol">[]</span><span class="tsd-signature-symbol">)</span> <span class="tsd-signature-symbol">=&gt;</span> <span class="tsd-signature-type">Module</span> <span class="tsd-signature-symbol">|</span> <span class="tsd-signature-type">undefined</span><span class="tsd-signature-symbol">;</span><br/>    <a class="tsd-kind-property" href="#log">log</a><span class="tsd-signature-symbol">?:</span> <span class="tsd-signature-symbol">(</span><span class="tsd-kind-parameter">line</span><span class="tsd-signature-symbol">:</span> <span class="tsd-signature-type">string</span><span class="tsd-signature-symbol">)</span> <span class="tsd-signature-symbol">=&gt;</span> <span class="tsd-signature-type">void</span><span class="tsd-signature-symbol">;</span><br/>    <a class="tsd-kind-property" href="#maximumpages">maximumPages</a><span class="tsd-signature-symbol">?:</span> <span class="tsd-signature-type">number</span><span class="tsd-signature-symbol">;</span><br/>    <a class="tsd-kind-property" href="#memory">memory</a><span class="tsd-signature-symbol">?:</span> <span class="tsd-signature-type">Memory</span><span class="tsd-signature-symbol">;</span><br/>    <a class="tsd-kind-property" href="#now">now</a><span class="tsd-signature-symbol">?:</span> <span class="tsd-signature-symbol">()</span> <span class="tsd-signature-symbol">=&gt;</span> <span class="tsd-signature-type">bigint</span><span class="tsd-signature-symbol">;</span><br/>    <a class="tsd-kind-property" href="#pagein">pageIn</a><span class="tsd-signature-symbol">?:</span> <span class="tsd-signature-symbol">(</span><span class="tsd-kind-parameter">page</span><span class="tsd-signature-symbol">:</span> <span class="tsd-signature-type">number</span><span class="tsd-signature-symbol">,</span> <span class="tsd-kind-parameter">canWait</span><span class="tsd-signature-symbol">:</span> <span class="tsd-signature-type">boolean</span><span class="tsd-signature-symbol">)</span> <span class="tsd-signature-symbol">=&gt;</span> <span class="tsd-signature-type">Promise</span><span class="tsd-signature-symbol">&lt;</span><span class="tsd-signature-type">void</span><span class="tsd-signature-symbol">&gt;</span> <span class="tsd-signature-symbol">|</span> <span class="tsd-signature-type">undefined</span><span class="tsd-signature-symbol">;</span><br/>    <a class="tsd-kind-property" href="#reenterafterrestore">reenterAfterRestore</a><span class="tsd-signature-symbol">?:</span> <span class="tsd-signature-type">number</span><span class="tsd-signature-symbol">;</span><br/>    <a class="tsd-kind-property" href="#registry">registry</a><span class="tsd-signature-symbol">:</span> <span class="tsd-signature-type">Map</span><span class="tsd-signature-symbol">&lt;</span><span class="tsd-signature-type">string</span><span class="tsd-signature-symbol">,</span> <span class="tsd-signature-type">Module</span><span class="tsd-signature-symbol">&gt;</span><span class="tsd-signature-symbol">;</span><br/>    <a class="tsd-kind-property" href="#restorefiles">restoreFiles</a><span class="tsd-signature-symbol">?:</span> <span class="tsd-signature-type">SyncedFile</span><span class="tsd-signature-symbol">[]</span><span class="tsd-signature-symbol">;</span><br/>    <a class="tsd-kind-property" href="#router">router</a><span class="tsd-signature-symbol">?:</span> <a href="RouterModules.html" class="tsd-signature-type tsd-kind-interface">RouterModules</a><span class="tsd-signature-symbol">;</span><br/>    <a class="tsd-kind-property" href="#sha256">sha256</a><span class="tsd-signature-symbol">:</span> <span class="tsd-signature-symbol">(</span><span class="tsd-kind-parameter">bytes</span><span class="tsd-signature-symbol">:</span> <span class="tsd-signature-type">Uint8Array</span><span class="tsd-signature-symbol">)</span> <span class="tsd-signature-symbol">=&gt;</span> <span class="tsd-signature-type">string</span><span class="tsd-signature-symbol">;</span><br/>    <a class="tsd-kind-property" href="#sharedkernel">sharedKernel</a><span class="tsd-signature-symbol">?:</span> <span class="tsd-signature-type">boolean</span><span class="tsd-signature-symbol">;</span><br/>    <a class="tsd-kind-property" href="#shareinstances">shareInstances</a><span class="tsd-signature-symbol">?:</span> <span class="tsd-signature-type">boolean</span><span class="tsd-signature-symbol">;</span><br/>    <a class="tsd-kind-property" href="#stepns">stepNs</a><span class="tsd-signature-symbol">?:</span> <span class="tsd-signature-type">bigint</span><span class="tsd-signature-symbol">;</span><br/>    <a class="tsd-kind-property" href="#syscallcache">syscallCache</a><span class="tsd-signature-symbol">?:</span> <span class="tsd-signature-type">boolean</span> <span class="tsd-signature-symbol">|</span> <span class="tsd-signature-type">&quot;verify&quot;</span><span class="tsd-signature-symbol">;</span><br/>    <a class="tsd-kind-property" href="#trace">trace</a><span class="tsd-signature-symbol">?:</span> <span class="tsd-signature-type">boolean</span><span class="tsd-signature-symbol">;</span><br/>    <a class="tsd-kind-property" href="#vmlinux">vmlinux</a><span class="tsd-signature-symbol">:</span> <span class="tsd-signature-type">Module</span><span class="tsd-signature-symbol">;</span><br/>    <a class="tsd-kind-property" href="#write">write</a><span class="tsd-signature-symbol">?:</span> <span class="tsd-signature-symbol">(</span><span class="tsd-kind-parameter">text</span><span class="tsd-signature-symbol">:</span> <span class="tsd-signature-type">string</span><span class="tsd-signature-symbol">)</span> <span class="tsd-signature-symbol">=&gt;</span> <span class="tsd-signature-type">void</span><span class="tsd-signature-symbol">;</span><br/>    <a class="tsd-kind-property" href="#yieldevery">yieldEvery</a><span class="tsd-signature-symbol">?:</span> <span class="tsd-signature-type">number</span><span class="tsd-signature-symbol">;</span><br/><span class="tsd-signature-symbol">}</span></div><aside class="tsd-sources">
 <ul>
-<li>Defined in <a href="https://github.com/gmitch215/gmux/blob/df6da1f0c07e8f65111a2a5f83348002b2946dac/src/worker/machine/machine.ts#L45">machine.ts:45</a></li></ul></aside>
+<li>Defined in <a href="https://github.com/gmitch215/gmux/blob/29cb634611e224842dd9f4fb783531354267504e/src/worker/machine/machine.ts#L45">machine.ts:45</a></li></ul></aside>
 <section class="tsd-panel-group tsd-index-group">
 <section class="tsd-panel tsd-index-panel">
 <details class="tsd-index-content tsd-accordion" open><summary class="tsd-accordion-summary tsd-index-summary"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" aria-hidden="true"><use href="../assets/icons.svg#icon-chevronDown"></use></svg>
@@ -62,14 +62,14 @@
 <code>checkpoint()</code> can turn every parked stack into bytes and <code>Machine.restore()</code> can rewind it</p>
 </div><aside class="tsd-sources">
 <ul>
-<li>Defined in <a href="https://github.com/gmitch215/gmux/blob/df6da1f0c07e8f65111a2a5f83348002b2946dac/src/worker/machine/machine.ts#L120">machine.ts:120</a></li></ul></aside></section>
+<li>Defined in <a href="https://github.com/gmitch215/gmux/blob/29cb634611e224842dd9f4fb783531354267504e/src/worker/machine/machine.ts#L120">machine.ts:120</a></li></ul></aside></section>
 <section class="tsd-panel tsd-member">
 <h3 class="tsd-anchor-link" id="cmdline"><span>cmdline</span><a href="#cmdline" aria-label="Permalink" class="tsd-anchor-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="../assets/icons.svg#icon-anchor"></use></svg></a></h3>
 <div class="tsd-signature"><span class="tsd-kind-property">cmdline</span><span class="tsd-signature-symbol">:</span> <span class="tsd-signature-type">string</span></div>
 <div class="tsd-comment tsd-typography"><p>the kernel command line; boot without <code>nohz_full</code> (see the technical report)</p>
 </div><aside class="tsd-sources">
 <ul>
-<li>Defined in <a href="https://github.com/gmitch215/gmux/blob/df6da1f0c07e8f65111a2a5f83348002b2946dac/src/worker/machine/machine.ts#L51">machine.ts:51</a></li></ul></aside></section>
+<li>Defined in <a href="https://github.com/gmitch215/gmux/blob/29cb634611e224842dd9f4fb783531354267504e/src/worker/machine/machine.ts#L51">machine.ts:51</a></li></ul></aside></section>
 <section class="tsd-panel tsd-member">
 <h3 class="tsd-anchor-link" id="core"><code class="tsd-tag">Optional</code><span>core</span><a href="#core" aria-label="Permalink" class="tsd-anchor-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="../assets/icons.svg#icon-anchor"></use></svg></a></h3>
 <div class="tsd-signature"><span class="tsd-kind-property">core</span><span class="tsd-signature-symbol">?:</span> <span class="tsd-signature-type">Module</span></div>
@@ -78,7 +78,7 @@ minimum run in C over the machine's memory, in pages reserved before the kernel 
 it the same decisions run in TypeScript</p>
 </div><aside class="tsd-sources">
 <ul>
-<li>Defined in <a href="https://github.com/gmitch215/gmux/blob/df6da1f0c07e8f65111a2a5f83348002b2946dac/src/worker/machine/machine.ts#L57">machine.ts:57</a></li></ul></aside></section>
+<li>Defined in <a href="https://github.com/gmitch215/gmux/blob/29cb634611e224842dd9f4fb783531354267504e/src/worker/machine/machine.ts#L57">machine.ts:57</a></li></ul></aside></section>
 <section class="tsd-panel tsd-member">
 <h3 class="tsd-anchor-link" id="countsyscalls"><code class="tsd-tag">Optional</code><span>count<wbr/>Syscalls</span><a href="#countsyscalls" aria-label="Permalink" class="tsd-anchor-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="../assets/icons.svg#icon-anchor"></use></svg></a></h3>
 <div class="tsd-signature"><span class="tsd-kind-property">countSyscalls</span><span class="tsd-signature-symbol">?:</span> <span class="tsd-signature-type">boolean</span> <span class="tsd-signature-symbol">|</span> (<span class="tsd-signature-symbol">(</span><span class="tsd-kind-parameter">call</span><span class="tsd-signature-symbol">:</span> <span class="tsd-signature-type">SyscallCall</span><span class="tsd-signature-symbol">)</span> <span class="tsd-signature-symbol">=&gt;</span> <span class="tsd-signature-type">void</span>)</div>
@@ -87,7 +87,7 @@ function is also called for each (before it for the calls that may not return, e
 counts, but every call pays a host crossing, so a run under it is not timed</p>
 </div><aside class="tsd-sources">
 <ul>
-<li>Defined in <a href="https://github.com/gmitch215/gmux/blob/df6da1f0c07e8f65111a2a5f83348002b2946dac/src/worker/machine/machine.ts#L143">machine.ts:143</a></li></ul></aside></section>
+<li>Defined in <a href="https://github.com/gmitch215/gmux/blob/29cb634611e224842dd9f4fb783531354267504e/src/worker/machine/machine.ts#L143">machine.ts:143</a></li></ul></aside></section>
 <section class="tsd-panel tsd-member">
 <h3 class="tsd-anchor-link" id="dlmisses"><code class="tsd-tag">Optional</code><span>dl<wbr/>Misses</span><a href="#dlmisses" aria-label="Permalink" class="tsd-anchor-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="../assets/icons.svg#icon-anchor"></use></svg></a></h3>
 <div class="tsd-signature"><span class="tsd-kind-property">dlMisses</span><span class="tsd-signature-symbol">?:</span> <span class="tsd-signature-type">DlMisses</span></div>
@@ -95,7 +95,7 @@ counts, but every call pays a host crossing, so a run under it is not timed</p>
 the same map to the next machine to carry the record across runs</p>
 </div><aside class="tsd-sources">
 <ul>
-<li>Defined in <a href="https://github.com/gmitch215/gmux/blob/df6da1f0c07e8f65111a2a5f83348002b2946dac/src/worker/machine/machine.ts#L153">machine.ts:153</a></li></ul></aside></section>
+<li>Defined in <a href="https://github.com/gmitch215/gmux/blob/29cb634611e224842dd9f4fb783531354267504e/src/worker/machine/machine.ts#L153">machine.ts:153</a></li></ul></aside></section>
 <section class="tsd-panel tsd-member">
 <h3 class="tsd-anchor-link" id="filesync"><code class="tsd-tag">Optional</code><span>file<wbr/>Sync</span><a href="#filesync" aria-label="Permalink" class="tsd-anchor-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="../assets/icons.svg#icon-anchor"></use></svg></a></h3>
 <div class="tsd-signature"><span class="tsd-kind-property">fileSync</span><span class="tsd-signature-symbol">?:</span> <span class="tsd-signature-symbol">(</span><span class="tsd-kind-parameter">file</span><span class="tsd-signature-symbol">:</span> <span class="tsd-signature-type">SyncedFile</span><span class="tsd-signature-symbol">)</span> <span class="tsd-signature-symbol">=&gt;</span> <span class="tsd-signature-type">Promise</span><span class="tsd-signature-symbol">&lt;</span><span class="tsd-signature-type">void</span><span class="tsd-signature-symbol">&gt;</span></div>
@@ -104,14 +104,14 @@ it; the program's call returns once this resolves, so resolve once the bytes are
 Without it (and without <code>restoreFiles</code>) programs call the kernel directly</p>
 </div><aside class="tsd-sources">
 <ul>
-<li>Defined in <a href="https://github.com/gmitch215/gmux/blob/df6da1f0c07e8f65111a2a5f83348002b2946dac/src/worker/machine/machine.ts#L126">machine.ts:126</a></li></ul></aside></section>
+<li>Defined in <a href="https://github.com/gmitch215/gmux/blob/29cb634611e224842dd9f4fb783531354267504e/src/worker/machine/machine.ts#L126">machine.ts:126</a></li></ul></aside></section>
 <section class="tsd-panel tsd-member">
 <h3 class="tsd-anchor-link" id="fuelbudget"><code class="tsd-tag">Optional</code><span>fuel<wbr/>Budget</span><a href="#fuelbudget" aria-label="Permalink" class="tsd-anchor-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="../assets/icons.svg#icon-anchor"></use></svg></a></h3>
 <div class="tsd-signature"><span class="tsd-kind-property">fuelBudget</span><span class="tsd-signature-symbol">?:</span> <span class="tsd-signature-type">number</span></div>
 <div class="tsd-comment tsd-typography"><p>loop iterations a user program runs between host yields</p>
 </div><aside class="tsd-sources">
 <ul>
-<li>Defined in <a href="https://github.com/gmitch215/gmux/blob/df6da1f0c07e8f65111a2a5f83348002b2946dac/src/worker/machine/machine.ts#L99">machine.ts:99</a></li></ul></aside></section>
+<li>Defined in <a href="https://github.com/gmitch215/gmux/blob/29cb634611e224842dd9f4fb783531354267504e/src/worker/machine/machine.ts#L99">machine.ts:99</a></li></ul></aside></section>
 <section class="tsd-panel tsd-member">
 <h3 class="tsd-anchor-link" id="guarded"><code class="tsd-tag">Optional</code><span>guarded</span><a href="#guarded" aria-label="Permalink" class="tsd-anchor-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="../assets/icons.svg#icon-anchor"></use></svg></a></h3>
 <div class="tsd-signature"><span class="tsd-kind-property">guarded</span><span class="tsd-signature-symbol">?:</span> <span class="tsd-signature-type">Map</span><span class="tsd-signature-symbol">&lt;</span><span class="tsd-signature-type">string</span><span class="tsd-signature-symbol">,</span> <span class="tsd-signature-type">Module</span><span class="tsd-signature-symbol">&gt;</span></div>
@@ -120,14 +120,14 @@ owner table (scripts/wasm/guard-pass.ts), by the same hash. A task whose effecti
 these, and one with no guarded build for its program cannot run it</p>
 </div><aside class="tsd-sources">
 <ul>
-<li>Defined in <a href="https://github.com/gmitch215/gmux/blob/df6da1f0c07e8f65111a2a5f83348002b2946dac/src/worker/machine/machine.ts#L70">machine.ts:70</a></li></ul></aside></section>
+<li>Defined in <a href="https://github.com/gmitch215/gmux/blob/29cb634611e224842dd9f4fb783531354267504e/src/worker/machine/machine.ts#L70">machine.ts:70</a></li></ul></aside></section>
 <section class="tsd-panel tsd-member">
 <h3 class="tsd-anchor-link" id="initrd"><span>initrd</span><a href="#initrd" aria-label="Permalink" class="tsd-anchor-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="../assets/icons.svg#icon-anchor"></use></svg></a></h3>
 <div class="tsd-signature"><span class="tsd-kind-property">initrd</span><span class="tsd-signature-symbol">:</span> <span class="tsd-signature-type">Uint8Array</span></div>
 <div class="tsd-comment tsd-typography"><p>the initramfs the kernel unpacks as its root filesystem (<code>kernel/initramfs.bin</code>)</p>
 </div><aside class="tsd-sources">
 <ul>
-<li>Defined in <a href="https://github.com/gmitch215/gmux/blob/df6da1f0c07e8f65111a2a5f83348002b2946dac/src/worker/machine/machine.ts#L49">machine.ts:49</a></li></ul></aside></section>
+<li>Defined in <a href="https://github.com/gmitch215/gmux/blob/29cb634611e224842dd9f4fb783531354267504e/src/worker/machine/machine.ts#L49">machine.ts:49</a></li></ul></aside></section>
 <section class="tsd-panel tsd-member">
 <h3 class="tsd-anchor-link" id="interpret"><code class="tsd-tag">Optional</code><span>interpret</span><a href="#interpret" aria-label="Permalink" class="tsd-anchor-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="../assets/icons.svg#icon-anchor"></use></svg></a></h3>
 <div class="tsd-signature"><span class="tsd-kind-property">interpret</span><span class="tsd-signature-symbol">?:</span> <span class="tsd-signature-symbol">(</span><span class="tsd-kind-parameter">exe</span><span class="tsd-signature-symbol">:</span> <span class="tsd-signature-type">string</span><span class="tsd-signature-symbol">,</span> <span class="tsd-kind-parameter">libs</span><span class="tsd-signature-symbol">:</span> <span class="tsd-signature-type">string</span><span class="tsd-signature-symbol">[]</span><span class="tsd-signature-symbol">)</span> <span class="tsd-signature-symbol">=&gt;</span> <span class="tsd-signature-type">Module</span> <span class="tsd-signature-symbol">|</span> <span class="tsd-signature-type">undefined</span></div>
@@ -135,21 +135,21 @@ these, and one with no guarded build for its program cannot run it</p>
 undefined when it cannot take them. Absent, a recorded miss is refused again</p>
 </div><aside class="tsd-sources">
 <ul>
-<li>Defined in <a href="https://github.com/gmitch215/gmux/blob/df6da1f0c07e8f65111a2a5f83348002b2946dac/src/worker/machine/machine.ts#L158">machine.ts:158</a></li></ul></aside></section>
+<li>Defined in <a href="https://github.com/gmitch215/gmux/blob/29cb634611e224842dd9f4fb783531354267504e/src/worker/machine/machine.ts#L158">machine.ts:158</a></li></ul></aside></section>
 <section class="tsd-panel tsd-member">
 <h3 class="tsd-anchor-link" id="log"><code class="tsd-tag">Optional</code><span>log</span><a href="#log" aria-label="Permalink" class="tsd-anchor-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="../assets/icons.svg#icon-anchor"></use></svg></a></h3>
 <div class="tsd-signature"><span class="tsd-kind-property">log</span><span class="tsd-signature-symbol">?:</span> <span class="tsd-signature-symbol">(</span><span class="tsd-kind-parameter">line</span><span class="tsd-signature-symbol">:</span> <span class="tsd-signature-type">string</span><span class="tsd-signature-symbol">)</span> <span class="tsd-signature-symbol">=&gt;</span> <span class="tsd-signature-type">void</span></div>
 <div class="tsd-comment tsd-typography"><p>host diagnostics: faults, crashes, and with <code>trace</code> every switch</p>
 </div><aside class="tsd-sources">
 <ul>
-<li>Defined in <a href="https://github.com/gmitch215/gmux/blob/df6da1f0c07e8f65111a2a5f83348002b2946dac/src/worker/machine/machine.ts#L76">machine.ts:76</a></li></ul></aside></section>
+<li>Defined in <a href="https://github.com/gmitch215/gmux/blob/29cb634611e224842dd9f4fb783531354267504e/src/worker/machine/machine.ts#L76">machine.ts:76</a></li></ul></aside></section>
 <section class="tsd-panel tsd-member">
 <h3 class="tsd-anchor-link" id="maximumpages"><code class="tsd-tag">Optional</code><span>maximum<wbr/>Pages</span><a href="#maximumpages" aria-label="Permalink" class="tsd-anchor-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="../assets/icons.svg#icon-anchor"></use></svg></a></h3>
 <div class="tsd-signature"><span class="tsd-kind-property">maximumPages</span><span class="tsd-signature-symbol">?:</span> <span class="tsd-signature-type">number</span></div>
 <div class="tsd-comment tsd-typography"><p>the most 64 KiB pages the machine's memory may grow to (default 2048); the kernel takes it all as RAM</p>
 </div><aside class="tsd-sources">
 <ul>
-<li>Defined in <a href="https://github.com/gmitch215/gmux/blob/df6da1f0c07e8f65111a2a5f83348002b2946dac/src/worker/machine/machine.ts#L72">machine.ts:72</a></li></ul></aside></section>
+<li>Defined in <a href="https://github.com/gmitch215/gmux/blob/29cb634611e224842dd9f4fb783531354267504e/src/worker/machine/machine.ts#L72">machine.ts:72</a></li></ul></aside></section>
 <section class="tsd-panel tsd-member">
 <h3 class="tsd-anchor-link" id="memory"><code class="tsd-tag">Optional</code><span>memory</span><a href="#memory" aria-label="Permalink" class="tsd-anchor-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="../assets/icons.svg#icon-anchor"></use></svg></a></h3>
 <div class="tsd-signature"><span class="tsd-kind-property">memory</span><span class="tsd-signature-symbol">?:</span> <span class="tsd-signature-type">Memory</span></div>
@@ -160,14 +160,14 @@ starts with is declined: the kernel takes everything past its start size as RAM,
 restores (a snapshot is full size) and not boots after one</p>
 </div><aside class="tsd-sources">
 <ul>
-<li>Defined in <a href="https://github.com/gmitch215/gmux/blob/df6da1f0c07e8f65111a2a5f83348002b2946dac/src/worker/machine/machine.ts#L97">machine.ts:97</a></li></ul></aside></section>
+<li>Defined in <a href="https://github.com/gmitch215/gmux/blob/29cb634611e224842dd9f4fb783531354267504e/src/worker/machine/machine.ts#L97">machine.ts:97</a></li></ul></aside></section>
 <section class="tsd-panel tsd-member">
 <h3 class="tsd-anchor-link" id="now"><code class="tsd-tag">Optional</code><span>now</span><a href="#now" aria-label="Permalink" class="tsd-anchor-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="../assets/icons.svg#icon-anchor"></use></svg></a></h3>
 <div class="tsd-signature"><span class="tsd-kind-property">now</span><span class="tsd-signature-symbol">?:</span> <span class="tsd-signature-symbol">()</span> <span class="tsd-signature-symbol">=&gt;</span> <span class="tsd-signature-type">bigint</span></div>
 <div class="tsd-comment tsd-typography"><p>the host clock in nanoseconds since the Unix epoch (default <code>Date.now()</code>)</p>
 </div><aside class="tsd-sources">
 <ul>
-<li>Defined in <a href="https://github.com/gmitch215/gmux/blob/df6da1f0c07e8f65111a2a5f83348002b2946dac/src/worker/machine/machine.ts#L74">machine.ts:74</a></li></ul></aside></section>
+<li>Defined in <a href="https://github.com/gmitch215/gmux/blob/29cb634611e224842dd9f4fb783531354267504e/src/worker/machine/machine.ts#L74">machine.ts:74</a></li></ul></aside></section>
 <section class="tsd-panel tsd-member">
 <h3 class="tsd-anchor-link" id="pagein"><code class="tsd-tag">Optional</code><span>page<wbr/>In</span><a href="#pagein" aria-label="Permalink" class="tsd-anchor-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="../assets/icons.svg#icon-anchor"></use></svg></a></h3>
 <div class="tsd-signature"><span class="tsd-kind-property">pageIn</span><span class="tsd-signature-symbol">?:</span> <span class="tsd-signature-symbol">(</span><span class="tsd-kind-parameter">page</span><span class="tsd-signature-symbol">:</span> <span class="tsd-signature-type">number</span><span class="tsd-signature-symbol">,</span> <span class="tsd-kind-parameter">canWait</span><span class="tsd-signature-symbol">:</span> <span class="tsd-signature-type">boolean</span><span class="tsd-signature-symbol">)</span> <span class="tsd-signature-symbol">=&gt;</span> <span class="tsd-signature-type">Promise</span><span class="tsd-signature-symbol">&lt;</span><span class="tsd-signature-type">void</span><span class="tsd-signature-symbol">&gt;</span> <span class="tsd-signature-symbol">|</span> <span class="tsd-signature-type">undefined</span></div>
@@ -177,7 +177,7 @@ canWait false the program runs outside WebAssembly.promising (its start function
 and constructors), so the page must be in place before this returns</p>
 </div><aside class="tsd-sources">
 <ul>
-<li>Defined in <a href="https://github.com/gmitch215/gmux/blob/df6da1f0c07e8f65111a2a5f83348002b2946dac/src/worker/machine/machine.ts#L89">machine.ts:89</a></li></ul></aside></section>
+<li>Defined in <a href="https://github.com/gmitch215/gmux/blob/29cb634611e224842dd9f4fb783531354267504e/src/worker/machine/machine.ts#L89">machine.ts:89</a></li></ul></aside></section>
 <section class="tsd-panel tsd-member">
 <h3 class="tsd-anchor-link" id="reenterafterrestore"><code class="tsd-tag">Optional</code><span>reenter<wbr/>After<wbr/>Restore</span><a href="#reenterafterrestore" aria-label="Permalink" class="tsd-anchor-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="../assets/icons.svg#icon-anchor"></use></svg></a></h3>
 <div class="tsd-signature"><span class="tsd-kind-property">reenterAfterRestore</span><span class="tsd-signature-symbol">?:</span> <span class="tsd-signature-type">number</span></div>
@@ -187,14 +187,14 @@ code it was entered with, so frames a restore rebuilt in freshly compiled code c
 V8 has optimized since. Once per program; nothing is copied</p>
 </div><aside class="tsd-sources">
 <ul>
-<li>Defined in <a href="https://github.com/gmitch215/gmux/blob/df6da1f0c07e8f65111a2a5f83348002b2946dac/src/worker/machine/machine.ts#L106">machine.ts:106</a></li></ul></aside></section>
+<li>Defined in <a href="https://github.com/gmitch215/gmux/blob/29cb634611e224842dd9f4fb783531354267504e/src/worker/machine/machine.ts#L106">machine.ts:106</a></li></ul></aside></section>
 <section class="tsd-panel tsd-member">
 <h3 class="tsd-anchor-link" id="registry"><span>registry</span><a href="#registry" aria-label="Permalink" class="tsd-anchor-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="../assets/icons.svg#icon-anchor"></use></svg></a></h3>
 <div class="tsd-signature"><span class="tsd-kind-property">registry</span><span class="tsd-signature-symbol">:</span> <span class="tsd-signature-type">Map</span><span class="tsd-signature-symbol">&lt;</span><span class="tsd-signature-type">string</span><span class="tsd-signature-symbol">,</span> <span class="tsd-signature-type">Module</span><span class="tsd-signature-symbol">&gt;</span></div>
 <div class="tsd-comment tsd-typography"><p>precompiled user programs keyed by the hex SHA-256 of their bytes</p>
 </div><aside class="tsd-sources">
 <ul>
-<li>Defined in <a href="https://github.com/gmitch215/gmux/blob/df6da1f0c07e8f65111a2a5f83348002b2946dac/src/worker/machine/machine.ts#L59">machine.ts:59</a></li></ul></aside></section>
+<li>Defined in <a href="https://github.com/gmitch215/gmux/blob/29cb634611e224842dd9f4fb783531354267504e/src/worker/machine/machine.ts#L59">machine.ts:59</a></li></ul></aside></section>
 <section class="tsd-panel tsd-member">
 <h3 class="tsd-anchor-link" id="restorefiles"><code class="tsd-tag">Optional</code><span>restore<wbr/>Files</span><a href="#restorefiles" aria-label="Permalink" class="tsd-anchor-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="../assets/icons.svg#icon-anchor"></use></svg></a></h3>
 <div class="tsd-signature"><span class="tsd-kind-property">restoreFiles</span><span class="tsd-signature-symbol">?:</span> <span class="tsd-signature-type">SyncedFile</span><span class="tsd-signature-symbol">[]</span></div>
@@ -202,7 +202,7 @@ V8 has optimized since. Once per program; nothing is copied</p>
 the first syscall any program makes, before that syscall runs</p>
 </div><aside class="tsd-sources">
 <ul>
-<li>Defined in <a href="https://github.com/gmitch215/gmux/blob/df6da1f0c07e8f65111a2a5f83348002b2946dac/src/worker/machine/machine.ts#L131">machine.ts:131</a></li></ul></aside></section>
+<li>Defined in <a href="https://github.com/gmitch215/gmux/blob/29cb634611e224842dd9f4fb783531354267504e/src/worker/machine/machine.ts#L131">machine.ts:131</a></li></ul></aside></section>
 <section class="tsd-panel tsd-member">
 <h3 class="tsd-anchor-link" id="router"><code class="tsd-tag">Optional</code><span>router</span><a href="#router" aria-label="Permalink" class="tsd-anchor-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="../assets/icons.svg#icon-anchor"></use></svg></a></h3>
 <div class="tsd-signature"><span class="tsd-kind-property">router</span><span class="tsd-signature-symbol">?:</span> <a href="RouterModules.html" class="tsd-signature-type tsd-kind-interface">RouterModules</a></div>
@@ -210,14 +210,14 @@ the first syscall any program makes, before that syscall runs</p>
 <code>fileSync</code>, <code>restoreFiles</code>, <code>syscallCache</code> or <code>countSyscalls</code></p>
 </div><aside class="tsd-sources">
 <ul>
-<li>Defined in <a href="https://github.com/gmitch215/gmux/blob/df6da1f0c07e8f65111a2a5f83348002b2946dac/src/worker/machine/machine.ts#L148">machine.ts:148</a></li></ul></aside></section>
+<li>Defined in <a href="https://github.com/gmitch215/gmux/blob/29cb634611e224842dd9f4fb783531354267504e/src/worker/machine/machine.ts#L148">machine.ts:148</a></li></ul></aside></section>
 <section class="tsd-panel tsd-member">
 <h3 class="tsd-anchor-link" id="sha256"><span>sha256</span><a href="#sha256" aria-label="Permalink" class="tsd-anchor-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="../assets/icons.svg#icon-anchor"></use></svg></a></h3>
 <div class="tsd-signature"><span class="tsd-kind-property">sha256</span><span class="tsd-signature-symbol">:</span> <span class="tsd-signature-symbol">(</span><span class="tsd-kind-parameter">bytes</span><span class="tsd-signature-symbol">:</span> <span class="tsd-signature-type">Uint8Array</span><span class="tsd-signature-symbol">)</span> <span class="tsd-signature-symbol">=&gt;</span> <span class="tsd-signature-type">string</span></div>
 <div class="tsd-comment tsd-typography"><p>the hex SHA-256 of an executable without an exec stub, to find it in <code>registry</code></p>
 </div><aside class="tsd-sources">
 <ul>
-<li>Defined in <a href="https://github.com/gmitch215/gmux/blob/df6da1f0c07e8f65111a2a5f83348002b2946dac/src/worker/machine/machine.ts#L80">machine.ts:80</a></li></ul></aside></section>
+<li>Defined in <a href="https://github.com/gmitch215/gmux/blob/29cb634611e224842dd9f4fb783531354267504e/src/worker/machine/machine.ts#L80">machine.ts:80</a></li></ul></aside></section>
 <section class="tsd-panel tsd-member">
 <h3 class="tsd-anchor-link" id="sharedkernel"><code class="tsd-tag">Optional</code><span>shared<wbr/>Kernel</span><a href="#sharedkernel" aria-label="Permalink" class="tsd-anchor-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="../assets/icons.svg#icon-anchor"></use></svg></a></h3>
 <div class="tsd-signature"><span class="tsd-kind-property">sharedKernel</span><span class="tsd-signature-symbol">?:</span> <span class="tsd-signature-type">boolean</span></div>
@@ -225,7 +225,7 @@ the first syscall any program makes, before that syscall runs</p>
 resume; needs a vmlinux that exports them (scripts/export-globals.ts)</p>
 </div><aside class="tsd-sources">
 <ul>
-<li>Defined in <a href="https://github.com/gmitch215/gmux/blob/df6da1f0c07e8f65111a2a5f83348002b2946dac/src/worker/machine/machine.ts#L115">machine.ts:115</a></li></ul></aside></section>
+<li>Defined in <a href="https://github.com/gmitch215/gmux/blob/29cb634611e224842dd9f4fb783531354267504e/src/worker/machine/machine.ts#L115">machine.ts:115</a></li></ul></aside></section>
 <section class="tsd-panel tsd-member">
 <h3 class="tsd-anchor-link" id="shareinstances"><code class="tsd-tag">Optional</code><span>share<wbr/>Instances</span><a href="#shareinstances" aria-label="Permalink" class="tsd-anchor-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="../assets/icons.svg#icon-anchor"></use></svg></a></h3>
 <div class="tsd-signature"><span class="tsd-kind-property">shareInstances</span><span class="tsd-signature-symbol">?:</span> <span class="tsd-signature-type">boolean</span></div>
@@ -233,14 +233,14 @@ resume; needs a vmlinux that exports them (scripts/export-globals.ts)</p>
 bases, stack pointer and globals swapped at each switch (needs <code>sharedKernel</code>; no checkpoints)</p>
 </div><aside class="tsd-sources">
 <ul>
-<li>Defined in <a href="https://github.com/gmitch215/gmux/blob/df6da1f0c07e8f65111a2a5f83348002b2946dac/src/worker/machine/machine.ts#L64">machine.ts:64</a></li></ul></aside></section>
+<li>Defined in <a href="https://github.com/gmitch215/gmux/blob/29cb634611e224842dd9f4fb783531354267504e/src/worker/machine/machine.ts#L64">machine.ts:64</a></li></ul></aside></section>
 <section class="tsd-panel tsd-member">
 <h3 class="tsd-anchor-link" id="stepns"><code class="tsd-tag">Optional</code><span>step<wbr/>Ns</span><a href="#stepns" aria-label="Permalink" class="tsd-anchor-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="../assets/icons.svg#icon-anchor"></use></svg></a></h3>
 <div class="tsd-signature"><span class="tsd-kind-property">stepNs</span><span class="tsd-signature-symbol">?:</span> <span class="tsd-signature-type">bigint</span></div>
 <div class="tsd-comment tsd-typography"><p>how far the kernel's clock moves per scheduling decision when the host clock does not</p>
 </div><aside class="tsd-sources">
 <ul>
-<li>Defined in <a href="https://github.com/gmitch215/gmux/blob/df6da1f0c07e8f65111a2a5f83348002b2946dac/src/worker/machine/machine.ts#L110">machine.ts:110</a></li></ul></aside></section>
+<li>Defined in <a href="https://github.com/gmitch215/gmux/blob/29cb634611e224842dd9f4fb783531354267504e/src/worker/machine/machine.ts#L110">machine.ts:110</a></li></ul></aside></section>
 <section class="tsd-panel tsd-member">
 <h3 class="tsd-anchor-link" id="syscallcache"><code class="tsd-tag">Optional</code><span>syscall<wbr/>Cache</span><a href="#syscallcache" aria-label="Permalink" class="tsd-anchor-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="../assets/icons.svg#icon-anchor"></use></svg></a></h3>
 <div class="tsd-signature"><span class="tsd-kind-property">syscallCache</span><span class="tsd-signature-symbol">?:</span> <span class="tsd-signature-type">boolean</span> <span class="tsd-signature-symbol">|</span> <span class="tsd-signature-type">&quot;verify&quot;</span></div>
@@ -249,35 +249,35 @@ generation (kernel patch 0022) and the task's view are what they were, without e
 kernel. 'verify' asks the kernel every time and counts answers the cache would have got wrong</p>
 </div><aside class="tsd-sources">
 <ul>
-<li>Defined in <a href="https://github.com/gmitch215/gmux/blob/df6da1f0c07e8f65111a2a5f83348002b2946dac/src/worker/machine/machine.ts#L137">machine.ts:137</a></li></ul></aside></section>
+<li>Defined in <a href="https://github.com/gmitch215/gmux/blob/29cb634611e224842dd9f4fb783531354267504e/src/worker/machine/machine.ts#L137">machine.ts:137</a></li></ul></aside></section>
 <section class="tsd-panel tsd-member">
 <h3 class="tsd-anchor-link" id="trace"><code class="tsd-tag">Optional</code><span>trace</span><a href="#trace" aria-label="Permalink" class="tsd-anchor-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="../assets/icons.svg#icon-anchor"></use></svg></a></h3>
 <div class="tsd-signature"><span class="tsd-kind-property">trace</span><span class="tsd-signature-symbol">?:</span> <span class="tsd-signature-type">boolean</span></div>
 <div class="tsd-comment tsd-typography"><p>log every task switch and release through <code>log</code></p>
 </div><aside class="tsd-sources">
 <ul>
-<li>Defined in <a href="https://github.com/gmitch215/gmux/blob/df6da1f0c07e8f65111a2a5f83348002b2946dac/src/worker/machine/machine.ts#L82">machine.ts:82</a></li></ul></aside></section>
+<li>Defined in <a href="https://github.com/gmitch215/gmux/blob/29cb634611e224842dd9f4fb783531354267504e/src/worker/machine/machine.ts#L82">machine.ts:82</a></li></ul></aside></section>
 <section class="tsd-panel tsd-member">
 <h3 class="tsd-anchor-link" id="vmlinux"><span>vmlinux</span><a href="#vmlinux" aria-label="Permalink" class="tsd-anchor-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="../assets/icons.svg#icon-anchor"></use></svg></a></h3>
 <div class="tsd-signature"><span class="tsd-kind-property">vmlinux</span><span class="tsd-signature-symbol">:</span> <span class="tsd-signature-type">Module</span></div>
 <div class="tsd-comment tsd-typography"><p>the kernel, compiled (<code>kernel/vmlinux.wasm</code>)</p>
 </div><aside class="tsd-sources">
 <ul>
-<li>Defined in <a href="https://github.com/gmitch215/gmux/blob/df6da1f0c07e8f65111a2a5f83348002b2946dac/src/worker/machine/machine.ts#L47">machine.ts:47</a></li></ul></aside></section>
+<li>Defined in <a href="https://github.com/gmitch215/gmux/blob/29cb634611e224842dd9f4fb783531354267504e/src/worker/machine/machine.ts#L47">machine.ts:47</a></li></ul></aside></section>
 <section class="tsd-panel tsd-member">
 <h3 class="tsd-anchor-link" id="write"><code class="tsd-tag">Optional</code><span>write</span><a href="#write" aria-label="Permalink" class="tsd-anchor-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="../assets/icons.svg#icon-anchor"></use></svg></a></h3>
 <div class="tsd-signature"><span class="tsd-kind-property">write</span><span class="tsd-signature-symbol">?:</span> <span class="tsd-signature-symbol">(</span><span class="tsd-kind-parameter">text</span><span class="tsd-signature-symbol">:</span> <span class="tsd-signature-type">string</span><span class="tsd-signature-symbol">)</span> <span class="tsd-signature-symbol">=&gt;</span> <span class="tsd-signature-type">void</span></div>
 <div class="tsd-comment tsd-typography"><p>console output, as the kernel writes it</p>
 </div><aside class="tsd-sources">
 <ul>
-<li>Defined in <a href="https://github.com/gmitch215/gmux/blob/df6da1f0c07e8f65111a2a5f83348002b2946dac/src/worker/machine/machine.ts#L78">machine.ts:78</a></li></ul></aside></section>
+<li>Defined in <a href="https://github.com/gmitch215/gmux/blob/29cb634611e224842dd9f4fb783531354267504e/src/worker/machine/machine.ts#L78">machine.ts:78</a></li></ul></aside></section>
 <section class="tsd-panel tsd-member">
 <h3 class="tsd-anchor-link" id="yieldevery"><code class="tsd-tag">Optional</code><span>yield<wbr/>Every</span><a href="#yieldevery" aria-label="Permalink" class="tsd-anchor-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="../assets/icons.svg#icon-anchor"></use></svg></a></h3>
 <div class="tsd-signature"><span class="tsd-kind-property">yieldEvery</span><span class="tsd-signature-symbol">?:</span> <span class="tsd-signature-type">number</span></div>
 <div class="tsd-comment tsd-typography"><p>pump steps between macrotask yields, so a frozen host clock can advance</p>
 </div><aside class="tsd-sources">
 <ul>
-<li>Defined in <a href="https://github.com/gmitch215/gmux/blob/df6da1f0c07e8f65111a2a5f83348002b2946dac/src/worker/machine/machine.ts#L108">machine.ts:108</a></li></ul></aside></section></section></details></div>
+<li>Defined in <a href="https://github.com/gmitch215/gmux/blob/29cb634611e224842dd9f4fb783531354267504e/src/worker/machine/machine.ts#L108">machine.ts:108</a></li></ul></aside></section></section></details></div>
 <div class="col-sidebar">
 <div class="page-menu">
 <div class="tsd-navigation settings">
