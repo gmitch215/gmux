@@ -18,7 +18,7 @@ import { Machine } from '../../../src/worker/machine/machine.ts';
  * per function, handlers that save nothing, every local saved, no handlers at fuel yields), guard and guardi (every load and store checked against a page owner table, the
  * check called and inlined), guardsi (the guard pass at GUARD_STORES inlined, to price loads), count
  * (provable.ts: which checked accesses a check outside the access could cover, counts printed), nostack
- * (plain without the stack pointer check, to price it), nofuel (plain without the loop-head fuel checks), peek (plain whose loop-head check only reads the budget, never yields), simd (the program from SIMD_CENSUS, a census
+ * (plain without the stack pointer check, to price it), nofuel (plain without the loop-head fuel checks), peek (plain whose loop-head check only reads the budget, never yields), local (plain with the count of a call-free loop in a local), gnocall and lnocall (the global count and the local one with the host call at zero replaced by a refill, to price the call), simd (the program from SIMD_CENSUS, a census
  * built with EXTRA_CFLAGS=-msimd128).
  * `node --experimental-strip-types experiments/mmu/scripts/bench.ts <census dir> [rounds]`; with
  * WORK=<dir>, arms already built there are reused, so a machine without the toolchain can time them
@@ -78,7 +78,7 @@ for (const name of Object.keys(workloads)) {
 		const fueled = join(work, `${name}.${arm}.fuel.wasm`);
 		const evacuation = { o2: ['--no-handlers', '--no-flatten'], emit: ['--no-handlers', '--no-flatten', '--no-opt'], flat: ['--no-handlers'], eh: [], ehr: ['--resume'], ehrp: ['--resume'], ehrn: ['--resume', '--no-spill'], ehrs: ['--resume', '--no-fuel-sites'], ehrt: ['--resume', '--try-sites'], eht: ['--try-sites'], ehf: ['--fold'], eh1: ['--one-try'], ehn: ['--no-spill'], eha: ['--all-locals'], ehs: ['--no-fuel-sites'] }[arm];
 		if (!built(fueled)) {
-			if (arm === 'plain' || arm === 'nostack' || arm === 'nofuel' || arm === 'peek' || arm === 'simd') writeFileSync(file, readFileSync(source));
+			if (arm === 'plain' || arm === 'nostack' || arm === 'nofuel' || arm === 'peek' || arm === 'local' || arm === 'gnocall' || arm === 'lnocall' || arm === 'simd') writeFileSync(file, readFileSync(source));
 			else if (evacuation) {
 				// as the host builds an evacuable program: instrumented first, so the fuel yields at loop
 				// heads are safepoints too
@@ -105,6 +105,8 @@ for (const name of Object.keys(workloads)) {
 					GMUX_NO_STACK_CHECK: arm === 'nostack' ? '1' : '',
 					GMUX_NO_FUEL: arm === 'nofuel' ? '1' : '',
 					GMUX_FUEL_PEEK: arm === 'peek' ? '1' : '',
+					GMUX_FUEL_LOCAL: arm === 'local' || arm === 'lnocall' ? '1' : '',
+					GMUX_FUEL_NOCALL: arm === 'gnocall' || arm === 'lnocall' ? '1' : '',
 					GMUX_KEEP_EXPORTS:
 						arm === 'count'
 							? WebAssembly.Module.exports(new WebAssembly.Module(readFileSync(file)))
@@ -178,11 +180,15 @@ for (let round = 0; round < rounds; round++) {
 			const line = cmd.replace(new RegExp(`^${name}\\b`), program);
 			const a = `a${id}`;
 			const b = `b${id++}`;
-			const sink = process.env.DEBUG ? '2>&1 | tail -3' : '> /tmp/out 2>&1';
+			// CHECK=1: each run's last command output as a checksum and its yield count, for an exactness check
+			const sink = process.env.CHECK ? '2>&1 | cksum' : process.env.DEBUG ? '2>&1 | tail -3' : '> /tmp/out 2>&1';
+			const [from, yields] = [output.length, machine.stats.fuelYields];
 			machine.type(`echo @@${a.slice(0, 1)}$((0))${a.slice(1)}@@; ${line} ${sink}; echo @@${b.slice(0, 1)}$((0))${b.slice(1)}@@\n`);
 			await run(() => marks.has(`b0${b.slice(1)}`));
 			const ms = marks.get(`b0${b.slice(1)}`)! - marks.get(`a0${a.slice(1)}`)!;
 			((results[name] ??= {})[arm] ??= []).push(ms);
+			if (process.env.CHECK)
+				console.log(JSON.stringify({ check: name, arm, round, yields: machine.stats.fuelYields - yields, output: output.slice(from).match(/^\d+ \d+$/m)?.[0] }));
 			if (arm === 'count' && round === 0)
 				for (const instance of live.splice(0))
 					for (const [k, v] of Object.entries(instance.exports))
