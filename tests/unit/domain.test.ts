@@ -18,7 +18,8 @@ import {
 	jsCopier,
 	putSockaddr,
 	putStatx,
-	refused
+	refused,
+	stringLength
 } from '../../src/worker/machine/domain.ts';
 
 const PAGE = 0x10000;
@@ -150,6 +151,58 @@ describe('crossings', () => {
 		expect(copyOut(domain, 0, 0, 8)).toBe(8);
 		expect(clear(domain, 0, 8)).toBe(8);
 		expect(copyIn(domain, 0, 0, 8)).toBe(0);
+	});
+});
+
+describe('strings', () => {
+	const text = (s: string) => Array.from(s, (c) => c.charCodeAt(0));
+
+	it('measure up to the first NUL, or count when there is none within count', () => {
+		const { domain, bytes } = rig();
+		bytes.set(text('/bin/sh\0tail'), 0x101);
+		expect(stringLength(domain, 0x101, 4096)).toBe(7);
+		expect(stringLength(domain, 0x101, 8)).toBe(7);
+		expect(stringLength(domain, 0x101, 7)).toBe(7);
+		expect(stringLength(domain, 0x101, 3)).toBe(3);
+		expect(stringLength(domain, 0x108, 4096)).toBe(0);
+	});
+
+	it('measure a string longer than the by-hand head too', () => {
+		const { domain, bytes } = rig();
+		bytes.fill(120, 0x200, 0x200 + 300);
+		bytes[0x200 + 200] = 0;
+		for (const [count, want] of [
+			[4096, 200],
+			[201, 200],
+			[200, 200],
+			[100, 100],
+			[64, 64],
+			[65, 65],
+			[63, 63]
+		] as const)
+			expect(stringLength(domain, 0x200, count)).toBe(want);
+		bytes[0x200 + 64] = 0;
+		expect(stringLength(domain, 0x200, 4096)).toBe(64);
+		bytes[0x200 + 63] = 0;
+		expect(stringLength(domain, 0x200, 4096)).toBe(63);
+	});
+
+	it('fail only when the domain ends before the NUL and before count', () => {
+		const { domain, bytes } = rig();
+		const size = 2 * PAGE;
+		bytes.fill(120, size - 8);
+		expect(stringLength(domain, size - 8, 9)).toBe(-1);
+		expect(stringLength(domain, size - 8, 8)).toBe(8);
+		expect(stringLength(domain, size - 8, 4)).toBe(4);
+		expect(stringLength(domain, size, 1)).toBe(-1);
+		expect(stringLength(domain, 0xfffffff8, 16)).toBe(-1);
+		bytes[size - 1] = 0;
+		expect(stringLength(domain, size - 8, 9)).toBe(7);
+	});
+
+	it('read nothing from a domain that may not be read', () => {
+		const domain = new Domain(memory(), WRITE);
+		expect(stringLength(domain, 0, 4)).toBe(-1);
 	});
 });
 

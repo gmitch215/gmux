@@ -135,7 +135,7 @@ describe('the deployment', () => {
 		expect(env.match(/^\s*\w+/gm)!.map((s) => s.trim())).toEqual(['MACHINE', 'ASSETS']);
 	});
 
-	it('publishes nothing a guest makes: every path but /_gmux/ is the no-site answer', async () => {
+	it('hands every path but the terminal page to the machine, which decides what a guest serves', async () => {
 		const { default: site } = await import('../../src/site.ts');
 		const calls: string[] = [];
 		const env = {
@@ -155,11 +155,13 @@ describe('the deployment', () => {
 				})
 			}
 		} as never;
-		for (const path of ['/', '/index.html', '/api/v4/accounts', '/_gmuxx', '/.well-known/x']) {
+		const paths = ['/', '/index.html', '/api/v4/accounts', '/_gmuxx', '/.well-known/x'];
+		for (const path of paths) {
 			const res = await site.fetch(new Request(`https://m.example${path}`), env, {} as never);
-			expect([path, res.status]).toEqual([path, 503]);
+			expect([path, res.status]).toEqual([path, 200]);
 		}
-		expect(calls).toEqual([]);
+		expect(calls).toEqual(paths.map((path) => `machine ${path}`));
+		calls.length = 0;
 		await site.fetch(new Request('https://m.example/_gmux/term'), env, {} as never);
 		await site.fetch(new Request('https://m.example/_gmux/status'), env, {} as never);
 		expect(calls).toEqual(['assets /_gmux/term/index.html', 'machine /_gmux/status']);

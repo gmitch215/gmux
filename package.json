@@ -28,7 +28,7 @@
 	],
 	"sideEffects": false,
 	"scripts": {
-		"build": "tsc -p ./tsconfig.build.json && bun scripts/package-kernel.ts",
+		"build": "bash scripts/build-router.sh && tsc -p ./tsconfig.build.json && bun scripts/package-kernel.ts",
 		"typecheck": "tsc --noEmit",
 		"test": "vitest run",
 		"test:coverage": "vitest run --coverage",

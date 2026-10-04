@@ -1,0 +1,108 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Gregory Mitchell <me@gmitch215.xyz>
+Date: Sun, 4 Oct 2026 06:10:13 +0000
+Subject: [PATCH] wasm: count path-query changes by inode number as well
+
+The host keeps a statx answer for as long as every inode its path crossed
+is unchanged, so a write in /tmp leaves the answers about /usr alone.
+wasm_fs_changed moves one of 4096 counters picked by the inode's number
+next to the generation it already moved, and a mount change or chroot
+moves wasm_fs_moves; wasm_fs_gen_at reads one or the other. Two inodes
+may share a counter, which only ends an answer early.
+---
+ arch/wasm/include/asm/wasm.h |  1 +
+ arch/wasm/mm/fsgen.c         | 12 ++++++++++++
+ include/linux/fs.h           | 20 ++++++++++++++++----
+ 3 files changed, 29 insertions(+), 4 deletions(-)
+
+diff --git a/arch/wasm/include/asm/wasm.h b/arch/wasm/include/asm/wasm.h
+index affda5df7..3e2eb06b8 100644
+--- a/arch/wasm/include/asm/wasm.h
++++ b/arch/wasm/include/asm/wasm.h
+@@ -47,6 +47,7 @@ unsigned int wasm_current_euid(void);
+ unsigned long wasm_current_mm(void);
+ unsigned long wasm_free_pages(void);
+ unsigned long wasm_fs_gen(void);
++unsigned long wasm_fs_gen_at(unsigned int i);
+ unsigned long wasm_fs_view(void);
+ 
+ /* gmux: a fork child's own memory (arch/wasm/mm/private.c): the host fills and forgets it */
+diff --git a/arch/wasm/mm/fsgen.c b/arch/wasm/mm/fsgen.c
+index c046d1926..f4eac307e 100644
+--- a/arch/wasm/mm/fsgen.c
++++ b/arch/wasm/mm/fsgen.c
+@@ -5,6 +5,8 @@
+  * include/linux/fs.h), and the view a task resolves paths in. The host may answer a query from an
+  * earlier answer only while both are what they were, and only for a lookup that stayed on the root
+  * mount, so changes on other filesystems (a tty's times, /dev/null's) leave the generation alone.
++ * The same changes also move one of WASM_FS_BUCKETS counters by the inode number, and mount and
++ * chroot changes a count of their own, for answers that depend on the inodes of a path's components.
+  */
+ 
+ #include <linux/capability.h>
+@@ -17,6 +19,8 @@
+ #include <asm/wasm.h>
+ 
+ unsigned long wasm_fs_generation;
++unsigned long wasm_fs_moves;
++unsigned int wasm_fs_buckets[WASM_FS_BUCKETS];
+ /* the root filesystem, once the host has first asked; until then every inode counts */
+ struct super_block *wasm_fs_root_sb;
+ 
+@@ -25,6 +29,14 @@ __visible unsigned long wasm_fs_gen(void)
+ 	return READ_ONCE(wasm_fs_generation);
+ }
+ 
++/* bucket i of the inode counters, or with i == WASM_FS_BUCKETS the mount and chroot count */
++__visible unsigned long wasm_fs_gen_at(unsigned int i)
++{
++	if (i < WASM_FS_BUCKETS)
++		return READ_ONCE(wasm_fs_buckets[i]);
++	return READ_ONCE(wasm_fs_moves);
++}
++
+ /*
+  * the current task's root dentry when its path queries depend on nothing but the path and the
+  * generation: it may search every directory (CAP_DAC_READ_SEARCH), resolves in the first mount
+diff --git a/include/linux/fs.h b/include/linux/fs.h
+index cd8015227..2cdbee802 100644
+--- a/include/linux/fs.h
++++ b/include/linux/fs.h
+@@ -1161,18 +1161,30 @@ static inline loff_t i_size_read(const struct inode *inode)
+  * changes, every mount change and every chroot, so the host can answer a path query from what it saw
+  * before while nothing that query could see has changed. A device, fifo or socket node's times move
+  * with every read and write of it; the host keeps no answer about one, so they do not count
+- * (arch/wasm/mm/fsgen.c)
++ * (arch/wasm/mm/fsgen.c). A change also counts in the bucket of its inode number, and a mount
++ * change or chroot in wasm_fs_moves, so an answer that depends on the inodes of a path's
++ * components stays valid while others change
+  */
++#define WASM_FS_BUCKETS 4096
+ extern unsigned long wasm_fs_generation;
++extern unsigned long wasm_fs_moves;
++extern unsigned int wasm_fs_buckets[WASM_FS_BUCKETS];
+ extern struct super_block *wasm_fs_root_sb;
+-#define wasm_fs_moved() WRITE_ONCE(wasm_fs_generation, wasm_fs_generation + 1)
++#define wasm_fs_bucket(ino) ((unsigned int)((u32)(ino) * 0x9e3779b1u) >> 20)
++#define wasm_fs_moved()							\
++	do {								\
++		WRITE_ONCE(wasm_fs_moves, wasm_fs_moves + 1);		\
++		WRITE_ONCE(wasm_fs_generation, wasm_fs_generation + 1);	\
++	} while (0)
+ #define wasm_fs_changed(inode)						\
+ 	do {								\
+ 		struct super_block *__sb = READ_ONCE(wasm_fs_root_sb);	\
+ 		umode_t __m = (inode)->i_mode;				\
+ 		if ((!__sb || (inode)->i_sb == __sb) &&			\
+-		    (S_ISREG(__m) || S_ISDIR(__m) || S_ISLNK(__m) || !__m))	\
+-			wasm_fs_moved();				\
++		    (S_ISREG(__m) || S_ISDIR(__m) || S_ISLNK(__m) || !__m)) {	\
++			wasm_fs_buckets[wasm_fs_bucket((inode)->i_ino)]++;	\
++			WRITE_ONCE(wasm_fs_generation, wasm_fs_generation + 1);	\
++		}							\
+ 	} while (0)
+ #else
+ #define wasm_fs_moved() do { } while (0)
+-- 
+2.43.0
+

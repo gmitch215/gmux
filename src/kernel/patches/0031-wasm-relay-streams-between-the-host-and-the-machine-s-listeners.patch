@@ -1,0 +1,550 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Gregory Mitchell <me@gmitch215.xyz>
+Date: Sun, 4 Oct 2026 08:00:00 -0400
+Subject: [PATCH] wasm: relay streams between the host and the machine's
+ listeners
+
+A host stream to a port a program listens on had no path in: the
+kernel has IPv4 over lo only and no device. khostnetd now connects an
+in-kernel TCP socket to the listener over loopback and copies bytes to
+and from the host through four imports, so the program accepts an
+ordinary connection and the host holds no TCP state. The listen start
+and stop hooks tell the host which ports are open, the host raises
+WASM_IRQ_NET when it has events, and the thread caps the client
+socket's receive buffer and keeps an unsent tail per stream so a slow
+side stalls the stream and not the kernel.
+---
+ arch/wasm/Kconfig                        |  10 +
+ arch/wasm/configs/wasm32_nommu_defconfig |   1 +
+ arch/wasm/include/asm/irq.h              |   1 +
+ arch/wasm/kernel/Makefile                |   1 +
+ arch/wasm/kernel/hostnet.c               | 400 +++++++++++++++++++++++
+ include/linux/hostnet.h                  |  18 +
+ net/ipv4/inet_connection_sock.c          |   7 +-
+ 7 files changed, 437 insertions(+), 1 deletion(-)
+ create mode 100644 arch/wasm/kernel/hostnet.c
+ create mode 100644 include/linux/hostnet.h
+
+diff --git a/arch/wasm/Kconfig b/arch/wasm/Kconfig
+index abc88f30a..f01e35cfe 100644
+--- a/arch/wasm/Kconfig
++++ b/arch/wasm/Kconfig
+@@ -118,6 +118,16 @@ config WASM_PAGE_SHIFT
+ 	   different WASM_PAGE_SHIFT than PAGE_SHIFT (which sets the page size
+ 	   as seen from within most parts of the kernel).
+ 
++config WASM_HOSTNET
++	bool "Host stream relay"
++	depends on INET
++	default y
++	help
++	  Lets the host open a stream to a port a program listens on. A
++	  kernel thread connects a socket to that port over loopback and
++	  copies bytes to and from the host, so the program accepts an
++	  ordinary connection.
++
+ config PGTABLE_LEVELS
+ 	int
+ 	default 2
+diff --git a/arch/wasm/configs/wasm32_nommu_defconfig b/arch/wasm/configs/wasm32_nommu_defconfig
+index 76f27a1f7..f7dfa3168 100644
+--- a/arch/wasm/configs/wasm32_nommu_defconfig
++++ b/arch/wasm/configs/wasm32_nommu_defconfig
+@@ -35,6 +35,7 @@ CONFIG_BOOT_MEM_PAGES=0xFFFF
+ CONFIG_NET=y
+ CONFIG_UNIX=y
+ CONFIG_INET=y
++CONFIG_WASM_HOSTNET=y
+ CONFIG_FILE_LOCKING=y
+ CONFIG_INOTIFY_USER=y
+ CONFIG_FHANDLE=y
+diff --git a/arch/wasm/include/asm/irq.h b/arch/wasm/include/asm/irq.h
+index 6e84f7ff0..ccf9e5f4f 100644
+--- a/arch/wasm/include/asm/irq.h
++++ b/arch/wasm/include/asm/irq.h
+@@ -8,6 +8,7 @@
+ #define WASM_IRQ_IPI			0
+ #define WASM_IRQ_TIMER			1
+ #define WASM_IRQ_HVC			2
++#define WASM_IRQ_NET			3
+ 
+ #include <asm-generic/irq.h>
+ 
+diff --git a/arch/wasm/kernel/Makefile b/arch/wasm/kernel/Makefile
+index f76b676c7..636dd5572 100644
+--- a/arch/wasm/kernel/Makefile
++++ b/arch/wasm/kernel/Makefile
+@@ -6,6 +6,7 @@ obj-y += cpu.o
+ obj-y += cpuflags.o
+ obj-y += entry.o
+ obj-y += head.o
++obj-$(CONFIG_WASM_HOSTNET) += hostnet.o
+ obj-y += irqflags.o
+ obj-y += irq.o
+ obj-y += process.o
+diff --git a/arch/wasm/kernel/hostnet.c b/arch/wasm/kernel/hostnet.c
+new file mode 100644
+index 000000000..daf771fd6
+--- /dev/null
++++ b/arch/wasm/kernel/hostnet.c
+@@ -0,0 +1,400 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * gmux: a stream relay between the host and the machine's own listeners. The host opens a stream
++ * for a port a program listens on; khostnetd connects an in-kernel TCP socket to that port over
++ * loopback and copies bytes between the socket and the host, so the program accepts an ordinary
++ * connection and the host holds no TCP state.
++ */
++
++#include <linux/atomic.h>
++#include <linux/fcntl.h>
++#include <linux/hostnet.h>
++#include <linux/in.h>
++#include <linux/interrupt.h>
++#include <linux/kthread.h>
++#include <linux/list.h>
++#include <linux/mutex.h>
++#include <linux/net.h>
++#include <linux/slab.h>
++#include <linux/socket.h>
++#include <linux/string.h>
++#include <linux/tcp.h>
++#include <net/sock.h>
++#include <net/tcp_states.h>
++#include <asm/irq.h>
++
++/* what the host hands wasm_net_next */
++enum { HN_OPEN = 1, HN_DATA, HN_SHUT, HN_ABORT };
++/* what wasm_net_end tells the host: the guest's end is done, or the stream is gone; hold and release
++   pause and resume the host's events for one stream */
++enum { HN_END_FIN, HN_END_RESET, HN_END_HOLD, HN_END_RELEASE };
++
++struct hn_event {
++	u32 op;
++	u32 id;
++	/* a port for an open, the byte count for data */
++	u32 arg;
++};
++
++extern int wasm_net_listen(unsigned int port, int on);
++extern int wasm_net_next(struct hn_event *event, void *buf, unsigned int cap);
++extern int wasm_net_send(unsigned int id, const void *buf, unsigned int len);
++extern void wasm_net_end(unsigned int id, int how);
++
++#define HN_BUF		16384
++/* SO_RCVBUF of the client socket, which bounds what a slow host reader leaves queued here */
++#define HN_RCVBUF	32768
++/* chunks one stream moves before the others take a turn */
++#define HN_BURST	16
++
++enum { C_WORK, C_UP, C_FIN_OUT, C_WDONE, C_RDONE };
++
++struct hn_conn {
++	struct list_head node;
++	struct socket *sock;
++	u32 id;
++	unsigned long flags;
++	/* bytes the host sent that the socket has not taken yet */
++	u8 *wtail;
++	u32 wlen;
++	u32 woff;
++	/* bytes the socket gave that the host has not taken yet */
++	u8 *rtail;
++	u32 rlen;
++	u32 roff;
++	void (*data_ready)(struct sock *sk);
++	void (*write_space)(struct sock *sk);
++	void (*state_change)(struct sock *sk);
++};
++
++/* the event and its data, in one block the host reads and writes */
++struct hn_io {
++	struct hn_event event;
++	u8 data[HN_BUF];
++};
++
++static struct task_struct *hn_task;
++static struct hn_io *hn_io;
++static atomic_t hn_pending = ATOMIC_INIT(0);
++/* only khostnetd touches the list */
++static LIST_HEAD(hn_conns);
++static DEFINE_MUTEX(hn_start);
++
++__visible int wasm_net_irq(void)
++{
++	return WASM_IRQ_NET;
++}
++
++static void hn_poke(void)
++{
++	atomic_xchg(&hn_pending, 1);
++	wake_up_process(hn_task);
++}
++
++static irqreturn_t hostnet_irq(int irq, void *dev)
++{
++	hn_poke();
++	return IRQ_HANDLED;
++}
++
++static void hn_work(struct sock *sk)
++{
++	struct hn_conn *c;
++
++	read_lock_bh(&sk->sk_callback_lock);
++	c = sk->sk_user_data;
++	if (c) {
++		set_bit(C_WORK, &c->flags);
++		hn_poke();
++	}
++	read_unlock_bh(&sk->sk_callback_lock);
++}
++
++static void hostnet_close(struct hn_conn *c)
++{
++	struct sock *sk = c->sock->sk;
++
++	write_lock_bh(&sk->sk_callback_lock);
++	sk->sk_user_data = NULL;
++	sk->sk_data_ready = c->data_ready;
++	sk->sk_write_space = c->write_space;
++	sk->sk_state_change = c->state_change;
++	write_unlock_bh(&sk->sk_callback_lock);
++	sock_release(c->sock);
++	list_del(&c->node);
++	kfree(c->wtail);
++	kfree(c->rtail);
++	kfree(c);
++}
++
++/* the stream is gone: tell the host, drop the socket */
++static void hn_reset(struct hn_conn *c)
++{
++	wasm_net_end(c->id, HN_END_RESET);
++	hostnet_close(c);
++}
++
++static struct hn_conn *hn_find(u32 id)
++{
++	struct hn_conn *c;
++
++	list_for_each_entry(c, &hn_conns, node)
++		if (c->id == id)
++			return c;
++	return NULL;
++}
++
++static void hostnet_open(u32 id, u32 port)
++{
++	struct sockaddr_in addr = {
++		.sin_family = AF_INET,
++		.sin_port = htons(port),
++		.sin_addr.s_addr = htonl(INADDR_LOOPBACK),
++	};
++	struct hn_conn *c = kzalloc(sizeof(*c), GFP_KERNEL);
++	struct sock *sk;
++	int err;
++
++	if (!c) {
++		wasm_net_end(id, HN_END_RESET);
++		return;
++	}
++	c->id = id;
++	err = sock_create_kern(&init_net, AF_INET, SOCK_STREAM, IPPROTO_TCP, &c->sock);
++	if (err) {
++		kfree(c);
++		wasm_net_end(id, HN_END_RESET);
++		return;
++	}
++	sk = c->sock->sk;
++	sock_set_rcvbuf(sk, HN_RCVBUF);
++	tcp_sock_set_nodelay(sk);
++	write_lock_bh(&sk->sk_callback_lock);
++	sk->sk_user_data = c;
++	c->data_ready = sk->sk_data_ready;
++	c->write_space = sk->sk_write_space;
++	c->state_change = sk->sk_state_change;
++	sk->sk_data_ready = hn_work;
++	sk->sk_write_space = hn_work;
++	sk->sk_state_change = hn_work;
++	write_unlock_bh(&sk->sk_callback_lock);
++	list_add_tail(&c->node, &hn_conns);
++	err = kernel_connect(c->sock, (struct sockaddr_unsized *)&addr, sizeof(addr), O_NONBLOCK);
++	if (err && err != -EINPROGRESS) {
++		hn_reset(c);
++		return;
++	}
++	set_bit(C_WORK, &c->flags);
++}
++
++static int hn_write(struct hn_conn *c, const u8 *data, u32 len)
++{
++	struct kvec vec = { .iov_base = (void *)data, .iov_len = len };
++	struct msghdr msg = { .msg_flags = MSG_DONTWAIT | MSG_NOSIGNAL };
++
++	return kernel_sendmsg(c->sock, &msg, &vec, 1, len);
++}
++
++/* what the socket takes of `data` goes in; the rest waits in a tail and the host is held off */
++static void hostnet_to_guest(struct hn_conn *c, const u8 *data, u32 len)
++{
++	int n = 0;
++
++	if (test_bit(C_UP, &c->flags)) {
++		n = hn_write(c, data, len);
++		if (n == -EAGAIN)
++			n = 0;
++		if (n < 0) {
++			hn_reset(c);
++			return;
++		}
++	}
++	if ((u32)n == len)
++		return;
++	c->wtail = kmemdup(data + n, len - n, GFP_KERNEL);
++	if (!c->wtail) {
++		hn_reset(c);
++		return;
++	}
++	c->wlen = len - n;
++	c->woff = 0;
++	wasm_net_end(c->id, HN_END_HOLD);
++}
++
++static void hn_events(void)
++{
++	struct hn_event *event = &hn_io->event;
++	struct hn_conn *c;
++
++	while (wasm_net_next(event, hn_io->data, HN_BUF)) {
++		if (event->op == HN_OPEN) {
++			hostnet_open(event->id, event->arg);
++			continue;
++		}
++		c = hn_find(event->id);
++		if (!c)
++			continue;
++		if (event->op == HN_DATA)
++			hostnet_to_guest(c, hn_io->data, event->arg);
++		else if (event->op == HN_SHUT) {
++			set_bit(C_FIN_OUT, &c->flags);
++			set_bit(C_WORK, &c->flags);
++		} else if (event->op == HN_ABORT)
++			hostnet_close(c);
++	}
++}
++
++/* the socket's bytes to the host, until the host is full or the socket has nothing more */
++static bool hostnet_to_host(struct hn_conn *c)
++{
++	struct kvec vec = { .iov_base = hn_io->data, .iov_len = HN_BUF };
++	int burst = 0;
++
++	while (burst++ < HN_BURST) {
++		struct msghdr msg = { .msg_flags = MSG_DONTWAIT };
++		int n, sent;
++
++		if (c->rlen) {
++			sent = wasm_net_send(c->id, c->rtail + c->roff, c->rlen - c->roff);
++			if (sent < 0)
++				return false;
++			if (!sent)
++				return true;
++			c->roff += sent;
++			if (c->roff < c->rlen)
++				return true;
++			kfree(c->rtail);
++			c->rtail = NULL;
++			c->rlen = c->roff = 0;
++			continue;
++		}
++		n = kernel_recvmsg(c->sock, &msg, &vec, 1, HN_BUF, MSG_DONTWAIT);
++		if (n == -EAGAIN)
++			return true;
++		if (n < 0)
++			return false;
++		if (!n) {
++			if (!test_and_set_bit(C_RDONE, &c->flags))
++				wasm_net_end(c->id, HN_END_FIN);
++			return true;
++		}
++		sent = wasm_net_send(c->id, hn_io->data, n);
++		if (sent < 0)
++			return false;
++		if (sent < n) {
++			c->rtail = kmemdup(hn_io->data + sent, n - sent, GFP_KERNEL);
++			if (!c->rtail)
++				return false;
++			c->rlen = n - sent;
++			c->roff = 0;
++			return true;
++		}
++	}
++	/* more may be waiting: come back after the other streams */
++	set_bit(C_WORK, &c->flags);
++	hn_poke();
++	return true;
++}
++
++static void hn_service(struct hn_conn *c)
++{
++	struct sock *sk = c->sock->sk;
++
++	if (!test_bit(C_UP, &c->flags)) {
++		if (sk->sk_state == TCP_SYN_SENT || sk->sk_state == TCP_SYN_RECV)
++			return;
++		if (sk->sk_state == TCP_CLOSE) {
++			hn_reset(c);
++			return;
++		}
++		set_bit(C_UP, &c->flags);
++	}
++	if (c->wlen) {
++		int n = hn_write(c, c->wtail + c->woff, c->wlen - c->woff);
++
++		if (n < 0 && n != -EAGAIN) {
++			hn_reset(c);
++			return;
++		}
++		if (n > 0)
++			c->woff += n;
++		if (c->woff == c->wlen) {
++			kfree(c->wtail);
++			c->wtail = NULL;
++			c->wlen = c->woff = 0;
++			wasm_net_end(c->id, HN_END_RELEASE);
++		}
++	}
++	if (!c->wlen && test_bit(C_FIN_OUT, &c->flags) && !test_and_set_bit(C_WDONE, &c->flags))
++		kernel_sock_shutdown(c->sock, SHUT_WR);
++	if (!hostnet_to_host(c)) {
++		hn_reset(c);
++		return;
++	}
++	if (test_bit(C_RDONE, &c->flags) && test_bit(C_WDONE, &c->flags))
++		hostnet_close(c);
++}
++
++static int hn_thread(void *unused)
++{
++	struct hn_conn *c, *next;
++
++	while (!kthread_should_stop()) {
++		set_current_state(TASK_INTERRUPTIBLE);
++		if (!atomic_read(&hn_pending))
++			schedule();
++		__set_current_state(TASK_RUNNING);
++		atomic_xchg(&hn_pending, 0);
++		hn_events();
++		/* ponytail: a walk of every stream per wake; a ready list when streams number in the thousands */
++		list_for_each_entry_safe(c, next, &hn_conns, node)
++			/* the host's interrupt means room in its buffers: a stream holding bytes retries */
++			if (test_and_clear_bit(C_WORK, &c->flags) || c->rlen)
++				hn_service(c);
++		cond_resched();
++	}
++	return 0;
++}
++
++static int hostnet_init(void)
++{
++	struct task_struct *task;
++	int err = 0;
++
++	mutex_lock(&hn_start);
++	if (hn_task)
++		goto out;
++	hn_io = kzalloc(sizeof(*hn_io), GFP_KERNEL);
++	if (!hn_io) {
++		err = -ENOMEM;
++		goto out;
++	}
++	task = kthread_create(hn_thread, NULL, "khostnetd");
++	if (IS_ERR(task)) {
++		err = PTR_ERR(task);
++		goto fail;
++	}
++	hn_task = task;
++	err = request_irq(WASM_IRQ_NET, hostnet_irq, 0, "hostnet", hn_io);
++	if (err) {
++		hn_task = NULL;
++		kthread_stop(task);
++		goto fail;
++	}
++	wake_up_process(task);
++	goto out;
++fail:
++	kfree(hn_io);
++	hn_io = NULL;
++out:
++	mutex_unlock(&hn_start);
++	return err;
++}
++
++/* a program started or stopped listening on `port` (inet_csk_listen_start and _stop) */
++void hostnet_listening(unsigned int port, bool on)
++{
++	if (on && hostnet_init())
++		return;
++	wasm_net_listen(port, on);
++}
+diff --git a/include/linux/hostnet.h b/include/linux/hostnet.h
+new file mode 100644
+index 000000000..f60507181
+--- /dev/null
++++ b/include/linux/hostnet.h
+@@ -0,0 +1,18 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++
++#ifndef _LINUX_HOSTNET_H
++#define _LINUX_HOSTNET_H
++
++#include <linux/types.h>
++
++#ifdef CONFIG_WASM_HOSTNET
++void hostnet_listening(unsigned int port, bool on);
++/* for the host: raise this on the interrupt cpu when it has stream events */
++int wasm_net_irq(void);
++#else
++static inline void hostnet_listening(unsigned int port, bool on)
++{
++}
++#endif
++
++#endif /* _LINUX_HOSTNET_H */
+diff --git a/net/ipv4/inet_connection_sock.c b/net/ipv4/inet_connection_sock.c
+index e961936b6..9352231e0 100644
+--- a/net/ipv4/inet_connection_sock.c
++++ b/net/ipv4/inet_connection_sock.c
+@@ -10,6 +10,7 @@
+  */
+ 
+ #include <linux/module.h>
++#include <linux/hostnet.h>
+ #include <linux/jhash.h>
+ 
+ #include <net/inet_connection_sock.h>
+@@ -1347,8 +1348,10 @@ int inet_csk_listen_start(struct sock *sk)
+ 		sk_dst_reset(sk);
+ 		err = sk->sk_prot->hash(sk);
+ 
+-		if (likely(!err))
++		if (likely(!err)) {
++			hostnet_listening(inet->inet_num, true);
+ 			return 0;
++		}
+ 	}
+ 
+ 	inet_sk_set_state(sk, TCP_CLOSE);
+@@ -1459,6 +1462,8 @@ void inet_csk_listen_stop(struct sock *sk)
+ 	struct request_sock_queue *queue = &icsk->icsk_accept_queue;
+ 	struct request_sock *next, *req;
+ 
++	hostnet_listening(inet_sk(sk)->inet_num, false);
++
+ 	/* Following specs, it would be better either to send FIN
+ 	 * (and enter FIN-WAIT-1, it is normal close)
+ 	 * or to send active reset (abort).
+-- 
+2.43.0
+

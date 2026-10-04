@@ -5,6 +5,7 @@ import { type BootstrapIndex, CHUNK, packImage } from '../src/worker/bootstrap.t
 import { encodeSnapshot } from '../src/worker/durable.ts';
 import { Machine } from '../src/worker/machine/machine.ts';
 import { CMDLINE, MAXIMUM_PAGES, siteOptions } from '../src/worker/site-machine.ts';
+import { routerModules } from './wasm/router-modules.ts';
 
 /**
  * Boots the site's machine from build/kernel, runs it to its shell prompt (then each `--run <line>
@@ -42,6 +43,7 @@ const options = siteOptions(
 		busybox: new WebAssembly.Module(kernel('busybox.async.wasm')),
 		busyboxGuard: new WebAssembly.Module(kernel('busybox.guard.wasm')),
 		katybug: new WebAssembly.Module(kernel('katybug.wasm')),
+		router: routerModules(),
 		initrd: new Uint8Array(kernel('initramfs.bin')),
 		manifest
 	},

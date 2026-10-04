@@ -2,7 +2,9 @@
 #include <arpa/inet.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <linux/sched.h>
 #include <netinet/in.h>
+#include <sched.h>
 #include <signal.h>
 #include <stdio.h>
 #include <string.h>
@@ -11,6 +13,7 @@
 #include <sys/file.h>
 #include <sys/inotify.h>
 #include <sys/mman.h>
+#include <sys/mount.h>
 #include <sys/signalfd.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
@@ -150,6 +153,49 @@ static void io(void) {
     if (names[0]) printf("answered:%s\n", names);
 }
 
+/* cgroup2 (kernel patch 0028): the mount, a child group, a pid moved in and out
+ * of it, and clone3's group file descriptor */
+static void cgroups(void) {
+    char b[128] = {0}, s[16];
+    snprintf(s, sizeof s, "%d", (int) getpid());
+    mkdir("/tmp/cg", 0755);
+    int m = mount("none", "/tmp/cg", "cgroup2", 0, 0);
+    int c = open("/tmp/cg/cgroup.controllers", O_RDONLY);
+    CHECK(
+        "cgroup2 mounts, cgroup.controllers reads",
+        m == 0 && c >= 0 && read(c, b, sizeof b) >= 0
+    );
+    int made = mkdir("/tmp/cg/g", 0755) == 0;
+    CHECK(
+        "cgroup2 child group has cgroup.procs",
+        made && access("/tmp/cg/g/cgroup.procs", F_OK) == 0
+    );
+    int g = open("/tmp/cg/g/cgroup.procs", O_WRONLY);
+    int moved = g >= 0 && write(g, s, strlen(s)) > 0;
+    int p = open("/proc/self/cgroup", O_RDONLY);
+    memset(b, 0, sizeof b);
+    CHECK(
+        "cgroup.procs moves a pid into the group",
+        moved && p >= 0 && read(p, b, sizeof b - 1) > 0 && !strcmp(b, "0::/g\n")
+    );
+    int r = open("/tmp/cg/cgroup.procs", O_WRONLY);
+    CHECK(
+        "the pid moves back and the empty group is removed",
+        r >= 0 && write(r, s, strlen(s)) > 0 && rmdir("/tmp/cg/g") == 0
+    );
+    struct clone_args a = {
+        .flags = CLONE_INTO_CGROUP, .exit_signal = SIGCHLD, .cgroup = -1
+    };
+    long bad = syscall(SYS_clone3, &a, sizeof a);
+    int e1 = errno;
+    a.cgroup = open("/tmp", O_RDONLY | O_DIRECTORY);
+    long notgroup = syscall(SYS_clone3, &a, sizeof a);
+    CHECK(
+        "clone3 CLONE_INTO_CGROUP checks its group descriptor",
+        bad < 0 && e1 == EINVAL && notgroup < 0 && errno == EBADF
+    );
+}
+
 int main(void) {
     int sv[2];
     char b[16] = {0};
@@ -227,5 +273,6 @@ int main(void) {
     );
     memory();
     io();
+    cgroups();
     return 0;
 }

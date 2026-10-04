@@ -12,6 +12,10 @@
 	(import "env" "wasm_start_cpu" (func $startCpu (param i32 i32)))
 	(import "env" "wasm_release_task" (func $release (param i32)))
 	(import "env" "wasm_random_get_bytes" (func $random (param i32 i32) (result i32)))
+	(import "env" "wasm_net_listen" (func $netListen (param i32 i32) (result i32)))
+	(import "env" "wasm_net_next" (func $netNext (param i32 i32 i32) (result i32)))
+	(import "env" "wasm_net_send" (func $netSend (param i32 i32 i32) (result i32)))
+	(import "env" "wasm_net_end" (func $netEnd (param i32 i32)))
 
 	(global $init_task (export "init_task") i32 (i32.const 1))
 	(global $boot_command_line (export "boot_command_line") i32 (i32.const 0x100))
@@ -138,6 +142,9 @@
 						(then (drop (call $create (i32.const 1) (i32.const 3) (i32.const 0x490) (i32.const 0x748) (i32.const 0x74c) (i32.const 0x10000) (i32.const 0)))))
 					(if (i32.eq (i32.load8_u (i32.const 0x600)) (i32.const 117))
 						(then (drop (call $create (i32.const 1) (i32.const 3) (i32.const 0x490) (i32.const 0x700) (i32.const 0x704) (i32.const 0x10000) (i32.const 0)))))
+					;; "l" listens on port 80, as a program's listen() does (kernel patch 0031)
+					(if (i32.eq (i32.load8_u (i32.const 0x600)) (i32.const 108))
+						(then (drop (call $netListen (i32.const 80) (i32.const 1)))))
 					(if (i32.eq (i32.load8_u (i32.const 0x600)) (i32.const 115))
 						(then
 							(drop (call $switch (i32.const 1) (i32.const 2)))
@@ -241,6 +248,11 @@
 	;; kernel patch 0022: the path-query generation at 0x858 and the view at 0x85c
 	(func (export "wasm_fs_gen") (result i32) (i32.load (i32.const 0x858)))
 	(func (export "wasm_fs_view") (result i32) (i32.load (i32.const 0x85c)))
+	;; kernel patch 0029: the mount and chroot count (index -1) at 0x870, else counter i & 0xff at
+	;; 0x1400 + 4 * i
+	(func (export "wasm_fs_gen_at") (param $i i32) (result i32)
+		(if (i32.eq (local.get $i) (i32.const -1)) (then (return (i32.load (i32.const 0x870)))))
+		(i32.load (i32.add (i32.const 0x1400) (i32.shl (i32.and (local.get $i) (i32.const 0xff)) (i32.const 2)))))
 	(data (i32.const 0x85c) "\01")
 	(data (i32.const 0x864) "\05")
 	(func (export "wasm_user_stack_high") (param $at i32) (result i32)
@@ -261,13 +273,26 @@
 	;; clone (220): task 3 makes task 4 and waits for it, as CLONE_VFORK does; returns the child's pid
 	(func (export "wasm_syscall_5") (param $sp i32) (param $tp i32) (param $nr i32)
 		(param $a i32) (param $b i32) (param $c i32) (param $d i32) (param $e i32) (result i32)
-		;; statx (291): the toy file is a regular file of mode 0644 and 5 bytes
-		;; and counts at 0x860, its size at 0x864, with STATX_MNT_ID and mount 0 in its mask
+		(local $len i32)
+		;; statx (291): the toy file is a regular file of mode 0644 and 5 bytes, inode 12, under the
+		;; directories "/toy" (11) and "/" (10), by the length of the path; counts at 0x860, its size
+		;; at 0x864, with STATX_INO, STATX_TYPE and STATX_MNT_ID and mount 0 in its mask
 		(if (i32.eq (local.get $nr) (i32.const 291))
 			(then
 				(i32.store (i32.const 0x860) (i32.add (i32.load (i32.const 0x860)) (i32.const 1)))
+				(loop $length
+					(if (i32.load8_u (i32.add (local.get $b) (local.get $len)))
+						(then
+							(local.set $len (i32.add (local.get $len) (i32.const 1)))
+							(br $length))))
 				(i32.store (local.get $e) (i32.const 0x17ff))
-				(i32.store16 (i32.add (local.get $e) (i32.const 28)) (i32.const 0x81a4))
+				(i64.store (i32.add (local.get $e) (i32.const 32))
+					(select (i64.const 10)
+						(select (i64.const 11) (i64.const 12) (i32.eq (local.get $len) (i32.const 4)))
+						(i32.eq (local.get $len) (i32.const 1))))
+				(i32.store16 (i32.add (local.get $e) (i32.const 28))
+					(select (i32.const 0x41ed) (i32.const 0x81a4)
+						(i32.or (i32.eq (local.get $len) (i32.const 1)) (i32.eq (local.get $len) (i32.const 4)))))
 				(i64.store (i32.add (local.get $e) (i32.const 40)) (i64.extend_i32_u (i32.load (i32.const 0x864))))
 				(i64.store (i32.add (local.get $e) (i32.const 144)) (i64.const 0))
 				(return (i32.const 0))))
@@ -346,11 +371,27 @@
 	(func (export "wasm_restored") (drop (call $random (i32.const 0x1200) (i32.const 32))))
 	;; cpu 1 sleeps on its interrupt word and reports the console's interrupt (2) when the host raises it
 	(func (export "_start_secondary") (param $idle i32)
+		(local $bits i64)
 		(loop $wait
 			(call $idle (i32.const 0x308) (i64.const -1))
-			(if (i64.ne (i64.and (i64.atomic.rmw.xchg (i32.const 0x308) (i64.const 0)) (i64.const 4)) (i64.const 0))
+			(local.set $bits (i64.atomic.rmw.xchg (i32.const 0x308) (i64.const 0)))
+			(if (i64.ne (i64.and (local.get $bits) (i64.const 4)) (i64.const 0))
 				(then (call $say (i32.const 0x550) (i32.const 12))))
+			;; the stream relay's interrupt (3): echo what the host sends and end when it does
+			(if (i64.ne (i64.and (local.get $bits) (i64.const 8)) (i64.const 0))
+				(then (call $netEcho)))
 			(br $wait)))
+	;; the event at 0x1300 (op, id, argument) and its bytes at 0x1310
+	(func $netEcho
+		(loop $next
+			(if (call $netNext (i32.const 0x1300) (i32.const 0x1310) (i32.const 64))
+				(then
+					(if (i32.eq (i32.load (i32.const 0x1300)) (i32.const 2))
+						(then (drop (call $netSend (i32.load (i32.const 0x1304)) (i32.const 0x1310) (i32.load (i32.const 0x1308))))))
+					(if (i32.eq (i32.load (i32.const 0x1300)) (i32.const 3))
+						(then (call $netEnd (i32.load (i32.const 0x1304)) (i32.const 0))))
+					(br $next)))))
+	(func (export "wasm_net_irq") (result i32) (i32.const 3))
 	;; the test has the kernel release the task named at 0x854 when input next arrives
 	(func (export "wasm_console_irq") (result i32)
 		(if (i32.load (i32.const 0x854))

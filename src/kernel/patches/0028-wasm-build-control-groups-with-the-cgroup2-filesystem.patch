@@ -1,0 +1,24 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Gregory Mitchell <me@gmitch215.xyz>
+Date: Sun, 4 Oct 2026 08:00:00 +0000
+Subject: [PATCH] wasm: build control groups with the cgroup2 filesystem
+
+systemd as PID 1 mounts cgroup2 on /sys/fs/cgroup and stops when the
+mount fails. CGROUPS builds kernel/cgroup (cgroup2, cgroup.procs,
+cgroup.controllers, cgroup.kill, cgroup.freeze) and nothing else; no
+controller is enabled.
+---
+ arch/wasm/configs/wasm32_nommu_defconfig | 1 +
+ 1 file changed, 1 insertion(+)
+
+diff --git a/arch/wasm/configs/wasm32_nommu_defconfig b/arch/wasm/configs/wasm32_nommu_defconfig
+--- a/arch/wasm/configs/wasm32_nommu_defconfig
++++ b/arch/wasm/configs/wasm32_nommu_defconfig
+@@ -53,3 +53,4 @@ CONFIG_EPOLL=y
+ CONFIG_FUTEX=y
+ CONFIG_MULTIUSER=y
+ CONFIG_POSIX_TIMERS=y
++CONFIG_CGROUPS=y
+--
+2.43.0
+

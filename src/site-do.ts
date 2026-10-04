@@ -6,12 +6,22 @@ import initrd from '../build/kernel/initramfs.bin';
 import katybug from '../build/kernel/katybug.wasm';
 import manifest from '../build/kernel/manifest.json';
 import vmlinux from '../build/kernel/vmlinux.async.wasm';
+import router from '../build/router/router.wasm';
+import statx from '../build/router/statx.wasm';
 import { bootstrapOf, fits, type BootstrapIndex } from './worker/bootstrap';
 import type { Sql } from './worker/durable';
 import { Keeper, QUANTUM_MS, type Policy } from './worker/keeper';
+import { GatewayTimeout, requestBytes, responseFrom } from './worker/machine/http';
+import type { IngressStream } from './worker/machine/ingress';
 import { claim, verify, type OwnerStore } from './worker/owner';
 import { placement, prime, type PlacementStore } from './worker/placement';
-import { CMDLINE, MAXIMUM_PAGES, siteOptions } from './worker/site-machine';
+import {
+	CMDLINE,
+	MAXIMUM_PAGES,
+	PUBLIC_PORT,
+	SERVE_LIMIT_MS,
+	siteOptions
+} from './worker/site-machine';
 
 export interface Env {
 	MACHINE: DurableObjectNamespace<MachineDO>;
@@ -51,6 +61,7 @@ export class MachineDO extends DurableObject<Env> {
 	private pending = '';
 	private typed = '';
 	private warm = 0;
+	private serving = 0;
 	private readonly instance = crypto.randomUUID();
 
 	constructor(ctx: DurableObjectState, env: Env) {
@@ -71,6 +82,7 @@ export class MachineDO extends DurableObject<Env> {
 							busybox,
 							busyboxGuard,
 							katybug,
+							router: { route: router, statx },
 							initrd: new Uint8Array(initrd),
 							manifest
 						},
@@ -154,7 +166,7 @@ export class MachineDO extends DurableObject<Env> {
 	 * checkpoint; overlapping events join the pump already running, and input typed meanwhile
 	 * reaches the machine as it runs
 	 */
-	private async pump(budgetMs: number, unattended = false) {
+	private async pump(budgetMs: number, unattended = false, wake?: () => boolean) {
 		if (this.pumping) return;
 		this.pumping = true;
 		const started = Date.now();
@@ -175,7 +187,7 @@ export class MachineDO extends DurableObject<Env> {
 						machine.type(this.typed);
 						this.typed = '';
 					}
-					return stop();
+					return stop() || (wake?.() ?? false);
 				},
 				this.keeper.sleeper((ms) => scheduler.wait(Math.min(ms, 50)))
 			);
@@ -185,7 +197,7 @@ export class MachineDO extends DurableObject<Env> {
 			} else if (outcome === 'crashed') {
 				this.send({ t: 'status', d: outcome });
 				this.keeper.crashed();
-			} else {
+			} else if (!wake) {
 				const written = await this.keeper.ran(Date.now() - started, this.warm > 0);
 				if (written) console.log(JSON.stringify({ gmux: 'checkpoint', ...written }));
 				console.log(
@@ -206,6 +218,109 @@ export class MachineDO extends DurableObject<Env> {
 		if (this.typed) await this.pump(INPUT_MS);
 	}
 
+	/**
+	 * runs the machine until `work` settles, a turn at a time: a turn ends when a stream has something
+	 * to read or `work` has settled, so the reader that waits can take it. A pump another request runs
+	 * is waited out; a stream whose reader has room is woken here when its own pull has not
+	 */
+	private async drive<T>(work: Promise<T>): Promise<T> {
+		let settled = false;
+		work.then(
+			() => (settled = true),
+			() => (settled = true)
+		);
+		let quiet = Date.now();
+		while (!settled) {
+			const { machine } = await this.keeper.open();
+			const seen = machine.netActivity;
+			if (this.pumping) {
+				machine.netPoll();
+				await scheduler.wait(2);
+			} else
+				await this.pump(QUANTUM_MS, false, () => {
+					machine.netPoll();
+					// a read that resolved on queued bytes has nothing new to wait for
+					return settled || machine.netActivity !== seen;
+				});
+			if (machine.netActivity !== seen) quiet = Date.now();
+			else if (!settled && Date.now() - quiet > SERVE_LIMIT_MS)
+				throw new GatewayTimeout('the machine did not answer in time');
+		}
+		return work;
+	}
+
+	/** a request outside /_gmux/ goes to whatever listens on the public port, as an ordinary connection */
+	private async serve(request: Request): Promise<Response> {
+		const { machine } = await this.keeper.open();
+		if (!machine.listening(PUBLIC_PORT))
+			return new Response('nothing listens on port 80', {
+				status: 503,
+				headers: { 'retry-after': '1' }
+			});
+		const stream: IngressStream = machine.ingress(PUBLIC_PORT);
+		this.serving++;
+		let over = false;
+		const finish = (clean: boolean) => {
+			if (over) return;
+			over = true;
+			this.serving--;
+			if (clean) stream.end();
+			else stream.abort();
+		};
+		const sent = (async () => {
+			for await (const chunk of requestBytes(request)) await stream.write(chunk);
+		})();
+		sent.catch(() => finish(false));
+		try {
+			const response = await this.drive(
+				responseFrom(stream.readable, request.method, finish)
+			);
+			const reader = response.body?.getReader();
+			if (!reader) return response;
+			// every read of the body drives the machine, so a slow reader slows the guest
+			const body = new ReadableStream<Uint8Array>({
+				pull: async (controller) => {
+					try {
+						const { done, value } = await this.drive(reader.read());
+						if (done) controller.close();
+						else controller.enqueue(value);
+					} catch (error) {
+						finish(false);
+						controller.error(error);
+					}
+					await this.settle();
+				},
+				cancel: async (reason) => {
+					finish(false);
+					await reader.cancel(reason);
+					await this.settle();
+				}
+			});
+			// a body of known length goes out under its Content-Length, as the machine sent it
+			const length = Number(response.headers.get('content-length'));
+			if (!Number.isSafeInteger(length) || response.headers.get('content-length') === null)
+				return new Response(body, response);
+			const { readable, writable } = new FixedLengthStream(length);
+			body.pipeTo(writable).catch(() => finish(false));
+			return new Response(readable, response);
+		} catch (error) {
+			finish(false);
+			return new Response(
+				error instanceof GatewayTimeout
+					? 'gateway timeout'
+					: `bad gateway: ${(error as Error).message}`,
+				{ status: error instanceof GatewayTimeout ? 504 : 502 }
+			);
+		} finally {
+			if (over) await this.settle();
+		}
+	}
+
+	/** the last stream is done: the keeper checkpoints if due and points the alarm */
+	private async settle() {
+		if (this.serving === 0 && !this.pumping) await this.keeper.ran(0, this.warm > 0);
+	}
+
 	override async fetch(request: Request): Promise<Response> {
 		const url = new URL(request.url);
 		// a new object is replaced after its first ~1 s of CPU; spend it before a machine exists
@@ -216,6 +331,7 @@ export class MachineDO extends DurableObject<Env> {
 				{ status: 503, headers: { 'retry-after': '1' } }
 			);
 		}
+		if (!url.pathname.startsWith('/_gmux/')) return this.serve(request);
 		switch (url.pathname) {
 			case '/_gmux/status':
 				return Response.json({

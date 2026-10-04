@@ -1,0 +1,108 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Gregory Mitchell <me@gmitch215.xyz>
+Date: Sun, 4 Oct 2026 12:00:00 -0400
+Subject: [PATCH] wasm: copy a fork child's strings and iovec arrays in one
+ crossing
+
+A fork child's memory is a WebAssembly memory of its own, so every
+access the kernel makes to it is a host call. strncpy_from_user and
+strnlen_user read a byte per get_user when the pointer or the
+destination is not word aligned (this arch does not select
+HAVE_EFFICIENT_UNALIGNED_ACCESS), so a 12-character path crossed 13
+times. copy_iovec_from_user crossed twice per entry.
+
+For such an mm both string functions now make one wasm_user_string
+call, which scans for the NUL in the child's memory, copies the bytes
+(strncpy_from_user) and returns what the generic code returns: the
+length, count when there is no NUL within count, -EFAULT when the
+memory ends first (strnlen_user: the length with the NUL, count + 1,
+0). copy_iovec_from_user fetches the whole array with one
+raw_copy_from_user and checks the lengths as before; when the array is
+not all in the child's memory it takes the field loop, so the order of
+EINVAL and EFAULT is Linux's. Every other mm takes the code it took.
+copy_msghdr_from_user already copies the header in one call.
+---
+ arch/wasm/include/asm/uaccess.h |  8 ++++++++
+ lib/iov_iter.c                  | 12 ++++++++++++
+ lib/strncpy_from_user.c         |  6 ++++++
+ lib/strnlen_user.c              |  5 +++++
+ 4 files changed, 31 insertions(+)
+
+diff --git a/arch/wasm/include/asm/uaccess.h b/arch/wasm/include/asm/uaccess.h
+index 5bdc3b3f5..5e7002c98 100644
+--- a/arch/wasm/include/asm/uaccess.h
++++ b/arch/wasm/include/asm/uaccess.h
+@@ -25,6 +25,14 @@ int wasm_user_range_ok(unsigned long addr, unsigned long size);
+ int wasm_user_private(void);
+ unsigned long wasm_user_copy(void *kaddr, unsigned long uaddr, unsigned long n, int to_user);
+ 
++/*
++ * A string in that memory in one crossing: mode 0 copies up to the NUL or count bytes into kaddr
++ * and returns the length without the NUL (count when there is none), -EFAULT when the memory ends
++ * first; mode 1 copies nothing and returns the length with the NUL, count + 1 when there is none
++ * within count, 0 when the memory ends first.
++ */
++long wasm_user_string(char *kaddr, unsigned long uaddr, unsigned long count, int mode);
++
+ static inline __must_check unsigned long
+ raw_copy_from_user(void *to, const void __user *from, unsigned long n)
+ {
+diff --git a/lib/iov_iter.c b/lib/iov_iter.c
+index 0a63c7fba..bc19d569d 100644
+--- a/lib/iov_iter.c
++++ b/lib/iov_iter.c
+@@ -1274,6 +1274,18 @@ static __noclone int copy_iovec_from_user(struct iovec *iov,
+ {
+ 	int ret = -EFAULT;
+ 
++#ifdef CONFIG_WASM
++	/* a fork child's array in one crossing; a fault falls to the loop below, which fails as before */
++	if (wasm_user_private() && !raw_copy_from_user(iov, uiov, nr_segs * sizeof(*uiov))) {
++		unsigned long i;
++
++		for (i = 0; i < nr_segs; i++)
++			if (unlikely((ssize_t)iov[i].iov_len < 0))
++				return -EINVAL;
++		return 0;
++	}
++#endif
++
+ 	if (!user_access_begin(uiov, nr_segs * sizeof(*uiov)))
+ 		return -EFAULT;
+ 
+diff --git a/lib/strncpy_from_user.c b/lib/strncpy_from_user.c
+index 5bb752ff7..363e8fa6c 100644
+--- a/lib/strncpy_from_user.c
++++ b/lib/strncpy_from_user.c
+@@ -123,6 +123,12 @@ long strncpy_from_user(char *dst, const char __user *src, long count)
+ 	kasan_check_write(dst, count);
+ 	check_object_size(dst, count, false);
+ 
++#ifdef CONFIG_WASM
++	/* a fork child's string is in a memory of its own: one host call, not a crossing per byte */
++	if (wasm_user_private())
++		return wasm_user_string(dst, (unsigned long)src, count, 0);
++#endif
++
+ 	if (can_do_masked_user_access()) {
+ 		long retval;
+ 
+diff --git a/lib/strnlen_user.c b/lib/strnlen_user.c
+index 4a6574b67..ee92b8fe2 100644
+--- a/lib/strnlen_user.c
++++ b/lib/strnlen_user.c
+@@ -96,6 +96,11 @@ long strnlen_user(const char __user *str, long count)
+ 	if (unlikely(count <= 0))
+ 		return 0;
+ 
++#ifdef CONFIG_WASM
++	if (wasm_user_private())
++		return wasm_user_string(NULL, (unsigned long)str, count, 1);
++#endif
++
+ 	if (can_do_masked_user_access()) {
+ 		long retval;
+ 
+-- 
+2.43.0
+

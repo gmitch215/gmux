@@ -1,13 +1,18 @@
+import { coreRegionPages, loadCore, type Core } from './core.ts';
 import { DlProcess, dylinkInfo, type DlMisses, type DlSaved, type DlView } from './dl.ts';
-import { clear, copyIn, copyOut, Domain, EFAULT, READ, WRITE } from './domain.ts';
+import { clear, copyIn, copyOut, Domain, EFAULT, READ, stringLength, WRITE } from './domain.ts';
+import { Ingress, type IngressStream } from './ingress.ts';
 import {
 	MISS,
 	ROUTE_HOOK,
 	ROUTE_KERNEL,
 	ROUTE_WATCH,
 	ROUTE_WRITES,
-	ROUTER,
-	WRITE_CALLS
+	STATX_GUARDS,
+	statxBucket,
+	StatxTable,
+	WRITE_CALLS,
+	type RouterModules
 } from './router.ts';
 
 /** a regular file as a program's fsync left it, or as a restore writes it back */
@@ -22,6 +27,18 @@ export interface SyncedFile {
 	removed?: boolean;
 }
 
+/** one syscall as `countSyscalls` hands it to a function */
+export interface SyscallCall {
+	/** the calling task's runner id */
+	task: number;
+	nr: number;
+	args: number[];
+	/** the kernel's return value, null when the call is reported before it runs */
+	ret: number | null;
+	/** the NUL-terminated string at a user address, in the caller's memory */
+	string(address: number): string;
+}
+
 /**
  * what a machine is built from: the kernel, its initramfs and command line, the programs it may run
  */
@@ -32,6 +49,12 @@ export interface MachineOptions {
 	initrd: Uint8Array;
 	/** the kernel command line; boot without `nohz_full` (see the technical report) */
 	cmdline: string;
+	/**
+	 * `gmux-core.wasm`, compiled (scripts/build-core.sh): the scheduler's idle table and deadline
+	 * minimum run in C over the machine's memory, in pages reserved before the kernel boots. Without
+	 * it the same decisions run in TypeScript
+	 */
+	core?: WebAssembly.Module;
 	/** precompiled user programs keyed by the hex SHA-256 of their bytes */
 	registry: Map<string, WebAssembly.Module>;
 	/**
@@ -112,6 +135,17 @@ export interface MachineOptions {
 	 * kernel. 'verify' asks the kernel every time and counts answers the cache would have got wrong
 	 */
 	syscallCache?: boolean | 'verify';
+	/**
+	 * routes every syscall through the host hook, which counts it by number in `stats.syscalls`; a
+	 * function is also called for each (before it for the calls that may not return, else after). Exact
+	 * counts, but every call pays a host crossing, so a run under it is not timed
+	 */
+	countSyscalls?: boolean | ((call: SyscallCall) => void);
+	/**
+	 * the syscall router and the statx hit path, compiled (`scripts/build-router.sh`); required with
+	 * `fileSync`, `restoreFiles`, `syscallCache` or `countSyscalls`
+	 */
+	router?: RouterModules;
 	/**
 	 * wasm side modules a process asked for that the registry did not hold, by executable hash. Pass
 	 * the same map to the next machine to carry the record across runs
@@ -196,6 +230,8 @@ export interface Snapshot {
 	memory: Uint8Array;
 	/** where the unwind scratch region sat in memory */
 	scratch: number;
+	/** where the C core's region sat in memory, when the machine ran one */
+	core?: number;
 	/** the kernel clock at checkpoint, in nanoseconds as a decimal string */
 	now: string;
 	/** console input not yet read */
@@ -216,6 +252,8 @@ export interface Snapshot {
 	owners?: Uint16Array;
 	/** a program had opened a file with O_DSYNC */
 	syncWrites?: boolean;
+	/** the ports programs listened on (kernel patch 0031), once per listener */
+	ports?: number[];
 }
 
 // asyncify buffers live in linear memory only while a stack unwinds or rewinds
@@ -248,6 +286,11 @@ const SYS_FSYNC = 82;
 const SYS_FDATASYNC = 83;
 const SYS_STATX = 291;
 const STATX_MNT_ID = 0x1000;
+const STATX_TYPE = 0x1;
+const STATX_INO = 0x100;
+const S_IFMT = 0o170000;
+const S_IFDIR = 0o040000;
+const S_IFLNK = 0o120000;
 const SYS_FCNTL = 25;
 const SYS_UNLINKAT = 35;
 const SYS_GETDENTS64 = 61;
@@ -322,6 +365,13 @@ interface Vfork {
 
 type Resume = (value: number) => void;
 
+/** a cpu parked on an interrupt word (an address) until it is raised or a deadline (negative: none) passes */
+interface Idle {
+	word: number;
+	deadline: bigint;
+	runner: Runner;
+}
+
 interface Runner {
 	name: string;
 	instance: WebAssembly.Instance | null;
@@ -329,7 +379,7 @@ interface Runner {
 	resume: Resume | null;
 	/** the value handed to `resume` */
 	value: number;
-	idle: { word: number; deadline: bigint } | null;
+	idle: Idle | null;
 	halted: boolean;
 	kill: boolean;
 	user: {
@@ -358,6 +408,10 @@ interface Runner {
 	/** task globals saved at park, with a shared kernel instance */
 	saved: number[] | null;
 	id: number;
+	/** the runner's place in creation order, which is the order `runners` lists them in */
+	seq: number;
+	/** its entry in the C core's tables, from the first idle wait until it is released */
+	slot: number;
 	entry: Entry;
 	started: boolean;
 	/** which instance's import the stack is parked in */
@@ -462,22 +516,11 @@ function isFault(error: unknown): boolean {
 	return error instanceof RangeError && /call stack size/.test(error.message);
 }
 
-/** a statx the kernel answered, and the generation the answer holds for */
-interface StatxAnswer {
-	view: number;
-	flags: number;
-	mask: number;
-	path: Uint8Array;
-	gen: number;
-	ret: number;
-	bytes: Uint8Array | null;
-}
-
 /**
  * FNV-1a over an absolute path's bytes in `mem` from `at`, with the view, flags and mask folded in;
- * null for a relative or unterminated path
+ * null for a relative or unterminated path. statx.wat's `key` is the same function
  */
-function statxHash(mem: Uint8Array, at: number, view: number, flags: number, mask: number) {
+export function statxHash(mem: Uint8Array, at: number, view: number, flags: number, mask: number) {
 	if (mem[at] !== 0x2f) return null;
 	let h = (0x811c9dc5 ^ view ^ Math.imul(flags, 0x9e3779b1) ^ Math.imul(mask, 0x85ebca6b)) >>> 0;
 	for (let i = at; i < at + 4096 && i < mem.length; i++) {
@@ -486,12 +529,6 @@ function statxHash(mem: Uint8Array, at: number, view: number, flags: number, mas
 		h = Math.imul(h ^ b, 16777619) >>> 0;
 	}
 	return null;
-}
-
-/** whether the NUL-terminated path at `at` is `path` */
-function samePath(mem: Uint8Array, at: number, path: Uint8Array) {
-	for (let i = 0; i < path.length; i++) if (mem[at + i] !== path[i]) return false;
-	return mem[at + path.length] === 0;
 }
 
 class Trap extends Error {
@@ -569,17 +606,33 @@ export interface MachineStats {
 	statxHits: number;
 	statxMisses: number;
 	statxFills: number;
+	/** the fills held on inode counters (kernel patch 0029) and the probes they and the others cost */
+	statxFineFills: number;
+	statxProbes: number;
 	/** with `syscallCache: 'verify'`: answers the cache held that the kernel then contradicted */
 	statxMismatches: number;
+	/** with `countSyscalls`: calls by syscall number */
+	syscalls: Record<number, number>;
 	/** host crossings into a fork child's own memory, and the bytes they moved */
 	userCopies: number;
 	userCopyBytes: number;
+	/** strings read from it in one crossing each (the kernel's strncpy_from_user and strnlen_user), and the bytes copied */
+	userStrings: number;
+	userStringBytes: number;
 	/** files a sync found gone since they were synced, handed to `fileSync` as removed */
 	fileRemovals: number;
 	/** the bytes those handed over */
 	fileSyncBytes: number;
 	/** syncs of a file with no path to name it by (deleted, or not a regular file), passed through */
 	fileSyncsSkipped: number;
+	/** streams opened to the machine's listeners, and the events the relay thread took */
+	netOpens: number;
+	netEvents: number;
+	/** the relay's sends to the host, the bytes it took from the host, the bytes the guest sent, and the sends the host could not take */
+	netSends: number;
+	netBytesIn: number;
+	netBytesOut: number;
+	netBackpressure: number;
 	/** `restoreFiles` written back */
 	filesRestored: number;
 	/** `restoreFiles` the kernel refused, with its error */
@@ -636,15 +689,28 @@ export class Machine {
 		statxHits: 0,
 		statxMisses: 0,
 		statxFills: 0,
+		statxFineFills: 0,
+		statxProbes: 0,
 		statxMismatches: 0,
+		syscalls: {},
 		userCopies: 0,
 		userCopyBytes: 0,
+		userStrings: 0,
+		userStringBytes: 0,
 		fileRemovals: 0,
 		fileSyncBytes: 0,
 		fileSyncsSkipped: 0,
+		netOpens: 0,
+		netEvents: 0,
+		netSends: 0,
+		netBytesIn: 0,
+		netBytesOut: 0,
+		netBackpressure: 0,
 		filesRestored: 0,
 		fileRestoreErrors: []
 	};
+	/** the streams hosts open to the machine's listeners (kernel patch 0031) */
+	private readonly net = new Ingress(this.stats, () => this.raiseNet());
 	/** whether the kernel halted (`reboot`, `poweroff`) */
 	halted = false;
 	/** the error that stopped the machine, if one did */
@@ -670,7 +736,7 @@ export class Machine {
 	/** files handed to `fileSync` since that checkpoint, which a sync reports gone if they are */
 	private readonly syncedPaths = new Set<string>();
 	/** statx answers by a hash of view, flags, mask and path, each with the generation it holds for */
-	private fsCache: Map<number, StatxAnswer> | null = null;
+	private fsCache: StatxTable | null = null;
 
 	/**
 	 * a machine that has not booted; `run` boots it. Its memory starts at `initialPages` 64 KiB
@@ -696,9 +762,37 @@ export class Machine {
 				shared: true
 			});
 		this.cpuZero = this.runner('cpu0', { kind: 'boot' });
-		if (options.fileSync || options.restoreFiles?.length || options.syscallCache)
-			this.route = new WebAssembly.Global({ value: 'i32', mutable: true }, ROUTE_WATCH);
-		if (options.syscallCache) this.fsCache = new Map();
+		if (
+			options.fileSync ||
+			options.restoreFiles?.length ||
+			options.syscallCache ||
+			options.countSyscalls
+		) {
+			if (!options.router)
+				throw new Error(
+					'fileSync, restoreFiles, syscallCache and countSyscalls need MachineOptions.router'
+				);
+			this.route = new WebAssembly.Global(
+				{ value: 'i32', mutable: true },
+				options.countSyscalls ? ROUTE_HOOK : ROUTE_WATCH
+			);
+		}
+		if (options.syscallCache) {
+			// the hit path counts in the table's header
+			const table = (this.fsCache = new StatxTable(options.syscallCache === 'verify'));
+			Object.defineProperties(this.stats, {
+				statxHits: {
+					enumerable: true,
+					get: () => table.hits,
+					set: (count: number) => (table.hits = count)
+				},
+				statxMisses: {
+					enumerable: true,
+					get: () => table.misses,
+					set: (count: number) => (table.misses = count)
+				}
+			});
+		}
 	}
 
 	/** whether a task is ready to run, which a machine with no timer to wait on can still have */
@@ -748,6 +842,8 @@ export class Machine {
 			program: null,
 			saved: null,
 			id: 0,
+			seq: this.seqs++,
+			slot: -1,
 			entry,
 			started: false,
 			where: null,
@@ -834,7 +930,10 @@ export class Machine {
 				self.ready.unshift(target);
 				// released while it ran, or before its last turn: this switch was its last
 				if (me.kill && !me.vfork && !me.vforkOf) {
-					if (self.runners.get(prev) === me) self.runners.delete(prev);
+					if (self.runners.get(prev) === me) {
+						self.unindex(me);
+						self.runners.delete(prev);
+					}
 					const parked = self.park(me);
 					queueMicrotask(() => self.abandon(me));
 					return parked;
@@ -885,7 +984,7 @@ export class Machine {
 				const me = owner();
 				if (me.rewinding) return self.rewound(me);
 				self.stats.idles++;
-				me.idle = { word, deadline: timeout < 0n ? -1n : self.now() + timeout };
+				self.arm(me, word, timeout < 0n ? -1n : self.now() + timeout);
 				if (me.name === `cpu${IRQ_CPU}` && self.irqWord === null) {
 					self.irqWord = word;
 					self.raiseConsole();
@@ -974,6 +1073,21 @@ export class Machine {
 				if (mode === 1) return copyOut(domain, k, u, len);
 				return clear(domain, u, len);
 			},
+			// a string there in one crossing: mode 0 copies it to the kernel and returns its length (or
+			// -EFAULT), mode 1 returns its length with the NUL (or 0); count means no NUL within count
+			wasm_user_string: (kaddr: number, uaddr: number, count: number, mode: number) => {
+				const mem = self.userMemory(owner());
+				if (mem === self.memory) return mode ? 0 : EFAULT;
+				self.stats.userStrings++;
+				const domain = self.domain(mem);
+				const limit = count >>> 0;
+				const len = stringLength(domain, uaddr, limit);
+				if (mode === 1) return len < 0 ? 0 : len < limit ? len + 1 : (limit + 1) | 0;
+				if (len < 0) return EFAULT;
+				const bytes = len < limit ? len + 1 : limit;
+				self.stats.userStringBytes += bytes;
+				return copyIn(domain, kaddr >>> 0, uaddr >>> 0, bytes) ? EFAULT : len;
+			},
 			// futex atomics there: FUTEX_OP_SET, ADD, OR, ANDN, XOR, and 5 for compare-exchange
 			wasm_user_atomic: (
 				op: number,
@@ -1040,7 +1154,13 @@ export class Machine {
 				const n = Math.min(count, self.input.length);
 				if (n > 0) new Uint8Array(self.memory.buffer).set(self.input.splice(0, n), buffer);
 				return n;
-			}
+			},
+			wasm_net_listen: (port: number, on: number) => self.net.listen(port, on !== 0),
+			wasm_net_next: (event: number, buf: number, cap: number) =>
+				self.net.next(self.memory, event, buf, cap),
+			wasm_net_send: (id: number, buf: number, n: number) =>
+				self.net.send(id, new Uint8Array(self.memory.buffer, buf, n)),
+			wasm_net_end: (id: number, how: number) => self.net.end(id, how)
 		};
 	}
 
@@ -1093,6 +1213,7 @@ export class Machine {
 		if (!runner) return;
 		if (runner === this.current) runner.kill = true;
 		else {
+			this.unindex(runner);
 			this.runners.delete(dead);
 			// one still in the ready queue has a turn to take (its final switch); it goes after that
 			if (this.ready.includes(runner)) runner.kill = true;
@@ -1177,6 +1298,8 @@ export class Machine {
 		);
 		// before _start: the kernel grows its RAM to the memory maximum and leaves no room after it
 		if (this.options.asyncify) this.ensureScratch();
+		if (this.options.core)
+			this.startCore(this.memory.grow(coreRegionPages(this.options.core)) * 0x10000);
 		await this.enter(runner, () => WebAssembly.promising(exports._start)(), '_start');
 	}
 
@@ -1236,7 +1359,7 @@ export class Machine {
 		const memoryBase = base(user.dataStart, shareable(user.module));
 		const env = this.userEnv(runner, global, memoryBase, base(user.tableStart));
 		const loader = this.dlProcess(user.dataStart);
-		loader.exe = { hash: user.hash, name: runner.name };
+		loader.exe = { hash: user.hash };
 		const dl = loader.view();
 		Object.assign(env, dl.imports());
 		const instance = this.instantiateUser(runner, env);
@@ -1429,23 +1552,27 @@ export class Machine {
 					this.syscallHook(this.shared ? this.current! : runner, sp, tls, nr, args)
 			);
 		}
-		const router = new WebAssembly.Instance(ROUTER, {
+		const modules = this.options.router!;
+		// the hit path reads the task's memory and the table, and asks the kernel for the view and
+		// the generation
+		const hit = this.fsCache
+			? new WebAssembly.Instance(modules.statx, {
+					env: { user: env.memory as WebAssembly.Memory, table: this.fsCache.memory },
+					kernel: {
+						view: kernel.wasm_fs_view as WebAssembly.ImportValue,
+						gen: kernel.wasm_fs_gen as WebAssembly.ImportValue,
+						// a kernel without patch 0029 has no counters: statxFill then keeps no fine answers
+						at: (kernel.wasm_fs_gen_at ?? (() => 0)) as WebAssembly.ImportValue
+					}
+				}).exports.hit
+			: () => MISS;
+		const router = new WebAssembly.Instance(modules.route, {
 			k: k as WebAssembly.ModuleImports,
 			h: h as WebAssembly.ModuleImports,
-			c: {
-				5: (
-					_sp: number,
-					_tls: number,
-					_nr: number,
-					_dirfd: number,
-					path: number,
-					flags: number,
-					mask: number,
-					buf: number
-				) => this.statxCached(this.shared ? this.current! : runner, path, flags, mask, buf)
-			},
-			m: {
-				route: this.route,
+			c: { 5: hit as WebAssembly.ImportValue },
+			env: {
+				memory: env.memory as WebAssembly.Memory,
+				route: this.route!,
 				cache: new WebAssembly.Global(
 					{ value: 'i32', mutable: false },
 					this.fsCache ? 1 : 0
@@ -1454,6 +1581,31 @@ export class Machine {
 		}).exports;
 		for (let n = 0; n <= 6; n++) env[`__wasm_syscall_${n}`] = router[`s${n}`];
 		return env;
+	}
+
+	private idleRoute(): number {
+		return this.options.countSyscalls
+			? ROUTE_HOOK
+			: this.syncWrites
+				? ROUTE_WRITES
+				: ROUTE_WATCH;
+	}
+
+	private reportCall(me: Runner, nr: number, args: number[], ret: number | null) {
+		const report = this.options.countSyscalls;
+		if (typeof report !== 'function') return;
+		const mem = () => new Uint8Array(this.userMemory(me).buffer);
+		report({
+			task: me.id,
+			nr,
+			args,
+			ret,
+			string: (address) => {
+				const bytes = mem();
+				const at = address >>> 0;
+				return String.fromCharCode(...bytes.subarray(at, bytes.indexOf(0, at)));
+			}
+		});
 	}
 
 	/**
@@ -1480,7 +1632,7 @@ export class Machine {
 					} finally {
 						this.pendingFiles = null;
 						this.applying = null;
-						this.route!.value = this.syncWrites ? ROUTE_WRITES : ROUTE_WATCH;
+						this.route!.value = this.idleRoute();
 					}
 					break;
 				}
@@ -1496,6 +1648,12 @@ export class Machine {
 			else if (sync === SYS_SYNC) await this.syncAll(me, sp, tls);
 			else if (sync === SYS_SYNCFS) await this.syncAll(me, sp, tls, args[0]!);
 			const query = this.fsCache && nr === SYS_STATX ? this.statxQuery(me, args) : null;
+			// execve and the exits may never return
+			const noReturn = nr === 221 || nr === 93 || nr === 94;
+			if (this.options.countSyscalls) {
+				this.stats.syscalls[nr] = (this.stats.syscalls[nr] ?? 0) + 1;
+				if (noReturn) this.reportCall(me, nr, args, null);
+			}
 			const result =
 				Number(
 					await WebAssembly.promising(kernel[`wasm_syscall_${args.length}`])(
@@ -1506,6 +1664,7 @@ export class Machine {
 					)
 				) | 0;
 			if (query) await this.statxFill(me, sp, tls, query, result, args[4]! >>> 0);
+			if (this.options.countSyscalls) this.reportCall(me, nr, args, result);
 			if (result < 0) return result;
 			if (sync === SYS_OPENAT && args[2]! & O_DSYNC) {
 				// ponytail: once set, every write on the machine passes the hook; a per-fd table in
@@ -1554,55 +1713,15 @@ export class Machine {
 		};
 	}
 
-	/**
-	 * the router's plain import for statx: the cached answer, or MISS. It runs on every statx, so it
-	 * hashes the path in place and allocates nothing
-	 */
-	private statxCached(
-		me: Runner,
-		path: number,
-		flags: number,
-		mask: number,
-		buf: number
-	): number {
-		const kernel = this.exp(me);
-		const view = kernel.wasm_fs_view() >>> 0;
-		const domain = this.domain(this.userMemory(me));
-		const mem = domain.bytes();
-		const at = path >>> 0;
-		const hash = view ? statxHash(mem, at, view, flags, mask) : null;
-		const held = hash === null ? undefined : this.fsCache!.get(hash);
-		if (
-			!held ||
-			held.gen !== kernel.wasm_fs_gen() >>> 0 ||
-			held.view !== view ||
-			held.flags !== flags ||
-			held.mask !== mask ||
-			!samePath(mem, at, held.path) ||
-			this.options.syscallCache === 'verify'
-		) {
-			this.stats.statxMisses++;
-			return MISS;
-		}
-		if (held.bytes) {
-			// a buffer outside the memory is the kernel's to refuse with EFAULT
-			if (!domain.holds(buf, held.bytes.length, WRITE)) {
-				this.stats.statxMisses++;
-				return MISS;
-			}
-			mem.set(held.bytes, buf >>> 0);
-		}
-		this.stats.statxHits++;
-		return held.ret;
-	}
-
-	/** the mount id of each view's "/" */
-	private readonly rootMounts = new Map<number, number | null>();
+	/** each view's "/": its mount id and inode number */
+	private readonly rootInfo = new Map<number, { mount: number; ino: number; mode: number }>();
 
 	/**
 	 * keeps the kernel's answer to a statx when nothing changed while it was asked and the lookup
 	 * ended on the root mount (a proc or sysfs answer changes with no timestamp moving). Only answers
-	 * that follow from the path are kept: success, ENOENT and ENOTDIR, never EFAULT
+	 * that follow from the path are kept: success, ENOENT and ENOTDIR, never EFAULT. A kernel with
+	 * patch 0029 holds an answer on the counters of the inodes its path crossed, so a change anywhere
+	 * else leaves it; any other answer holds on the kernel's whole generation
 	 */
 	private async statxFill(
 		me: Runner,
@@ -1614,15 +1733,20 @@ export class Machine {
 	) {
 		const kernel = this.exp(me);
 		const gen = () => Number(kernel.wasm_fs_gen()) >>> 0;
+		const at: ((index: number) => number) | undefined = kernel.wasm_fs_gen_at;
 		if ((result !== 0 && result !== -2 && result !== -20) || gen() !== q.gen) return;
 		const bytes =
 			result === 0 ? new Uint8Array(this.userMemory(me).buffer).slice(buf, buf + 256) : null;
 		// a device, fifo or socket's times move without the generation (kernel patch 0022)
-		const type = bytes ? new DataView(bytes.buffer).getUint16(28, true) & 0o170000 : 0;
-		if (bytes && !(bytes[0]! & 1 && [0o100000, 0o040000, 0o120000].includes(type))) return;
+		const type = bytes ? new DataView(bytes.buffer).getUint16(28, true) & S_IFMT : 0;
+		if (bytes && !(bytes[0]! & 1 && [0o100000, S_IFDIR, S_IFLNK].includes(type))) return;
 		const held = this.fsCache!.get(q.hash);
 		if (
-			held?.gen === q.gen &&
+			held &&
+			(held.guards?.length
+				? Number(at!(-1)) >>> 0 === held.gen &&
+					held.guards.every(([index, value]) => Number(at!(index)) >>> 0 === value)
+				: held.gen === q.gen) &&
 			held.view === q.view &&
 			held.flags === q.flags &&
 			held.mask === q.mask &&
@@ -1632,33 +1756,99 @@ export class Machine {
 		)
 			this.stats.statxMismatches++;
 		// a task's "/" is its root dentry, the view, whatever is mounted over it later
-		let root = this.rootMounts.get(q.view);
-		if (root === undefined) {
-			root = await this.statxMount(me, sp, tls, '/', 0);
-			if (typeof root === 'number') this.rootMounts.set(q.view, root);
+		let root = this.rootInfo.get(q.view);
+		if (!root) {
+			const probe = await this.statxProbe(me, sp, tls, '/', 0);
+			if (!probe) return;
+			this.rootInfo.set(q.view, (root = probe));
 		}
-		let mount: number | null | undefined =
-			bytes && new DataView(bytes.buffer).getUint32(0, true) & STATX_MNT_ID
-				? Number(new DataView(bytes.buffer).getBigUint64(144, true))
-				: undefined;
-		if (bytes && mount === undefined)
-			mount = await this.statxMount(me, sp, tls, q.name, q.flags);
-		// a missing path: the nearest ancestor that exists holds the lookup's last mount
-		for (let p = q.name; mount === undefined && p !== '/';) {
-			p = p.slice(0, p.lastIndexOf('/')) || '/';
-			mount = await this.statxMount(me, sp, tls, p, 0);
+		const inos = at ? await this.statxChain(me, sp, tls, q, result, root) : null;
+		if (!inos) {
+			let mount: number | null | undefined =
+				bytes && new DataView(bytes.buffer).getUint32(0, true) & STATX_MNT_ID
+					? Number(new DataView(bytes.buffer).getBigUint64(144, true))
+					: undefined;
+			if (bytes && mount === undefined) {
+				const probe = await this.statxProbe(me, sp, tls, q.name, q.flags);
+				mount = probe ? probe.mount : probe;
+			}
+			// a missing path: the nearest ancestor that exists holds the lookup's last mount
+			for (let p = q.name; mount === undefined && p !== '/';) {
+				p = p.slice(0, p.lastIndexOf('/')) || '/';
+				const probe = await this.statxProbe(me, sp, tls, p, 0);
+				mount = probe ? probe.mount : probe;
+			}
+			if (mount !== root.mount) return;
 		}
-		if (root == null || mount !== root || gen() !== q.gen) return;
-		const { view, flags, mask, path, gen: at } = q;
-		this.fsCache!.set(q.hash, { view, flags, mask, path, gen: at, ret: result, bytes });
-		this.stats.statxFills++;
+		// the counters are read with nothing awaited between them and the generation check
+		const guards = inos
+			? [...new Set(inos.map(statxBucket))].map((b): [number, number] => [
+					b,
+					Number(at!(b)) >>> 0
+				])
+			: undefined;
+		const stamp = inos ? Number(at!(-1)) >>> 0 : q.gen;
+		if (gen() !== q.gen) return;
+		const { view, flags, mask, path } = q;
+		if (
+			this.fsCache!.set(q.hash, {
+				view,
+				flags,
+				mask,
+				path,
+				gen: stamp,
+				guards,
+				ret: result,
+				bytes
+			})
+		) {
+			this.stats.statxFills++;
+			if (inos) this.stats.statxFineFills++;
+		}
 	}
 
 	/**
-	 * the mount id of `path` by a statx the hook makes below the task's stack pointer; undefined when
-	 * the path does not resolve, null when the answer cannot be had
+	 * the inode numbers of the root and of every prefix of the lookup's path, when an answer about it
+	 * depends on nothing else: no `.` or `..`, no symlink to follow, every prefix on the root mount
+	 * and few enough to guard. A missing path ends at the last prefix that exists, a file with more
+	 * path after it at that file. Null otherwise
 	 */
-	private async statxMount(me: Runner, sp: number, tls: number, path: string, flags: number) {
+	private async statxChain(
+		me: Runner,
+		sp: number,
+		tls: number,
+		q: NonNullable<ReturnType<Machine['statxQuery']>>,
+		result: number,
+		root: { mount: number; ino: number }
+	) {
+		const parts = q.name.split('/').filter(Boolean);
+		if (parts.some((part) => part === '.' || part === '..') || parts.length >= STATX_GUARDS)
+			return null;
+		const inos = [root.ino];
+		for (let i = 1; i <= parts.length; i++) {
+			const path = `/${parts.slice(0, i).join('/')}`;
+			const probe = await this.statxProbe(me, sp, tls, path, AT_SYMLINK_NOFOLLOW);
+			if (probe === undefined) return result === -2 ? inos : null;
+			if (probe === null || probe.mount !== root.mount) return null;
+			inos.push(probe.ino);
+			const kind = probe.mode & S_IFMT;
+			const last = i === parts.length;
+			if (
+				kind === S_IFLNK &&
+				!(last && q.flags & AT_SYMLINK_NOFOLLOW && !q.name.endsWith('/'))
+			)
+				return null;
+			if (kind !== S_IFDIR && !last) return result === -20 ? inos : null;
+		}
+		return result === -2 ? null : inos;
+	}
+
+	/**
+	 * mount id, inode number and mode of `path` by a statx the hook makes below the task's stack
+	 * pointer; undefined when the path does not resolve, null when the answer cannot be had
+	 */
+	private async statxProbe(me: Runner, sp: number, tls: number, path: string, flags: number) {
+		this.stats.statxProbes++;
 		const at = (sp - 8192) & ~15;
 		const low = Number(this.exp(me).wasm_user_stack_low?.(sp) ?? 0) >>> 0;
 		if (at < low) return null;
@@ -1667,11 +1857,16 @@ export class Machine {
 		mem[at + path.length] = 0;
 		const statx = at + 4608;
 		// the region is free stack; a signal frame the call might push goes below it
-		const r = await this.sys(me, at, tls, SYS_STATX, AT_FDCWD, at, flags, STATX_MNT_ID, statx);
+		const mask = STATX_MNT_ID | STATX_INO | STATX_TYPE;
+		const r = await this.sys(me, at, tls, SYS_STATX, AT_FDCWD, at, flags, mask, statx);
 		if (r === -2 || r === -20) return undefined;
 		const view = new DataView(this.userMemory(me).buffer);
-		if (r < 0 || !(view.getUint32(statx, true) & STATX_MNT_ID)) return null;
-		return Number(view.getBigUint64(statx + 144, true));
+		if (r < 0 || (view.getUint32(statx, true) & mask) !== mask) return null;
+		return {
+			mount: Number(view.getBigUint64(statx + 144, true)),
+			ino: view.getUint32(statx + 32, true),
+			mode: view.getUint16(statx + 28, true)
+		};
 	}
 
 	/** a synchronous-looking kernel call in the task's context, which may park it */
@@ -2736,6 +2931,9 @@ export class Machine {
 		// ponytail: a fork child's own memory is not in the snapshot yet
 		if (this.privateMemories.size)
 			throw new Error('checkpoint: fork children with their own memory are not saved yet');
+		// ponytail: a stream is a socket in the kernel and queues here; closing them at a checkpoint is part 2
+		if (this.net.open)
+			throw new Error('checkpoint: streams are open to the machine and are not saved');
 		// ponytail: shared instances hold one process's values at a time; saving each runner's
 		// set and rebuilding the template on restore would lift this
 		if (this.sharedPrograms.size)
@@ -2870,6 +3068,7 @@ export class Machine {
 			version: 1,
 			memory: new Uint8Array(this.memory.buffer),
 			scratch: this.scratch,
+			core: this.coreBase || undefined,
 			now: String(now),
 			input: [...this.input],
 			ready: this.ready.map((r) => r.id),
@@ -2886,7 +3085,8 @@ export class Machine {
 				.filter((d) => d.libs.length || d.slots.length)
 				.map((d) => d.save()),
 			owners,
-			syncWrites: this.syncWrites || undefined
+			syncWrites: this.syncWrites || undefined,
+			ports: this.net.listeners
 		};
 	}
 
@@ -2980,7 +3180,15 @@ export class Machine {
 		);
 		machine.stats.filledPages = 0;
 		machine.input = [...snapshot.input];
+		machine.net.restore(snapshot.ports);
 		machine.scratch = snapshot.scratch;
+		if (options.core) {
+			if (snapshot.core === undefined)
+				throw new Error(
+					'restore: the snapshot has no core region; restore without options.core'
+				);
+			machine.startCore(snapshot.core);
+		}
 		machine.instantiate(machine.cpuZero);
 		for (const saved of snapshot.dl ?? []) machine.dlProcess(saved.dataStart).load(saved);
 		const now = machine.now();
@@ -3022,6 +3230,7 @@ export class Machine {
 			runner.signal = saved.signal ?? null;
 			if (!saved.released) machine.runners.set(saved.id, runner);
 		}
+		machine.reindexIdle();
 		for (const [i, saved] of snapshot.runners.entries()) {
 			const runner = made[i]!;
 			const entry = saved.entry;
@@ -3123,34 +3332,198 @@ export class Machine {
 		this.stats.consoleRaises++;
 	}
 
+	/** changes whenever a stream gains something to read or its guest end closes, which a pump waiting on a stream can end its turn at */
+	get netActivity(): number {
+		return this.net.activity;
+	}
+
+	/** raises the relay's interrupt for any stream that has room again; the site calls it between steps */
+	netPoll() {
+		this.net.poll();
+	}
+
+	/** streams opened to the machine's listeners that are not finished with */
+	get openStreams(): number {
+		return this.net.open;
+	}
+
+	/** whether a program in the machine listens on `port` (kernel patch 0031) */
+	listening(port: number): boolean {
+		return this.net.listening(port);
+	}
+
+	/**
+	 * opens a stream to the program listening on `port`: the kernel connects a socket to it and the
+	 * program accepts an ordinary connection. Throws when nothing listens there
+	 */
+	ingress(port: number): IngressStream {
+		return this.net.connect(port);
+	}
+
+	/** kernel patch 0031: the relay thread is woken by an interrupt, as the console is */
+	private raiseNet() {
+		if (!this.cpuZero.instance) return;
+		const irq = this.exp(this.cpuZero).wasm_net_irq?.();
+		if (irq === undefined) return;
+		const cpu = [...this.runners.values()].find((r) => r.name === `cpu${IRQ_CPU}`);
+		const word = cpu?.idle?.word ?? this.irqWord;
+		if (word === null) return;
+		Atomics.or(new BigInt64Array(this.memory.buffer), word / 8, 1n << BigInt(irq));
+	}
+
 	/** the interrupt cpu's pending-interrupt word, once it has idled */
 	private irqWord: number | null = null;
 
-	/** an idle cpu whose interrupt word is raised; with `timers`, also one whose deadline passed */
-	private pickIdle(timers: boolean): Runner | null {
-		const words = new BigInt64Array(this.memory.buffer);
-		const now = timers ? this.now() : 0n;
-		for (const runner of this.runners.values()) {
-			if (!runner.idle || runner.halted) continue;
-			if (words[runner.idle.word / 8] !== 0n) return runner;
-			if (timers && runner.idle.deadline >= 0n && runner.idle.deadline <= now) return runner;
+	// #region idle cpus
+	/** cpus parked on an interrupt word or a timer, in the order `runners` lists them */
+	private readonly idlers: Runner[] = [];
+	/**
+	 * the waits that have a deadline, earliest first (a binary heap); one whose cpu has woken or
+	 * waited again is skipped when it reaches the top
+	 */
+	private readonly timers: Idle[] = [];
+	private words = new Int32Array(0);
+	private wordsOf: ArrayBufferLike | null = null;
+	private seqs = 0;
+	private core: Core | null = null;
+	/** where the core's region starts in memory, or 0 */
+	private coreBase = 0;
+	/** the runners the core's tables name, by slot */
+	private readonly slots: Runner[] = [];
+
+	/** starts the C core over the pages at `base`, which the machine reserved before the kernel booted */
+	private startCore(base: number) {
+		this.coreBase = base;
+		this.core = loadCore(this.options.core!, this.memory, base);
+	}
+
+	/** tables for the idle cpus a restore brought back, in the order `runners` lists them */
+	private reindexIdle() {
+		for (const runner of this.runners.values())
+			if (runner.idle) this.arm(runner, runner.idle.word, runner.idle.deadline);
+	}
+
+	/** parks a cpu on `word` (an address) until it is raised or `deadline` passes; negative: no deadline */
+	private arm(runner: Runner, word: number, deadline: bigint) {
+		if (runner.idle) this.unindex(runner);
+		const idle: Idle = { word, deadline, runner };
+		runner.idle = idle;
+		const core = this.core;
+		if (core) {
+			if (runner.slot < 0) {
+				runner.slot = this.slots.length;
+				this.slots.push(runner);
+			}
+			if (core.core_idle(runner.slot, runner.seq, word, deadline) < 0)
+				throw new Error('core: the idle table is full');
+			return;
+		}
+		const list = this.idlers;
+		let at = list.push(runner) - 1;
+		for (; at > 0 && list[at - 1]!.seq > runner.seq; at--) list[at] = list[at - 1]!;
+		list[at] = runner;
+		if (deadline < 0n) return;
+		// waits that woke by their word leave their entries behind until they surface
+		if (this.timers.length > 4 * list.length + 64) {
+			const live = this.timers.filter((t) => t.runner.idle === t);
+			this.timers.length = 0;
+			for (const t of live) this.pushTimer(t);
+		}
+		this.pushTimer(idle);
+	}
+
+	private pushTimer(idle: Idle) {
+		const timers = this.timers;
+		let at = timers.push(idle) - 1;
+		while (at > 0) {
+			const parent = (at - 1) >> 1;
+			if (timers[parent]!.deadline <= idle.deadline) break;
+			timers[at] = timers[parent]!;
+			at = parent;
+		}
+		timers[at] = idle;
+	}
+
+	/** the earliest deadline among the cpus still waiting, or null */
+	private soonest(): bigint | null {
+		const timers = this.timers;
+		while (timers.length && timers[0]!.runner.idle !== timers[0]) {
+			const last = timers.pop()!;
+			if (!timers.length) break;
+			let at = 0;
+			for (;;) {
+				let child = 2 * at + 1;
+				if (child >= timers.length) break;
+				if (
+					child + 1 < timers.length &&
+					timers[child + 1]!.deadline < timers[child]!.deadline
+				)
+					child++;
+				if (last.deadline <= timers[child]!.deadline) break;
+				timers[at] = timers[child]!;
+				at = child;
+			}
+			timers[at] = last;
+		}
+		return timers.length ? timers[0]!.deadline : null;
+	}
+
+	/** takes a runner out of the idle tables */
+	private unindex(runner: Runner) {
+		if (!runner.idle) return;
+		if (this.core) {
+			if (runner.slot >= 0) this.core.core_cancel(runner.slot);
+		} else {
+			const at = this.idlers.indexOf(runner);
+			if (at >= 0) this.idlers.splice(at, 1);
+		}
+		runner.idle = null;
+	}
+
+	/** the first cpu, in `runners` order, whose interrupt word is raised or whose deadline passed */
+	private pickIdle(): Runner | null {
+		const now = this.now();
+		if (this.core) {
+			const slot = this.core.core_pick(now);
+			if (slot < 0) return null;
+			const picked = this.slots[slot]!;
+			picked.idle = null;
+			return picked;
+		}
+		const list = this.idlers;
+		if (!list.length) return null;
+		const buffer = this.memory.buffer;
+		if (this.wordsOf !== buffer) {
+			this.words = new Int32Array(buffer);
+			this.wordsOf = buffer;
+		}
+		const words = this.words;
+		const next = this.soonest();
+		const due = next !== null && next <= now;
+		for (let i = 0; i < list.length; i++) {
+			const runner = list[i]!;
+			if (runner.halted) continue;
+			const idle = runner.idle!;
+			const at = idle.word >> 2;
+			if (
+				words[at] !== 0 ||
+				words[at + 1] !== 0 ||
+				(due && idle.deadline >= 0n && idle.deadline <= now)
+			) {
+				list.splice(i, 1);
+				runner.idle = null;
+				return runner;
+			}
 		}
 		return null;
 	}
 
 	private nextDeadline(): bigint | null {
-		let soonest: bigint | null = null;
-		for (const runner of this.runners.values()) {
-			if (
-				runner.idle &&
-				runner.idle.deadline >= 0n &&
-				(soonest === null || runner.idle.deadline < soonest)
-			) {
-				soonest = runner.idle.deadline;
-			}
-		}
-		return soonest;
+		if (!this.core) return this.soonest();
+		const deadline = this.core.core_deadline();
+		return deadline < 0n ? null : deadline;
 	}
+	// #endregion
 
 	/**
 	 * Runs the machine until `until` says stop, or nothing can run and no timer is armed.
@@ -3186,7 +3559,7 @@ export class Machine {
 			// idle cpus with a raised interrupt or a due timer go first, or a spinner starves them
 			if (steps % (this.options.yieldEvery ?? 2000) === 0) await sleep(0);
 			this.clock = this.now() + (this.options.stepNs ?? 50_000n);
-			let next = this.pickIdle(true);
+			let next = this.pickIdle();
 			if (next) next.idle = null;
 			else next = this.ready.shift() ?? null;
 			if (!next) {
@@ -3212,9 +3585,7 @@ export class Machine {
 					? ROUTE_KERNEL
 					: this.pendingFiles || this.applying
 						? ROUTE_HOOK
-						: this.syncWrites
-							? ROUTE_WRITES
-							: ROUTE_WATCH;
+						: this.idleRoute();
 			if (next.saved) {
 				this.taskGlobals.forEach((g, i) => (g.value = next.saved![i]));
 				next.saved = null;

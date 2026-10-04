@@ -10,11 +10,6 @@ export default {
 		if (url.pathname === '/_gmux/term' || url.pathname === '/_gmux/term/') {
 			return env.ASSETS.fetch(new URL('/_gmux/term/index.html', url));
 		}
-		if (url.pathname.startsWith('/_gmux/'))
-			return env.MACHINE.get(env.MACHINE.idFromName(MACHINE)).fetch(request);
-		return new Response(
-			'gmux: this machine serves no site yet; the terminal is at /_gmux/term',
-			{ status: 503 }
-		);
+		return env.MACHINE.get(env.MACHINE.idFromName(MACHINE)).fetch(request);
 	}
 } satisfies ExportedHandler<Env>;

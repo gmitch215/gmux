@@ -6,8 +6,11 @@ import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
 import { uleb } from '../../scripts/wasm/binary.ts';
 import { stub } from '../../scripts/wasm/exec-stubs.ts';
+import { routerModules } from '../../scripts/wasm/router-modules.ts';
+import { Ingress, READ_BUFFER, type NetStats } from '../../src/worker/machine/ingress.ts';
 import {
 	Machine,
+	statxHash,
 	stubHash,
 	type MachineOptions,
 	type SyncedFile
@@ -18,8 +21,11 @@ import {
 	ROUTE_KERNEL,
 	ROUTE_WATCH,
 	ROUTE_WRITES,
-	ROUTER
+	STATX_GUARDS,
+	statxBucket
 } from '../../src/worker/machine/router.ts';
+
+const ROUTER = routerModules();
 
 const PARK_IMPORTS = [
 	'wasm_serialize_tasks',
@@ -128,6 +134,7 @@ function rig(options: Partial<MachineOptions> = {}) {
 		sha256: (bytes) => String.fromCharCode(bytes[0] ?? 0),
 		now: () => clock.ns,
 		write: (text) => (output += text),
+		router: ROUTER,
 		...options
 	};
 	const sleep = async (ms: number) => {
@@ -906,6 +913,42 @@ describe('Machine', () => {
 		});
 	});
 
+	describe('syscall counting', () => {
+		const counted = async (countSyscalls: MachineOptions['countSyscalls']) => {
+			const r = rig({
+				sharedKernel: true,
+				registry: new Map([['Y', toyUser('toy-sync.wat')]]),
+				countSyscalls
+			});
+			const machine = new Machine(r.machineOptions);
+			await r.run(machine, () => r.output().includes('parent ok'));
+			machine.type('y');
+			await r.run(machine, () => r.output().includes('user back'));
+			return machine;
+		};
+
+		it('counts every call of a program by number and still reaches the kernel', async () => {
+			const machine = await counted(true);
+			// toy-sync.wat: fsync, fdatasync, then calls 2 and 4
+			expect(machine.stats.syscalls).toMatchObject({ 82: 1, 83: 1, 2: 1, 4: 1 });
+			const word = new DataView(machine.memory.buffer).getUint32(0x830, true);
+			expect(word).toBe(2);
+		});
+
+		it('hands a function each call with its arguments and what the kernel returned', async () => {
+			const calls: [number, number[], number | null][] = [];
+			await counted((call) => calls.push([call.nr, call.args, call.ret]));
+			const sync = calls.filter(([nr]) => nr === 82);
+			expect(sync).toEqual([[82, [3], expect.any(Number)]]);
+			expect(calls.every(([, , ret]) => ret !== null)).toBe(true);
+		});
+
+		it('counts nothing without the option', async () => {
+			const machine = await counted(undefined);
+			expect(machine.stats.syscalls).toEqual({});
+		});
+	});
+
 	describe('file syncs', () => {
 		const word = (m: Machine, at: number) => new DataView(m.memory.buffer).getUint32(at, true);
 
@@ -1013,20 +1056,31 @@ describe('Machine', () => {
 		});
 
 		describe('statx cache', () => {
-			const statxRig = (syscallCache: true | 'verify') => {
+			// without counters the toy kernel is one with patch 0022 only
+			const statxRig = (syscallCache: true | 'verify', counters = true) => {
 				const r = rig({
 					sharedKernel: true,
 					syscallCache,
 					registry: new Map([['T', toyUser('toy-statx.wat')]])
 				});
 				const machine = new Machine(r.machineOptions);
+				if (!counters) {
+					const exp = (machine as any).exp.bind(machine);
+					(machine as any).exp = (runner: unknown) => ({
+						...exp(runner),
+						wasm_fs_gen_at: undefined
+					});
+				}
 				const set = (at: number, v: number) =>
 					new DataView(machine.memory.buffer).setUint32(at, v, true);
 				return { r, machine, set };
 			};
+			// the toy kernel's counter of an inode number, and its mount count
+			const counter = (ino: number) => 0x1400 + (statxBucket(ino) & 0xff) * 4;
+			const MOUNTS = 0x870;
 
 			it('answers a repeated absolute statx from the host until the generation moves', async () => {
-				const { r, machine, set } = statxRig(true);
+				const { r, machine, set } = statxRig(true, false);
 				await r.run(machine, () => r.output().includes('parent ok'));
 				machine.type('t');
 				await r.run(machine, () => r.output().includes('handled'));
@@ -1045,7 +1099,153 @@ describe('Machine', () => {
 					statxHits: 2,
 					statxMisses: 3,
 					statxFills: 2,
+					statxFineFills: 0,
 					statxMismatches: 0
+				});
+			});
+
+			it('holds an answer on the inodes its path crossed, and not on the generation', async () => {
+				const { r, machine, set } = statxRig(true);
+				await r.run(machine, () => r.output().includes('parent ok'));
+				machine.type('t');
+				await r.run(machine, () => r.output().includes('handled'));
+				// the kernel's answer, the probes of "/", "/toy" and "/toy/file", and the relative path
+				expect(word(machine, 0x860)).toBe(5);
+				expect(machine.stats).toMatchObject({
+					statxHits: 1,
+					statxMisses: 2,
+					statxFills: 1,
+					statxFineFills: 1,
+					statxProbes: 3
+				});
+				// the toy's view is 1, and the program asks with no flags and the basic mask
+				const hash = statxHash(new Uint8Array(machine.memory.buffer), 0x750, 1, 0, 0x7ff)!;
+				const held = (machine as any).fsCache.get(hash);
+				expect(held.guards.map(([index]: number[]) => index)).toEqual(
+					[10, 11, 12].map(statxBucket)
+				);
+				// a write anywhere, and a change to an inode that is not on the path
+				set(0x858, 7);
+				set(counter(99), 1);
+				machine.type('r');
+				await r.run(machine, () => r.output().includes('user back'));
+				expect(word(machine, 0x860)).toBe(5);
+				expect(machine.stats).toMatchObject({
+					statxHits: 3,
+					statxMisses: 2,
+					statxFills: 1,
+					statxMismatches: 0
+				});
+			});
+
+			it.each([
+				['the file', () => counter(12)],
+				['a directory above it', () => counter(11)],
+				['the root', () => counter(10)],
+				['the mount tree', () => MOUNTS]
+			])('refills an answer once a counter of %s moves', async (_name, at) => {
+				const { r, machine, set } = statxRig(true);
+				await r.run(machine, () => r.output().includes('parent ok'));
+				machine.type('t');
+				await r.run(machine, () => r.output().includes('handled'));
+				set(at(), 1);
+				machine.type('r');
+				await r.run(machine, () => r.output().includes('user back'));
+				// the kernel's answer and the probes of "/toy" and "/toy/file" (the root's was kept)
+				expect(word(machine, 0x860)).toBe(8);
+				expect(machine.stats).toMatchObject({
+					statxHits: 2,
+					statxMisses: 3,
+					statxFills: 2,
+					statxFineFills: 2,
+					statxProbes: 5
+				});
+			});
+
+			describe('the inodes a lookup depends on', () => {
+				const DIR = 0o040755;
+				const FILE = 0o100644;
+				const LINK = 0o120777;
+				const AT_SYMLINK_NOFOLLOW = 0x100;
+				const root = { mount: 1, ino: 2, mode: DIR };
+				type Probe = { mount: number; ino: number; mode: number } | undefined | null;
+				// what a statx of each prefix answers: a directory or file, a symlink, none, or an error
+				const entry = (ino: number, mode = DIR, mount = 1): Probe => ({ mount, ino, mode });
+				const chain = (
+					name: string,
+					result: number,
+					probes: Record<string, Probe>,
+					flags = AT_SYMLINK_NOFOLLOW
+				) => {
+					const asked: string[] = [];
+					const host = {
+						statxProbe: async (_m: unknown, _s: number, _t: number, path: string) => {
+							asked.push(path);
+							return probes[path];
+						}
+					};
+					const walk = (Machine.prototype as any).statxChain as Function;
+					return walk
+						.call(host, null, 0, 0, { name, flags }, result, root)
+						.then((inos: number[] | null) => ({ inos, asked }));
+				};
+				const tree = {
+					'/usr': entry(3),
+					'/usr/lib': entry(4),
+					'/usr/lib/x': entry(5, FILE),
+					'/usr/link': entry(6, LINK),
+					'/usr/file': entry(7, FILE)
+				};
+
+				it('is the root and each prefix of the path', async () => {
+					expect(await chain('/usr/lib/x', 0, tree)).toEqual({
+						inos: [2, 3, 4, 5],
+						asked: ['/usr', '/usr/lib', '/usr/lib/x']
+					});
+					expect((await chain('/', 0, tree)).inos).toEqual([2]);
+					expect((await chain('//usr//lib/', 0, tree)).inos).toEqual([2, 3, 4]);
+				});
+
+				it('ends at the last prefix that exists for a missing path', async () => {
+					expect((await chain('/usr/lib/none', -2, tree)).inos).toEqual([2, 3, 4]);
+					expect((await chain('/usr/none/deeper', -2, tree)).inos).toEqual([2, 3]);
+					// the kernel said missing and every prefix is there: not an answer to hold
+					expect((await chain('/usr/lib/x', -2, tree)).inos).toBeNull();
+					// and the kernel found it where a prefix is missing
+					expect((await chain('/usr/none', 0, tree)).inos).toBeNull();
+				});
+
+				it('ends at a file that has more path after it, or a slash', async () => {
+					expect((await chain('/usr/file/x', -20, tree)).inos).toEqual([2, 3, 7]);
+					expect((await chain('/usr/file/', -20, tree)).inos).toEqual([2, 3, 7]);
+					expect((await chain('/usr/file/x', 0, tree)).inos).toBeNull();
+				});
+
+				it('gives up on a dot, a dotdot or a symlink it would follow', async () => {
+					expect((await chain('/usr/../usr/lib', 0, tree)).inos).toBeNull();
+					expect((await chain('/usr/./lib', 0, tree)).inos).toBeNull();
+					expect((await chain('/usr/link/x', 0, tree)).inos).toBeNull();
+					expect((await chain('/usr/link', 0, tree, 0)).inos).toBeNull();
+					expect((await chain('/usr/link/', 0, tree)).inos).toBeNull();
+					// a final symlink asked about itself is an inode like another
+					expect((await chain('/usr/link', 0, tree)).inos).toEqual([2, 3, 6]);
+				});
+
+				it('gives up on another mount, an unanswered prefix or too long a path', async () => {
+					expect(
+						(await chain('/usr/lib', 0, { ...tree, '/usr/lib': entry(4, DIR, 9) })).inos
+					).toBeNull();
+					expect(
+						(await chain('/usr/lib', 0, { ...tree, '/usr/lib': null })).inos
+					).toBeNull();
+					const deep = (parts: number) => {
+						const probes: Record<string, Probe> = {};
+						let path = '';
+						for (let i = 1; i <= parts; i++) probes[(path += `/d${i}`)] = entry(10 + i);
+						return chain(path, 0, probes);
+					};
+					expect((await deep(STATX_GUARDS - 1)).inos).toHaveLength(STATX_GUARDS);
+					expect((await deep(STATX_GUARDS)).inos).toBeNull();
 				});
 			});
 
@@ -1055,7 +1255,16 @@ describe('Machine', () => {
 				machine.type('t');
 				await r.run(machine, () => r.output().includes('handled'));
 				const me = [...(machine as any).runners.values()].find((x: any) => x.instance);
-				const ask = (buf: number) => (machine as any).statxCached(me, 0x750, 0, 0x7ff, buf);
+				const kernel = (machine as any).exp(me);
+				const hit = new WebAssembly.Instance(ROUTER.statx, {
+					env: { user: machine.memory, table: (machine as any).fsCache.memory },
+					kernel: {
+						view: kernel.wasm_fs_view,
+						gen: kernel.wasm_fs_gen,
+						at: kernel.wasm_fs_gen_at
+					}
+				}).exports.hit as (...args: number[]) => number;
+				const ask = (buf: number) => hit(0, 0, 291, -100, 0x750, 0, 0x7ff, buf);
 				const size = machine.memory.buffer.byteLength;
 				expect(ask(0x3000)).toBe(0);
 				expect(ask(size - 255)).toBe(MISS);
@@ -1105,7 +1314,13 @@ describe('Machine', () => {
 						n: number,
 						m: number
 					) => number,
-					atomic: imports.wasm_user_atomic as (...a: number[]) => number
+					atomic: imports.wasm_user_atomic as (...a: number[]) => number,
+					string: imports.wasm_user_string as (
+						k: number,
+						u: number,
+						count: number,
+						mode: number
+					) => number
 				};
 			};
 
@@ -1132,6 +1347,54 @@ describe('Machine', () => {
 				expect(child.subarray(size - 4).every((b) => b === 0)).toBe(true);
 			});
 
+			it('reads a string in one crossing, as strncpy_from_user and strnlen_user do', () => {
+				const { machine, child, kernel, string } = childRig();
+				const put = (at: number, text: string) =>
+					child.set(
+						Array.from(text, (c) => c.charCodeAt(0)),
+						at
+					);
+				put(0x201, 'hello\0world');
+				kernel.fill(0xaa, 0x1000, 0x1010);
+				expect(string(0x1000, 0x201, 16, 0)).toBe(5);
+				expect(kernel.subarray(0x1000, 0x1007)).toEqual(
+					new Uint8Array([104, 101, 108, 108, 111, 0, 0xaa])
+				);
+				expect(string(0, 0x201, 16, 1)).toBe(6);
+				// no NUL within count: count (strnlen_user: count + 1), and only count bytes copied
+				put(0x300, 'abcdefgh');
+				kernel.fill(0xaa, 0x1100, 0x1110);
+				expect(string(0x1100, 0x300, 4, 0)).toBe(4);
+				expect(kernel.subarray(0x1100, 0x1105)).toEqual(
+					new Uint8Array([97, 98, 99, 100, 0xaa])
+				);
+				expect(string(0, 0x300, 4, 1)).toBe(5);
+				// the NUL is the last byte counted
+				put(0x400, 'abc\0');
+				expect(string(0x1200, 0x400, 4, 0)).toBe(3);
+				expect(string(0, 0x400, 4, 1)).toBe(4);
+				expect(string(0, 0x400, 3, 1)).toBe(4);
+				expect(machine.stats).toMatchObject({ userStrings: 7, userStringBytes: 6 + 4 + 4 });
+			});
+
+			it('fails a string that runs out of the child memory as Linux does', () => {
+				const { child, string } = childRig();
+				const size = child.length;
+				child.fill(120, size - 16);
+				// -EFAULT from strncpy_from_user, 0 from strnlen_user, the NUL at the very end is read
+				expect(string(0x1000, size - 16, 64, 0)).toBe(-14);
+				expect(string(0, size - 16, 64, 1)).toBe(0);
+				expect(string(0x1000, size, 8, 0)).toBe(-14);
+				expect(string(0, size, 8, 1)).toBe(0);
+				expect(string(0x1000, 0xfffffff0, 8, 0)).toBe(-14);
+				// count reached exactly at the end is not a fault
+				expect(string(0x1000, size - 16, 16, 0)).toBe(16);
+				expect(string(0, size - 16, 16, 1)).toBe(17);
+				child[size - 1] = 0;
+				expect(string(0x1000, size - 16, 64, 0)).toBe(15);
+				expect(string(0, size - 16, 64, 1)).toBe(16);
+			});
+
 			it('refuses a futex word outside the child memory or unaligned with EFAULT', () => {
 				const { child, atomic } = childRig();
 				const at = (uaddr: number) => atomic(1, uaddr, 5, 0, 0x1000);
@@ -1153,13 +1416,14 @@ describe('Machine', () => {
 				h[n] = (_sp: number, _tls: number, nr: number) => (seen.push(`h${nr}`), 0);
 			}
 			const router = (cache: boolean, answer: number) =>
-				new WebAssembly.Instance(ROUTER, {
+				new WebAssembly.Instance(ROUTER.route, {
 					k: k as WebAssembly.ModuleImports,
 					h: h as WebAssembly.ModuleImports,
 					c: {
 						5: (_sp: number, _tls: number, nr: number) => (seen.push(`c${nr}`), answer)
 					},
-					m: {
+					env: {
+						memory: new WebAssembly.Memory({ initial: 1, maximum: 1, shared: true }),
 						route,
 						cache: new WebAssembly.Global(
 							{ value: 'i32', mutable: false },
@@ -1214,4 +1478,237 @@ describe('Machine', () => {
 			expect(machine.deadline).not.toBeNull();
 		});
 	});
+
+	describe('the stream relay', () => {
+		/** the toy kernel with its interrupt cpu up and a program listening on port 80 */
+		async function listening() {
+			const r = rig({ asyncify: true, sharedKernel: true });
+			const machine = new Machine(r.machineOptions);
+			await r.run(machine, () => r.output().includes('parent ok'));
+			machine.type('k');
+			await r.run(machine, () => r.output().includes('echo:k'));
+			expect(machine.listening(80)).toBe(false);
+			expect(() => machine.ingress(80)).toThrow('nothing listens on port 80');
+			machine.type('l');
+			await r.run(machine, () => r.output().includes('echo:l'));
+			const drive = async <T>(work: Promise<T>) => {
+				let done = false;
+				const result = work.finally(() => (done = true));
+				await r.run(machine, () => done);
+				return result;
+			};
+			return { r, machine, drive };
+		}
+
+		it('carries bytes both ways to a listening program and empties its table at the close', async () => {
+			const { machine, drive } = await listening();
+			expect(machine.listening(80)).toBe(true);
+			const stream = machine.ingress(80);
+			const reader = stream.readable.getReader();
+			const echoed = await drive(
+				(async () => {
+					await stream.write('hello');
+					return new TextDecoder().decode((await reader.read()).value);
+				})()
+			);
+			expect(echoed).toBe('hello');
+			expect(machine.openStreams).toBe(1);
+			stream.end();
+			expect((await drive(reader.read())).done).toBe(true);
+			expect(machine.openStreams).toBe(0);
+			expect(machine.stats).toMatchObject({
+				netOpens: 1,
+				netBytesIn: 5,
+				netBytesOut: 5,
+				netSends: 1
+			});
+			expect(machine.stats.netEvents).toBe(3);
+		});
+
+		it('refuses a checkpoint while a stream is open and takes it once the stream is gone', async () => {
+			const { r, machine, drive } = await listening();
+			const stream = machine.ingress(80);
+			await expect(machine.checkpoint()).rejects.toThrow('streams are open');
+			stream.abort();
+			await drive(new Promise((resolve) => setTimeout(resolve, 0)));
+			expect(machine.openStreams).toBe(0);
+			const snapshot = await machine.checkpoint();
+			expect(snapshot.ports).toEqual([80]);
+			const restored = await Machine.restore(r.machineOptions, snapshot);
+			expect(restored.listening(80)).toBe(true);
+			expect(restored.listening(81)).toBe(false);
+		});
+
+		it('keeps a port that two programs listen on until both have stopped', () => {
+			const net = new Ingress(netStats(), () => {});
+			net.listen(80, true);
+			net.listen(80, true);
+			expect(net.listeners).toEqual([80, 80]);
+			net.listen(80, false);
+			expect(net.listening(80)).toBe(true);
+			net.listen(80, false);
+			net.listen(80, false);
+			expect(net.listening(80)).toBe(false);
+			net.restore([8080, 8080, 80]);
+			expect(net.listeners.sort()).toEqual([80, 8080, 8080]);
+		});
+
+		describe('the host end', () => {
+			const EVENT = 0x100;
+			const BUF = 0x200;
+			function rigNet() {
+				const memory = new WebAssembly.Memory({ initial: 1 });
+				const stats = netStats();
+				const raised = { n: 0 };
+				const net = new Ingress(stats, () => raised.n++);
+				net.listen(80, true);
+				const next = (cap = 64) => {
+					const got = net.next(memory, EVENT, BUF, cap);
+					const view = new DataView(memory.buffer);
+					return {
+						got,
+						op: view.getUint32(EVENT, true),
+						id: view.getUint32(EVENT + 4, true),
+						arg: view.getUint32(EVENT + 8, true),
+						bytes: new Uint8Array(
+							memory.buffer,
+							BUF,
+							view.getUint32(EVENT + 8, true)
+						).slice()
+					};
+				};
+				return { net, stats, raised, next };
+			}
+
+			it('hands the kernel an open, then the bytes in pieces no bigger than it asked for, then the end', async () => {
+				const { net, stats, raised, next } = rigNet();
+				const stream = net.connect(80);
+				expect(raised.n).toBe(1);
+				expect(next()).toMatchObject({ op: 1, id: stream.id, arg: 80 });
+				let taken = false;
+				const wrote = stream.write(new Uint8Array(150).fill(7)).then(() => (taken = true));
+				expect(next(64)).toMatchObject({ op: 2, arg: 64 });
+				expect(next(64)).toMatchObject({ op: 2, arg: 64 });
+				await Promise.resolve();
+				expect(taken).toBe(false);
+				expect(next(64)).toMatchObject({ op: 2, arg: 22 });
+				await wrote;
+				expect(next().got).toBe(0);
+				stream.end();
+				expect(next()).toMatchObject({ op: 3, id: stream.id });
+				expect(stats.netBytesIn).toBe(150);
+				expect(net.open).toBe(1);
+				net.end(stream.id, 0);
+				expect(net.open).toBe(0);
+			});
+
+			it('holds back a stream the kernel asks it to, and wakes the kernel when it is let go', () => {
+				const { net, raised, next } = rigNet();
+				const first = net.connect(80);
+				const second = net.connect(80);
+				next();
+				next();
+				first.write('aa').catch(() => {});
+				second.write('bb').catch(() => {});
+				net.end(first.id, 2);
+				const before = raised.n;
+				expect(next()).toMatchObject({ op: 2, id: second.id });
+				expect(next().got).toBe(0);
+				net.end(first.id, 3);
+				expect(raised.n).toBe(before + 1);
+				expect(next()).toMatchObject({ op: 2, id: first.id });
+			});
+
+			it('takes what the reader has room for, then answers 0 and raises the interrupt once it reads', async () => {
+				const { net, stats, raised } = rigNet();
+				const stream = net.connect(80);
+				expect(net.send(stream.id, new Uint8Array(READ_BUFFER + 10))).toBe(READ_BUFFER);
+				expect(net.send(stream.id, new Uint8Array(10))).toBe(0);
+				expect(stats.netBackpressure).toBe(2);
+				expect(stats.netBytesOut).toBe(READ_BUFFER);
+				const before = raised.n;
+				const reader = stream.readable.getReader();
+				expect((await reader.read()).value).toHaveLength(READ_BUFFER);
+				expect(raised.n).toBe(before + 1);
+				expect(net.send(stream.id, new Uint8Array(10))).toBe(10);
+			});
+
+			it('wakes the kernel from a poll for a starved stream whose reader has room though no pull said so', async () => {
+				const { net, raised } = rigNet();
+				const stream = net.connect(80) as unknown as {
+					id: number;
+					starved: boolean;
+					readable: ReadableStream<Uint8Array>;
+				};
+				net.send(stream.id, new Uint8Array(READ_BUFFER + 10));
+				const before = raised.n;
+				net.poll();
+				expect(raised.n).toBe(before);
+				await stream.readable.getReader().read();
+				expect(raised.n).toBe(before + 1);
+				stream.starved = true;
+				net.poll();
+				expect(raised.n).toBe(before + 2);
+				net.poll();
+				expect(raised.n).toBe(before + 2);
+			});
+
+			it('delivers an abort once, rejects what was waiting, and answers a late send with closed', async () => {
+				const { net, next } = rigNet();
+				const stream = net.connect(80);
+				next();
+				const waiting = stream.write('late');
+				stream.abort();
+				await expect(waiting).rejects.toThrow('aborted');
+				await expect(stream.write('more')).rejects.toThrow('closed');
+				expect(next()).toMatchObject({ op: 4, id: stream.id });
+				expect(net.open).toBe(0);
+				expect(net.send(stream.id, new Uint8Array(1))).toBe(-1);
+				expect(next().got).toBe(0);
+			});
+
+			it('never tells the kernel of a stream it aborted before the kernel saw it', () => {
+				const { net, next } = rigNet();
+				net.connect(80).abort();
+				expect(net.open).toBe(0);
+				expect(next().got).toBe(0);
+			});
+
+			it('errors the reader and the writes at a reset, and drops the stream', async () => {
+				const { net, next } = rigNet();
+				const stream = net.connect(80);
+				next();
+				const reader = stream.readable.getReader();
+				const waiting = stream.write('x');
+				net.end(stream.id, 1);
+				await expect(waiting).rejects.toThrow('reset');
+				await expect(reader.read()).rejects.toThrow('reset');
+				expect(net.open).toBe(0);
+			});
+
+			it('keeps a stream whose guest ended until the host has ended too', async () => {
+				const { net, next } = rigNet();
+				const stream = net.connect(80);
+				next();
+				const reader = stream.readable.getReader();
+				net.end(stream.id, 0);
+				expect((await reader.read()).done).toBe(true);
+				expect(net.open).toBe(1);
+				stream.end();
+				next();
+				expect(net.open).toBe(0);
+			});
+		});
+	});
 });
+
+function netStats(): NetStats {
+	return {
+		netOpens: 0,
+		netEvents: 0,
+		netSends: 0,
+		netBytesIn: 0,
+		netBytesOut: 0,
+		netBackpressure: 0
+	};
+}

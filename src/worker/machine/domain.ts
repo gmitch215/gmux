@@ -185,6 +185,26 @@ export function clear(user: Domain, u: number, n: number): number {
 	return 0;
 }
 
+/**
+ * what `strncpy_from_user` and `strnlen_user` find in a domain: the index of the first NUL within
+ * `count` bytes, `count` when there is none, or -1 when the domain ends before either
+ */
+export function stringLength(domain: Domain, u: number, count: number): number {
+	if (!(domain.perm & READ)) return -1;
+	const bytes = domain.bytes();
+	const at = u >>> 0;
+	const limit = count >>> 0;
+	const end = at + Math.min(limit, Math.max(0, bytes.length - at));
+	// a path is short, and subarray() allocates: the first 64 bytes by hand
+	const head = Math.min(end, at + 64);
+	for (let i = at; i < head; i++) if (bytes[i] === 0) return i - at;
+	if (head < end) {
+		const nul = bytes.subarray(head, end).indexOf(0);
+		if (nul >= 0) return head - at + nul;
+	}
+	return end - at === limit ? limit : -1;
+}
+
 // #endregion
 
 // #region marshalers

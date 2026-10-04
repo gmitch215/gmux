@@ -10,7 +10,8 @@ import { hostOnly, leaks, SURFACE, watch } from './authority.ts';
 
 /**
  * Boots build/kernel with the tests/c probes from build/probes and checks each one's output;
- * GMUX_BUILD points at another build, FROZEN=1 stops the host clock.
+ * GMUX_BUILD points at another build, FROZEN=1 stops the host clock, CORE=<gmux-core.wasm> runs the
+ * scheduler's tables in C.
  * `node --experimental-strip-types tests/c/run.ts [probe...]`
  */
 interface Probe {
@@ -32,7 +33,43 @@ interface Probe {
 	evacuate?: boolean | string[];
 	/** the machine's memory in 64 KiB pages: a probe that sets it boots a machine of its own */
 	pages?: number;
+	/** problems the host finds in the probe's output, beyond its lines and PASS count */
+	check?: (section: string) => string[];
 }
+
+/**
+ * tests/c/gens.c prints a STEP line per call: a changed hash with a counter that did not move is a
+ * missing bump, and each class needs a change that moved its counter or the corpus proves nothing
+ */
+function gensCheck(section: string): string[] {
+	const classes = ['fd', 'cred', 'mm', 'sig'];
+	const bumps = classes.map(() => 0);
+	const falses = classes.map(() => 0);
+	const problems: string[] = [];
+	let steps = 0;
+	for (const step of section.matchAll(/^STEP (\w+) (\S+)(.*)$/gm)) {
+		steps++;
+		for (const [, name, h, g] of step[3]!.matchAll(/(\w+):([h-])([g-])/g)) {
+			const at = classes.indexOf(name!);
+			if (h === 'h' && g === 'g') bumps[at] = bumps[at]! + 1;
+			if (h === '-' && g === 'g') falses[at] = falses[at]! + 1;
+			if (h === 'h' && g === '-')
+				problems.push(`missing ${name} bump after ${step[2]} (${step[1]})`);
+		}
+	}
+	classes.forEach((name, i) => bumps[i] || problems.push(`no step changed the ${name} state`));
+	if (
+		!WebAssembly.Module.exports(new WebAssembly.Module(read('kernel/vmlinux.wasm'))).some(
+			(e) => e.name === 'wasm_current_gens'
+		)
+	)
+		problems.push('the kernel does not export wasm_current_gens');
+	console.log(
+		`gens: ${steps} steps; counter moved with a change ${bumps.join('/')}, without one ${falses.join('/')} (fd/cred/mm/sig)`
+	);
+	return problems;
+}
+
 const probes: Record<string, Probe> = {
 	// SECURITY.md: root is trusted with the machine; a non-root task runs its guarded build, which
 	// checks loads and stores, and reaches a shared mapping (System V, POSIX, a file, anonymous)
@@ -52,9 +89,13 @@ const probes: Record<string, Probe> = {
 	sig: { lines: ['handler slept', 'after pause'] },
 	thr: { lines: ['threads count 40000'] },
 	spin: { lines: [], passes: 3 },
-	// caught at the stack's own bound, not by running off the end of memory
-	stack: { lines: [], passes: 2, host: 'fault: stack overflow' },
+	// 128 KiB in a mapping of its own, the arguments in another, and a 122 KiB frame on it with no
+	// host segment; caught at the stack's own bound, not by running off the end of memory
+	stack: { lines: [], passes: 5, host: 'fault: stack overflow' },
 	time: { lines: [], passes: 5 },
+	// the kernel's generation counters (patch 0030) against the state they guard, after each call of a
+	// scripted sequence in this task, a thread, a fork child and an exec
+	gens: { evacuate: true, lines: ['SUMMARY'], passes: 9, check: gensCheck },
 	// foreign ELFs (tests/c/katybug/run.sh builds them) run by katybug inside the machine
 	katybug: {
 		program: null,
@@ -92,7 +133,8 @@ const probes: Record<string, Probe> = {
 			'/bin/bash': 'katybug/transcript/ubin/bash',
 			'/bin/coreutils': 'katybug/transcript/ubin/coreutils',
 			'/bin/curl': 'katybug/transcript/ubin/curl',
-			'/bin/sqlite3': 'katybug/transcript/ubin/sqlite3'
+			'/bin/sqlite3': 'katybug/transcript/ubin/sqlite3',
+			'/bin/busybox-static': 'katybug/transcript/busybox'
 		},
 		cmd:
 			'coreutils --coreutils-prog=factor 1234567 600851475143; ' +
@@ -122,6 +164,17 @@ const probes: Record<string, Probe> = {
 			'served'
 		]
 	},
+	// katybug ran musl's exp, log and pow (a static Alpine busybox's awk) as host kernels, found by their
+	// code; the digits are the native run's. A line typed past about 1,020 bytes is cut, so this is not
+	// part of userland's
+	libm: {
+		program: null,
+		files: { '/bin/busybox-static': 'katybug/transcript/busybox' },
+		cmd:
+			'KATYBUG_STATS=1 KATYBUG_PRIM_LOG=/tmp/pm busybox-static awk \'BEGIN { printf "%.17g %.17g %.17g\\n", exp(1.5), log(10), 2^0.5 }\'; ' +
+			'echo "prim libm kernels $(grep -c \'prim.* exp [1-9].* log [1-9].* pow [1-9]\' /tmp/pm)"',
+		lines: ['4.4816890703380645 2.3025850929940459 1.4142135623730951', 'prim libm kernels 1']
+	},
 	// the console shell is interactive: a redirected group or loop reads its file to the end, not the
 	// terminal after its first command (src/busybox/patches/0001)
 	shell: {
@@ -130,6 +183,18 @@ const probes: Record<string, Probe> = {
 			'printf \'a\\nb\\nc\\n\' > /tmp/rx; { read a; read b; echo "group $a $b"; } < /tmp/rx; ' +
 			'while read l; do echo "loop $l"; done < /tmp/rx',
 		lines: ['group a b', 'loop a', 'loop b', 'loop c']
+	},
+	// BusyBox httpd serves a static file and a CGI script over lo to wget; the host's stream relay
+	// reaches the same listener (experiments/serving, tests/unit/machine.test.ts)
+	serve: {
+		program: null,
+		cmd:
+			'mkdir -p /www/cgi-bin; echo served-$((6*7)) > /www/n.txt; ' +
+			"printf '#!/bin/sh\\necho Content-Type: text/plain\\necho\\necho cgi-served-%s\\n' $((6*7)) > /www/cgi-bin/hi.cgi; " +
+			'chmod +x /www/cgi-bin/hi.cgi; httpd -p 8081 -h /www; sleep 1; ' +
+			'wget -q -O - http://127.0.0.1:8081/n.txt; wget -q -O - http://127.0.0.1:8081/cgi-bin/hi.cgi; ' +
+			'wget -q -O /dev/null http://127.0.0.1:8081/missing || echo "missing rc $?"',
+		lines: ['served-42', 'cgi-served-42', 'missing rc 1']
 	},
 	// SECURITY.md: exec takes only registered modules; byte 200 is inside the stub's hash, and the
 	// refused exec kills the process (SIGSEGV), not the machine
@@ -145,7 +210,7 @@ const probes: Record<string, Probe> = {
 		setup: 'ifconfig lo 127.0.0.1 up',
 		evacuate: true,
 		lines: ['exec from a fork child'],
-		passes: 7
+		passes: 26
 	},
 	// zlib as a side module (dlopen/dlsym); the first lines are the same program's native output
 	// against the same zlib
@@ -163,7 +228,7 @@ const probes: Record<string, Probe> = {
 	posix: {
 		setup: 'ifconfig lo 127.0.0.1 up; mkdir -p /lua-tests',
 		lines: [],
-		passes: 25
+		passes: 30
 	},
 	// perl's core XS modules as side modules: every extension loads through dlopen, and the script
 	// prints what the same perl prints natively (perl-xs.out)
@@ -215,8 +280,8 @@ const probes: Record<string, Probe> = {
 		lines: ['test 0001...[HTTP GET]', '1 tests out of 1 reported OK: 100%']
 	},
 	// an 800-page machine (what a Free isolate holds) with 10 MB of files in memory runs 106 execs, as
-	// a coreutils run's link loop does; each exec maps a stack and a data block of its own, and blocks
-	// of 64 pages must still be free after them
+	// a coreutils run's link loop does; each exec maps a stack of 32 pages, a page of arguments and a
+	// data block of its own, and blocks of 64 pages must still be free after them
 	exec: {
 		program: null,
 		pages: 800,
@@ -399,6 +464,9 @@ async function boot(group: string[], maximumPages: number) {
 		guarded,
 		// FROZEN=1: a host clock that never moves, as a deployed Worker's while code runs
 		...(process.env.FROZEN ? { now: () => 0n } : {}),
+		...(process.env.CORE
+			? { core: new WebAssembly.Module(readFileSync(process.env.CORE)) }
+			: {}),
 		log: (line) => hostLog.push(line),
 		write: (text) => {
 			output += text;
@@ -455,6 +523,7 @@ for (const name of names) {
 	const { lines, passes = 0, host } = probes[name]!;
 	const problems = [
 		...(name === 'authority' ? hostSide : []),
+		...(probes[name]!.check?.(section) ?? []),
 		...(host && !hostLog.some((line) => line.includes(host))
 			? [`host never logged "${host}"`]
 			: []),

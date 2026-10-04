@@ -2,6 +2,7 @@ import binaryen from 'binaryen';
 import { readFileSync } from 'node:fs';
 import { describe, expect, it } from 'vitest';
 import { sqlite } from '../../experiments/write-back/scripts/sqlite.ts';
+import { routerModules } from '../../scripts/wasm/router-modules.ts';
 import { bootstrapOf, CHUNK, packImage, type BootstrapIndex } from '../../src/worker/bootstrap.ts';
 import { encodeSnapshot } from '../../src/worker/durable.ts';
 import {
@@ -17,6 +18,8 @@ import {
 } from '../../src/worker/keeper.ts';
 import { Machine } from '../../src/worker/machine/machine.ts';
 import { MIN_SPAN_MS, type Decision } from '../../src/worker/thermal.ts';
+
+const ROUTER = routerModules();
 
 const PARK_IMPORTS = [
 	'wasm_serialize_tasks',
@@ -74,6 +77,7 @@ function rig(options: { asyncify?: boolean; sql?: ReturnType<typeof sqlite> } = 
 			maximumPages: 64,
 			sharedKernel: true,
 			asyncify: options.asyncify !== false,
+			router: ROUTER,
 			sha256: (bytes) => String.fromCharCode(bytes[0] ?? 0),
 			now: () => clock.ns,
 			write: (text) => (output += text)
