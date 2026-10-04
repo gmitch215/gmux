@@ -5,7 +5,8 @@
 # and of its SMT sibling and the load average beside it; a sample another process shared the core
 # with runs again (TRIES), and one that stays shared is marked dirty. One TSV row per sample.
 # usage: run.sh <out dir>   (CPU required; LAYOUTS=3 ROUNDS=2 TRIES=3 NATIVE_RUNS=15 ARCHES="x86_64
-# aarch64" WORKLOADS=<file>; LOCK=<dir> makes each sample hold that lock directory, waiting while
+# aarch64" WORKLOADS=<file> ARMS="off strlen ..." (KATYBUG_PRIM names; all = the four string
+# functions); LOCK=<dir> makes each sample hold that lock directory, waiting while
 # another run has it; SRC builds from another copy of src/gmux/katybug)
 # Needs build/katybug/transcript{,-aarch64} (tests/c/katybug/transcript.sh).
 set -uo pipefail
@@ -20,7 +21,7 @@ sib=${sib:-$cpu}
 layouts=${LAYOUTS:-3} rounds=${ROUNDS:-2} tries=${TRIES:-3} native_runs=${NATIVE_RUNS:-15}
 wl=${WORKLOADS:-$here/../workloads.txt}
 srcs=("${SRC:-$root/src/gmux/katybug}"/*.c)
-arms=(off strlen memcmp strcmp memchr all)
+arms=(${ARMS:-off strlen memcmp strcmp memchr all})
 knob() {
 	case $1 in
 		off) echo 0 ;;
