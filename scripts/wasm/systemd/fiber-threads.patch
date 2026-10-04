@@ -1,0 +1,512 @@
+--- a/src/libsystemd/sd-future/fiber.c
++++ b/src/libsystemd/sd-future/fiber.c
+@@ -1,18 +1,13 @@
+ /* SPDX-License-Identifier: LGPL-2.1-or-later */
+ 
++#include <linux/futex.h>
+ #include <pthread.h>
+-#include <setjmp.h>
+-#include <sys/mman.h>
++#include <signal.h>
+ #include <sys/resource.h>
+-#include <sys/uio.h>
++#include <bits/syscall.h>
+ #include <threads.h>
+-#include <ucontext.h>
+ #include <unistd.h>
+ 
+-#if HAVE_VALGRIND_VALGRIND_H
+-#include <valgrind/valgrind.h>
+-#endif
+-
+ #include "sd-event.h"
+ #include "sd-future.h"
+ 
+@@ -27,18 +22,16 @@
+ #include "pthread-util.h"
+ #include "time-util.h"
+ 
+-#if HAS_FEATURE_ADDRESS_SANITIZER
+-#include <sanitizer/common_interface_defs.h>
++/* Each fiber runs on a thread of its own and exactly one of the threads involved runs at a time: the
++ * thread that resumes a fiber hands over the turn and waits for it to come back. This replaces
++ * getcontext()/makecontext()/swapcontext() and the sigjmp_buf switching, which a libc without ucontext
++ * (musl) and a wasm target (no way to switch stacks in C) cannot do. The thread-locals of the caller are not the
++ * fiber's: a fiber that needs an event loop uses sd_fiber_get_event(), not sd_event_default(). */
++
++#ifndef FIBER_STACK_MAX
++#define FIBER_STACK_MAX (256U * 1024U)
+ #endif
+ 
+-/* glibc's _FORTIFY_SOURCE wraps siglongjmp() with __longjmp_chk, which asserts that the target SP is below
+- * the current SP. That assumption is incompatible with fiber switching, where the target SP lives on a
+- * separately-mmap'd stack and can be at any address relative to the caller. The fortify redirect happens
+- * in <setjmp.h>'s declaration of siglongjmp; we sidestep it by declaring our own alias that links
+- * directly to the unchecked "siglongjmp" symbol. musl doesn't fortify setjmp.h, so the alias is a plain
+- * synonym there. */
+-_noreturn_ extern void siglongjmp_unchecked(sigjmp_buf env, int val) __asm__("siglongjmp");
+-
+ static thread_local Fiber *current_fiber = NULL;
+ 
+ typedef enum FiberState {
+@@ -52,16 +45,11 @@
+ } FiberState;
+ 
+ typedef struct Fiber {
+-        struct iovec stack;
+-        sigjmp_buf context;             /* Where to jump to when entering or resuming the fiber. */
+-        sigjmp_buf resume_context;      /* Where to jump back to when the fiber yields or completes. */
++        size_t stack_size;              /* Stack size of the fiber's thread, created when the fiber first runs. */
++        bool started;
++        uint32_t turn;                  /* Futex word: 0 while the resuming thread runs, 1 while the fiber runs. */
++        sigset_t mask;                  /* The signal mask, handed over with the turn. */
+ 
+-        /* Caller's stack range, recorded by fiber_run() on each entry so the fiber's siglongjmp back
+-         * out (in fiber_swap() or the trampoline's terminate path) can hand AddressSanitizer the
+-         * destination stack info. With ucontext this comes for free via uc_link/uc_stack; sigjmp_buf
+-         * is opaque and doesn't carry it. */
+-        struct iovec resume_stack;
+-
+         FiberState state;
+         int result;                     /* Either resume error code or final return value */
+ 
+@@ -76,17 +64,6 @@
+         sd_fiber_func_t func;
+         void *userdata;
+         sd_fiber_destroy_t destroy;
+-
+-        /* Storage for the swap performed in fiber_run(): while the fiber is suspended these hold the
+-         * fiber's own log state; while it is running they hold the caller's log state. The active state
+-         * always lives in the thread-locals in log.c / log-context.c. */
+-        LIST_HEAD(LogContext, log_context);
+-        size_t log_context_num_fields;
+-        const char *log_prefix;
+-
+-#if HAVE_VALGRIND_VALGRIND_H
+-        unsigned stack_id;
+-#endif
+ } Fiber;
+ 
+ static Fiber* fiber_get_current(void) {
+@@ -97,184 +74,42 @@
+         current_fiber = f;
+ }
+ 
+-static int fiber_allocate_stack(size_t size, void **ret) {
+-        void *stack = NULL;
+-        int r;
++/* Give the turn to the other side. The signal mask is saved in f->mask for whoever takes the turn, and
++ * the thread that gives it up blocks every signal until it gets the turn back, so only the running thread
++ * is interrupted. Takes no lock: nothing but the turn is shared while a thread waits. */
++static void fiber_pass_turn(Fiber *f, uint32_t to) {
++        int saved_errno = errno;
++        sigset_t all;
+ 
+-        /* The effective stack size is one page less than the given size, because we have to use
+-         * one page as the guard page for the stack. */
+-
+-        assert(size > 0 && size % page_size() == 0);
+-        assert(ret);
+-
+-        stack = mmap(/* addr= */ NULL, size,
+-                     PROT_READ | PROT_WRITE,
+-                     MAP_PRIVATE | MAP_ANONYMOUS | MAP_STACK,
+-                     /* fd= */ -EBADF, /* offset= */ 0);
+-        if (stack == MAP_FAILED)
+-                return -errno;
+-
+-        /* Place the guard page where stack overflow will hit it: the high end on architectures
+-         * where the stack grows up (PA-RISC), the low end everywhere else. fiber_stack_usable()
+-         * mirrors this with the inverse offset. */
+-        void *guard = STACK_GROWS_UP ? (uint8_t*) stack + size - page_size() : stack;
+-
+-        /* Prefer MADV_GUARD_INSTALL (Linux 6.13+): unlike mprotect(PROT_NONE) it doesn't split
+-         * the VMA, so guard installation skips the mmap-lock contention and per-guard VMA cost.
+-         * Fall back to mprotect on older kernels, which return EINVAL for unknown advice.
+-         * FIXME: delete when baseline above 6.13. */
+-        r = RET_NERRNO(madvise(guard, page_size(), MADV_GUARD_INSTALL));
+-        if (r == -EINVAL)
+-                r = RET_NERRNO(mprotect(guard, page_size(), PROT_NONE));
+-        if (r < 0) {
+-                (void) munmap(stack, size);
+-                return r;
+-        }
+-
+-        *ret = TAKE_PTR(stack);
+-        return 0;
+-}
+-
+-/* Usable stack range of a fiber: the full mmap region minus the guard page. Single source of
+- * truth for the layout assumed by fiber_allocate_stack(); every consumer (ucontext ss_sp,
+- * ASAN handoff iovecs, Valgrind stack registration) goes through here.
+- *
+- * iov_base is the lowest usable byte regardless of growth direction — that matches POSIX's
+- * definition of stack_t.ss_sp, so libc's makecontext() handles the direction for us. Only the
+- * guard page placement (and hence iov_base's offset within the mapping) varies. */
+-static struct iovec fiber_stack_usable(const struct iovec *stack) {
+-        assert(stack);
+-        assert(stack->iov_len > page_size());
+-        return (struct iovec) {
+-                .iov_base = STACK_GROWS_UP ? stack->iov_base : (uint8_t*) stack->iov_base + page_size(),
+-                .iov_len = stack->iov_len - page_size(),
+-        };
+-}
+-
+-static inline void start_switch_stack(void **fake_stack_save, const struct iovec *dest) {
+-#if HAS_FEATURE_ADDRESS_SANITIZER
+-        __sanitizer_start_switch_fiber(fake_stack_save,
+-                                       dest ? dest->iov_base : NULL,
+-                                       dest ? dest->iov_len : 0);
+-#endif
+-}
+-
+-static inline void finish_switch_stack(void *fake_stack_save) {
+-#if HAS_FEATURE_ADDRESS_SANITIZER
+-        __sanitizer_finish_switch_fiber(fake_stack_save, NULL, NULL);
+-#endif
+-}
+-
+-/* Refresh f->resume_stack from whoever is currently the running fiber, so the next siglongjmp() out
+- * of f (in the trampoline or fiber_swap()) can hand the right destination stack to ASAN. Must be
+- * called before fiber_set_current(f) — relies on fiber_get_current() returning the caller. */
+-static void fiber_set_resume_stack(Fiber *f, Fiber *resume) {
+         assert(f);
+ 
+-        if (resume)
+-                f->resume_stack = fiber_stack_usable(&resume->stack);
+-        else
+-                f->resume_stack = (struct iovec) {};
+-}
++        assert_se(sigfillset(&all) >= 0);
++        assert_se(pthread_sigmask(SIG_SETMASK, &all, &f->mask) == 0);
+ 
+-_noreturn_ static void fiber_entry_point(void) {
+-        Fiber *f = ASSERT_PTR(fiber_get_current());
+-        void *fake_stack_save = NULL;
++        __atomic_store_n(&f->turn, to, __ATOMIC_SEQ_CST);
++        (void) syscall(__NR_futex_time64, &f->turn, FUTEX_WAKE_PRIVATE, 1, NULL, NULL, 0);
+ 
+-        assert(f->func);
+-        assert(IN_SET(f->state, FIBER_STATE_INITIAL, FIBER_STATE_READY, FIBER_STATE_CANCELLED));
+-
+-        finish_switch_stack(NULL);
+-
+-        /* Capture our resumable point on the fiber's stack, then bounce back to whoever last set
+-         * f->resume_context. On bootstrap that's fiber_bootstrap(); on every subsequent yield it's
+-         * the most recent fiber_run(). sigsetjmp(buf, 0) skips the signal-mask save: switching is
+-         * thread-shared with respect to signal masks. */
+-        if (sigsetjmp(f->context, /* savemask= */ 0) == 0) {
+-                start_switch_stack(&fake_stack_save, &f->resume_stack);
+-                siglongjmp_unchecked(f->resume_context, /* val= */ 1);
+-        }
+-
+-        /* Re-entered for real via fiber_run()'s siglongjmp(f->context). */
+-        finish_switch_stack(fake_stack_save);
+-
+-        /* Block scope so the cleanups attached to LOG_SET_PREFIX / LOG_CONTEXT_PUSH_KEY_VALUE fire
+-         * before the siglongjmp below — siglongjmp skips _cleanup_ attributes, so we have to make
+-         * sure the scope ends via a normal control-flow path first. */
+-        {
+-                LOG_SET_PREFIX(f->name);
+-                LOG_CONTEXT_PUSH_KEY_VALUE("FIBER=", f->name);
+-
+-                f->result = f->state == FIBER_STATE_CANCELLED ? -ECANCELED : f->func(f->userdata);
+-                f->state = FIBER_STATE_COMPLETED;
+-        }
+-
+-        /* Pass NULL fake_stack_save to discard the fiber's fake stack since the fiber is done. */
+-        start_switch_stack(NULL, &f->resume_stack);
+-
+-        /* Bounce back to whichever fiber_run() call most recently entered us. resume_context is
+-         * per-fiber so nested fiber_run() — e.g. a bus method dispatched as a fiber handler while
+-         * sd_event_loop() itself runs in a fiber — is safe. */
+-        siglongjmp_unchecked(f->resume_context, 1);
+-        assert_not_reached();
++        errno = saved_errno;
+ }
+ 
+-static int fiber_init(Fiber *f) {
+-        ucontext_t old_uc, uc;
+-        void *fake_stack_save = NULL;
++static void fiber_wait_turn(Fiber *f, uint32_t turn) {
++        int saved_errno = errno;
+ 
+         assert(f);
+ 
+-        if (getcontext(&uc) < 0)
+-                return -errno;
++        while (__atomic_load_n(&f->turn, __ATOMIC_SEQ_CST) != turn)
++                (void) syscall(__NR_futex_time64, &f->turn, FUTEX_WAIT_PRIVATE, turn ^ 1U, NULL, NULL, 0);
+ 
+-        struct iovec fiber_stack = fiber_stack_usable(&f->stack);
+-
+-        uc.uc_link = NULL;              /* Unused: trampoline siglongjmps out instead of returning. */
+-        uc.uc_stack.ss_sp = fiber_stack.iov_base;
+-        uc.uc_stack.ss_size = fiber_stack.iov_len;
+-        uc.uc_stack.ss_flags = 0;
+-
+-        Fiber *prev = fiber_get_current();
+-        fiber_set_current(f);
++        assert_se(pthread_sigmask(SIG_SETMASK, &f->mask, NULL) == 0);
+ 
+-        makecontext(&uc, fiber_entry_point, /* argc= */ 0);
+-
+-        fiber_set_resume_stack(f, prev);
+-        if (sigsetjmp(f->resume_context, /* savemask= */ 0) == 0) {
+-                start_switch_stack(&fake_stack_save, &fiber_stack);
+-                if (swapcontext(&old_uc, &uc) < 0) {
+-                        finish_switch_stack(fake_stack_save);
+-                        fiber_set_current(prev);
+-                        return -errno;
+-                }
+-                assert_not_reached();   /* Trampoline siglongjmps back; swapcontext doesn't return. */
+-        }
+-
+-        finish_switch_stack(fake_stack_save);
+-
+-        fiber_set_current(prev);
+-        return 0;
++        errno = saved_errno;
+ }
+ 
+-/* Swap the thread-local log prefix and log context with the values stashed in f. While the fiber is
+- * suspended, f holds the fiber's own log state; while it's running, f holds the caller's log state. The
+- * swap is its own inverse, so the same call drives both directions. */
+-static void fiber_swap_log_state(Fiber *f) {
+-        assert(f);
+-        log_prefix_swap(&f->log_prefix);
+-        log_context_swap(&f->log_context, &f->log_context_num_fields);
+-}
+-
+ static void reset_current_fiber(void) {
+-        /* Restore the caller's log state stashed in the running fiber (if any) before clearing
+-         * current_fiber. Without this, the child of a fork() that happened mid-fiber would inherit the
+-         * fiber's log prefix / context list in its thread-locals even though no fiber is running. */
+-        Fiber *f = fiber_get_current();
+-        if (f) {
+-                fiber_swap_log_state(f);
++        /* A fork() from a fiber leaves the child with only the forking thread, which has no fiber to
++         * return to. */
++        if (fiber_get_current())
+                 fiber_ops_set(NULL);
+-        }
+         fiber_set_current(NULL);
+ }
+ 
+@@ -318,23 +153,64 @@
+         .cancel_wait_unref = sd_future_cancel_wait_unref,
+ };
+ 
+-static void fiber_enter(Fiber *fiber, Fiber *prev, void **fake_stack_save) {
+-        fiber_set_current(fiber);
+-        fiber_swap_log_state(fiber);
+-        if (!prev)
+-                fiber_ops_set(&fiber_ops);
++static void* fiber_thread_main(void *userdata) {
++        Fiber *f = ASSERT_PTR(userdata);
+ 
+-        struct iovec fiber_stack = fiber_stack_usable(&fiber->stack);
+-        start_switch_stack(fake_stack_save, &fiber_stack);
+-        fiber_set_resume_stack(fiber, prev);
++        /* The resumer passed the turn before creating us, so this only installs the signal mask. */
++        fiber_wait_turn(f, 1);
++        fiber_set_current(f);
++        fiber_ops_set(&fiber_ops);
++
++        assert(f->func);
++        assert(IN_SET(f->state, FIBER_STATE_INITIAL, FIBER_STATE_READY, FIBER_STATE_CANCELLED));
++
++        /* Block scope so the cleanups attached to LOG_SET_PREFIX / LOG_CONTEXT_PUSH_KEY_VALUE fire
++         * before the turn goes back, after which f may be freed. */
++        {
++                LOG_SET_PREFIX(f->name);
++                LOG_CONTEXT_PUSH_KEY_VALUE("FIBER=", f->name);
++
++                f->result = f->state == FIBER_STATE_CANCELLED ? -ECANCELED : f->func(f->userdata);
++                f->state = FIBER_STATE_COMPLETED;
++        }
++
++        /* The thread is detached and touches nothing of f from here on. */
++        fiber_pass_turn(f, 0);
++        return NULL;
+ }
+ 
+-static void fiber_leave(Fiber *fiber, Fiber *prev, void *fake_stack_save) {
+-        finish_switch_stack(fake_stack_save);
+-        if (!prev)
+-                fiber_ops_set(NULL);
+-        fiber_swap_log_state(fiber);
+-        fiber_set_current(prev);
++/* Run the fiber until it yields, suspends or completes. The first call creates its thread. */
++static int fiber_switch_in(Fiber *f) {
++        int r;
++
++        assert(f);
++
++        fiber_pass_turn(f, 1);
++
++        if (!f->started) {
++                pthread_attr_t attr;
++                pthread_t thread;
++
++                r = pthread_attr_init(&attr);
++                if (r == 0) {
++                        (void) pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
++                        r = pthread_attr_setstacksize(&attr, f->stack_size);
++                        if (r == 0)
++                                r = pthread_create(&thread, &attr, fiber_thread_main, f);
++                        (void) pthread_attr_destroy(&attr);
++                }
++                if (r != 0) {
++                        /* No thread to hand over to: take the turn and our signal mask back. */
++                        __atomic_store_n(&f->turn, 0, __ATOMIC_SEQ_CST);
++                        assert_se(pthread_sigmask(SIG_SETMASK, &f->mask, NULL) == 0);
++                        return -r;
++                }
++
++                f->started = true;
++        }
++
++        fiber_wait_turn(f, 0);
++        return 0;
+ }
+ 
+ static int fiber_run(sd_future *f) {
+@@ -358,23 +234,16 @@
+ 
+         log_debug("Scheduling fiber");
+ 
+-        /* Save the previously-current fiber (if any) so we can restore it when this fiber yields or
+-         * completes. This matters when fiber_run() is invoked from within another fiber (e.g. an
+-         * sd-event dispatch that happens to be running inside a fiber context itself): the
+-         * LOG_SET_PREFIX/LOG_CONTEXT_PUSH above attached to whichever fiber was current at that moment,
+-         * and their scope-level cleanup must see the same fiber_get_current() when it runs to detach
+-         * them from the correct list. */
+-        Fiber *prev = fiber_get_current();
+-        void *fake_stack_save = NULL;
+-        fiber_enter(fiber, prev, &fake_stack_save);
++        r = fiber_switch_in(fiber);
++        if (r < 0) {
++                /* The fiber never ran, so settle its future with the error. */
++                log_debug_errno(r, "Failed to start fiber: %m");
++                fiber->result = r;
++                fiber->state = FIBER_STATE_COMPLETED;
++                fiber_resolve(f);
++                return 0;
++        }
+ 
+-        /* This is where we start executing the fiber. Once it yields, we continue here as if nothing
+-         * happened. resume_context captures this point; the fiber siglongjmps back to it. */
+-        if (sigsetjmp(fiber->resume_context, 0) == 0)
+-                siglongjmp_unchecked(fiber->context, 1);
+-
+-        fiber_leave(fiber, prev, fake_stack_save);
+-
+         switch (fiber->state) {
+ 
+         case FIBER_STATE_COMPLETED:
+@@ -417,10 +286,10 @@
+                 return 0;
+ 
+         if (fiber->state == FIBER_STATE_INITIAL) {
+-                /* The fiber's stack was allocated but never entered, so there are no scope-level cleanups
+-                 * waiting to run. Skip the dispatch round-trip that would just have fiber_entry_point()
+-                 * fall straight through with -ECANCELED, and settle the future right here — mirroring the
+-                 * FIBER_STATE_COMPLETED branch of fiber_run(). */
++                /* The fiber never ran, so it has no thread and no scope-level cleanups waiting to run.
++                 * Skip the dispatch round-trip that would just have the fiber fall straight through with
++                 * -ECANCELED, and settle the future right here — mirroring the FIBER_STATE_COMPLETED
++                 * branch of fiber_run(). */
+                 fiber->result = -ECANCELED;
+                 fiber->state = FIBER_STATE_COMPLETED;
+                 fiber_resolve(f);
+@@ -480,22 +349,14 @@
+          * outer fiber should take care of cleaning up any created child fibers (for example using
+          * sd_future_cancel_wait_unref()).
+          *
+-         * FIBER_STATE_INITIAL is also accepted: the stack was allocated but never entered, so there are no
+-         * registered cleanups to run. This covers the partial-construction failure path in sd_fiber_new()
+-         * as well as fibers that are unrefed before the event loop ever dispatches them. */
++         * FIBER_STATE_INITIAL is also accepted: the fiber never ran, so there is no thread and no registered
++         * cleanups to run. This covers the partial-construction failure path in sd_fiber_new() as well as
++         * fibers that are unrefed before the event loop ever dispatches them. */
+         assert(IN_SET(fiber->state, FIBER_STATE_INITIAL, FIBER_STATE_COMPLETED));
+ 
+         if (fiber->destroy)
+                 fiber->destroy(fiber->userdata);
+ 
+-#if HAVE_VALGRIND_VALGRIND_H
+-        if (fiber->stack.iov_base)
+-                VALGRIND_STACK_DEREGISTER(fiber->stack_id);
+-#endif
+-
+-        if (fiber->stack.iov_base)
+-                (void) munmap(fiber->stack.iov_base, fiber->stack.iov_len);
+-
+         sd_event_source_disable_unref(fiber->defer_event_source);
+         sd_event_source_disable_unref(fiber->exit_event_source);
+         sd_event_unref(fiber->event);
+@@ -537,15 +398,9 @@
+ 
+         f->state = state;
+ 
+-        void *fake_stack_save = NULL;
++        fiber_pass_turn(f, 0);
++        fiber_wait_turn(f, 1);
+ 
+-        if (sigsetjmp(f->context, 0) == 0) {
+-                start_switch_stack(&fake_stack_save, &f->resume_stack);
+-                siglongjmp_unchecked(f->resume_context, 1);
+-        }
+-
+-        finish_switch_stack(fake_stack_save);
+-
+         /* When we get here, we've been resumed. */
+ 
+         if (f->state == FIBER_STATE_CANCELLED)
+@@ -635,14 +490,18 @@
+         if (rl.rlim_cur == RLIM_INFINITY)
+                 rl.rlim_cur = 8U * U64_MB; /* Same as the default thread stack size */
+ 
+-        /* Reserve room for the guard page so the usable region stays above PTHREAD_STACK_MIN, which
+-         * is what libc/pthread routines (e.g. TLS setup on musl) assume. */
++        /* A machine without an MMU commits every byte of a stack when it is created, so the 8 MB the
++         * limit usually names would cost 8 MB per fiber. */
++        rl.rlim_cur = MIN(rl.rlim_cur, (rlim_t) FIBER_STACK_MAX);
++
++        /* Keep the size the context-based fibers had: the limit rounded to pages, less the page that was
++         * their guard, and never below what libc needs for a thread. */
+         size_t stack_len = ROUND_UP(rl.rlim_cur, page_size());
+         if (stack_len < (size_t) PTHREAD_STACK_MIN + page_size())
+                 stack_len = ROUND_UP((size_t) PTHREAD_STACK_MIN + page_size(), page_size());
+ 
+         *fiber = (Fiber) {
+-                .stack.iov_len = stack_len,
++                .stack_size = stack_len - page_size(),
+                 .state = FIBER_STATE_INITIAL,
+                 .name = strdup(name),
+                 .func = func,
+@@ -652,23 +511,6 @@
+         if (!fiber->name)
+                 return -ENOMEM;
+ 
+-        r = fiber_allocate_stack(fiber->stack.iov_len, &fiber->stack.iov_base);
+-        if (r < 0)
+-                return r;
+-
+-#if HAVE_VALGRIND_VALGRIND_H
+-        /* Register the usable stack range (above the guard page) before fiber_bootstrap() so the
+-         * trampoline's first sigsetjmp doesn't trip Valgrind's stack-tracking heuristics. */
+-        struct iovec usable = fiber_stack_usable(&fiber->stack);
+-        fiber->stack_id = VALGRIND_STACK_REGISTER(
+-                        usable.iov_base,
+-                        (uint8_t*) usable.iov_base + usable.iov_len);
+-#endif
+-
+-        r = fiber_init(fiber);
+-        if (r < 0)
+-                return r;
+-
+         /* Execution of the fiber is driven by two event sources, one deferred, one exit. The exit event
+          * source kicks in when sd_event_exit() is called, as from that point onwards only exit event
+          * sources will be dispatched. */

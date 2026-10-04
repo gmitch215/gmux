@@ -227,6 +227,7 @@ prog openssh https://cdn.openbsd.org/pub/OpenBSD/OpenSSH/portable/openssh-9.9p1.
 		&& fetch "https://git.musl-libc.org/cgit/musl/plain/include/stdio.h?h=v1.2.6" musl126-stdio.h && cp $D/src/musl126-stdio.h $MUSL126/stdio.h \
 		&& unpack systemd https://github.com/systemd/systemd/archive/refs/tags/v262.tar.gz systemd.tgz \
 		&& patch -p1 -s < $SD/wasm32.patch \
+		&& patch -p1 -s < $SD/fiber-threads.patch \
 		&& mkdir -p $P/lib/pkgconfig \
 		&& $CC $CFLAGS -c $SD/compat.c -o $B/compat.o && $AR rcs $P/lib/libucontext.a $B/compat.o \
 		&& printf 'Name: libucontext\nDescription: stubs\nVersion: 1.3\nLibs: -L%s -lucontext\n' $P/lib > $P/lib/pkgconfig/libucontext.pc \
@@ -251,7 +252,7 @@ c_link_args = [$(for a in $LDFLAGS; do printf "'%s'," "$a"; done)]
 EOF
 	[ -f $B/systemd.cross ] || exit
 	meson setup $B/systemd-build --cross-file $B/systemd.cross --prefix=/usr --buildtype=plain --default-library=static \
-		-Dlibc=musl -Dmode=release -Dbuild-static=true -Dsystemd-multicall-binary=true --prefer-static -Dtests=false \
+		-Dlibc=musl -Dmode=release -Dbuild-static=true -Dsystemd-multicall-binary=true --prefer-static -Dtests=true \
 		-Dman=disabled -Dhtml=disabled -Dtranslations=false -Dbootloader=disabled -Defi=false -Dukify=disabled \
 		-Dbpf-framework=disabled -Dlibmount=disabled -Dpam=disabled -Dseccomp=disabled -Dselinux=disabled \
 		-Dapparmor=disabled -Daudit=disabled > $D/logs$ROUND/systemd.configure.log 2>&1 || {
@@ -260,6 +261,17 @@ EOF
 	}
 	ninja -C $B/systemd-build -k 0 systemd > $D/logs$ROUND/systemd.make.log 2>&1
 	checkwasm systemd $B/systemd-build/systemd
+	# the fiber tests, linked against the static archives: the shared library their targets name does not link here
+	$CC $CFLAGS -c $SD/static-destruct.c -o $B/static-destruct.o
+	for t in test-fiber test-fiber-ops test-fiber-io; do
+		ninja -C $B/systemd-build $t.p/src_libsystemd_sd-future_$t.c.o >> $D/logs$ROUND/systemd.make.log 2>&1 \
+			&& (cd $B/systemd-build && $SD/cc.sh -o $t $t.p/src_libsystemd_sd-future_$t.c.o $B/static-destruct.o -L$P/lib \
+				-fuse-ld=$LINUX_WASM/tools/fake-llvm/ld.lld --target=wasm-linux-musl -march=wasm32 --sysroot=$SYSROOT \
+				-Wl,-shared -fPIC -Wl,--start-group src/shared/libsystemd-shared-262.a src/libsystemd/libsystemd_static.a \
+				src/libc/libc-wrapper.a src/basic/libbasic.a -static -lm $P/lib/libucontext.a -Wl,--end-group) \
+				>> $D/logs$ROUND/systemd.make.log 2>&1
+		checkwasm $t $B/systemd-build/$t
+	done
 )
 # #endregion
 echo "CENSUS6-DONE $(($(date +%s) - T0))s results=$RESULTS"

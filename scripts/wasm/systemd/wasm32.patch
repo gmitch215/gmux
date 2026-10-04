@@ -25,7 +25,7 @@
                  { "tilegx",     ARCHITECTURE_TILEGX   },
  
 +#elif defined(__wasm32__)
-+                { "wasm32",     ARCHITECTURE_WASM32   },
++                { "wasm",       ARCHITECTURE_WASM32   },
 +
  #else
  #  error "Please register your architecture here!"
