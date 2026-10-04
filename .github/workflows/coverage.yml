@@ -32,6 +32,8 @@ jobs:
           node-version: '26'
       - name: Install Dependencies
         run: bun install --frozen-lockfile --ignore-scripts
+      - name: Install clang and lld
+        run: sudo apt-get install -y clang lld
       - name: Run Coverage
         run: bun run test:coverage
       - name: Run Wat Coverage
