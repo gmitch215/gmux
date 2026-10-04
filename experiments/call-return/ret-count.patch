@@ -1,0 +1,142 @@
+--- a/kb.h
++++ b/kb.h
+@@ -246,6 +246,7 @@
+ #ifdef KB_COUNT
+     /* guest instructions, and the cpu struct words step() reads and writes */
+     int insns, rd, wr;
++    int is_ret; /* ends in a return (x86 ret, A64 ret) */
+ #endif
+ #ifdef KB_AOT
+     /* a region of lifted blocks this block's IR matched exactly; it runs from
+--- a/run.c
++++ b/run.c
+@@ -1575,7 +1575,86 @@
+     fclose(f);
+ }
+ #endif
++
++#ifdef KB_COUNT
++/* per return block: the last target and up to 8 distinct ones, counted */
++struct ret_row {
++    uint64_t pc, last, n, ichit, other, tgt[8], cnt[8];
++    int ntgt;
++};
++static struct ret_row ret_tab[1 << 16];
++
++static void ret_note(struct kb_block* b, uint64_t target) {
++    unsigned h = (unsigned) ((b->pc >> 2) ^ (b->pc >> 14)) & 0xffffu;
++    while (ret_tab[h].n && ret_tab[h].pc != b->pc) h = (h + 1) & 0xffffu;
++    struct ret_row* r = &ret_tab[h];
++    r->pc = b->pc;
++    r->n++;
++    if (r->last == target) r->ichit++;
++    r->last = target;
++    int i = 0;
++    while (i < r->ntgt && r->tgt[i] != target) i++;
++    if (i < r->ntgt)
++        r->cnt[i]++;
++    else if (r->ntgt < 8) {
++        r->tgt[r->ntgt] = target;
++        r->cnt[r->ntgt++] = 1;
++    }
++    else
++        r->other++;
++}
+ 
++static void ret_report(struct kb_cpu* cpu) {
++    uint64_t total = 0, ichit = 0, blocks = 0, mono = 0, over = 0;
++    uint64_t d95 = 0, d95m = 0, d99 = 0, d80 = 0;
++    uint64_t nb[5] = {0}, nr[5] = {0};
++    for (unsigned h = 0; h < (1u << 16); h++) {
++        struct ret_row* r = &ret_tab[h];
++        if (!r->n) continue;
++        uint64_t top = 0;
++        for (int i = 0; i < r->ntgt; i++)
++            if (r->cnt[i] > top) top = r->cnt[i];
++        total += r->n;
++        ichit += r->ichit;
++        blocks++;
++        over += r->other > 0;
++        mono += r->ntgt == 1 && !r->other;
++        if (top * 100 > r->n * 95) d95 += r->n;
++        if (top * 100 > r->n * 95 && r->n >= KB_TRACE_AT) d95m += r->n;
++        if (top * 100 > r->n * 99) d99 += r->n;
++        if (top * 100 > r->n * 80) d80 += r->n;
++        int k = r->other       ? 4
++                : r->ntgt == 1 ? 0
++                : r->ntgt == 2 ? 1
++                : r->ntgt <= 4 ? 2
++                               : 3;
++        nb[k]++;
++        nr[k] += r->n;
++    }
++    fprintf(
++        kb_log,
++        "katybug: ret: returns %llu, same target as the block's last %llu, "
++        "blocks %llu, one target %llu, dominant>95%% %llu, dominant>95%% "
++        "in blocks run >= %d times %llu, dominant>99%% %llu, dominant>80%% "
++        "%llu, blocks that overflowed 8 targets %llu; blocks (returns) with "
++        "1 target %llu (%llu), 2 %llu (%llu), 3-4 %llu (%llu), 5-8 %llu "
++        "(%llu), "
++        "more %llu (%llu); dispatches %llu, lookups %llu\n",
++        (unsigned long long) total, (unsigned long long) ichit,
++        (unsigned long long) blocks, (unsigned long long) mono,
++        (unsigned long long) d95, KB_TRACE_AT, (unsigned long long) d95m,
++        (unsigned long long) d99, (unsigned long long) d80,
++        (unsigned long long) over, (unsigned long long) nb[0],
++        (unsigned long long) nr[0], (unsigned long long) nb[1],
++        (unsigned long long) nr[1], (unsigned long long) nb[2],
++        (unsigned long long) nr[2], (unsigned long long) nb[3],
++        (unsigned long long) nr[3], (unsigned long long) nb[4],
++        (unsigned long long) nr[4], (unsigned long long) cpu->steps,
++        (unsigned long long) cpu->lookups
++    );
++}
++#endif
++
+ /** runs the guest until it exits; the exit status (128 + a signal when one
+  * ended it) */
+ int kb_run(struct kb_cpu* cpu) {
+@@ -1669,6 +1748,9 @@
+             continue;
+         }
+         cpu->pc = next;
++#ifdef KB_COUNT
++        if (b->is_ret) ret_note(b, next);
++#endif
+ #if KB_TRACE > 1
+         if (next == b->target)
+             b->taken++;
+@@ -1703,5 +1785,8 @@
+             kb_yield(cpu);
+         }
+     }
++#ifdef KB_COUNT
++    if (getenv("KATYBUG_RET")) ret_report(cpu);
++#endif
+     return cpu->status;
+ }
+--- a/x86.c
++++ b/x86.c
+@@ -543,6 +543,9 @@
+                 put(d, KB_ADD, 8, 4, 4, T5, 0);
+             }
+             put(d, KB_JMP, 8, 0, T1, 0, 0);
++#ifdef KB_COUNT
++            blk->is_ret = 1;
++#endif
+             return 1;
+         }
+         case 0xc6:
+--- a/a64.c
++++ b/a64.c
+@@ -357,6 +357,9 @@
+             put(d, KB_MOV, 8, 30, T2, 0, 0);
+         }
+         put(d, KB_JMP, 8, 0, T1, 0, 0);
++#ifdef KB_COUNT
++        blk->is_ret = opc == 2;
++#endif
+         return 1;
+     }
+     if ((i & 0xffe0001f) == 0xd4000001) /* svc */
