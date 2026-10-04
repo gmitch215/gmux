@@ -6,6 +6,8 @@
 # usage: coreutils-test.sh <test>...  (default: all of tests.txt)
 cd /cu || exit 1
 while read -r p; do [ -e "src/$p" ] || ln -s coreutils "src/$p"; done < links.txt
+# alpine has getent and the machine's BusyBox does not; the files are all it reads
+command -v getent > /dev/null || { printf '#!/bin/sh\nexec cat /etc/"$1"\n' > src/getent && chmod +x src/getent; }
 [ $# -gt 0 ] || set -- $(cat tests.txt)
 programs=$(tr '\n' ' ' < links.txt)
 for t in "$@"; do

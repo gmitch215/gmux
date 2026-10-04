@@ -17,7 +17,7 @@ tar xf /t3/coreutils-9.5.tar.xz
 tar xf /t3/bash-5.2.37.tar.gz
 j=$(nproc)
 (cd coreutils-9.5 && FORCE_UNSAFE_CONFIGURE=1 ./configure -q LDFLAGS=-static --disable-nls \
-	--enable-single-binary=symlinks && make -s -j"$j")
+	--enable-single-binary=symlinks --enable-install-program=arch && make -s -j"$j")
 (cd bash-5.2.37 && ./configure -q --enable-static-link --without-bash-malloc --disable-nls \
 	&& make -s -j"$j")
 strip coreutils-9.5/src/coreutils bash-5.2.37/bash
