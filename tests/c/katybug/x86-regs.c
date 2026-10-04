@@ -188,7 +188,8 @@ static const char* const reg[16] = {"rax", "rcx", "rdx", "rbx", "rsp", "rbp",
                                     "r12", "r13", "r14", "r15"};
 
 static char* page;
-static char src[8192];
+/* fixed address so the dumped rsi does not move with the linker's layout */
+static char* src;
 
 static void run(
     int c, const char* tag, long rbx, long rsi, long rdi, long rcx
@@ -240,6 +241,8 @@ void rep_main(void) {
     page = (char*) 0x7e0000000000;
     sys6(NR_MMAP, (long) page, 8192, 3, MAP_FIXED_ANON, -1, 0);
     sys(NR_MUNMAP, (long) (page + 4096), 4096, 0);
+    src = (char*) 0x7d0000000000;
+    sys6(NR_MMAP, (long) src, 8192, 3, MAP_FIXED_ANON, -1, 0);
     for (int i = 0; i < 4096; i++) page[i] = (char) (i * 7 + 3);
     for (int i = 0; i < 8192; i++) src[i] = (char) (i * 5 + 1);
     for (int c = 0; c < (int) (sizeof cases / sizeof cases[0]); c++) {
