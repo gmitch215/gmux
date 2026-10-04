@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # the native (x86-64) time of region.sh's builds: the binary, the interpreter alone and each arm in each
 # form, rounds interleaved on one core, `r` against the binary. Take the host's timing lock around it.
-# usage: region-time.sh <bin dir> <out dir of region.sh> <workload> <core> [rounds, 7]
+# usage: [ARMS="binary interp fn:0 ..."] region-time.sh <bin dir> <out dir of region.sh> <workload> <core> [rounds, 7]
 set -euo pipefail
 here=$(cd "$(dirname "$0")" && pwd)
 bin=$(cd "$1" && pwd)
@@ -10,7 +10,7 @@ w=$3
 core=$4
 rounds=${5:-7}
 . "$here/workloads.sh"
-arms=(binary interp fn:0 fn:1 fn:2 fnc:0 fnc:1 fnc:2 all:0 all:1 all:2)
+read -ra arms <<< "${ARMS:-binary interp fn:0 fn:1 fn:2 fnc:0 fnc:1 fnc:2 all:0 all:1 all:2}"
 prog() {
 	case $1 in
 		binary) echo "" ;;
@@ -23,7 +23,7 @@ run() { # arm: time of one run in ms
 	local arm=$1 regs=0
 	[[ $arm == *:* ]] && regs=${arm##*:}
 	local t0=${EPOCHREALTIME/./}
-	KATYBUG_REGS=$regs taskset -c "$core" sh -c "$(cmd "$(prog "$arm")" "$w")" > /dev/null 2>&1
+	KATYBUG_REGS=$regs taskset -c "$core" timeout "${RUN_TIMEOUT:-600}" sh -c "$(cmd "$(prog "$arm")" "$w")" > /dev/null 2>&1
 	echo $(((${EPOCHREALTIME/./} - t0) / 1000))
 }
 for arm in "${arms[@]}"; do run "$arm" > /dev/null; done

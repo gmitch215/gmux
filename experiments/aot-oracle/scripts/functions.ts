@@ -7,7 +7,9 @@ import { readFileSync } from 'node:fs';
  * branches, fall-through and direct jumps, without following a call into its callee. The program
  * is stripped, so a function is its entry address and the code range its blocks span.
  *
- * `functions.ts <dump.hot>... [--top n]`, one table per run on stdout
+ * `functions.ts <dump.hot>... [--top n]`, one table per run on stdout. `--emit=<rank>[+callees]` prints one
+ * lift.ts ranges text for the function (and its hot callees); `--emit-split=<rank>[:<n>]` prints one per line for the
+ * function and its n hottest callees (all worth keeping, without n), each to be a region of its own.
  */
 export interface Ins {
 	op: number;
@@ -126,6 +128,11 @@ export function functions(blocks: Block[], op: Record<string, number>, program: 
  * `callees`, the functions it calls (transitively) that run at least `minShare` of all ops are included.
  */
 export function rangesOf(fns: Fn[], total: bigint, rank: number, callees = false, minShare = 0.01): string {
+	return mergedRanges(pickedOf(fns, total, rank, callees, minShare));
+}
+
+/** the function of that rank, then the callees (transitively) worth keeping, most self ops first, at most `most` of them */
+export function pickedOf(fns: Fn[], total: bigint, rank: number, callees = false, minShare = 0.01, most = Infinity): Fn[] {
 	const byEntry = new Map(fns.map((f) => [f.entry, f]));
 	const root = fns[rank]!;
 	const picked = new Set<Fn>([root]);
@@ -135,7 +142,11 @@ export function rangesOf(fns: Fn[], total: bigint, rank: number, callees = false
 			if (g && !picked.has(g) && Number(g.self) >= minShare * Number(total)) picked.add(g);
 		}
 	}
-	const spans = [...picked].flatMap((f) => f.blocks.map((b) => [b.pc, b.next] as const)).sort((x, y) => (x[0] < y[0] ? -1 : x[0] > y[0] ? 1 : 0));
+	return [root, ...[...picked].slice(1).sort((x, y) => (y.self > x.self ? 1 : y.self < x.self ? -1 : 0)).slice(0, most)];
+}
+
+function mergedRanges(picked: Fn[]): string {
+	const spans = picked.flatMap((f) => f.blocks.map((b) => [b.pc, b.next] as const)).sort((x, y) => (x[0] < y[0] ? -1 : x[0] > y[0] ? 1 : 0));
 	const merged: [bigint, bigint][] = [];
 	for (const [lo, hi] of spans) {
 		const last = merged.at(-1);
@@ -143,6 +154,11 @@ export function rangesOf(fns: Fn[], total: bigint, rank: number, callees = false
 		else merged.push([lo, hi]);
 	}
 	return merged.map(([lo, hi]) => `0x${lo.toString(16)}-0x${hi.toString(16)}`).join(',');
+}
+
+/** the same functions as rangesOf, one ranges text per function (the root first), for one region each */
+export function splitRanges(fns: Fn[], total: bigint, rank: number, minShare = 0.01, most = Infinity): string[] {
+	return pickedOf(fns, total, rank, true, minShare, most).map((f) => mergedRanges([f]));
 }
 
 if (process.argv[1]?.endsWith('functions.ts')) {
@@ -164,6 +180,12 @@ if (process.argv[1]?.endsWith('functions.ts')) {
 		}
 		const first = [...blocks].sort((x, y) => (x.pc < y.pc ? -1 : 1))[0]!.pc;
 		const ranked = functions(blocks, op, first);
+		const split = args.find((a) => a.startsWith('--emit-split='))?.slice(13);
+		if (split) {
+			const [rank, most] = split.split(':');
+			console.log(splitRanges(ranked, total, Number(rank), 0.01, most === undefined ? Infinity : Number(most)).join('\n'));
+			continue;
+		}
 		const emit = args.find((a) => a.startsWith('--emit='))?.slice(7);
 		if (emit) {
 			const [rank, withCallees] = emit.split('+');

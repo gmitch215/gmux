@@ -2,7 +2,9 @@
 # the x86-64 guests of tests/c/katybug lifted whole (every block they run) in both forms of lift.ts
 # --regs --slots, run with KATYBUG_REGS=0, 1 and 2: stdout and exit status must equal the interpreter's
 # (and x86-regs.expected for that guest). LIFT_MUTATE=noguard or nowrite builds the slots form unsound on
-# purpose: the slots guest must then fail with regs=2. usage: regs-check.sh <out dir> [guest...]
+# purpose: the slots guest must then fail with regs=2. KB_EPOCH=1 builds the regions' runtime with the epoch
+# guard (-DKB_EPOCH=1) and lifts with --epochs; EPOCHS=0 lifts without it (the interpreter's guard alone).
+# usage: [KB_EPOCH=1] [EPOCHS=0] regs-check.sh <out dir> [guest...]
 set -euo pipefail
 here=$(cd "$(dirname "$0")" && pwd)
 root=$(cd "$here/../../.." && pwd)
@@ -19,10 +21,14 @@ source_of() {
 	case $1 in faults) echo x86-faults.c ;; prim) echo prim-faults.c ;; regs) echo x86-regs.c ;; slots) echo x86-slots.c ;; *) echo "$1.c" ;; esac
 }
 flags_of() {
-	case $1 in regs) echo "" ;; slots) echo "-mno-sse -mno-mmx -mno-red-zone" ;; prim) echo "-I$T -mno-sse -mno-mmx -mno-red-zone" ;; *) echo "-mno-sse -mno-mmx" ;; esac
+	case $1 in regs) echo "" ;; slots) echo "-mno-sse -mno-mmx -mno-red-zone" ;; prim) echo "-I$T -mno-sse -mno-mmx -mno-red-zone" ;; epochs) echo "-Wl,-N -mno-sse -mno-mmx" ;; *) echo "-mno-sse -mno-mmx" ;; esac
 }
+epoch_cc=
+epoch_lift=
+[ "${KB_EPOCH:-0}" = 1 ] && epoch_cc=-DKB_EPOCH=1
+[ "${EPOCHS:-${KB_EPOCH:-0}}" = 1 ] && epoch_lift=--epochs
 guests=("$@")
-[ "${#guests[@]}" -gt 0 ] || guests=(guest signals faults prim returns pieces fds regs slots)
+[ "${#guests[@]}" -gt 0 ] || guests=(guest signals faults prim returns pieces fds regs slots epochs)
 $cc -o "$out/hot" -DKB_HOT "$K"/*.c -lm
 $cc -o "$out/plain" "$K"/*.c -lm
 failed=0
@@ -32,10 +38,14 @@ for g in "${guests[@]}"; do
 	mkdir -p "$out/hot-$g"
 	rm -f "$out/hot-$g"/*.hot
 	KATYBUG_HOT=$out/hot-$g "$out/hot" "$out/$g" > /dev/null 2>&1 || true
-	"$node" --no-warnings --experimental-strip-types "$here/lift.ts" --temps --windows --regs --slots "$out/aot-$g.c" 1 "$out/hot-$g"/*.hot 2> "$out/lift-$g.log"
-	(ulimit -S -t unlimited; $cc -DKB_AOT -I"$K" -I"$here/../src" -o "$out/aot-$g" "$K"/*.c "$out/aot-$g.c" -lm)
+	"$node" --no-warnings --experimental-strip-types "$here/lift.ts" --temps --windows --regs --slots $epoch_lift "$out/aot-$g.c" 1 "$out/hot-$g"/*.hot 2> "$out/lift-$g.log"
+	(ulimit -S -t unlimited; $cc $epoch_cc -DKB_AOT -I"$K" -I"$here/../src" -o "$out/aot-$g" "$K"/*.c "$out/aot-$g.c" -lm)
 	rc=0
 	"$out/plain" "$out/$g" > "$out/$g.want" 2> /dev/null || rc=$?
+	if [ "$g" = epochs ] && grep -q ' FAIL' "$out/$g.want"; then
+		echo "FAIL $g: the interpreter alone reports a failing case"
+		failed=1
+	fi
 	for regs in 0 1 2; do
 		got=0
 		KATYBUG_REGS=$regs "$out/aot-$g" "$out/$g" > "$out/$g.got$regs" 2> /dev/null || got=$?

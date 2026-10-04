@@ -6,6 +6,7 @@ import {
 	opNumbers,
 	parse,
 	rangesOf,
+	splitRanges,
 	type Block,
 	type Ins
 } from '../../experiments/aot-oracle/scripts/functions.ts';
@@ -88,6 +89,14 @@ describe('functions', () => {
 		expect(rangesOf(fns, total, 0)).toBe('0x2000-0x2021');
 		expect(rangesOf(fns, total, 0, true, 0)).toBe('0x2000-0x2021,0x3000-0x3001');
 		expect(rangesOf(fns, total, 0, true, 0.5)).toBe('0x2000-0x2021');
+	});
+
+	it('splits a function and its hot callees into one ranges text each, the root first', () => {
+		const fns = functions(blocks, op, 0x1000n);
+		const total = blocks.reduce((s, b) => s + b.runs * BigInt(b.ins.length), 0n);
+		expect(splitRanges(fns, total, 0, 0)).toEqual(['0x2000-0x2021', '0x3000-0x3001']);
+		expect(splitRanges(fns, total, 0, 0, 0)).toEqual(['0x2000-0x2021']);
+		expect(splitRanges(fns, total, 0, 0.5)).toEqual(['0x2000-0x2021']);
 	});
 
 	it('reads the dump format the interpreter writes', () => {
