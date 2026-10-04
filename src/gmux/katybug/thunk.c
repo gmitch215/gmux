@@ -3,24 +3,38 @@
 #include "kb.h"
 
 /*
- * Library calls found by name. A loaded ELF object imports memcpy, memmove and
- * memset through relocated slots (JUMP_SLOT, GLOB_DAT); once the loader has
- * bound a slot, its value is the entry of the implementation the guest's libc
- * chose (musl's function, or the variant glibc's ifunc picked). A block that
- * starts there is that call. The objects are found by their ELF headers at
- * mapping starts, so no state has to cross fork.c's exec
+ * Library calls found by name. A loaded ELF object imports strlen, memcmp,
+ * strcmp, memchr, memcpy, memmove, memset, exp, log and pow (and zlib's
+ * entries) through relocated slots (JUMP_SLOT, GLOB_DAT); once
+ * the loader has bound a slot, its value is the entry of the implementation the
+ * guest's libc chose (musl's function, or the variant glibc's ifunc picked). A
+ * block that starts there is that call. The objects are found by their ELF
+ * headers at mapping starts, so no state has to cross fork.c's exec
  */
 
 #define MAX_OBJS 32
-#define MAX_SLOTS 12
+#define MAX_SLOTS 40
 
 static const struct {
     const char* name;
     int id;
 } wanted[] = {
+    {"strlen", KB_THUNK_STRLEN},
+    {"memcmp", KB_THUNK_MEMCMP},
+    {"strcmp", KB_THUNK_STRCMP},
+    {"memchr", KB_THUNK_MEMCHR},
     {"memcpy", KB_THUNK_MEMCPY},
     {"memmove", KB_THUNK_MEMMOVE},
     {"memset", KB_THUNK_MEMSET},
+    {"exp", KB_THUNK_EXP},
+    {"log", KB_THUNK_LOG},
+    {"pow", KB_THUNK_POW},
+#ifdef KB_ZLIB
+    {"crc32", KB_THUNK_CRC32},
+    {"adler32", KB_THUNK_ADLER32},
+    {"compress2", KB_THUNK_COMPRESS2},
+    {"uncompress", KB_THUNK_UNCOMPRESS},
+#endif
 };
 
 static struct obj {

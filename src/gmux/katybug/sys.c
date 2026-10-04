@@ -254,6 +254,10 @@ static int x86_to_generic(uint64_t n) {
         case 98: return 165;  /* getrusage */
         case 100: return 153; /* times */
         case 115: return 158; /* getgroups */
+        case 133: return 33;  /* mknod, as mknodat in syscall_body() */
+        case 259: return 33;  /* mknodat */
+        case 140: return 141; /* getpriority */
+        case 141: return 140; /* setpriority */
         case 127: return 136; /* rt_sigpending */
         case 130: return 133; /* rt_sigsuspend */
         case 137: return 43;  /* statfs */
@@ -493,6 +497,10 @@ static int host_oflags(struct kb_cpu* cpu, uint64_t f) {
     uint64_t nofollow = cpu->arch == KB_X86 ? 0400000 : 0100000;
     if (f & dir) h |= O_DIRECTORY;
     if (f & nofollow) h |= O_NOFOLLOW;
+#ifdef O_PATH
+    /* without it, musl's fchmodat on a fifo opens it for reading and waits */
+    if (f & 010000000) h |= O_PATH;
+#endif
     return h;
 }
 
@@ -911,6 +919,10 @@ static void syscall_body(struct kb_cpu* cpu) {
                 a[3] = a[2], a[2] = a[1], a[1] = a[0],
                 a[0] = (uint64_t) LINUX_AT_FDCWD, nr = 78;
                 break;
+            case 133: /* mknod */
+                a[3] = a[2], a[2] = a[1], a[1] = a[0],
+                a[0] = (uint64_t) LINUX_AT_FDCWD;
+                break;
             case 158: nr = -3; break; /* arch_prctl */
             case 82:
                 a[3] = a[1], a[2] = (uint64_t) LINUX_AT_FDCWD, a[1] = a[0],
@@ -1142,6 +1154,38 @@ static void syscall_body(struct kb_cpu* cpu) {
         case 49: {
             char* path = kb_str(cpu, a[0]);
             v = path ? ret(chdir(path)) : -14;
+            break;
+        }
+        case 33: {
+            char* path = kb_str(cpu, a[1]);
+            /* Linux's answer for a type it cannot make; hosts differ */
+            uint64_t type = a[2] & 0170000;
+            if (path && type != 0 && type != 0100000 && type != 010000 &&
+                type != 0140000 && type != 020000 && type != 060000) {
+                v = type == 040000 ? -1 : -22;
+                break;
+            }
+            v = path ? ret(mknodat(
+                           host_dirfd((int64_t) a[0]), path, (mode_t) a[2],
+                           (dev_t) a[3]
+                       ))
+                     : -14;
+            break;
+        }
+        case 140:
+            v = a[0] > 2
+                    ? -22
+                    : ret(setpriority((int) a[0], (id_t) a[1], (int) a[2]));
+            break;
+        case 141: {
+            /* the kernel's value is 20 - nice, libc undoes it */
+            if (a[0] > 2) {
+                v = -22;
+                break;
+            }
+            errno = 0;
+            int nice = getpriority((int) a[0], (id_t) a[1]);
+            v = nice == -1 && errno ? kb_err(errno) : 20 - nice;
             break;
         }
         case 34: {

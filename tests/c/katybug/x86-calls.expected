@@ -1,0 +1,62 @@
+call_load mapped ok
+  rax 0x3333333333333334
+  rdx 0x71e152c2b223937
+  r8 0xf60d041b1a112813
+  r10 0x1111111111111112
+  r11 0x2940374e4d445bd1
+  flags 0x80
+call_load unmapped fault at +0x2
+  rax 0x3333333333333334
+  rdx 0x1
+  r8 0xeeeeeeeeeeeeeedd
+  r10 0x1111111111111112
+  r11 0x222222222222229b
+  flags 0x84
+  fault rax 0x3333333333333334
+  fault r8 0xeeeeeeeeeeeeeedc
+  fault flags 0x80
+call_store mapped ok
+  rax 0x3333333333333334
+  rdx 0x1
+  r8 0xeeeeeeeeeeeeeedd
+  r10 0x1111111111111112
+  r11 0x222222222222229b
+  flags 0x84
+call_store unmapped fault at +0x2
+  rax 0x3333333333333334
+  rdx 0x1
+  r8 0xeeeeeeeeeeeeeedd
+  r10 0x1111111111111112
+  r11 0x222222222222229b
+  flags 0x84
+  fault rax 0x3333333333333334
+  fault r8 0xeeeeeeeeeeeeeedc
+  fault flags 0x80
+deep_load mapped ok
+  rax 0x6666666666666668
+  rdx 0x3333333333333334
+  r8 0xffffffffffffffc8
+  r10 0x1111111111111112
+  flags 0x4
+deep_load unmapped fault at +0x0
+  rax 0x6666666666666669
+  r8 0xffffffffffffffc8
+  r10 0x1111111111111112
+  flags 0x4
+  fault rax 0x3333333333333334
+  fault r12 0x6666666666666669
+  fault flags 0x4
+return_elsewhere plain ok
+  rax 0x3333333333333334
+  r12 0xbeef
+  flags 0x0
+loop_of_calls plain ok
+  rax 0xbbbbbbbbbbbbbbc0
+  r12 0x0
+  flags 0x44
+mutual_calls plain ok
+  rax 0x111111111111112c
+  rcx 0x2222222222222227
+  rdx 0x333333333333333b
+  rdi 0x0
+  flags 0x4

@@ -852,6 +852,13 @@ static int translate(struct kb_cpu* cpu, struct kb_block* b) {
     for (int i = 0; !bad && i < b->n; i++) b->insns += b->ins[i].op == KB_PC;
 #endif
     if (!bad) bad = lean_pcs(cpu, b);
+    if (!bad && b->n) {
+        /* the decoder's buffer doubled from 64 ops; keep what is used */
+        void* p = realloc(b->ins, (size_t) b->n * sizeof *b->ins);
+        if (p) b->ins = p;
+        if (b->pcs && (p = realloc(b->pcs, (size_t) b->n * sizeof *b->pcs)))
+            b->pcs = p;
+    }
     if (!bad) bad = kb_block_ready(cpu, b);
     if (bad) {
         free(b->ins);
@@ -888,6 +895,17 @@ int kb_block_ready(struct kb_cpu* cpu, struct kb_block* b) {
 #endif
     return 0;
 }
+
+#ifdef KB_AOT
+/* a region moves between its blocks by direct edges, which the guard that
+ * finds old code never sees: when the code generation moves, each block
+ * leaves its region until it has been through the guard again */
+void kb_aot_stale(struct kb_cpu* cpu) {
+    for (int h = 0; h < 4096; h++)
+        for (struct kb_block* b = cpu->cache[h]; b; b = b->chain)
+            if (b->aot) kb_aot_detach(b);
+}
+#endif
 
 /* b emptied for its code to be decoded again: pc and its place in the cache
  * stay, so blocks linked to it stay linked */

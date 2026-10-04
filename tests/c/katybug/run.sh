@@ -23,6 +23,8 @@ flags=(-nostdlib -static -fuse-ld=lld -O2 -ffreestanding -fno-stack-protector -f
 "$llvm/clang" --target=x86_64-linux-gnu "${flags[@]}" -mno-sse -mno-mmx -o "$out/faults-x86" "$here/x86-faults.c"
 "$llvm/clang" --target=x86_64-linux-gnu "${flags[@]}" -o "$out/regs-x86" "$here/x86-regs.c"
 "$llvm/clang" --target=x86_64-linux-gnu "${flags[@]}" -mno-sse -mno-mmx -mno-red-zone -o "$out/slots-x86" "$here/x86-slots.c"
+"$llvm/clang" --target=x86_64-linux-gnu "${flags[@]}" -mno-sse -mno-mmx -mno-red-zone -o "$out/calls-x86" "$here/x86-calls.c"
+"$llvm/clang" --target=x86_64-linux-gnu "${flags[@]}" -mno-sse -mno-mmx -mno-red-zone -o "$out/index-x86" "$here/x86-index.c"
 "$llvm/clang" --target=x86_64-linux-gnu "${flags[@]}" -I"$here" -mno-sse -mno-mmx -mno-red-zone -o "$out/prim-x86" "$here/prim-faults.c"
 "$llvm/clang" --target=aarch64-linux-gnu "${flags[@]}" -I"$here" -mgeneral-regs-only -o "$out/prim-a64" "$here/prim-faults.c"
 "$llvm/clang" --target=x86_64-linux-gnu "${flags[@]}" -mno-sse -mno-mmx -o "$out/returns-x86" "$here/returns.c"
@@ -33,9 +35,16 @@ flags=(-nostdlib -static -fuse-ld=lld -O2 -ffreestanding -fno-stack-protector -f
 "$llvm/clang" --target=aarch64-linux-gnu "${flags[@]}" -mgeneral-regs-only -o "$out/fds-a64" "$here/fds.c"
 "$llvm/clang" --target=x86_64-linux-gnu "${flags[@]}" -mno-sse -mno-mmx -o "$out/bigsend-x86" "$here/bigsend.c"
 "$llvm/clang" --target=aarch64-linux-gnu "${flags[@]}" -mgeneral-regs-only -o "$out/bigsend-a64" "$here/bigsend.c"
+"$llvm/clang" --target=x86_64-linux-gnu "${flags[@]}" -mno-sse -mno-mmx -o "$out/prio-x86" "$here/prio.c"
+"$llvm/clang" --target=aarch64-linux-gnu "${flags[@]}" -mgeneral-regs-only -o "$out/prio-a64" "$here/prio.c"
+"$llvm/clang" --target=x86_64-linux-gnu "${flags[@]}" -mno-sse -mno-mmx -o "$out/cpuid-x86" "$here/x86-cpuid.c"
+cc -std=c11 -O2 -Wall -Wextra -Werror -o "$out/libm-kernel" "$here/libm-kernel.c" "$root/src/gmux/katybug/libm.c" \
+	"$root/src/gmux/katybug/libm-data.c" -lm
+cc -std=c11 -O2 -Wall -Wextra -Werror -DFROM_KERNEL -o "$out/libm-tables" "$here/libm-tables.c" "$root/src/gmux/katybug/libm-data.c"
 # -N: one writable and executable segment, for the loop that patches its own code
 "$llvm/clang" --target=x86_64-linux-gnu "${flags[@]}" -Wl,-N -mno-sse -mno-mmx -o "$out/epochs-x86" "$here/epochs.c"
 "$llvm/clang" --target=aarch64-linux-gnu "${flags[@]}" -Wl,-N -mgeneral-regs-only -o "$out/epochs-a64" "$here/epochs.c"
+"$llvm/clang" --target=x86_64-linux-gnu "${flags[@]}" -Wl,-N -mno-sse -mno-mmx -o "$out/region-smc-x86" "$here/x86-region-smc.c"
 "$llvm/clang" --target=x86_64-linux-gnu -nostdlib -static -fuse-ld=lld -o "$out/hello-x86" "$here/hello-x86.S"
 "$llvm/clang" --target=aarch64-linux-gnu -nostdlib -static -fuse-ld=lld -o "$out/hello-a64" "$here/hello-a64.S"
 
@@ -99,6 +108,12 @@ check regs-x86 "$(cat "$here/x86-regs.expected")" 0 "$out/katybug" "$out/regs-x8
 # x86-slots.expected is native Linux's: stack slots written through pointers, by a callee, a signal
 # handler, other widths, sse and rep stos, and read after a fault
 check slots-x86 "$(cat "$here/x86-slots.expected")" 0 "$out/katybug" "$out/slots-x86"
+# x86-calls.expected is native Linux's: registers and flags across calls, a fault in a callee, a return elsewhere
+check calls-x86 "$(cat "$here/x86-calls.expected")" 0 "$out/katybug" "$out/calls-x86"
+# x86-index.expected is native Linux's: masked and compared indexes, a mask that is loaded and changes, a store read
+# by a later load, and a window that ends in a PROT_NONE page or a hole, where the access faults at its own address
+check index-x86 "$(cat "$here/x86-index.expected")" 0 "$out/katybug" "$out/index-x86"
+check index-x86-small-pieces "$(cat "$here/x86-index.expected")" 0 "$out/katybug-4k" "$out/index-x86"
 # prim-faults.expected is native Linux's on both architectures: musl's strlen, memcmp, strcmp and
 # memchr, byte for byte, called at a page end, a hole, PROT_NONE and across mappings; a kernel that
 # reaches a page it cannot read hands over to the function, which faults at the same address
@@ -154,6 +169,25 @@ for a in x86 a64; do
 	check bigsend-$a-small-pieces "$bigsend" 0 "$out/katybug-4k" "$out/bigsend-$a"
 done
 check bigsend-x86-fork-exec "$bigsend" 0 env KATYBUG_FORK=exec "$out/katybug" "$out/bigsend-x86"
+# prio.c: mknod (x86-64 only), mknodat, getpriority and setpriority, with the errors native Linux
+# gives (EEXIST, ENOENT, EFAULT, EINVAL, ESRCH, EPERM, EACCES for a caller without privilege)
+prio=$'mknod ok\nmknod-exists ok\nmknodat-exists ok\nmknodat ok\nmknod-missing-dir ok\nmknod-fault ok\nmknod-type ok\nmknod-device ok\ngetpriority ok\nsetpriority ok\ngetpriority-raised ok\nsetpriority-lower ok\ngetpriority-which ok\nsetpriority-which ok\ngetpriority-missing ok\nsetpriority-missing ok\nsetpriority-other ok'
+check prio-x86 "$prio" 0 "$out/katybug" "$out/prio-x86"
+check prio-a64 "$prio" 0 "$out/katybug" "$out/prio-a64"
+# libm kernels: exp, log and pow run on the guest's behalf only where glibc 2.36 and 2.39 and musl 1.2.5 return
+# the same bits. libm-tables.txt holds the hash of each table as the three define them (libm-tables.sh); the
+# kernel's copy must be the same value for value, and libm-vectors.txt (glibc 2.36 on x86-64 without FMA,
+# glibc 2.36 and musl 1.2.5 on AArch64, run natively) must come out of the kernel bit for bit wherever it runs
+if awk 'NR > 1 && ($2 != $3 || $2 != $4 || $2 != $5) { bad = 1 } END { exit bad }' "$here/libm-tables.txt"; then
+	check libm-tables "$(awk 'NR > 1 { print $1, $2 }' "$here/libm-tables.txt")" 0 "$out/libm-tables"
+else
+	echo "FAIL libm-tables.txt: the sources' tables differ from each other or from the kernel's"
+	failed=1
+fi
+check libm-vectors $'exp 2400 inputs: x86-64 kernel ran 2288, 0 differing; AArch64 kernel ran 2288, 0 differing\nlog 2400 inputs: x86-64 kernel ran 2327, 0 differing; AArch64 kernel ran 2327, 0 differing\npow 2400 inputs: x86-64 kernel ran 1511, 0 differing; AArch64 kernel ran 1511, 0 differing' 0 \
+	"$out/libm-kernel" "$here/libm-vectors.txt"
+# x86-cpuid.c: no FMA, AVX or FMA4 reported, so a guest's libm takes its SSE2 variants
+check cpuid-x86 $'fma 0\nosxsave 0\navx 0\nleaf7 0\nfma4 0' 0 "$out/katybug" "$out/cpuid-x86"
 # epochs.c: a mapping, the signal state, executable code or a descriptor changes in the middle of a
 # loop that is already a trace, once and every few iterations; each loop's result is what native Linux
 # gives (x86-64 run there too), and the traces really ran
@@ -171,6 +205,10 @@ for a in x86 a64; do
 		failed=1
 	fi
 done
+# x86-region-smc.c: the immediate of a loop's add is rewritten between calls and the code generation
+# moves; lifted by experiments/aot-oracle/scripts/regions-guards.sh it checks a region against old code
+check region-smc-x86 "region-smc ok" 0 "$out/katybug" "$out/region-smc-x86"
+check region-smc-x86-segments-1 "region-smc ok" 0 env KATYBUG_SEGMENTS=1 "$out/katybug" "$out/region-smc-x86"
 # signals.expected is the x86-64 build's output on native Linux; SIGTERM's default action ends it.
 # a CI runner starts steps with SIGPIPE ignored, so the default case sets it back first
 dfl=(perl -e '$SIG{PIPE} = "DEFAULT"; exec @ARGV or die')

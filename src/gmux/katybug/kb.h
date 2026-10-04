@@ -134,9 +134,10 @@ enum kb_op
                  zero (bit 8 set, bit 0 clear) or nonzero (both set) */
     KB_A64V,  /* AArch64 floating point, Advanced SIMD, FPCR/FPSR: imm is the
                  instruction word, b a load or store's address; a64v.c */
-    KB_PRIM   /* first op of a block at the entry of a string function (imm 1
+    KB_PRIM   /* first op of a block at the entry of a library function (imm 1
                  strlen, 2 memcmp, 3 strcmp, 4 memchr, 5 memcpy, 6 memmove, 7
-                 memset): runs it as a host
+                 memset, 8 exp, 9 log, 10 pow, 11 crc32, 12 adler32, 13
+                 compress2, 14 uncompress): runs it as a host
                  kernel and returns to the caller, or falls through to the
                  function's own ops; prim.c */
 };
@@ -355,12 +356,23 @@ int kb_grow(struct kb_cpu* cpu, struct kb_mapping* m, uint64_t end);
  * function i */
 int kb_prim_enabled(void);
 /* thunk.c: library calls found by the name a loaded object imports them under;
- * the ids continue prim.c's */
+ * the ids are prim.c's */
 enum
 {
-    KB_THUNK_MEMCPY = 5,
+    KB_THUNK_STRLEN = 1,
+    KB_THUNK_MEMCMP,
+    KB_THUNK_STRCMP,
+    KB_THUNK_MEMCHR,
+    KB_THUNK_MEMCPY,
     KB_THUNK_MEMMOVE,
-    KB_THUNK_MEMSET
+    KB_THUNK_MEMSET,
+    KB_THUNK_EXP,
+    KB_THUNK_LOG,
+    KB_THUNK_POW,
+    KB_THUNK_CRC32,
+    KB_THUNK_ADLER32,
+    KB_THUNK_COMPRESS2,
+    KB_THUNK_UNCOMPRESS
 };
 int kb_thunk_at(struct kb_cpu* cpu, uint64_t pc);
 int kb_prim_at(struct kb_cpu* cpu, uint64_t pc);
@@ -462,6 +474,7 @@ void kb_count_report(struct kb_cpu* cpu);
  * to a block whose IR matches one exactly */
 void kb_aot_attach(struct kb_cpu* cpu, struct kb_block* b);
 void kb_aot_detach(struct kb_block* b);
+void kb_aot_stale(struct kb_cpu* cpu);
 void kb_aot_string(struct kb_cpu* cpu, int stos, int w, int rep);
 extern volatile int* kb_pending_flag;
 #endif

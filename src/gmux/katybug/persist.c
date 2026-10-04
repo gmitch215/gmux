@@ -16,7 +16,7 @@
  * every setting the plan depends on
  */
 
-#define VERSION 1
+#define VERSION 2
 
 struct header {
     char magic[4];
@@ -30,7 +30,7 @@ struct header {
 struct record {
     uint64_t pc, next, target, code; /* code: the hash of the guest bytes */
     uint32_t n, nseg, taken, fall, traced, pcs;
-    int flag_writes, dropped, pruned, resolves;
+    int flag_writes, dropped, pruned, resolves, insns;
 };
 
 struct table {
@@ -60,9 +60,10 @@ static uint64_t file_hash(const char* path) {
 }
 
 static uint32_t settings(const struct kb_cpu* cpu) {
-    return (uint32_t) cpu->noplan | KB_FUSE << 1 | KB_CHAIN << 2 |
-           KB_LAZY << 3 | (uint32_t) cpu->segments << 5 |
-           (uint32_t) KB_POLL << 13 | (uint32_t) kb_prim_enabled() << 24;
+    return ((uint32_t) cpu->noplan | KB_FUSE << 1 | KB_CHAIN << 2 |
+            KB_LAZY << 3 | (uint32_t) cpu->segments << 5 |
+            (uint32_t) KB_POLL << 13) ^
+           (uint32_t) kb_prim_enabled() * 0x9e3779b1u;
 }
 
 /** the guest bytes a block was decoded from, hashed; *ok is 0 when a range is
@@ -172,6 +173,9 @@ int kb_persist_take(struct kb_cpu* cpu, struct kb_block* b) {
         b->taken = r->taken, b->fall = r->fall, b->traced = (int) r->traced;
         b->flag_writes = r->flag_writes, b->dropped = r->dropped;
         b->pruned = r->pruned, b->resolves = r->resolves;
+#ifdef KB_COUNT
+        b->insns = r->insns;
+#endif
         b->ins = t->ins[i], b->pcs = t->pcs[i], b->nseg = c.nseg,
         b->seg = c.seg;
         t->ins[i] = NULL, t->pcs[i] = NULL,
@@ -209,8 +213,11 @@ void kb_persist_save(struct kb_cpu* cpu) {
                 code,           (uint32_t) b->n, (uint32_t) b->nseg,
                 b->taken,       b->fall,         (uint32_t) b->traced,
                 b->pcs != NULL, b->flag_writes,  b->dropped,
-                b->pruned,      b->resolves
+                b->pruned,      b->resolves,     0
             };
+#ifdef KB_COUNT
+            r.insns = b->insns;
+#endif
             fwrite(&r, sizeof r, 1, f);
             fwrite(b->seg, 2 * sizeof(uint64_t), (size_t) b->nseg, f);
             fwrite(b->ins, sizeof(struct kb_ins), (size_t) b->n, f);

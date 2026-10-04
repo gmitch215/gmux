@@ -94,6 +94,13 @@ static void changed(struct kb_cpu* cpu) {
     last = -1;
     cpu->mapgen++;
     KB_BUMP_AS(map);
+#ifdef KB_AOT
+    static uint32_t seen;
+    if (cpu->codegen != seen) {
+        seen = cpu->codegen;
+        kb_aot_stale(cpu);
+    }
+#endif
 }
 
 /** how many pieces [s, e) touches */
