@@ -1,0 +1,45 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Gregory Mitchell <me@gmitch215.xyz>
+Date: Sun, 4 Oct 2026 01:20:00 -0400
+Subject: [PATCH] wasm: read the argument tables' address from the top of the
+ stack
+
+_start took the argument tables to sit at the page-aligned address above
+its stack pointer, so the kernel had to put them at the top of the
+program's stack mapping, and the stack and the arguments were one
+mapping of 33 pages, a 64-page block from the page allocator. The kernel
+now maps the arguments apart and leaves their address in the word at the
+top of the stack. _start still finds the top by rounding up the address of
+a local, and reads the word below it.
+---
+--- a/arch/wasm/crt_arch.h
++++ b/arch/wasm/crt_arch.h
+@@ -19,7 +19,9 @@
+
+ /*
+  * This must really be written in assembly (to capture the stack pointer properly), but we know that
+- * the initial stack pointer is page aligned, so we can cheat a bit and align it to the next page...
++ * the initial stack pointer is just below a page aligned top of the stack, so we can cheat a bit and
++ * align it to the next page... The word at the top holds the address of the argument tables, which
++ * are in a mapping of their own.
+  * The problem is that LLVM does not seem to work when functions are defined with inline asm (in C).
+  * TODO: fix this hack by refactoring musl and moving things into a .S file.
+  */
+@@ -28,13 +30,15 @@
+ {
+ 	void _start_c(/* no prototype on purpose */);
+ 	int dummy;
+-	_start_c(((unsigned long)(void*)&dummy + 4095UL) & ~4095UL);
++	long *top = (long *)(((unsigned long)(void*)&dummy + 4095UL) & ~4095UL);
++	_start_c(top[-1]);
+ }
+ #else
+ void _dlstart(void)
+ {
+ 	void _dlstart_c(/* no prototype on purpose */);
+ 	int dummy;
+-	_dlstart_c(((unsigned long)(void*)&dummy + 4095UL) & ~4095UL);
++	long *top = (long *)(((unsigned long)(void*)&dummy + 4095UL) & ~4095UL);
++	_dlstart_c(top[-1]);
+ }
+ #endif

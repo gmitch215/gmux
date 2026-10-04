@@ -15,5 +15,7 @@ void _start_c(long* p) {
 
 void _start(void) {
     int dummy;
-    _start_c((long*) (((unsigned long) (void*) &dummy + 4095UL) & ~4095UL));
+    // the word at the page-aligned top of the stack holds the tables' address
+    long* top = (long*) (((unsigned long) (void*) &dummy + 4095UL) & ~4095UL);
+    _start_c((long*) top[-1]);
 }

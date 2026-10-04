@@ -45,7 +45,7 @@ index ee5bee34e..ac4cd4611 100644
  	current_thread_info()->flags |= _TIF_RELOAD_PROGRAM;
  }
 diff --git a/fs/binfmt_wasm.c b/fs/binfmt_wasm.c
-index 508c953b2..be527d3d9 100644
+index 8268c39e9..f0f9d50b6 100644
 --- a/fs/binfmt_wasm.c
 +++ b/fs/binfmt_wasm.c
 @@ -20,6 +20,8 @@
@@ -55,9 +55,9 @@ index 508c953b2..be527d3d9 100644
 +#include <asm/wasm.h>
 +
  /*
-  * 128 KiB with the argument page, binfmt_elf_fdpic's default for nommu programs. Without an MMU a
-  * stack is committed memory, so the host grows it in segments up to RLIMIT_STACK as the program
-@@ -441,6 +443,14 @@ static int load_wasm_binary(struct linux_binprm *bprm)
+  * 128 KiB, binfmt_elf_fdpic's default for nommu programs, in a mapping of its own. Without an MMU
+  * a stack is committed memory, so the host grows it in segments up to RLIMIT_STACK as the program
+@@ -462,6 +464,14 @@ static int load_wasm_binary(struct linux_binprm *bprm)
  	if (res)
  		return res;
  

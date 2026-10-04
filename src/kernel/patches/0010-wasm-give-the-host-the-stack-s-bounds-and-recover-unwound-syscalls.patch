@@ -22,8 +22,8 @@ mode". The functions the host calls are declared in asm/wasm.h.
  arch/wasm/kernel/process.c   | 30 ++++++++++++++++++++++++++++++
  arch/wasm/kernel/signal.c    |  1 +
  arch/wasm/kernel/traps.c     | 15 +++++++++++++++
- fs/binfmt_wasm.c             |  7 ++++++-
- 5 files changed, 58 insertions(+), 1 deletion(-)
+ fs/binfmt_wasm.c             |  9 ++++++---
+ 5 files changed, 58 insertions(+), 3 deletions(-)
 
 diff --git a/arch/wasm/include/asm/wasm.h b/arch/wasm/include/asm/wasm.h
 index a70785bba..573ad05f0 100644
@@ -127,23 +127,25 @@ index bf2270ad7..740c27bfd 100644
  	__visible long __wasm_syscall_##x args;					\
  	__visible long __wasm_syscall_##x args					\
 diff --git a/fs/binfmt_wasm.c b/fs/binfmt_wasm.c
-index 4d67dbf30..508c953b2 100644
+index 585de67c9..8268c39e9 100644
 --- a/fs/binfmt_wasm.c
 +++ b/fs/binfmt_wasm.c
-@@ -20,7 +20,12 @@
- #include <linux/uaccess.h>
+@@ -21,9 +21,12 @@
  #include <linux/vmalloc.h>
  
--/* 128 KiB, the default binfmt_elf_fdpic gives nommu programs */
-+/*
-+ * 128 KiB with the argument page, binfmt_elf_fdpic's default for nommu programs. Without an MMU a
-+ * stack is committed memory, so the host grows it in segments up to RLIMIT_STACK as the program
-+ * needs them (split stacks): a program that uses all of the 124 KiB below its arguments moves on to
-+ * a second segment, mapped when it first needs one.
-+ */
+ /*
+- * 128 KiB, the default binfmt_elf_fdpic gives nommu programs, in a mapping of its own. The
+- * mapping is 32 pages, one block from the page allocator; a 33rd page would take a 64-page block
+- * and give back the rest, and a small machine runs out of those after a hundred execs.
++ * 128 KiB, binfmt_elf_fdpic's default for nommu programs, in a mapping of its own. Without an MMU
++ * a stack is committed memory, so the host grows it in segments up to RLIMIT_STACK as the program
++ * needs them (split stacks): a program that needs more than the 128 KiB moves on to a second
++ * segment, mapped when it first needs one. The mapping is 32 pages, one block from the page
++ * allocator; a 33rd page would take a 64-page block and give back the rest, and a small machine
++ * runs out of those after a hundred execs.
+  */
  #define WASM_STACK_SIZE		(128UL * 1024)
  
- /*
 -- 
 2.43.0
 
