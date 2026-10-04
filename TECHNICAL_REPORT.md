@@ -88,12 +88,15 @@ Root processes share one trust domain; non-root processes are isolated for reads
 (Isolation, below), at the cost measured there. A non-root process cannot fork (`ENOSYS`), and a
 forked child copies its parent's memory eagerly, so a shared mapping across `fork` is a copy.
 Checkpoints do not save shared instances or a fork child's own memory. The deployed machine has
-run the whole kernel patch set (25 patches) once, on Free: the staged start, a survive across a
-redeploy and the isolation, fork and posix probes pass there, and coreutils at 800 pages does not
-(0 of 20 tests). The idle-day figures for the new keeper defaults are read for four hours, not a
-day. Also unmeasured: any serving workload, execution memoization, publication of proven
-responses, and energy per job (a rig exists, its table is unusable). None of it has a number, and
-no figure here stands in for one.
+run the whole kernel patch set (30 patches) on Free: the smoke start and the 13 probes of the boot
+rig pass there, but a first start of the shipped bootstrap image prints an RCU stall dump (4 of 4
+deployments, see Checkpoints), and coreutils at 800 pages passes 2 of its first 140 tests (302 of
+516 with a 32-cpu patch that is not installed). Serving has a measurement (Serving a Guest's HTTP)
+but no slow-client, keepalive or concurrency figure. The idle-day figures for the new keeper
+defaults are read for 24 hours (Idle Machine, 24 Hours), and a short-sleep job still makes 900 s
+events. Also unmeasured: execution memoization, publication of proven responses, and energy per
+job on the wasm arms (the native and Katybug arms have a table). None of it has a number, and no
+figure here stands in for one.
 
 ---
 
@@ -829,7 +832,15 @@ on x86-64 and by 15.3% on AArch64. Alone, memcmp gives -5.7%, strcmp -6.6%, memc
 `nl` 5.2% (inside that workload's 8-12% link-order spread); the kernels-off arm's own link-order
 spread is 0.5-2.5% (`nl` 9.7%). The 5.3 million recognized calls in `sort` buy about 1.3 s of 7.97
 s, roughly 0.25 us each. A kernel does not pay when calls are few or operands short. glibc's
-versions are ifunc variants with other bytes, so a Debian guest recognizes none.
+versions are ifunc variants with other bytes, so a Debian guest recognized none; glibc 2.36's
+variants are now recognized by the bytes of the whole function (x86-64 sse2 and AArch64): 4,672
+strlen, 1,932 memcmp, 547 strcmp and 1,565 memchr calls on x86-64, equal to native in
+`thunk.sh` on both arches (4,125 clean lines). glibc's memcmp and AArch64 strcmp do not return the
+byte difference (351 and 1,020 of 4,125 lines differ in value, sign equal), so each variant has
+its own rule, and a call that ends within 64 bytes of unreadable memory is left to the guest so it
+faults as the variant does. The sha256 block function of coreutils 9.5 is a host kernel, exact on 23
+fault cases: `sha256sum` of a 1.29 MB file goes from `r` 258 (0.517 s) to 5 (0.010 s, native
+0.002 s).
 
 `memcpy`, `memmove` and `memset` in a dynamically linked guest run as host kernels too, found by
 the dynamic symbol (glibc and musl, x86-64 and AArch64, lazy and `-z now`). Output equals native on
@@ -839,17 +850,29 @@ selects is another function (`tests/c/katybug/thunk.sh`; `dynamic.sh` 29 of 29 o
 Alpine, both arches). The thunk beats the guest's own copy at every size
 measured, from 1 byte (-11% to -41% of the loop's time at 1-8 bytes) to 64 KiB (-99%), so there is
 no size below which it should stay in the interpreter; over a long run `r` is 2-12 with the thunk
-against 284-668 without (3 samples per arm). A libm thunk is not shipped: against musl's results
-`exp`, `log` and `pow` differ in 0 of 1M inputs and `sin` and `cos` in 3.1%, and glibc's FMA
-variants of `exp` and `pow` differ from its non-FMA ones in 0.06-0.07% of results.
+against 284-668 without (3 samples per arm). `exp`, `log` and `pow` run as host kernels
+too, from a private copy of musl's code and tables (x86-64 and AArch64 musl, x86-64 glibc), pinned by
+2,400 vectors per function with 0 differing; against musl's results `sin` and `cos` differ in 3.1%
+and stay refused, glibc's FMA variants of `exp` and `pow` differ from its non-FMA ones in
+0.06-0.07% of results, and AArch64 glibc's fused variants differ on 1 of 2,288 `exp`, 0 of 2,327
+`log` and 4 of 1,511 `pow` vectors, so that case is refused. zlib's `crc32`, `adler32`, `compress2`
+and `uncompress` are built and not shipped: +79,208 B of module (+23% of the product), and `r`
+1.07-1.11 against 50-166 without on paisley-park with the host's zlib (byte equality proven for
+zlib 1.2.13, 1.3.1 and 1.3.2).
 
 An interpreter block guards what it assumed with one epoch compare instead of a check per access:
 the mapping generation, the code generation and the signal state. Assumption checks per 1,000 guest
 instructions fall from 309 / 510 / 588 / 478 / 122 / 413 to 73 / 88 / 101 / 51 / 15 / 62 on factor,
 gzip, bzip2, sqlite, sha256 and bash (76-89% fewer; the load and store range compare stays). Native
-time with epochs is -3.2% (bash) to +1.4% (sha256, outside its spread) of without; no V8 timing
-exists. Fourteen tests equal native Linux on both arches and each of six deliberate breakages of an
-epoch is caught by one of them.
+time with epochs is -3.2% (bash) to +1.4% (sha256, outside its spread) of without; the V8
+timing is below. Fourteen tests equal native Linux on both arches and each of six
+deliberate breakages of an epoch is caught by one of them. Under V8, `-DKB_EPOCH=1` against 0 (3
+link orders, 6 workloads, all 18 cells exact) has a geomean of 0.9924 against a mean spread of
+1.8%: 2.5% on factor, 1.6% on bash, 0.1-1.0% on sqlite and bzip2, nothing on sha256 or gzip, inside
+the build-noise floor of 0.9892-1.0283, so the default stays 0. A lifted region built with
+`--epochs` reads the epoch once at entry and tests it at back edges: gzip's function region goes
+from 325.8 to 57.8 checks per 1,000 guest instructions, exact in every arm (183 of 183 function
+checks), not timed.
 
 Lifted regions carry state in wasm locals only where it is exact. Registers moved through helpers
 fall 44% on factor, 41% on sqlite, 22% on bash and 10% on bzip2 in words per 1,000 guest
@@ -859,6 +882,26 @@ sha256's loads and 30% of gzip's; neither moves V8 time against the plain form (
 guest's instructions at `r` 11.66-12.43 on x86 and 18.67-21.38 under V8, against 70.60 and 102.14
 interpreted; two thirds of the V8 figure is the 12% still interpreted. All forms equal the
 interpreter's output, and no shipped build holds a lifted region.
+
+Regions can call each other without leaving lifted code: gzip's 1,996,332 calls between three regions
+become 266 region entries, against 3,992,843 through the interpreter, and the output is exact. A
+callee called out of line runs within 2.6% of one merged region under V8 (`r` 19.26 against 18.77,
+12% under the interpreter-between arm's 21.90) and 5.2% slower on x86-64 (12.44 against 11.82); a
+callee inlined at every call site is 31-33% slower than merged under V8, because its function
+bodies are 322-335 KB. bzip2 lifts 40.4% of its instructions, capped by which functions the recipe
+picks. A product build of one form is smaller and faster than a build of three: gzip +161,856 B
+against +408,732 B over the interpreter alone, sha256 +370,919 B against +654,554 B (65 and 26 bytes
+of wasm per IR operation), and under V8 the one-form builds ran 7.1-7.5% faster (cause not
+isolated). sha256's function region runs at `r` 5.27-5.34 (form 2) and 6.58-6.67 (form 0) under V8
+against 346.93-351.68 interpreted, and 1.74 and 3.18 on x86-64. gzip's whole-program arm made
+2,589,447 region entries because the 99% cut by IR operations leaves 14 short hot blocks out; the
+99.9% cut gives 16,028 entries and 99.8% lifted, exact. curl's profile is flat (the top function is
+5.84% of operations), and its whole-program region does not compile in 10 minutes. A region ran
+stale lifted code after the guest changed code and moved the code generation; the guard is now
+looked at on a region's direct edges. Windows from interval analysis (4,080 B windows over 4.5-7.2%
+of the base-plus-index residue) are exact and move nothing beyond the spread (gzip's windowed share
+53.62% to 54.32%, `r` inside 3.1% on x86-64 and 5.3% under V8); a 64 KiB window never resolves from
+an unaligned base and costs 17.7% (x86-64) and 20.1% (V8).
 
 Three changes cut dispatch. Block fusion decodes through direct jumps into one block; each block
 links the two successors it last saw, so most transitions skip the block hash; and a block run 64
@@ -888,6 +931,20 @@ untraced build the result depends on the program: from 5.3% faster (AArch64 sort
 (x86-64 awk), 0.5% faster on average. On an Apple M-series host traces are 3.1% faster on average
 and sqlite 7-8% faster. The traced build pays for its branch profile, which short traces do not win
 back. Traces hold 19-80% more decoded ops.
+
+A return costs one block dispatch and one block-cache lookup, and returns are 51-82% of the lookups
+(201-351 per 1,000 blocks) in bash, sqlite, awk and sort on both arches. Priced at the crossing
+table's lookup and chained dispatch (an Apple M2 Pro's, not the timing host's), a per-return inline
+cache could save at most 0.62% of those runs' time (0.86% if every return hit; the cache's hit
+rate is 69-90%) and a trace through a return at most 1.60% (1.79% at 14 ns), under a 2% bar in all
+12 workload-by-arch cells; neither was built.
+
+The syscall census inside a machine (`MachineOptions.countSyscalls`) puts the kernel at 17.7-33.0%
+of the sampled CPU of four workloads, and process start in host JavaScript (instantiating the
+module) at 33-54% of the busy samples of the three that are not Katybug. No file shape clears 3%
+(open-read-close 0.13%, statx 0.12% in the configure-shaped run); the spawn calls are 14.3% of
+that run and Katybug's mmap and munmap 12.1% of its userland run. Katybug sweeps `fcntl` over 1,024
+descriptors on every guest fork, 48.7% of that run's syscalls at 27 ns each in the kernel.
 
 Dispatch count does not predict time. Going from 2- to 32-block traces removes 25.6 M dispatches
 and 8.8 M ops from sqlite and saves 0.36 s, 14 ns per dispatch removed, while links remove 83.7 M
@@ -1345,6 +1402,13 @@ printed an RCU stall and a dump of every cpu (none at a 4 s gap, a stall at 36 s
 Node), which hung the site when it happened there. With the hook, restores 35 s, 10 minutes and 2
 hours after their checkpoints ran clean.
 
+The shipped bootstrap image with `ifconfig lo 127.0.0.1 up` in `rcS` (the relay needs loopback) still
+prints an RCU stall after its prompt on Free: 4 of 4 first starts, against 2 of 2 clean without the
+line; locally 2 of 2 on one image (gaps of 15 and 41 minutes) and 10 of 10 clean on six others. The
+dump (`t=66945` jiffies, a grace period open at the checkpoint, `rcu_sched` waiting 66,944 jiffies
+for a timer) shows an open grace period that `wasm_restored`'s reset does not cover; the cause is
+not isolated.
+
 On Free, each run against a fresh deployment:
 
 | start | prompt, from connecting | CPU of the start |
@@ -1392,6 +1456,75 @@ frozen `Date.now()`, so a step looked free and the cap doubled every turn to 12,
 loop's events on Free then ran 18.4, 10.3 and 16.6 s of CPU. A turn with no elapsed time now
 teaches nothing.
 
+### Serving a Guest's HTTP
+
+The machine's own listener is reached by a stream relay: each connection is a kernel socket in guest
+memory over `lo`, and the host holds two byte queues per stream (patch 0031, four non-suspending
+imports). A packet device was priced first, in Node over `lo` with a 6,888,896-byte file (three
+boots per setting, Mac load 8.95, so a smoke run): MTU 65536 against 1500 took 14.0 and 14.5 ms
+(3.6% slower, inside the spread), with 1.6-3.5x the pump steps and task switches at 1500, and
+`wget` made no host call in either; a host TCP endpoint would have needed the handshake,
+segmentation, window and per-connection state a checkpoint must carry. An unmodified BusyBox `httpd`
+serves. Raw bytes equal native on 6 of 6 requests (1 KiB, 404, HEAD, a range, 6.9 MB, a 22.9 MB CGI
+stream), local workerd body hashes equal on 6 of 6, and with four concurrent requests and one aborted
+mid-body the others complete exact and the open-stream count returns to 0. On paisley-park (Node,
+pinned, load 1.0-1.25) a request costs 0.93 ms of CPU for a 1 KiB file, 1.44-1.81 ms for a CGI
+hello and 11.0 ms for 6.9 MB (168-171 of about 590 sends backpressured). Deployed on Free, all six
+requests answered with the native hashes: 305 ms for the 1 KiB file, 1,396 ms for 6.9 MB and 4,091
+ms for 22.9 MB, a Durable Object turn of 654 and 488 ms of CPU during the two large replies, and
+1,542 ms of CPU for the first claim (boot); 2,581 sends and 29,781,118 bytes out. A long reply
+first stalled (1.35 MB in 100 s) for two reasons, a pump that ended only on new guest activity and
+workerd calling a stream's `pull` later than the specification does; after the fixes 6.9 MB takes
+2.2 s locally. A slow reader at 64 KiB/s holds about 1.1 MiB of the machine while stalled and the
+guest resets the connection after 80,030 ms with 1.4 MB unsent (the cause is not isolated; the
+native control was not run).
+
+The guest and the control plane share one origin, so every proxied reply carries
+`Content-Security-Policy: sandbox allow-scripts allow-forms` (an opaque origin: a guest page cannot
+read the owner token in `localStorage`), the guest's `set-cookie` and `clear-site-data` are removed,
+and the browser's `cookie` and `authorization` are not forwarded. The host parses a response the
+guest controls: its head is bounded at 64 KiB and bad framing is a 502.
+
+### Scheduler Core
+
+The scan-free tables in `machine.ts` (idle cpus and sleepers as indexes rather than scans) cut
+ns per step against the previous scans by 5% (a ring of 4 tasks) to 39% (54 sleepers), with traces
+exact (12 of 12 identical). The C core (`src/gmux/core/`, 4.3 KB of module) is a further 4.7-7.5% per
+step over the tables, beyond the spread at a ring of 56 and 54 sleepers and inside it at 4 and 32,
+and picks 1.7-2.2x faster in the isolated wake (`pickIdle` is 9.8-11.1% of samples at a ring of 56
+on the tables and 5.6% on the core). Rings of 64 and 256 tasks are not reachable in a machine:
+`vfork` fails with `Resource busy` near 57 tasks because every user task takes its own cpu slot
+(`NR_CPUS` 64), and a guest hangs in about 1 run in 6 at 56 tasks on every arm.
+
+### Idle Machine, 24 Hours
+
+On Free (STUDENT account, 37 hours read, 24 hours tabulated) the idle machine used 47 requests,
+477 rows written and 4.01 GB-s with 28 ticks of its file, against the simulation's 94 wakes, 872
+rows and about 3.5 GB-s per day; it woke hourly after its first hour, not at the 15-minute floor.
+The short-sleep job (`gzip -c` in a loop with `sleep 0.01`) used 951 requests, 11,386 rows (11.4%
+of the daily row meter) and 1,469.8 GB-s (11.3% of 13,000), with four 900 s `exceededWallTime`
+events; it was not stopped at the 16:28 UTC stop and ran to its cap of 100,000 iterations with 0
+bad checksums. The waited-time counter in the keeper did not end those events.
+
+### Energy per Job
+
+RAPL on paisley-park, a quiet box (30 of 30 idle windows under 0.3 other-tenant cores, median 0.013;
+idle 15.86 W), 5 of 5 samples kept in every cell, joules per job against native static glibc gcc
+-O2 (Katybug runs the same binaries):
+
+| workload | native J/job | Katybug J/job | ratio | spread (native, Katybug) |
+| --- | --- | --- | --- | --- |
+| lua | 0.331 | 59.9 | 181x | 15%, 19% |
+| gzip | 1.76 | 184.4 | 104.8x | 13%, 9% |
+| bzip2 | 1.82 | 228.3 | 125.2x | 11%, 8% |
+| sqlite | 0.385 | 103.6 | 269x | 10%, 9% |
+| sed | 2.54 | 839.2 | 330.5x | 9%, 11% |
+| gawk | 1.07 | 302.9 | 283.4x | 10%, 8% |
+
+The `null` arm (a 3 s sleep) nets about 0 with a noise of 3-5 W. The three wasm arms (gmux in
+node, asyncified, workerd) have no table on the current kernel: the census programs built before
+the stack change fail at start.
+
 ### Fuel
 
 1e8 loop-head iterations per shape, deployed:
@@ -1405,6 +1538,14 @@ teaches nothing.
 
 At the host's default budget of 200,000 iterations, the distance between safepoints is 0.35-31 ms of
 CPU across these shapes.
+
+Counting a call-free loop's fuel in a local (`GMUX_FUEL_LOCAL=1`, off by default) is exact and
+recovers part of the counter's cost on six programs (census A, 6 programs interleaved): 33-45% of the
+gap to a build with no fuel on gzip and bzip2, 17-20% on sed, 20-54% on gawk (wide spread) and
+4-10% on sqlite, and makes lua 1.6-3.9% slower than the plain build; the mean over the six is 0.978
+of plain in one census and 0.961 in the other. The call in the loop costs more than the count: a
+build with the count and no call runs at 0.924 of plain on gzip, the read-only check with the call
+at 0.969.
 
 ### Asset Fetches
 
@@ -1562,6 +1703,30 @@ cache between crossings adds only 1-15%. In a Durable Object on Free the same th
 656 and 860 ns at 2, 3, 5 and 7 arguments, 3.0-4.4 times the Mac. A plain Worker on Free hit error
 1102 above about 50,000 crossings, so the deployed loop runs in a Durable Object.
 
+A per-guest calibration (`tau.ts calibrate`, one rung of the hottest leaf, stored in the profile
+record with a 270 ns fallback and refusals for a spread over 20%, under 1,000 crossings or another
+host or module) is built, but it does not yet predict inside 7%. With it, 7 of 24 crossing-heavy
+rows miss: zlib at a 0.1 budget +8.4 to +10.8%, zstd -9.2 to -9.9%. Repeated calibrations of one
+guest range 342-412 ns (zlib) and 255-318 ns (zstd) against each session's own fit of 323-336 and
+300-317, bzip2's was refused 2 times in 4 (spread 59% and 47%), and a calibration takes 15.9 s
+(zlib), 24.1 s (bzip2) and 8.3 s (zstd), at Mac load 4-7 (smoke runs). A fixed 292 ns gave -6.8 to
++2.7% on the same rows.
+
+The second pass of the crossing table (`experiments/cut-model`) did not meet 5% either. Frozen
+before any prediction, it missed all 32 cells on both arches (worst -36.7% on x86-64, -46.3% on
+AArch64). The block-cache lookup is the larger error: a lookup priced from a working-set guest
+costs 3-5 times what real programs save (sqlite 13.8 ns tabled against 2.5 ns measured), no guest
+at the programs' (blocks held, blocks dispatched over) reproduces the real figure, and lookup cost
+grows with the size of the decoded blocks held (the indirect ring is 17 to 329 ns above the
+16-block ring from 1,024 to 98,000 blocks on x86-64; real programs hold 1,154-4,368 blocks, not
+19,000-98,000). The block term was pooled from guests that disagree by 9-16%; the trace guest alone
+gives 6.3-11.3 ns on x86-64 and 4.1-7.0 on AArch64 with a 4-6% higher per-op cost in trace arms.
+With both repaired and the lookup read from the program's own base and chain runs, the four
+programs land 1 of 32 (x86-64) and 0 of 32 (AArch64) outside 5%, but three held-out programs land
+8 of 24 (worst +9.8%) and 2 of 24 (worst +7.2%), and with the lookup read from the working-set
+table, 16 of 32 and 10 of 32 (worst -18.8% and -14.1%). Crossings do not add: the lookup cost
+depends on the size of the blocks held. Every timing was taken at Mac load above 4.
+
 A profile takes 12.6-16.6 s to make and about 1 ms to load (`experiments/profile-cache`). A record
 per guest, keyed by the module's SHA-256, holds the call graph, the ladder's two end timings, the
 plan and target sets and the mined fusion catalog. It is used only while its provenance (format,
@@ -1623,7 +1788,7 @@ compressed bytes once, and its cpio is the same.
 | `delay` calls `wasm_delay`; reboot calls `wasm_halt` | no busy delay, a clean stop |
 | `head.S` memory-grow retry shrinks by a page on failure | upstream retried the same size forever |
 | `CONFIG_BOOT_MEM_PAGES` 512 MiB to 64 MiB | 512 MiB cannot be allocated in an object |
-| `binfmt_wasm`'s program stack 8 KiB to 128 KiB, the argument page inside that mapping | brk, and with it mallocng's metadata, starts at the bottom of the same mapping; 128 KiB is `binfmt_elf_fdpic`'s default; the stack and the argument page are one 32-page block (order 5) because a 33-page mapping rounds to order 6, and a machine of 800 pages ran out of order-6 blocks (12 of 12 106-exec runs now finish, 1 of 4 before) |
+| `binfmt_wasm`'s program stack 8 KiB to 128 KiB, the arguments in a mapping of their own | brk, and with it mallocng's metadata, starts at the bottom of the same mapping; 128 KiB is `binfmt_elf_fdpic`'s default; the stack is a mapping of exactly 32 pages (order 5) because a 33-page mapping rounds to order 6, and a machine of 800 pages ran out of order-6 blocks (12 of 12 and 6 of 6 106-exec runs finish with 0 failure lines, 1 of 4 before); the tables' address is in the last word of the stack, which `crt1.c` reads, so a program built before this fails at start |
 | `__alloc_pages_slowpath` calls `cpu_relax` when the OOM killer made progress | every cpu shares one host thread, so the retrying task never gave the victim the thread: at 1,200 pages the kernel spun at 100% cpu after its OOM kills until a test timed out |
 | `binfmt_wasm` leaves brk no room | brk could grow to the top of the stack mapping, through the live stack |
 | `ARCH_FORCE_MAX_ORDER` 14 | without an MMU an anonymous mmap is one contiguous block; order 10 capped allocations at 4 MiB |
@@ -1644,6 +1809,11 @@ compressed bytes once, and its cpio is the same.
 | the host can refuse an executable, and the exec fails | the host could only throw for a program it holds no build of, which stopped the whole machine; now that process ends with `SIGSEGV` |
 | after a restore the host calls `wasm_restored`: fresh host bytes reseed the crng, and the RCU stall and soft-lockup detectors reset | every copy of one checkpoint drew the same random numbers, and a restore more than 21 s after its checkpoint printed an RCU stall |
 | `mlock` and its family, `mincore`, `msync`, `madvise`; `memfd_create` | MMU-only in `mm/`, so they returned `ENOSYS`; without an MMU every page is resident, so each checks its range and succeeds, `msync` writes a shared file mapping back, and `MADV_DONTNEED` zeroes or rereads its range as an MMU kernel's next fault would. `MEMFD_CREATE` had come only with `TMPFS`, which needs an MMU |
+| a fork child's path, argument and iovec-array copies go through `wasm_user_string`, which scans for the NUL on the host (0026) | a fork child's `stat` made 9 host crossings and `open` 13; now 2 and 1 (`writev` 7 to 4), and a call's time falls 23-35% in `experiments/mmu/scripts/calls.ts` on paisley-park; a string with no NUL, or one that runs past the memory, returns `EFAULT` as Linux does at an unmapped page (19 refusal checks in `tests/c/fork.c`) |
+| `CONFIG_CGROUPS` with the cgroup2 filesystem, no controller (0028) | systemd mounts cgroup2 at start; the staged kernel grows 61,484 B (1.24%), a group costs 51 kB at 64 cpus, and an idle machine's free memory moves by 0 to about 20 pages (800 pages -42 kB, 1,200 pages -3 kB against a standard deviation of 23-99 kB) |
+| path-query changes are counted by inode number as well (0029) | the statx cache dropped every answer when any `/bin` symlink's atime moved; the host keeps a fill on the counters of the inodes its path crossed |
+| generation counters for the fd table, credentials, memory map and signal handlers, with a per-task block, an exported address and `/proc/gmux_gens` (0030) | a guarded specialized path needs to know that state did not change; 0 missing bumps in 102 oracle steps, and the cost is inside the old kernel's spread on 8 marks (largest +16 ns on open-read-close) |
+| a stream relay between the host and the machine's own listeners: `hostnet.c`, four non-suspending imports, `lo` up in `rcS` (0031) | the machine's HTTP server needs inbound connections; see Serving a Guest's HTTP |
 
 The host boots the kernel without `nohz_full`. With it, the timekeeping cpu never stops its tick,
 so an idle machine woke the host about 220 times a second, and context tracking reads the clock
@@ -1759,8 +1929,10 @@ Threads created after `dlopen` see the library, and snapshots carry it.
 
 ### Stacks
 
-A process starts on a stack of 124 KiB (a 128 KiB mapping whose top page holds the arguments) and
-grows in 1 MiB segments up to `RLIMIT_STACK`, where an
+A process starts on a stack of 128 KiB (a mapping of exactly 32 pages; the arguments are mapped
+apart and the tables' address sits in the stack's last word). The host's guard reserves the bottom
+4 KiB for leaf functions that carry no check, so frames past 124 KiB, less the start-up frames,
+move to a 1 MiB segment. The stack then grows in 1 MiB segments up to `RLIMIT_STACK`, where an
 overflow is `SIGSEGV` instead of a write into the heap below. Each frame allocation is checked by one
 unsigned compare, which costs 2.4% on gawk, 1.8% on sed and nothing measurable on Lua (11 rounds); a
 first form that checked every stack pointer write cost up to 7.6%.
@@ -1819,6 +1991,27 @@ cache pays only above roughly 50 hits a miss. The kernel's own statx of a cached
 cheap, and `ls -l` still invalidates everything about 70 times in 1,000 runs for a reason not yet
 found. The option stays off.
 
+The unexplained invalidations were atime stores on the `/bin` symlinks (relatime removes 88% of the
+misses). Patch 0029 counts path-query changes by inode number as well, and the host keeps each fill
+on the counters of the inodes its path crossed (`wasm_fs_gen_at`, one probe per component). Against
+the whole-tree generation the hit rate under a churn workload goes from 3.4% to 96.1%, and
+`cache.ts` stays exact (0 mismatches, 5 of 5 paisley-park samples on both kernels, every kernel and
+host mutant caught). Still no win at today's costs (paisley-park, microseconds per iteration):
+
+| workload | cache off | cache on, per-inode guard | cache on, `RELATIME=1` |
+| --- | --- | --- | --- |
+| churn | 847 | 961 | not measured |
+| `ls -l /bin`, 1,000 times | 688 (682.5 in the relatime run) | 751 | 638 |
+
+An exec costs about 38 us more with the cache on whether or not it stats anything (mechanism not
+isolated), which is larger than anything the guard wins back. The hit itself is cheap: the router
+and the statx hit are compiled from C and wat (`src/gmux/core/router/`), and on paisley-park a hit
+takes 34 ns where the old hand-assembled one took 97-109 ns and the kernel's statx takes 480 ns
+(`experiments/syscall-cost/scripts/hit.ts`); `ls -l` with the cache off and on is equal. The table
+is bounded: 2 MiB, 2-way, paths up to 223 bytes. The router instance adds 0.8 us and the statx
+instance 2.7 us to an exec. The new router replays 947,520 calls against the old one with 0
+mismatches.
+
 ### Threads
 
 Pthreads never worked on linux-wasm. Its variadic `__clone` read the TLS and clear-tid arguments only
@@ -1860,8 +2053,13 @@ check, libraries installed into a per-run prefix so later packages link against 
 `scripts/wasm/config.site` holds the autoconf answers that recipes used to carry, and
 `scripts/wasm/toolchain.cmake` builds lighttpd. perl's interpreter builds (3.5 MB) and keeps 96 libc
 symbols for its extensions, 51 of which build as side modules (see dlopen). systemd v262
-builds as one static wasm32 module of 6,560,522 bytes and has not been started: its cgroup2 mount
-is fatal on a kernel without `CONFIG_CGROUPS`, and its fibers need `swapcontext`. nano and tmux now configure and stop at unresolved ncurses data symbols.
+builds as one static wasm32 module of 6,555,741 bytes. The kernel now has cgroup2 (patch 0028), and
+its fibers run each on a thread with a futex handoff (stacks capped at 256 KiB, because 8 MB each
+fails at about 11 fibers in a 256 MB machine): systemd's own fiber tests pass, 74 of 74, and no fiber
+is created at boot. As PID 1 it freezes at its first mount, because it is built without libmount;
+with a hand-written mount-option table (not shipped) it reaches `default.target` and its main loop in
+1.3 s of machine time (a smoke figure), and a service then fails because `F_ADD_SEALS` on a memfd
+returns `EINVAL`. nano and tmux now configure and stop at unresolved ncurses data symbols.
 
 | result | packages |
 | --- | --- |
@@ -1888,13 +2086,22 @@ native musl 29 of 32, and the two agree on 31 files: `big` and `literals` fail o
 the 128 KiB stack overflowing into the heap, a wall clock stuck in 1970, and a missing `/tmp`.
 libc-test's pthread suite is under Threads.
 
-GNU coreutils 9.5's own suite (516 tests, `tests/suites/coreutils-gmux.ts`) passes 329 of 510 under
-Katybug in a machine of 1,200 pages, where native passes 353 of 516; the 45 tests that differ are
-a missing name for uid 0, four syscalls Katybug does not map (`getpriority`, `setpriority`,
-`mknod`, `mknodat`), `uname -m` reporting `wasm`, one file system where 14 tests need two, and
-order-3 allocation failures that end in a timeout. At 800 pages no test passes (0 of the 155 and 38
-tests that ran before the runs were stopped): small kernel allocations of Katybug processes fail
-there.
+GNU coreutils 9.5's own suite (516 tests, `tests/suites/coreutils-gmux.ts`) passes 336 of 516 under
+Katybug in a machine of 1,200 pages (94 FAIL, 13 ERROR, 70 SKIP, 3 TIMEOUT, 0 LOST), where native
+passes 353 of 516. The previous run passed 329 of 510; the 10 tests that moved to PASS are a name
+for uid 0 and `getent` in the image, getpriority, setpriority, mknod and mknodat in Katybug, and
+three (`factor-parallel`, `od-endian`, `abmon-align`) that passed this time without a traced cause. The remaining 36 that differ from native are one
+file system where 14 tests need two, no mounts, `/sys/kernel/profiling`, `O_NOATIME`, memory
+exhaustion at 1,200 pages, two untraced failures (`dd/sparse`, `misc/yes`) and tests that pass in
+gmux and fail natively. `misc/arch` passes once the coreutils tree is rebuilt with `arch`.
+
+At 800 pages the machine passes 2 of the first 140 tests (113 `invoked oom-killer` lines): the
+holders of an 800-page machine at its first out-of-memory are 1,591 + 2,425 + 2,360 + 134 + 5,534
++ 198 + 414 = 12,656 pages, and the largest is the 64 cpu slots, about 1,000 pages at 25-34 pages a
+slot. Trimming a decoded block's op and pc arrays takes a lone `bash` guest from 1,336 to 936
+pages; with that and a kernel of 32 cpu slots (a patch that is not installed, +1,077 free pages at
+boot) the suite passes 302 of 516 at 800 pages, with 56 oom-killer lines left, 8 TIMEOUT and one
+machine that ended silently (18 `ls` tests lost). Without the trim, 64 slots pass 0 of 40.
 
 ---
 
