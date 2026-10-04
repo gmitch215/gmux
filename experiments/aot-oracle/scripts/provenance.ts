@@ -1,5 +1,6 @@
 import { readdirSync, readFileSync } from 'node:fs';
 import { basename, join } from 'node:path';
+import { follow } from './bounds.ts';
 
 /**
  * Provenance of every memory access in the hot blocks (traces included) of KATYBUG_HOT dumps, weighted
@@ -10,7 +11,9 @@ import { basename, join } from 'node:path';
  * its window at the trace's start covers it, and nothing in a straight run of ops can remap memory
  * except a syscall, which ends a block.
  *
- * `provenance.ts <dump dir>...`, one row per directory (a workload; every process's dump in it)
+ * `provenance.ts [--bounds] <dump dir>...`, one row per directory (a workload; every process's dump in it).
+ * `--bounds` follows each register's interval too (bounds.ts, the lifter's own tracker) and splits the base plus
+ * index residue into an index with a bound (and the window it needs) and two unbounded terms.
  */
 const header = readFileSync(new URL('../../../src/gmux/katybug/kb.h', import.meta.url), 'utf8');
 const opBody = header.match(/enum kb_op\s*\{([\s\S]*?)\};/)![1]!.replace(/\/\*[\s\S]*?\*\//g, '');
@@ -100,7 +103,7 @@ const CLASSES = [
 	'after a syscall',
 	'rep string, runtime length'
 ] as const;
-type Class = (typeof CLASSES)[number];
+type Class = (typeof CLASSES)[number] | 'bounded index';
 
 interface Access {
 	cls: Class;
@@ -110,9 +113,13 @@ interface Access {
 	runs: number;
 	nominal: number;
 	grouped: boolean;
+	// with --bounds: the class without bounds, and for an access whose index has a bound, the bytes of its window
+	before: Class;
+	window?: bigint;
+	constant?: boolean;
 }
 
-function analyse(b: Block, out: Access[]) {
+function analyse(b: Block, out: Access[], bounded: boolean) {
 	const v: Val[] = Array.from({ length: 64 }, (_, r) => (r === KB_ZERO ? { k: 'const', off: 0n } : { k: 'root', id: r, off: 0n }));
 	let remapped = false;
 	let gone = 0;
@@ -120,7 +127,7 @@ function analyse(b: Block, out: Access[]) {
 	const taint = (...regs: number[]) => {
 		for (const r of regs) if (r < 64) v[r] = { k: 'unk', cause: 'opaque' };
 	};
-	const access = (base: Val, w: number, grouped: boolean, rep = false) => {
+	const access = (base: Val, w: number, grouped: boolean, rep = false, at = -1) => {
 		let cls: Class;
 		let root = -1;
 		let off = 0n;
@@ -132,8 +139,10 @@ function analyse(b: Block, out: Access[]) {
 			off = BigInt.asIntN(64, base.off);
 			cls = loadedRoots.has(base.id) ? 'loaded pointer' : 'entry base, lone';
 		} else cls = base.cause === 'indexed' ? 'base plus index' : base.cause === 'computed' ? 'computed base' : 'clobbered by an opaque op';
-		own.push({ cls, root, off, w, runs: b.runs - gone, nominal: b.runs, grouped });
+		own.push({ cls, root, off, w, runs: b.runs - gone, nominal: b.runs, grouped, before: cls });
+		index.push(at);
 	};
+	const index: number[] = [];
 	const name = (o: number) => Object.keys(op).find((k) => op[k] === o)!;
 	for (const [i, x] of b.ins.entries()) {
 		gone += b.exits.get(i - 1) ?? 0;
@@ -142,7 +151,7 @@ function analyse(b: Block, out: Access[]) {
 		const C = v[x.c]!;
 		if (x.op === op.LD || x.op === op.LDS || x.op === op.ST) {
 			const base: Val = B.k === 'root' ? { k: 'root', id: B.id, off: BigInt.asUintN(64, B.off + x.imm) } : B.k === 'const' ? { k: 'const', off: BigInt.asUintN(64, B.off + x.imm) } : B;
-			access(base, x.w, x.c !== 0);
+			access(base, x.w, x.c !== 0, false, i);
 			if (x.op !== op.ST && x.a !== KB_ZERO) v[x.a] = x.w === 8 ? fresh(true) : { k: 'unk', cause: 'computed' };
 			continue;
 		}
@@ -187,6 +196,17 @@ function analyse(b: Block, out: Access[]) {
 			else v[a] = { k: 'unk', cause: 'computed' };
 		}
 	}
+	// an access of the residue whose address is a live-in register or a constant plus an interval is a window
+	if (bounded) {
+		const fb = new Map(follow(b.ins, op, true, !process.argv.includes("--no-exits")).map((f) => [f.i, f]));
+		own.forEach((a, n) => {
+			const f = fb.get(index[n]!);
+			if (!f || f.hi === f.lo || !['base plus index', 'computed base', 'clobbered by an opaque op'].includes(a.cls)) return;
+			a.cls = 'bounded index';
+			a.window = f.hi - f.lo + BigInt(a.w);
+			a.constant = f.root < 0;
+		});
+	}
 	// windows: accesses on one entry base within the plan's span share one check
 	const byRoot = new Map<number, Access[]>();
 	for (const a of own) if (a.cls === 'entry base, lone') byRoot.set(a.root, [...(byRoot.get(a.root) ?? []), a]);
@@ -209,11 +229,16 @@ function analyse(b: Block, out: Access[]) {
 }
 
 const rows: string[] = [];
-const dirs = process.argv.slice(2);
+const dirs = process.argv.slice(2).filter((a) => !a.startsWith('--'));
+const withBounds = process.argv.includes('--bounds');
 let mismatches = 0;
-for (const dir of dirs) {
+const load = (dir: string, bounded: boolean) => {
 	const acc: Access[] = [];
-	for (const f of readdirSync(dir).filter((f) => f.endsWith('.hot'))) for (const b of parse(join(dir, f))) analyse(b, acc);
+	for (const f of readdirSync(dir).filter((f) => f.endsWith('.hot'))) for (const b of parse(join(dir, f))) analyse(b, acc, bounded);
+	return acc;
+};
+for (const dir of dirs) {
+	const acc = load(dir, false);
 	const total = acc.reduce((s, a) => s + a.runs, 0);
 	const by = Object.fromEntries(CLASSES.map((c) => [c, 0])) as Record<Class, number>;
 	let nominal = 0;
@@ -243,3 +268,63 @@ console.log(
 console.log(`| --- | --- | --- | ${CLASSES.map(() => '---').join(' | ')} | --- | --- | --- |`);
 for (const r of rows) console.log(r);
 if (mismatches) process.exitCode = 1;
+
+// the residue with an interval on each register: base plus index against a live-in base and a bounded index
+if (withBounds) {
+	const SIZES: [string, bigint][] = [
+		['<= 16', 16n],
+		['<= 256', 256n],
+		['<= 4,080', BigInt(SPAN)],
+		['<= 65,536', 65536n],
+		['<= 1 MiB', 1n << 20n],
+		['<= 4 GiB', 1n << 32n],
+		['wider', 1n << 62n]
+	];
+	const bucket = (n: bigint) => SIZES.findIndex(([, hi]) => n <= hi);
+	const head: string[] = [];
+	const dist: string[] = [];
+	for (const dir of dirs) {
+		const acc = load(dir, true);
+		const plain = load(dir, false);
+		if (acc.length !== plain.length) throw new Error(`${dir}: ${acc.length} accesses with bounds, ${plain.length} without`);
+		const total = acc.reduce((s, a) => s + a.runs, 0);
+		const sum = (f: (a: Access) => boolean) => acc.filter(f).reduce((s, a) => s + a.runs, 0);
+		const pct = (n: number, of = total) => `${((100 * n) / of).toFixed(1)}%`;
+		const provable = sum((a) => ['entry base, window shared', 'entry base, lone', 'constant address'].includes(a.cls));
+		const residue = sum((a) => a.before === 'base plus index');
+		const bounded = (a: Access) => a.cls === 'bounded index';
+		const inResidue = (a: Access) => a.before === 'base plus index';
+		const fits = (a: Access) => bounded(a) && a.window! <= 65536n;
+		const small = (a: Access) => bounded(a) && a.window! <= BigInt(SPAN);
+		const rest = sum((a) => inResidue(a) && !bounded(a));
+		const rescued = sum((a) => !inResidue(a) && bounded(a));
+		head.push(
+			`| ${basename(dir).replace(/^hot-/, '')} | ${total} | ${pct(provable)} | ${pct(residue)} | ${pct(sum((a) => inResidue(a) && small(a)), residue)} | ${pct(sum((a) => inResidue(a) && fits(a) && !small(a)), residue)} | ${pct(sum((a) => inResidue(a) && bounded(a) && !fits(a)), residue)} | ${pct(rest, residue)} | ${pct(rescued)} | ${pct(provable + sum(fits))} |`
+		);
+		const all = acc.filter(bounded);
+		const weight = all.reduce((s, a) => s + a.runs, 0);
+		const counts = SIZES.map((_, k) => all.filter((a) => bucket(a.window!) === k).reduce((s, a) => s + a.runs, 0));
+		const sorted = [...all].sort((p, q) => (p.window! < q.window! ? -1 : p.window! > q.window! ? 1 : 0));
+		let cum = 0;
+		let median = 0n;
+		for (const a of sorted) {
+			cum += a.runs;
+			if (cum * 2 >= weight) {
+				median = a.window!;
+				break;
+			}
+		}
+		const bySize = new Map<bigint, number>();
+		for (const a of all) bySize.set(a.window!, (bySize.get(a.window!) ?? 0) + a.runs);
+		const top = [...bySize].sort((p, q) => q[1] - p[1]).slice(0, 4).map(([s, n]) => `${s} (${pct(n, weight || 1)})`).join(', ');
+		dist.push(`| ${basename(dir).replace(/^hot-/, '')} | ${weight} | ${counts.map((n) => pct(n, weight || 1)).join(' | ')} | ${pct(all.filter((a) => a.constant).reduce((s, a) => s + a.runs, 0), weight || 1)} | ${median} | ${top} |`);
+	}
+	console.log();
+	console.log('| workload | weighted accesses | provable without bounds | base plus index (residue) | residue: bounded, window <= 4,080 | residue: bounded, window <= 65,536 | residue: bounded, window wider than a piece | residue: two unbounded terms | other classes now bounded (share of all) | provable with bounds (window <= 65,536) |');
+	console.log('| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |');
+	for (const r of head) console.log(r);
+	console.log();
+	console.log(`| workload | weighted bounded accesses | ${SIZES.map(([n]) => `window ${n}`).join(' | ')} | constant base | median window bytes | the four commonest windows, bytes |`);
+	console.log(`| --- | --- | ${SIZES.map(() => '---').join(' | ')} | --- | --- | --- |`);
+	for (const r of dist) console.log(r);
+}
