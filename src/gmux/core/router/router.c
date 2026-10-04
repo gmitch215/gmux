@@ -12,7 +12,8 @@
 #define GLOBAL extern __attribute__((address_space(1)))
 
 GLOBAL int route;
-GLOBAL const int cache;
+// not const: clang 23 imports const as immutable, clang 18 as mutable
+GLOBAL int cache;
 
 IMPORT("k", "0") int k0(int, int, int);
 IMPORT("k", "1") int k1(int, int, int, int);

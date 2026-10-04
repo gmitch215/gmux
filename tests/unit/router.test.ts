@@ -72,7 +72,7 @@ describe('syscall router', () => {
 				env: {
 					memory: new WebAssembly.Memory({ initial: 1, maximum: 1, shared: true }),
 					route: global,
-					cache: new WebAssembly.Global({ value: 'i32', mutable: false }, 0)
+					cache: new WebAssembly.Global({ value: 'i32', mutable: true }, 0)
 				}
 			}).exports as Record<string, (...a: number[]) => number>;
 			for (let n = 0; n <= 6; n++)

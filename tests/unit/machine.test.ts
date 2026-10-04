@@ -1426,7 +1426,7 @@ describe('Machine', () => {
 						memory: new WebAssembly.Memory({ initial: 1, maximum: 1, shared: true }),
 						route,
 						cache: new WebAssembly.Global(
-							{ value: 'i32', mutable: false },
+							{ value: 'i32', mutable: true },
 							cache ? 1 : 0
 						)
 					}

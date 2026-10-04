@@ -1573,10 +1573,7 @@ export class Machine {
 			env: {
 				memory: env.memory as WebAssembly.Memory,
 				route: this.route!,
-				cache: new WebAssembly.Global(
-					{ value: 'i32', mutable: false },
-					this.fsCache ? 1 : 0
-				)
+				cache: new WebAssembly.Global({ value: 'i32', mutable: true }, this.fsCache ? 1 : 0)
 			}
 		}).exports;
 		for (let n = 0; n <= 6; n++) env[`__wasm_syscall_${n}`] = router[`s${n}`];
