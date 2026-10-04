@@ -18,6 +18,7 @@ export interface Row {
 	median: number;
 	spread: number;
 	md5: string;
+	loads: number[];
 }
 
 export function parse(text: string): Row[] {
@@ -38,7 +39,8 @@ export function parse(text: string): Row[] {
 			runs: c[3]!.split(' ').map(Number),
 			median: Number(c[4]),
 			spread: parseFloat(c[5]!) / 100,
-			md5: c[6]!
+			md5: c[6]!,
+			loads: (c[7] ?? '').split(' ').filter(Boolean).map(Number).filter(Number.isFinite)
 		});
 	}
 	return rows;
@@ -72,8 +74,8 @@ export interface Verdict {
 	earns: boolean;
 }
 
-export function verdict(rows: Row[], arm: string): Verdict {
-	const cmp = compare(rows, arm);
+export function verdict(rows: Row[], arm: string, base = 'regs=0'): Verdict {
+	const cmp = compare(rows, arm, base);
 	const workloads = [...new Set(cmp.map((c) => c.workload))];
 	const per = workloads.map((w) => {
 		const mine = cmp.filter((c) => c.workload === w);
