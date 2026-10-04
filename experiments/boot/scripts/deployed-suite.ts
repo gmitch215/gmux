@@ -3,12 +3,12 @@ const B = process.env.WORKER_URL;
 if (!B) throw new Error('set WORKER_URL to the deployed worker, e.g. https://<name>.<subdomain>.workers.dev');
 const passes = (n) => (o) => (o.match(/^PASS /gm) ?? []).length === n && !/^FAIL /m.test(o);
 const probes = [
-	['isolation', 'isolation', (o) => o.includes('TRUST kernel-address write accepted') && passes(14)(o)],
+	['isolation', 'isolation', (o) => o.includes('TRUST kernel-address write accepted') && passes(90)(o)],
 	['vf', 'vf', (o) => o.includes('second exited 7') && o.includes('third exited 9')],
 	['sig', 'sig', (o) => o.includes('handler slept') && o.includes('after pause')],
 	['thr', 'thr', (o) => o.includes('threads count 40000')],
-	['spin', 'spin', passes(2)],
-	['stack', 'stack', passes(2)],
+	['spin', 'spin', passes(3)],
+	['stack', 'stack', passes(5)],
 	['time', 'time', passes(5)],
 	[
 		'katybug',
@@ -33,7 +33,7 @@ const probes = [
 	[
 		'fork',
 		'ifconfig lo 127.0.0.1 up; fork',
-		(o) => o.includes('exec from a fork child') && passes(5)(o)
+		(o) => o.includes('exec from a fork child') && passes(26)(o)
 	],
 	[
 		'shell',
@@ -45,9 +45,9 @@ const probes = [
 		'dl',
 		(o) =>
 			['zlib 1.3.1', 'crc32 273b7535', 'compressed 639 bytes (rc 0), adler32 99df58be', 'round trip same (rc 0)'].every((l) => o.includes(l)) &&
-			passes(5)(o)
+			passes(8)(o)
 	],
-	['posix', 'ifconfig lo 127.0.0.1 up; mkdir -p /lua-tests; posix', passes(9)]
+	['posix', 'ifconfig lo 127.0.0.1 up; mkdir -p /lua-tests; posix', passes(30)]
 ];
 // fork needs resumable frames; PROT_NONE mappings take real memory without an MMU
 const blocked = new Set(['ipc_sem', 'pthread_atfork-errno-clobber', 'pthread_exit-dtor', 'pthread_create-oom']);
