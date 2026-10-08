@@ -1,4 +1,6 @@
 FROM oven/bun:1-debian AS build
+RUN apt-get update && apt-get install -y --no-install-recommends clang lld \
+	&& rm -rf /var/lib/apt/lists/*
 WORKDIR /src
 COPY package.json bun.lock ./
 RUN bun install --frozen-lockfile --ignore-scripts
