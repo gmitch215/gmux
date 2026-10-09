@@ -4,6 +4,7 @@ import { join } from 'node:path';
 import { Keeper, QUANTUM_MS, type KeeperHost, type Policy } from '../../../src/worker/keeper.ts';
 import type { Machine } from '../../../src/worker/machine/machine.ts';
 import { siteOptions } from '../../../src/worker/site-machine.ts';
+import { hostRuntime } from '../../../scripts/wasm/router-modules.ts';
 import { FREE_DAY, OBJECT_GB } from '../../../src/worker/thermal.ts';
 import { JOBS, READ, readback, start, type Job } from './jobs.ts';
 import { sqlite } from '../../write-back/scripts/sqlite.ts';
@@ -39,6 +40,7 @@ const build = {
 	busybox: new WebAssembly.Module(kernel('busybox.async.wasm')),
 	busyboxGuard: new WebAssembly.Module(kernel('busybox.guard.wasm')),
 	katybug: new WebAssembly.Module(kernel('katybug.wasm')),
+	runtime: hostRuntime(),
 	initrd: kernel('initramfs.bin'),
 	manifest: JSON.parse(readFileSync(join(root, 'build/kernel/manifest.json'), 'utf8'))
 };
