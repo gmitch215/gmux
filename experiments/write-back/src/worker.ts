@@ -94,7 +94,7 @@ export class MachineDO extends DurableObject<Env> {
 			maximumPages: this.pages,
 			sharedKernel: true,
 			asyncify: true,
-			router: { route: router, statx },
+			runtime: { route: router, statx },
 			sha256: (bytes) => createHash('sha256').update(bytes).digest('hex'),
 			write: (text) => (this.output = (this.output + text).slice(-4000)),
 			fileSync:

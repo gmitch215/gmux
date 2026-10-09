@@ -29,7 +29,8 @@ function build() {
 		sha256: () => '',
 		maximumPages: 64,
 		now: () => 0n,
-		...(core ? { core } : {})
+		// a baseline machine.ts takes `core`, the current one `runtime.core`
+		...(core ? { core, runtime: { core } } : {})
 	});
 	if (core) machine.startCore(machine.memory.grow(1) * 0x10000);
 	const idlers: any[] = [];

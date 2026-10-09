@@ -4,7 +4,7 @@ import { mkdtempSync, readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { beforeAll, describe, expect, it } from 'vitest';
-import { routerModules } from '../../scripts/wasm/router-modules.ts';
+import { hostRuntime } from '../../scripts/wasm/router-modules.ts';
 import { CORE_ABI, coreRegionPages, loadCore, type Core } from '../../src/worker/machine/core.ts';
 import { Machine, type MachineOptions } from '../../src/worker/machine/machine.ts';
 
@@ -249,7 +249,7 @@ describe('the idle tables of a machine', () => {
 				sha256: () => '',
 				maximumPages: 64,
 				now: () => clock,
-				...(arm === 'C core' ? { core: built } : {})
+				...(arm === 'C core' ? { runtime: { ...hostRuntime(), core: built } } : {})
 			});
 			if (arm === 'C core') machine.startCore(machine.memory.grow(1) * 0x10000);
 			const count = 48;
@@ -316,7 +316,8 @@ describe('the idle tables of a machine', () => {
 });
 
 describe('a machine with the core', () => {
-	function session(extra: Partial<MachineOptions>) {
+	/** a toy machine whose runtime holds the core or not */
+	function session(core: boolean, extra: Partial<MachineOptions> = {}) {
 		const clock = { ns: 0n };
 		let output = '';
 		const options: MachineOptions = {
@@ -328,7 +329,7 @@ describe('a machine with the core', () => {
 			sha256: (bytes) => String.fromCharCode(bytes[0] ?? 0),
 			now: () => clock.ns,
 			write: (text) => (output += text),
-			router: routerModules(),
+			runtime: { ...hostRuntime(undefined, { core: false }), core: core ? built : undefined },
 			asyncify: true,
 			sharedKernel: true,
 			...extra
@@ -342,10 +343,11 @@ describe('a machine with the core', () => {
 
 	it('boots, forks and switches like the TypeScript tables, with the same counters', async () => {
 		const runs = [];
-		for (const core of [undefined, built]) {
-			const s = session({ core });
+		for (const core of [false, true]) {
+			const s = session(core);
 			const machine = new Machine(s.options);
 			await s.run(machine, () => s.output().includes('parent ok'));
+			expect(machine.coreScheduling).toBe(core);
 			machine.type('s');
 			await s.run(machine, () => s.output().includes('parent back ok'));
 			const { switches, idles, relaxes, runners } = machine.stats;
@@ -356,12 +358,13 @@ describe('a machine with the core', () => {
 	});
 
 	it('checkpoints with its region recorded and restores with its idle cpus armed again', async () => {
-		const s = session({ core: built });
+		const s = session(true);
 		const machine = new Machine(s.options);
 		await s.run(machine, () => s.output().includes('parent ok'));
 		const snapshot = await machine.checkpoint();
 		expect(snapshot.core).toBeGreaterThan(0);
 		const restored = await Machine.restore(s.options, snapshot);
+		expect(restored.coreScheduling).toBe(true);
 		restored.type('s');
 		await s.run(restored, () => s.output().includes('parent back ok'));
 		expect(s.output()).toContain('echo:schild ok\nparent back ok\n');
@@ -369,13 +372,40 @@ describe('a machine with the core', () => {
 		expect(await s.run(restored, () => false)).toBe('halted');
 	});
 
-	it('refuses to restore a snapshot that has no core region', async () => {
-		const s = session({});
+	it('schedules with the core whenever the runtime holds it, with no other option', async () => {
+		const s = session(false, { runtime: hostRuntime() });
+		const machine = new Machine(s.options);
+		await s.run(machine, () => s.output().includes('parent ok'));
+		expect(machine.coreScheduling).toBe(true);
+		expect((await machine.checkpoint()).core).toBeGreaterThan(0);
+	});
+
+	it('restores a snapshot that has no core region on the TypeScript scheduler', async () => {
+		const s = session(false);
 		const machine = new Machine(s.options);
 		await s.run(machine, () => s.output().includes('parent ok'));
 		const snapshot = await machine.checkpoint();
-		await expect(Machine.restore({ ...s.options, core: built }, snapshot)).rejects.toThrow(
-			/no core region/
-		);
+		expect(snapshot.core).toBeUndefined();
+		const withCore = session(true);
+		const restored = await Machine.restore(withCore.options, snapshot);
+		expect(restored.coreScheduling).toBe(false);
+		restored.type('s');
+		await withCore.run(restored, () => withCore.output().includes('parent back ok'));
+		expect(withCore.output()).toContain('echo:schild ok\nparent back ok\n');
+		expect((await restored.checkpoint()).core).toBeUndefined();
+	});
+
+	it('restores a snapshot that has a core region without the core, keeping the region recorded', async () => {
+		const s = session(true);
+		const machine = new Machine(s.options);
+		await s.run(machine, () => s.output().includes('parent ok'));
+		const snapshot = await machine.checkpoint();
+		const plain = session(false);
+		const restored = await Machine.restore(plain.options, snapshot);
+		expect(restored.coreScheduling).toBe(false);
+		restored.type('s');
+		await plain.run(restored, () => plain.output().includes('parent back ok'));
+		expect(plain.output()).toContain('echo:schild ok\nparent back ok\n');
+		expect((await restored.checkpoint()).core).toBe(snapshot.core);
 	});
 });

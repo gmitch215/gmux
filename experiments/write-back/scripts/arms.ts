@@ -1,7 +1,7 @@
 import { createHash } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
-import { routerModules } from '../../../scripts/wasm/router-modules.ts';
+import { hostRuntime } from '../../../scripts/wasm/router-modules.ts';
 import { decodeSnapshot, DurableStore, encodeSnapshot } from '../../../src/worker/durable.ts';
 import { Machine, type MachineOptions } from '../../../src/worker/machine/machine.ts';
 import { Cadence } from '../../../src/worker/schedule.ts';
@@ -44,7 +44,7 @@ const options = (): MachineOptions => ({
 	sha256: (bytes) => createHash('sha256').update(bytes).digest('hex'),
 	sharedKernel: true,
 	asyncify: true,
-	router: routerModules(),
+	runtime: hostRuntime(),
 	write: (text) => (output = (output + text).slice(-20000)),
 	fileSync:
 		arm === 'writeback'

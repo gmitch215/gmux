@@ -14,6 +14,8 @@ import { join } from 'node:path';
 const root = new URL('../../../', import.meta.url).pathname;
 const kernel = join(process.env.GMUX_BUILD ?? join(root, 'build'), 'kernel');
 const read = (path: string) => new Uint8Array(readFileSync(path));
+// a baseline machine.ts takes `core`, the current one `runtime.core`
+const withCore = (core: WebAssembly.Module) => ({ core, runtime: { core } });
 const sha256 = (bytes: Uint8Array) => createHash('sha256').update(bytes).digest('hex');
 const manifest = JSON.parse(readFileSync(join(kernel, 'manifest.json'), 'utf8'));
 if (process.env.FROZEN) {
@@ -71,7 +73,7 @@ const machine = new Machine({
 	sha256,
 	sharedKernel: true,
 	...(process.env.FROZEN ? { now: () => 0n } : {}),
-	...(process.env.CORE ? { core: new WebAssembly.Module(read(process.env.CORE)) } : {}),
+	...(process.env.CORE ? withCore(new WebAssembly.Module(read(process.env.CORE))) : {}),
 	trace: Boolean(process.env.TRACE),
 	log: (line: string) => process.env.TRACE && lines.push(line),
 	write: (text: string) => {

@@ -4,7 +4,7 @@ import { mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { appendCpio } from '../../../scripts/wasm/cpio-append.ts';
-import { routerModules } from '../../../scripts/wasm/router-modules.ts';
+import { hostRuntime } from '../../../scripts/wasm/router-modules.ts';
 import {
 	decodeSnapshot,
 	DurableStore,
@@ -76,7 +76,7 @@ const base = (): MachineOptions => ({
 	sha256,
 	sharedKernel: true,
 	asyncify: true,
-	router: routerModules(),
+	runtime: hostRuntime(),
 	write: (text) => {
 		output += text;
 		transcript += text;
