@@ -124,6 +124,7 @@ if (!token) throw new Error(`claim: ${claimed.status}`);
 const attached = Date.now();
 const t = await attach(token);
 let pass = true;
+const stalled = () => /rcu: INFO/.test(output);
 if (mode === 'port') {
 	// the image's shell is parked in `read`; the first line typed is the port's input
 	await t.type('hello\n');
@@ -157,6 +158,12 @@ if (mode === 'survive') {
 	const after = await status();
 	log('ready', { ready, readyMs, drops, resets, statuses, durable: after.durable });
 	pass = ready === N && (after.durable?.restores ?? 0) > 0 && drops.length > 0;
+}
+// a restore's stall report comes on the first ticks after the prompt
+if (mode === 'start') await new Promise((r) => setTimeout(r, 5000));
+if (mode === 'start' && stalled()) {
+	pass = false;
+	log('stall', { head: output.slice(output.search(/rcu: INFO/), -1).slice(0, 300) });
 }
 t.close();
 console.log(pass ? `PASS ${mode}` : `FAIL ${mode}`);
