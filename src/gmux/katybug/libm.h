@@ -46,15 +46,25 @@ extern const struct kb_pow_log_data {
     } tab[1 << POW_LOG_TABLE_BITS];
 } kb_pow_log_data;
 
+/* how the guest's libm was compiled: without a fused multiply-add (x86-64),
+ * with one at the sites the source writes as fma (musl on AArch64, built with
+ * -ffp-contract=off), and glibc 2.36 on AArch64 (Debian 12), where gcc fused
+ * more than that and rounds a tie in the argument reduction away from zero */
+enum
+{
+    KB_LIBM_X86,
+    KB_LIBM_MUSL_A64,
+    KB_LIBM_GLIBC_A64
+};
+
 /* exp, log and pow as glibc and musl compute them in the normal cases. Each
  * returns 1 with the value in *out, or 0 for an input or a result outside
  * them (non-finite, zero, subnormal, a result that would set errno or raise
- * underflow or overflow, an exact tie in the argument reduction), where the
- * caller runs the guest's own code. fused is 0 for the code as built without a
- * fused multiply-add (x86-64) and 1 as built with one (AArch64) */
-int kb_libm_exp(double x, int fused, double* out);
-int kb_libm_log(double x, int fused, double* out);
-int kb_libm_pow(double x, double y, int fused, double* out);
+ * underflow or overflow, an exact tie in the argument reduction except for
+ * KB_LIBM_GLIBC_A64), where the caller runs the guest's own code */
+int kb_libm_exp(double x, int flavor, double* out);
+int kb_libm_log(double x, int flavor, double* out);
+int kb_libm_pow(double x, double y, int flavor, double* out);
 /* 1 when a*b + c is rounded twice here, as the kernels need */
 int kb_libm_ok(void);
 

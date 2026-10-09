@@ -45,7 +45,9 @@ int main(int argc, char** argv) {
             );
             return 127;
         }
-        return kb_run(cpu);
+        int status = kb_run(cpu);
+        if (getenv("KATYBUG_STATS")) kb_prim_report(), kb_image_report(cpu);
+        return status;
     }
     if (argc >= 4 && !strcmp(argv[1], "--wasm"))
         return kb_wasm_main(cpu, argc, argv);
@@ -117,7 +119,7 @@ int main(int argc, char** argv) {
             (unsigned long long) held_ops, (unsigned long long) cpu->decoded,
             (unsigned long long) cpu->loaded, (unsigned long long) cpu->lookups
         );
-    if (getenv("KATYBUG_STATS")) kb_prim_report();
+    if (getenv("KATYBUG_STATS")) kb_prim_report(), kb_image_report(cpu);
 #ifdef KB_HOT
     kb_hot_dump(cpu);
 #endif

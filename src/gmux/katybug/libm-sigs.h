@@ -55,18 +55,25 @@ static const struct libm_sig {
     uint32_t len;
     uint64_t head, hash;
     const struct libm_mask* mask;
-    int nmask;
+    int nmask, flavor;
 } libm_sigs[] = {
-    {KB_X86, 8, 492, 0xca8948c17e0f4866ull, 0xcc5f335ada7ba28aull, exp_x86,
-     17}, /* exp */
-    {KB_X86, 9, 669, 0x000000000000ba48ull, 0x8b67e71758a0421eull, log_x86,
-     24}, /* log */
+    {KB_X86, 8, 492, 0xca8948c17e0f4866ull, 0xcc5f335ada7ba28aull, exp_x86, 17,
+     KB_LIBM_X86}, /* exp */
+    {KB_X86, 9, 669, 0x000000000000ba48ull, 0x8b67e71758a0421eull, log_x86, 24,
+     KB_LIBM_X86}, /* log */
     {KB_X86, 10, 1800, 0x486653c07e0f4866ull, 0xb3dbd5815fb8984cull, pow_x86,
-     39}, /* pow */
-    {KB_A64, 8, 408, 0xd374f8239e660001ull, 0xc61a6c5ad7e1e06cull, exp_a64,
-     5}, /* exp */
-    {KB_A64, 9, 524, 0xd2f802409e660002ull, 0x32ea4a5704d712b5ull, log_a64,
-     7}, /* log */
+     39, KB_LIBM_X86}, /* pow */
+    {KB_A64, 8, 408, 0xd374f8239e660001ull, 0xc61a6c5ad7e1e06cull, exp_a64, 5,
+     KB_LIBM_MUSL_A64}, /* exp */
+    {KB_A64, 9, 524, 0xd2f802409e660002ull, 0x32ea4a5704d712b5ull, log_a64, 7,
+     KB_LIBM_MUSL_A64}, /* log */
     {KB_A64, 10, 1276, 0x9e6600239e660004ull, 0xb44d517c9a7fc3eaull, pow_a64,
-     10}, /* pow */
+     10, KB_LIBM_MUSL_A64}, /* pow */
+    /* glibc AArch64 libm.so.6 sha256 3c4cb3be0b974edf */
+    {KB_A64, 8, 368, 0xd374f8229e660001ull, 0x081177ad978281ceull, NULL, 0,
+     KB_LIBM_GLIBC_A64}, /* exp */
+    {KB_A64, 9, 440, 0xd2f802409e660002ull, 0x3cf1d6a4fe04e78bull, NULL, 0,
+     KB_LIBM_GLIBC_A64}, /* log */
+    {KB_A64, 10, 1172, 0x9e6600229e660003ull, 0xe2fa150eb2d66ddbull, NULL, 0,
+     KB_LIBM_GLIBC_A64}, /* pow */
 };

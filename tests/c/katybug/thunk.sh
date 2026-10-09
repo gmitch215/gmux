@@ -27,7 +27,7 @@ on_host() {
 }
 out=$(mktemp -d)
 mkdir -p "$out/t"
-cp "$here/thunk.c" "$here/libm.c" "$here/libm-vectors.txt" "$out/t/"
+cp "$here/thunk.c" "$here/libm.c" "$here/libm-edit.c" "$here/libm-vectors.txt" "$out/t/"
 cat > "$out/t/libm-each.sh" << 'EOF'
 #!/bin/sh
 # libm-each.sh launcher bin args...: one libm run (the launcher may be empty), then its prim line
@@ -54,14 +54,18 @@ echo "rc $?"
 EOF
 tar -C "$root/src/gmux/katybug" -cf "$out/t/src.tar" .
 tar -C "$out" -cf - t | on_host "mkdir -p ~/$rig && tar -C ~/$rig -xf -"
-on_host "$dock -v \"\$HOME/$rig/t:/t\" alpine:3.20 sh -c 'apk add --no-cache build-base > /dev/null &&
-	mkdir -p /src && tar -C /src -xf /t/src.tar && cc -std=c11 -D_DEFAULT_SOURCE -O2 -static -o /t/katybug /src/*.c -lm &&
+on_host "$dock -v \"\$HOME/$rig/t:/t\" alpine:3.20 sh -c 'apk add --no-cache build-base zlib-dev zlib-static > /dev/null &&
+	mkdir -p /src && tar -C /src -xf /t/src.tar && cc -std=c11 -D_DEFAULT_SOURCE -DKB_ZLIB -O2 -static -o /t/katybug /src/*.c -lm -lz &&
 	cc -O1 -fno-builtin -o /t/thunk-musl /t/thunk.c && cc -O1 -fno-builtin -Wl,-z,now -o /t/thunk-musl-now /t/thunk.c &&
 	cc -O1 -fno-builtin -ffp-contract=off -o /t/libm-musl /t/libm.c -lm'"
 on_host "$dock -v \"\$HOME/$rig/t:/t\" debian:bookworm-slim sh -c 'apt-get -qq update > /dev/null &&
 	apt-get -qq install -y gcc libc6-dev > /dev/null 2>&1 && gcc -O1 -fno-builtin -o /t/thunk-glibc /t/thunk.c &&
 	gcc -O1 -fno-builtin -Wl,-z,now -o /t/thunk-glibc-now /t/thunk.c &&
-	gcc -O1 -fno-builtin -ffp-contract=off -o /t/libm-glibc /t/libm.c -lm'"
+	gcc -O1 -fno-builtin -ffp-contract=off -o /t/libm-glibc /t/libm.c -lm &&
+	if [ \$(uname -m) = aarch64 ]; then
+		gcc -O1 -o /t/libm-edit /t/libm-edit.c -ldl && mkdir -p /t/edit &&
+		/t/libm-edit /lib/aarch64-linux-gnu/libm.so.6 /t/edit/libm.so.6
+	fi'"
 fail=0
 for img in debian:bookworm-slim alpine:3.20; do
 	tag=${img%%:*}
@@ -135,7 +139,8 @@ done
 # the kernels leave to the guest and the rounding modes. Native, off and on print the same lines (refuse's
 # mode lines, where katybug rounds to nearest whatever the register holds, only off against on). glibc on
 # x86-64 runs natively without FMA (the variant katybug's cpuid selects). The kernels must have run, and
-# the refusals must have reached them; glibc on AArch64 is fused by its compiler and is left to the guest
+# the refusals must have reached them; glibc on AArch64 runs them for Debian 12's build, whose code
+# libm-sigs.h lists
 n=${LIBM_SAMPLES:-300000}
 for img in debian:bookworm-slim alpine:3.20; do
 	tag=${img%%:*}
@@ -179,12 +184,7 @@ for img in debian:bookworm-slim alpine:3.20; do
 		for f in exp log pow; do
 			ran=$(printf '%s\n' "$prim" | grep -o "$f [0-9]* (" | tr -dc '0-9')
 			gave=$(printf '%s\n' "$prim" | grep -o "$f [0-9]* ([0-9]* gave up" | grep -o '([0-9]*' | tr -dc '0-9')
-			if [ "$platform$libc" = linux/arm64glibc ]; then
-				[ "${ran:-0}" -eq 0 ] || {
-					echo "FAIL $name: $f ran $ran under AArch64 glibc"
-					fail=1
-				}
-			elif [ "${mode%% *}" = sample ] && [ "${ran:-0}" -eq 0 ]; then
+			if [ "${mode%% *}" = sample ] && [ "${ran:-0}" -eq 0 ]; then
 				echo "FAIL $name: no $f kernel ran"
 				fail=1
 			elif [ -n "$want" ] && [ "$f ${ran:-0} ${gave:-0}" != "$(printf '%s\n' "$want" | grep -o "$f [0-9]* [0-9]*")" ]; then
@@ -195,4 +195,40 @@ for img in debian:bookworm-slim alpine:3.20; do
 		echo "$(wc -l < "$out/$name.on.out") lines"
 	done
 done
+
+# a glibc build the kernels were not checked against (libm-edit.c changes one bit of each function): the
+# same lines natively, off and on, and no kernel runs. The unedited library above runs them on the same
+# inputs, so zero here is the edit and not the environment
+if [ "$platform" = linux/arm64 ]; then
+	for mode in "sample $n" refuse; do
+		name=libm-debian-edited-${mode%% *}
+		elrun() { on_host "rm -f \$HOME/$rig/t/prim.log; $dock -v \"\$HOME/$rig/t:/t\" -e LD_LIBRARY_PATH=/t/edit ${2:-} debian:bookworm-slim sh /t/libm-each.sh '$1' /t/libm-glibc $mode; cat \$HOME/$rig/t/prim.log 2> /dev/null || true"; }
+		elrun "" > "$out/$name.native.txt"
+		elrun /t/katybug > "$out/$name.on.txt"
+		elrun /t/katybug "-e KATYBUG_PRIM=0" > "$out/$name.off.txt"
+		for arm in native on off; do grep -v '^katybug:' "$out/$name.$arm.txt" > "$out/$name.$arm.out"; done
+		prim=$(grep '^katybug: prim' "$out/$name.on.txt" | tail -1 || true)
+		echo "# $name: $(printf '%s\n' "$prim" | grep -o 'exp [0-9]* ([0-9]* gave up) log [0-9]* ([0-9]* gave up) pow [0-9]* ([0-9]* gave up)')"
+		grep -q '^rc 0$' "$out/$name.on.out" || {
+			echo "FAIL $name: rc"
+			tail -3 "$out/$name.on.out"
+			fail=1
+		}
+		for arm in native off; do
+			cmp -s "$out/$name.$arm.out" "$out/$name.on.out" || {
+				echo "FAIL $name: $arm != on"
+				diff "$out/$name.$arm.out" "$out/$name.on.out" | head || true
+				fail=1
+			}
+		done
+		for f in exp log pow; do
+			ran=$(printf '%s\n' "$prim" | grep -o "$f [0-9]* (" | tr -dc '0-9')
+			[ "${ran:-0}" -eq 0 ] || {
+				echo "FAIL $name: $f ran $ran in an edited libm"
+				fail=1
+			}
+		done
+		echo "$(wc -l < "$out/$name.on.out") lines"
+	done
+fi
 exit $fail

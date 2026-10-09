@@ -48,8 +48,8 @@ fi
 tar -C "$root/src/gmux/katybug" -cf "$out/t/src.tar" .
 tar -C "$out" -cf - t | on_host "mkdir -p ~/$rig && tar -C ~/$rig -xf -"
 # a static katybug, so it runs in either image, and the pthread suite against each image's libc
-on_host "$dock -v \"\$HOME/$rig/t:/t\" alpine:3.20 sh -c 'apk add --no-cache build-base > /dev/null &&
-	mkdir -p /src && tar -C /src -xf /t/src.tar && cc -std=c11 -D_DEFAULT_SOURCE -O2 -static -o /t/katybug /src/*.c -lm &&
+on_host "$dock -v \"\$HOME/$rig/t:/t\" alpine:3.20 sh -c 'apk add --no-cache build-base zlib-dev zlib-static > /dev/null &&
+	mkdir -p /src && tar -C /src -xf /t/src.tar && cc -std=c11 -D_DEFAULT_SOURCE -DKB_ZLIB -O2 -static -o /t/katybug /src/*.c -lm -lz &&
 	cc -O2 -pthread -o /t/threads-musl /t/threads.c'"
 on_host "$dock -v \"\$HOME/$rig/t:/t\" debian:bookworm-slim sh -c 'apt-get -qq update > /dev/null &&
 	apt-get -qq install -y gcc libc6-dev > /dev/null 2>&1 && gcc -O2 -pthread -o /t/threads-glibc /t/threads.c'"

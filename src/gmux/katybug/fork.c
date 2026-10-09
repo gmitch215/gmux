@@ -3,6 +3,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 #include "kb.h"
@@ -13,7 +14,9 @@ extern char** environ;
    program (gmux's no-MMU kernel): vfork, exec katybug again, and send the new
    process the guest's whole state over a pipe: the cpu, the descriptors that
    must regain FD_CLOEXEC, the guest's descriptor limit, then every mapping's
-   bytes in order */
+   bytes in order; a piece that was never made (an image's, not yet read from
+   its file) is not sent, and the child reads it from the descriptor on the
+   file, which the exec keeps at its number */
 
 static int put(int fd, const void* p, size_t n) {
     const uint8_t* b = p;
@@ -97,7 +100,7 @@ int64_t kb_fork(struct kb_cpu* cpu) {
                 uint64_t lo, hi;
                 uint64_t va =
                     (((m->start >> KB_PIECE_BITS) + k) << KB_PIECE_BITS);
-                kb_piece(m, va > m->start ? va : m->start, &lo, &hi);
+                kb_piece_blank(m, va > m->start ? va : m->start, &lo, &hi);
                 bad = put(p[1], m->pieces[k], hi - lo);
             }
         }
@@ -118,6 +121,13 @@ int kb_resume(struct kb_cpu* cpu, int fd) {
         n > 1024 || get(fd, cloexec, sizeof *cloexec * (size_t) n) ||
         get(fd, nofile, sizeof nofile))
         return -1;
+    for (int i = 0; i < cpu->nimages; i++) {
+        struct stat st;
+        if (fstat(cpu->images[i].fd, &st) ||
+            (uint64_t) st.st_dev != cpu->images[i].dev ||
+            (uint64_t) st.st_ino != cpu->images[i].ino)
+            return -1; /* the file the parent read pieces from did not arrive */
+    }
     kb_nofile_set(nofile);
     memset(cpu->cache, 0, sizeof cpu->cache);
     cpu->trace = NULL;
@@ -135,7 +145,7 @@ int kb_resume(struct kb_cpu* cpu, int fd) {
             uint64_t lo, hi;
             uint64_t va = (((m->start >> KB_PIECE_BITS) + k) << KB_PIECE_BITS);
             uint8_t* piece =
-                kb_piece(m, va > m->start ? va : m->start, &lo, &hi);
+                kb_piece_blank(m, va > m->start ? va : m->start, &lo, &hi);
             if (!piece || get(fd, piece, hi - lo)) return -1;
         }
     }

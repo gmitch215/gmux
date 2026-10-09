@@ -138,6 +138,17 @@ run "RT=/rig/gmux-rt; mkdir -p \$RT $W/build/busybox-$V $W/install/busybox-$V
 			\$CMD
 	done"
 
+# the pinned zlib: its sources go into katybug (the thunks for crc32, adler32, compress2 and uncompress) and
+# into the side module below
+zlib=$work/zlib-$(pin zlib url | sed 's|.*/zlib-||; s|.tar.gz||')
+retry curl -fsSL -o "$work/zlib.tar.gz" "$(pin zlib url)"
+echo "$(pin zlib sha256)  $work/zlib.tar.gz" | sha256sum -c - > /dev/null
+tar -C "$work" -xzf "$work/zlib.tar.gz"
+zsrc=
+for c in adler32 compress crc32 deflate infback inffast inflate inftrees trees uncompr zutil; do
+	zsrc="$zsrc /rig/$(basename "$zlib")/$c.c"
+done
+
 # the initramfs from sorted entries owned by root with one timestamp, and no gzip name or time
 run "out=/rig/out/initramfs.cpio
 	cp /rig/linux-wasm/patches/initramfs/initramfs-base.cpio \$out
@@ -156,15 +167,12 @@ run "out=/rig/out/initramfs.cpio
 	mkdir -p /rig/rootfs/bin /rig/probes-tmp
 	(cd /rig/probes-tmp && LINUX_WASM=/rig/linux-wasm REAL_LLVM=$W/install/llvm/bin TMPDIR=/rig/probes-tmp \
 		/rig/repo/scripts/cc-strict --target=wasm-linux-musl -march=wasm32 --sysroot=$W/install/musl-$V \
-		-fPIC -O2 -Wl,-shared -D_DEFAULT_SOURCE /rig/repo/src/gmux/katybug/*.c -o /rig/rootfs/bin/katybug -lc)
+		-fPIC -O2 -Wl,-shared -D_DEFAULT_SOURCE -DKB_ZLIB -I/rig/$(basename "$zlib") /rig/repo/src/gmux/katybug/*.c \
+		$zsrc -o /rig/rootfs/bin/katybug -lc)
 	cd /rig/rootfs && pack
 	gzip -n -9 -c \$out > \$out.gz"
 
 # zlib as a wasm side module, for tests/c/dl.c
-zlib=$work/zlib-$(pin zlib url | sed 's|.*/zlib-||; s|.tar.gz||')
-retry curl -fsSL -o "$work/zlib.tar.gz" "$(pin zlib url)"
-echo "$(pin zlib sha256)  $work/zlib.tar.gz" | sha256sum -c - > /dev/null
-tar -C "$work" -xzf "$work/zlib.tar.gz"
 run "export LINUX_WASM=/rig/linux-wasm REAL_LLVM=$W/install/llvm/bin TMPDIR=/rig/probes-tmp
 	mkdir -p \$TMPDIR; cd \$TMPDIR
 	for c in /rig/repo/tests/c/*.c; do

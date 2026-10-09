@@ -63,7 +63,7 @@ static uint32_t settings(const struct kb_cpu* cpu) {
     return ((uint32_t) cpu->noplan | KB_FUSE << 1 | KB_CHAIN << 2 |
             KB_LAZY << 3 | (uint32_t) cpu->segments << 5 |
             (uint32_t) KB_POLL << 13) ^
-           (uint32_t) kb_prim_enabled() * 0x9e3779b1u;
+           (uint32_t) (kb_prim_enabled() * 0x9e3779b97f4a7c15ull >> 32);
 }
 
 /** the guest bytes a block was decoded from, hashed; *ok is 0 when a range is

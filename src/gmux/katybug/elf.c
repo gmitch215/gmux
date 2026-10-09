@@ -1,6 +1,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 #include "kb.h"
@@ -62,6 +63,45 @@ static int load_bytes(
     return 0;
 }
 
+/* makes m, the mapping just made for an image, read each piece from f's file
+ * when the guest first touches it (mem.c); 0 when it cannot (the table is
+ * full, or katybug has no descriptor number to keep) and the caller loads the
+ * bytes now */
+static int lazy_image(
+    struct kb_cpu* cpu, FILE* f, const struct ehdr* eh, uint64_t base,
+    struct kb_mapping* m
+) {
+    _Static_assert(sizeof(struct ehdr) == 64, "the header is cached whole");
+    struct kb_image im = {0};
+    struct phdr ph;
+    struct stat st;
+    if (cpu->nimages == KB_IMAGES || fstat(fileno(f), &st)) return 0;
+    for (int i = 0; i < eh->phnum; i++) {
+        if (phdr_at(f, eh, i, &ph)) return 0;
+        if (ph.type != 1 || !ph.filesz) continue;
+        if (im.nseg == KB_IMAGE_SEGS) return 0;
+        /* a file that ends inside a segment is refused by the eager load */
+        if (ph.offset > (uint64_t) st.st_size ||
+            ph.filesz > (uint64_t) st.st_size - ph.offset)
+            return 0;
+        im.seg[im.nseg].va = base + ph.vaddr;
+        im.seg[im.nseg].off = ph.offset;
+        im.seg[im.nseg++].len = ph.filesz;
+    }
+    im.fd = kb_keep_fd(fileno(f));
+    if (im.fd < 0) return 0;
+    im.dev = (uint64_t) st.st_dev, im.ino = (uint64_t) st.st_ino;
+    if (im.nseg && im.seg[0].off == 0 && im.seg[0].len >= sizeof im.hdr &&
+        (im.seg[0].va & ~0xfffull) == m->start) {
+        im.hdr_ok = 1, im.start = m->start;
+        memcpy(im.hdr, eh, sizeof im.hdr);
+    }
+    cpu->images[cpu->nimages] = im;
+    m->image = (uint8_t) ++cpu->nimages;
+    cpu->image_total += kb_pieces(m->start, m->end);
+    return 1;
+}
+
 /* maps an ELF image's PT_LOAD segments at base (ET_EXEC: at their own
  * addresses); 0 on success */
 static int map_image(
@@ -99,12 +139,15 @@ static int map_image(
     if (lo > hi) return -5;
     lo &= ~0xfffull;
     /* one mapping for the whole image: segments may share pages */
-    if (!kb_map(cpu, base + lo, hi - lo, 7)) return -6;
-    for (int i = 0; i < eh.phnum; i++) {
-        if (phdr_at(f, &eh, i, &ph)) return -2;
-        if (ph.type != 1 || !ph.filesz) continue;
-        int e = load_bytes(cpu, f, ph.offset, base + ph.vaddr, ph.filesz);
-        if (e) return e;
+    struct kb_mapping* m = kb_map(cpu, base + lo, hi - lo, 7);
+    if (!m) return -6;
+    if (!lazy_image(cpu, f, &eh, base, m)) {
+        for (int i = 0; i < eh.phnum; i++) {
+            if (phdr_at(f, &eh, i, &ph)) return -2;
+            if (ph.type != 1 || !ph.filesz) continue;
+            int e = load_bytes(cpu, f, ph.offset, base + ph.vaddr, ph.filesz);
+            if (e) return e;
+        }
     }
     im->base = base, im->entry = base + eh.entry, im->phdr = base + phdr_va;
     im->end = base + hi, im->phnum = eh.phnum;

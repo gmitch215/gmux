@@ -139,7 +139,9 @@ enum kb_op
                  memset, 8 exp, 9 log, 10 pow, 11 crc32, 12 adler32, 13
                  compress2, 14 uncompress): runs it as a host
                  kernel and returns to the caller, or falls through to the
-                 function's own ops; prim.c */
+                 function's own ops; also the head of cksum's loop, whose
+                 kernel advances the loop's registers and runs on into the
+                 block's own ops; prim.c */
 };
 
 /* semantic classes (run.c, kb_class): the plans read these, not opcodes */
@@ -254,11 +256,30 @@ struct kb_block {
 #endif
 };
 
+/* a loaded ELF's file, kept open so a piece of its mapping is read on first
+ * touch (mem.c). The descriptor is katybug's own, below 1024 and close-on-exec,
+ * so a fork's exec carries it at the same number */
+#define KB_IMAGES 2
+#define KB_IMAGE_SEGS 8
+struct kb_image {
+    int fd, hdr_ok;
+    uint64_t dev, ino;
+    uint64_t start; /* where the first segment's page, and the header, sit */
+    uint8_t hdr[64];
+    int nseg;
+    struct {
+        uint64_t va, off, len; /* the file's [off, off + len) is at va */
+    } seg[KB_IMAGE_SEGS];
+};
+
 struct kb_mapping {
     uint64_t start, end;
     uint8_t** pieces; /* mappings never overlap; each owns its pieces (mem.c),
                          which are NULL until touched */
     int prot;
+    uint8_t image; /* 1 + the kb_cpu.images entry that fills a piece when it is
+                      made, 0 for none; a split keeps it, a mapping that
+                      replaces part of one starts at 0 */
 };
 
 struct kb_sigaction {
@@ -288,6 +309,10 @@ struct kb_cpu {
     struct kb_mapping
         maps[1024]; /* later ones cover earlier ones where they overlap */
     int nmaps;
+    struct kb_image images[KB_IMAGES];
+    int nimages;
+    uint64_t image_total, /* pieces the image mappings had when loaded */
+        image_filled;     /* pieces made from an image's file */
     uint32_t mapgen;  /* bumped by every change to maps, which makes older kb_ic
                          entries stale */
     uint32_t codegen; /* bumped when executable code is unmapped or changes
@@ -347,14 +372,31 @@ int kb_iov(
 );
 uint64_t kb_pieces(uint64_t start, uint64_t end);
 uint8_t* kb_piece(
+    struct kb_cpu* cpu, struct kb_mapping* m, uint64_t va, uint64_t* lo,
+    uint64_t* hi
+);
+int kb_bus(uint64_t va);
+uint8_t* kb_piece_blank(
     struct kb_mapping* m, uint64_t va, uint64_t* lo, uint64_t* hi
 );
+int kb_image_header(
+    const struct kb_cpu* cpu, const struct kb_mapping* m, uint8_t out[64]
+);
+void kb_image_report(const struct kb_cpu* cpu);
 int kb_grow(struct kb_cpu* cpu, struct kb_mapping* m, uint64_t end);
 
 /* prim.c: string functions as host kernels (KATYBUG_PRIM=0 turns them off,
  * KATYBUG_PRIM=memcmp,strlen keeps only those); the mask has bit i for
  * function i */
-int kb_prim_enabled(void);
+uint64_t kb_prim_enabled(void);
+/* hash.c: n blocks of 64 bytes (128 for sha512) into a hash's state words */
+void kb_sha256_blocks(uint32_t st[8], const uint8_t* p, size_t n);
+void kb_sha1_blocks(uint32_t st[5], const uint8_t* p, size_t n);
+void kb_md5_blocks(uint32_t st[4], const uint8_t* p, size_t n);
+void kb_sha512_blocks(uint64_t st[8], const uint8_t* p, size_t n);
+uint32_t kb_cksum_blocks(
+    uint32_t crc, const uint8_t* tab, const uint8_t* p, size_t n
+);
 /* thunk.c: library calls found by the name a loaded object imports them under;
  * the ids are prim.c's */
 enum
@@ -372,9 +414,28 @@ enum
     KB_THUNK_CRC32,
     KB_THUNK_ADLER32,
     KB_THUNK_COMPRESS2,
-    KB_THUNK_UNCOMPRESS
+    KB_THUNK_UNCOMPRESS,
+    KB_THUNK_ZS, /* KB_ZS_N stream entries from here (zstream.c's order) */
+    KB_THUNK_ZPOISON = 0x7f /* an import of one that cannot be served */
 };
+#define KB_ZS_N 31
+extern const char* const kb_zs_name[KB_ZS_N];
 int kb_thunk_at(struct kb_cpu* cpu, uint64_t pc);
+/* a stream init called from caller may be taken: that object imports the
+ * life cycle (deflate and deflateEnd, or inflate and inflateEnd) and no object
+ * imports an entry the stream mirror cannot serve */
+int kb_thunk_zok(struct kb_cpu* cpu, uint64_t caller, int inflate);
+/* zstream.c: entry e (0..KB_ZS_N-1) of a guest z_stream whose libz is version
+ * ver of prim.c's list of stock zlib versions: 0 gives up with nothing changed,
+ * 1 ran (*v is the return value), 2 raised a guest fault. KB_ZV_RESET_CLEARS
+ * is the index of the first version whose inflateReset clears data_type */
+#define KB_ZV_RESET_CLEARS 4
+int kb_zs(struct kb_cpu* cpu, int e, int ver, uint64_t* v);
+void kb_zs_report(FILE* f);
+/* the loaded ELF object that holds pc, as the span it maps, or 0 */
+int kb_thunk_object(
+    struct kb_cpu* cpu, uint64_t pc, uint64_t* lo, uint64_t* hi
+);
 int kb_prim_at(struct kb_cpu* cpu, uint64_t pc);
 int kb_prim(struct kb_cpu* cpu, int id, uint64_t* next);
 void kb_prim_report(void);
@@ -503,6 +564,7 @@ char* kb_str(struct kb_cpu* cpu, uint64_t va);
 extern FILE* kb_log;
 void kb_log_init(int resumed);
 int kb_own_fd(int fd);
+int kb_keep_fd(int fd);
 FILE* kb_own_fopen(const char* path, const char* mode);
 int kb_past_limit(int fd);
 int64_t kb_newfd(int fd);

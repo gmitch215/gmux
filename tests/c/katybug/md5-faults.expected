@@ -1,0 +1,24 @@
+empty: 67452301 efcdab89 98badcfe 10325476 fffffff0 00000007
+one block: 38d54720 f7f7f12e 873ef251 a3d27a99 00000030 00000008
+blocks: b9a16bf4 f87c6d62 dc0b515d 654603fd 00000bf0 00000008
+whole page: 5447fe54 41bc65f2 2b159940 1be56323 00000ff0 00000008
+page, ends at the page end: 832ac8c1 bcafe467 aea95599 e01c4ac1 000000b0 00000008
+across mappings: d0453d36 9cb8d403 2d1f77c4 df84a32a 000000f0 00000008
+count carries: cb286520 47883f77 9d1e27f2 0d73992b 00000070 00000008
+len 2^32: fault 4096 67452301 efcdab89 98badcfe 10325476 fffffff0 00000008
+buffer runs into the hole: fault 4096 67452301 efcdab89 98badcfe 10325476 00000070 00000008
+buffer starts in the hole: fault 4096 67452301 efcdab89 98badcfe 10325476 00000030 00000008
+buffer runs into PROT_NONE: fault 4096 67452301 efcdab89 98badcfe 10325476 00000070 00000008
+buffer past the end: fault 4096 67452301 efcdab89 98badcfe 10325476 00001ff0 00000008
+len 2^40: fault 4096 67452301 efcdab89 98badcfe 10325476 fffffff0 00000107
+len not a multiple of 64: f300dfce 4eddfd56 0867e9cc f188cf7a 00000054 00000008
+len 100 past the end: fault 4096 67452301 efcdab89 98badcfe 10325476 00000054 00000008
+ctx in the hole: fault 4172 
+ctx runs into the hole: fault 4096 
+ctx at the page end: 3cc39985 e9a0b6df 4ecb631c 6d5f9baa 00000030 00000008
+ctx across mappings: af7f831a 9ab801c4 689d3c9a 2ad4bfa4 00000030 00000008
+ctx runs into PROT_NONE: fault 4116 
+buffer over the context: e2689530 f8e8ac46 1f99b0a4 7b5108c6 00000030 00000008
+buffer over the count: 532eed57 a1bfe6a8 cb4f3062 80d72c28 00000030 00000008
+buffer just past the count: c3ce520b f51b90e8 3803aba0 a5ba4819 00000030 00000008
+faults 10

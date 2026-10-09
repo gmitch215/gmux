@@ -10,7 +10,9 @@
  * and 2.39 run the same arithmetic on those paths; the differences are
  * tabulated in tests/c/katybug/libm-tables.txt. Every other input gives up and
  * the guest's code runs. A fused multiply-add anywhere would change bits, so
- * the file asks the compiler not to contract and kb_libm_ok checks that it did
+ * the file asks the compiler not to contract and kb_libm_ok checks that it did;
+ * the fused sites of Debian 12's AArch64 glibc are written out as fma calls
+ * (read from its libm.so.6, listed in tests/c/katybug/libm-glibc-a64.txt)
  */
 #if defined(__clang__)
     #pragma STDC FP_CONTRACT OFF
@@ -60,14 +62,52 @@ static inline int tie(double z) {
     return z - floor(z) == 0.5;
 }
 
+/* the reduction x = kd * ln2/N + r: ki is kd as an integer. glibc on AArch64
+ * takes both from round and fcvtas (ties away) and fuses both steps of r; the
+ * others use the shift and give up on a tie */
+static inline int reduce(
+    double x, int flavor, double* r, double* kd, uint64_t* ki
+) {
+    double z = InvLn2N * x;
+    if (flavor == KB_LIBM_GLIBC_A64) {
+        *kd = round(z);
+        *ki = (uint64_t) (int64_t) *kd;
+        *r = fma(*kd, NegLn2loN, fma(*kd, NegLn2hiN, x));
+        return 1;
+    }
+    if (tie(z)) return 0;
+    double k = z + Shift;
+    *ki = asuint64(k);
+    *kd = k - Shift;
+    *r = x + *kd * NegLn2hiN + *kd * NegLn2loN;
+    return 1;
+}
+
+/* exp(r) - 1 less the leading terms, tail included; glibc on AArch64 fuses
+ * every product that feeds a sum, except r2 * r2, which it computes first */
+static inline double expm1ish(double r, double tail, int flavor) {
+    double r2 = r * r;
+    if (flavor == KB_LIBM_GLIBC_A64)
+        return fma(r2 * r2, fma(C5, r, C4), fma(fma(C3, r, C2), r2, r + tail));
+    return tail + r + r2 * (C2 + r * C3) + r2 * r2 * (C4 + r * C5);
+}
+
+static inline double times_scale(double scale, double tmp, int flavor) {
+    return flavor == KB_LIBM_GLIBC_A64 ? fma(scale, tmp, scale)
+                                       : scale + scale * tmp;
+}
+
 /* scale * (1 + tmp) with the exponent adjustment of the large |x| arguments;
- * 0 when the result overflows or reaches the subnormal range */
-static int scaled(double tmp, uint64_t sbits, uint64_t ki, double* y) {
+ * 0 when the result overflows or reaches the subnormal range. The branch for
+ * a negative k adds with a product it keeps, so glibc does not fuse it */
+static int scaled(
+    double tmp, uint64_t sbits, uint64_t ki, int flavor, double* y
+) {
     double scale, v;
     if ((ki & 0x80000000) == 0) {
         sbits -= 1009ull << 52;
         scale = asdouble(sbits);
-        v = 0x1p1009 * (scale + scale * tmp);
+        v = 0x1p1009 * times_scale(scale, tmp, flavor);
         if (!isfinite(v)) return 0;
         return *y = v, 1;
     }
@@ -78,30 +118,23 @@ static int scaled(double tmp, uint64_t sbits, uint64_t ki, double* y) {
     return *y = 0x1p-1022 * v, 1;
 }
 
-int kb_libm_exp(double x, int fused, double* out) {
-    (void) fused;
+int kb_libm_exp(double x, int flavor, double* out) {
     uint32_t abstop = top12(x) & 0x7ff;
     if (abstop < 0x3c9 || abstop >= 0x409) return 0;
-    double z = InvLn2N * x;
-    if (tie(z)) return 0;
-    double kd = z + Shift;
-    uint64_t ki = asuint64(kd);
-    kd -= Shift;
-    double r = x + kd * NegLn2hiN + kd * NegLn2loN;
+    double r, kd;
+    uint64_t ki;
+    if (!reduce(x, flavor, &r, &kd, &ki)) return 0;
     uint64_t idx = 2 * (ki % EN);
     uint64_t top = ki << (52 - EXP_TABLE_BITS);
     double tail = asdouble(ET[idx]);
     uint64_t sbits = ET[idx + 1] + top;
-    double r2 = r * r;
-    double tmp = tail + r + r2 * (C2 + r * C3) + r2 * r2 * (C4 + r * C5);
+    double tmp = expm1ish(r, tail, flavor);
     double y;
     if (abstop == 0x408) {
-        if (!scaled(tmp, sbits, ki, &y)) return 0;
+        if (!scaled(tmp, sbits, ki, flavor, &y)) return 0;
     }
-    else {
-        double scale = asdouble(sbits);
-        y = scale + scale * tmp;
-    }
+    else
+        y = times_scale(asdouble(sbits), tmp, flavor);
     if (!normal(y)) return 0;
     return *out = y, 1;
 }
@@ -115,15 +148,35 @@ int kb_libm_exp(double x, int fused, double* out) {
 #define LN (1 << LOG_TABLE_BITS)
 #define LOFF 0x3fe6000000000000
 
-int kb_libm_log(double x, int fused, double* out) {
+/* glibc 2.36 on AArch64 near 1, every site gcc fused (the rest as the source
+ * has it): the three polynomial levels, rhi, and the sums of w and of lo */
+static double log_near_one_glibc(double x) {
+    double r = x - 1.0, r2 = r * r, r3 = r * r2;
+    double q3 = fma(LB[10], r3, fma(LB[9], r2, fma(LB[8], r, LB[7])));
+    double q2 = fma(q3, r3, fma(LB[6], r2, fma(LB[5], r, LB[4])));
+    double q1 = fma(q2, r3, fma(LB[3], r2, fma(LB[2], r, LB[1])));
+    double rhi = fma(-r, 0x1p27, fma(r, 0x1p27, r));
+    double rlo = r - rhi, rhi2 = rhi * rhi;
+    double hi = fma(rhi2, LB[0], r);
+    double lo = fma(rhi2, LB[0], r - hi);
+    lo = fma(LB[0] * rlo, rhi + r, lo);
+    return hi + fma(q1, r3, lo);
+}
+
+int kb_libm_log(double x, int flavor, double* out) {
     uint64_t ix = asuint64(x), iz, tmp;
     uint32_t top = (uint32_t) (ix >> 48);
     double w, z, r, r2, r3, y, invc, logc, kd, hi, lo;
-    int k, i;
+    int k, i, glibc = flavor == KB_LIBM_GLIBC_A64;
 #define LO asuint64(1.0 - 0x1p-4)
 #define HI asuint64(1.0 + 0x1.09p-4)
     if (ix - LO < HI - LO) {
         if (ix == asuint64(1.0)) return 0;
+        if (glibc) {
+            y = log_near_one_glibc(x);
+            if (!normal(y)) return 0;
+            return *out = y, 1;
+        }
         r = x - 1.0;
         r2 = r * r;
         r3 = r * r2;
@@ -150,17 +203,27 @@ int kb_libm_log(double x, int fused, double* out) {
     invc = LT[i].invc;
     logc = LT[i].logc;
     z = asdouble(iz);
-    if (fused)
+    if (flavor != KB_LIBM_X86)
         r = fma(z, invc, -1.0);
     else
         r = (z - LT2[i].chi - LT2[i].clo) * invc;
     kd = (double) k;
-    w = kd * Ln2hi + logc;
-    hi = w + r;
-    lo = w - hi + r + kd * Ln2lo;
-    r2 = r * r;
-    y = lo + r2 * LA[0] +
-        r * r2 * (LA[1] + r * LA[2] + r2 * (LA[3] + r * LA[4])) + hi;
+    if (glibc) {
+        w = fma(kd, Ln2hi, logc);
+        hi = w + r;
+        lo = fma(kd, Ln2lo, w - hi + r);
+        r2 = r * r;
+        double poly = fma(fma(LA[4], r, LA[3]), r2, fma(LA[2], r, LA[1]));
+        y = fma(r * r2, poly, fma(LA[0], r2, lo)) + hi;
+    }
+    else {
+        w = kd * Ln2hi + logc;
+        hi = w + r;
+        lo = w - hi + r + kd * Ln2lo;
+        r2 = r * r;
+        y = lo + r2 * LA[0] +
+            r * r2 * (LA[1] + r * LA[2] + r2 * (LA[3] + r * LA[4])) + hi;
+    }
     if (!normal(y)) return 0;
     return *out = y, 1;
 }
@@ -173,10 +236,11 @@ int kb_libm_log(double x, int fused, double* out) {
 #define POFF 0x3fe6955500000000
 #define SIGN_BIAS (0x800 << EXP_TABLE_BITS)
 
-static double log_inline(uint64_t ix, int fused, double* tail) {
+static double log_inline(uint64_t ix, int flavor, double* tail) {
     double z, r, y, invc, logc, logctail, kd, hi, t1, t2, lo, lo1, lo2, p;
     uint64_t iz, tmp;
-    int k, i;
+    int k, i, fused = flavor != KB_LIBM_X86,
+              glibc = flavor == KB_LIBM_GLIBC_A64;
     tmp = ix - POFF;
     i = (int) ((tmp >> (52 - POW_LOG_TABLE_BITS)) % PN);
     k = (int) ((int64_t) tmp >> 52);
@@ -191,9 +255,9 @@ static double log_inline(uint64_t ix, int fused, double* tail) {
     double rhi = zhi * invc - 1.0;
     double rlo = zlo * invc;
     r = fused ? fma(z, invc, -1.0) : rhi + rlo;
-    t1 = kd * PLn2hi + logc;
+    t1 = glibc ? fma(kd, PLn2hi, logc) : kd * PLn2hi + logc;
     t2 = t1 + r;
-    lo1 = kd * PLn2lo + logctail;
+    lo1 = glibc ? fma(kd, PLn2lo, logctail) : kd * PLn2lo + logctail;
     lo2 = t1 - t2 + r;
     double ar, ar2, ar3, lo3, lo4;
     ar = PA[0] * r;
@@ -211,39 +275,43 @@ static double log_inline(uint64_t ix, int fused, double* tail) {
         lo3 = rlo * (ar + arhi);
         lo4 = t2 - hi + arhi2;
     }
-    p =
-        (ar3 * (PA[1] + r * PA[2] +
-                ar2 * (PA[3] + r * PA[4] + ar2 * (PA[5] + r * PA[6]))));
-    lo = lo1 + lo2 + lo3 + lo4 + p;
+    if (glibc) {
+        double inner = fma(ar2, fma(r, PA[6], PA[5]), fma(r, PA[4], PA[3]));
+        lo =
+            fma(ar3, fma(ar2, inner, fma(r, PA[2], PA[1])),
+                lo1 + lo2 + lo3 + lo4);
+    }
+    else {
+        p =
+            (ar3 * (PA[1] + r * PA[2] +
+                    ar2 * (PA[3] + r * PA[4] + ar2 * (PA[5] + r * PA[6]))));
+        lo = lo1 + lo2 + lo3 + lo4 + p;
+    }
     y = hi + lo;
     *tail = hi - y + lo;
     return y;
 }
 
-static int exp_inline(double x, double xtail, uint32_t sign_bias, double* out) {
+static int exp_inline(
+    double x, double xtail, uint32_t sign_bias, int flavor, double* out
+) {
     uint32_t abstop = top12(x) & 0x7ff;
     if (abstop < 0x3c9 || abstop >= 0x409) return 0;
-    double z = InvLn2N * x;
-    if (tie(z)) return 0;
-    double kd = z + Shift;
-    uint64_t ki = asuint64(kd);
-    kd -= Shift;
-    double r = x + kd * NegLn2hiN + kd * NegLn2loN;
+    double r, kd;
+    uint64_t ki;
+    if (!reduce(x, flavor, &r, &kd, &ki)) return 0;
     r += xtail;
     uint64_t idx = 2 * (ki % EN);
     uint64_t top = (ki + sign_bias) << (52 - EXP_TABLE_BITS);
     double tail = asdouble(ET[idx]);
     uint64_t sbits = ET[idx + 1] + top;
-    double r2 = r * r;
-    double tmp = tail + r + r2 * (C2 + r * C3) + r2 * r2 * (C4 + r * C5);
+    double tmp = expm1ish(r, tail, flavor);
     double y;
     if (abstop == 0x408) {
-        if (!scaled(tmp, sbits, ki, &y)) return 0;
+        if (!scaled(tmp, sbits, ki, flavor, &y)) return 0;
     }
-    else {
-        double scale = asdouble(sbits);
-        y = scale + scale * tmp;
-    }
+    else
+        y = times_scale(asdouble(sbits), tmp, flavor);
     if (!normal(y)) return 0;
     return *out = y, 1;
 }
@@ -257,7 +325,7 @@ static inline int checkint(uint64_t iy) {
     return 2;
 }
 
-int kb_libm_pow(double x, double y, int fused, double* out) {
+int kb_libm_pow(double x, double y, int flavor, double* out) {
     uint32_t sign_bias = 0;
     uint64_t ix = asuint64(x), iy = asuint64(y);
     uint32_t topx = top12(x), topy = top12(y);
@@ -272,11 +340,12 @@ int kb_libm_pow(double x, double y, int fused, double* out) {
     }
     if (ix == asuint64(1.0)) return 0;
     double lo;
-    double hi = log_inline(ix, fused, &lo);
+    double hi = log_inline(ix, flavor, &lo);
     double ehi, elo;
-    if (fused) {
+    if (flavor != KB_LIBM_X86) {
         ehi = y * hi;
-        elo = y * lo + fma(y, hi, -ehi);
+        elo = flavor == KB_LIBM_GLIBC_A64 ? fma(y, lo, fma(y, hi, -ehi))
+                                          : y * lo + fma(y, hi, -ehi);
     }
     else {
         double yhi = asdouble(iy & -1ULL << 27);
@@ -286,5 +355,5 @@ int kb_libm_pow(double x, double y, int fused, double* out) {
         ehi = yhi * lhi;
         elo = ylo * lhi + y * llo;
     }
-    return exp_inline(ehi, elo, sign_bias, out);
+    return exp_inline(ehi, elo, sign_bias, flavor, out);
 }

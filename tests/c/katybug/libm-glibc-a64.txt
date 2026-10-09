@@ -1,0 +1,78 @@
+fused multiply-add sites of exp, log and pow in Debian 12's AArch64 glibc 2.36
+
+Read from libm.so.6 of libc6 2.36-9+deb12u14 (arm64), sha256
+3c4cb3be0b974edf05f023f85ab15107fb5afc2687163593d0d4cf8e80c17b39 (the build
+libm-sigs.h lists; objdump -d of exp at 0x30840, log at 0x33fc0, pow at
+0x34260). Every fmadd, fmsub and fnmsub of the three functions is a line
+below (exp 8, log 23, pow 20); there is no fnmadd, fmla or fmls. libm.c writes
+each as an fma() call for KB_LIBM_GLIBC_A64 and leaves every other product and
+sum unfused, as the code has them. Most of these are outside the
+__FP_FAST_FMA branches of the source: gcc contracted them on its own, so
+copying the source's explicit fma calls is not enough (musl on AArch64, built
+without contraction, has only those).
+
+exp (e_exp.c; pow's exp_inline has the same sites, offset by its own code)
+  30878 fmadd  r0 = fma(kd, NegLn2hiN, x)
+  30888 fmadd  r = fma(kd, NegLn2loN, r0)
+  30894 fmadd  p1 = fma(C3, r, C2)
+  30898 fmadd  p2 = fma(C5, r, C4)
+  308ac fmadd  t1 = fma(p1, r2, r + tail)
+  308b0 fmadd  tmp = fma(r2 * r2, p2, t1)
+  308bc fmadd  y = fma(scale, tmp, scale)
+  30994 fmadd  the same for |x| >= 512, before the scaling by 0x1p1009
+  not fused: 308f4 to 30908, scale + scale * tmp for a negative k (the product
+  is used again in the correction term, so gcc kept an fmul and an fadd)
+  kd and ki come from frinta and fcvtas (ties away from zero), not the shift
+
+log (e_log.c)
+  main path
+  34034 fmadd  w = fma(kd, Ln2hi, logc)
+  34040 fmadd  r = fma(z, invc, -1.0)
+  3404c fmadd  fma(A4, r, A3)
+  34050 fmadd  fma(A2, r, A1)
+  34064 fmadd  q = fma(fma(A4, r, A3), r2, fma(A2, r, A1))
+  34068 fmadd  lo = fma(kd, Ln2lo, (w - hi) + r)
+  3406c fmadd  lo = fma(A0, r2, lo)
+  34070 fmadd  lo = fma(r * r2, q, lo), then y = lo + hi
+  near 1
+  340a4 fmadd  fma(r, 0x1p27, r)
+  340b4 fmadd  fma(B8, r, B7)
+  340b8 fmsub  rhi = fma(-r, 0x1p27, fma(r, 0x1p27, r))
+  340c8 fmadd  fma(B9, r2, .)
+  340d0 fmadd  fma(B5, r, B4)
+  340d4 fmadd  q3 = fma(B10, r3, .)
+  340dc fmadd  fma(B6, r2, .)
+  340e4 fmadd  hi = fma(rhi * rhi, B0, r)
+  340e8 fmadd  fma(B2, r, B1)
+  340ec fmadd  q2 = fma(q3, r3, .)
+  340f8 fmadd  fma(B3, r2, .)
+  34104 fmadd  lo = fma(rhi * rhi, B0, r - hi)
+  34108 fmadd  q1 = fma(q2, r3, .)
+  3410c fmadd  lo = fma(B0 * rlo, rhi + r, lo)
+  34110 fmadd  y = fma(q1, r3, lo), then y = hi + y
+
+pow (e_pow.c: log_inline, the product with y, exp_inline)
+  342dc fmadd  t1 = fma(kd, Ln2hi, logc)
+  342e4 fmadd  r = fma(z, invc, -1.0)
+  342f4 fmadd  lo1 = fma(kd, Ln2lo, logctail)
+  34304 fmadd  fma(r, A6, A5)
+  3430c fmadd  fma(r, A4, A3)
+  34310 fmadd  fma(r, A2, A1)
+  3431c fnmsub lo3 = fma(ar, r, -ar2)
+  34320 fmadd  inner = fma(ar2, fma(r, A6, A5), fma(r, A4, A3))
+  34338 fmadd  q = fma(ar2, inner, fma(r, A2, A1))
+  34348 fmadd  lo = fma(ar3, q, lo1 + lo2 + lo3 + lo4)
+  34358 fnmsub fma(y, hi, -ehi)
+  34368 fmadd  elo = fma(y, tail, fma(y, hi, -ehi))
+  3439c fmadd  fma(kd, NegLn2hiN, ehi)
+  343b0 fmadd  r = fma(kd, NegLn2loN, .), then r + elo
+  343c4 fmadd  fma(r, C3, C2)
+  343c8 fmadd  fma(r, C5, C4)
+  343d8 fmadd  fma(r2, fma(r, C3, C2), r + tail)
+  343dc fmadd  tmp = fma(r2 * r2, fma(r, C5, C4), .)
+  343e8 fmadd  y = fma(scale, tmp, scale)
+  345c0 fmadd  the same for |x| >= 512, before the scaling by 0x1p1009
+
+Checked against them by libm-vectors.txt (2,400 inputs per function, the glibc
+AArch64 column), thunk.sh in a Debian arm64 container, and 300,000,000 random
+inputs per function against that container's libm called natively.

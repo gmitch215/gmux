@@ -160,4 +160,5 @@ bun run format:check
 ## 📄 License
 
 gmux is GPL-3.0-only. The kernel and its patches are GPL-2.0-only (`LICENSES/`), BusyBox is
-GPL-2.0-only, and musl is MIT.
+GPL-2.0-only, musl is MIT, and zlib, built into Katybug, is under the zlib licence
+(`LICENSES/Zlib.txt`).

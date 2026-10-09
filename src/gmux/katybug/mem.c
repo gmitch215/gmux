@@ -1,6 +1,9 @@
+#include <errno.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
+#include <sys/stat.h>
+#include <unistd.h>
 
 #include "kb.h"
 
@@ -77,6 +80,10 @@ static uint8_t* block_resize(uint8_t* p, uint64_t n, uint64_t n2) {
 
 static int last = -1;
 
+/* the last piece an image's file could not fill (it ends before a page the
+ * piece holds): an access in it is a SIGBUS, as a file mapping's is */
+static uint64_t bus_lo, bus_hi;
+
 /* the mapping holding va; mappings never overlap */
 static struct kb_mapping* find(struct kb_cpu* cpu, uint64_t va) {
     if (last >= 0 && last < cpu->nmaps && va >= cpu->maps[last].start &&
@@ -92,6 +99,7 @@ static struct kb_mapping* find(struct kb_cpu* cpu, uint64_t va) {
 
 static void changed(struct kb_cpu* cpu) {
     last = -1;
+    bus_lo = bus_hi = 0;
     cpu->mapgen++;
     KB_BUMP_AS(map);
 #ifdef KB_AOT
@@ -117,15 +125,109 @@ static void bounds(
     *hi = g + PIECE < m->end ? g + PIECE : m->end;
 }
 
-/** the block of the piece of m holding va, made on first touch; *lo is the
+/* n bytes at va of what an image's file puts there, into dst (zeroed): the
+ * file's bytes inside each segment, nothing elsewhere. -1 when the file ends
+ * before a page the range needs (the page holding its last byte is read as far
+ * as it goes and zero after, as a file mapping does) */
+static int image_read(
+    const struct kb_image* im, uint8_t* dst, uint64_t va, uint64_t n
+) {
+    for (int i = 0; i < im->nseg; i++) {
+        uint64_t a = va > im->seg[i].va ? va : im->seg[i].va;
+        uint64_t e = im->seg[i].va + im->seg[i].len;
+        if (va + n < e) e = va + n;
+        if (a >= e) continue;
+        uint64_t off = im->seg[i].off + (a - im->seg[i].va), got = 0;
+        while (got < e - a) {
+            ssize_t r = pread(
+                im->fd, dst + (a - va) + got, (size_t) (e - a - got),
+                (off_t) (off + got)
+            );
+            if (r < 0 && errno == EINTR) continue;
+            if (r <= 0) break;
+            got += (uint64_t) r;
+        }
+        if (got == e - a) continue;
+        struct stat st;
+        if (fstat(im->fd, &st) || (uint64_t) st.st_size > off + got)
+            return -1; /* a read error, or a short read before the end */
+        if (off + (e - a) > ((uint64_t) st.st_size + PAGE - 1) / PAGE * PAGE)
+            return -1;
+    }
+    return 0;
+}
+
+/** the block of the piece of m holding va, made on first touch (read from the
+ * image file when m has one: NULL when the file cannot give it); *lo is the
  * address of its first byte and *hi where it ends */
 uint8_t* kb_piece(
+    struct kb_cpu* cpu, struct kb_mapping* m, uint64_t va, uint64_t* lo,
+    uint64_t* hi
+) {
+    uint64_t i = (va >> KB_PIECE_BITS) - (m->start >> KB_PIECE_BITS);
+    bounds(m, i, lo, hi);
+    if (m->pieces[i]) return m->pieces[i];
+    uint8_t* p = block_new(*hi - *lo);
+    if (p && m->image) {
+        if (image_read(&cpu->images[m->image - 1], p, *lo, *hi - *lo)) {
+            block_free(p, *hi - *lo);
+            bus_lo = *lo, bus_hi = *hi;
+            return NULL;
+        }
+        cpu->image_filled++;
+    }
+    return m->pieces[i] = p;
+}
+
+/** whether va is in the piece an image's file last failed to fill */
+int kb_bus(uint64_t va) {
+    return va >= bus_lo && va < bus_hi;
+}
+
+/** kb_piece without the image: a zeroed block, for a piece whose bytes come
+ * from somewhere else (a fork's stream) */
+uint8_t* kb_piece_blank(
     struct kb_mapping* m, uint64_t va, uint64_t* lo, uint64_t* hi
 ) {
     uint64_t i = (va >> KB_PIECE_BITS) - (m->start >> KB_PIECE_BITS);
     bounds(m, i, lo, hi);
     if (!m->pieces[i]) m->pieces[i] = block_new(*hi - *lo);
     return m->pieces[i];
+}
+
+/** the ELF header an image mapping starts with, from the file's copy, while
+ * the mapping has not made its first piece; 0 when there is none */
+int kb_image_header(
+    const struct kb_cpu* cpu, const struct kb_mapping* m, uint8_t out[64]
+) {
+    if (!m->image) return 0;
+    const struct kb_image* im = &cpu->images[m->image - 1];
+    if (!im->hdr_ok || im->start != m->start) return 0;
+    memcpy(out, im->hdr, 64);
+    return 1;
+}
+
+/** what the image mappings hold now, and the guest memory in all */
+void kb_image_report(const struct kb_cpu* cpu) {
+    uint64_t held = 0, pieces = 0, pages = 0;
+    for (int i = 0; i < cpu->nmaps; i++) {
+        const struct kb_mapping* m = &cpu->maps[i];
+        for (uint64_t k = 0, n = kb_pieces(m->start, m->end); k < n; k++) {
+            if (!m->pieces[k]) continue;
+            uint64_t lo, hi;
+            bounds(m, k, &lo, &hi);
+            pieces++, pages += (hi - lo) / PAGE;
+            if (m->image) held++;
+        }
+    }
+    fprintf(
+        kb_log,
+        "katybug: image pieces %llu filled of %llu, %llu held; guest memory "
+        "%llu pages in %llu pieces\n",
+        (unsigned long long) cpu->image_filled,
+        (unsigned long long) cpu->image_total, (unsigned long long) held,
+        (unsigned long long) pages, (unsigned long long) pieces
+    );
 }
 
 /* kb_host, and when ic is given, ic keeps the piece; *cross is set when the
@@ -137,7 +239,7 @@ static uint8_t* translate(
     struct kb_mapping* m = find(cpu, va);
     if (!m || !m->prot || va + len < va) return NULL;
     uint64_t lo, hi;
-    uint8_t* p = kb_piece(m, va, &lo, &hi);
+    uint8_t* p = kb_piece(cpu, m, va, &lo, &hi);
     if (!p) return NULL;
     if (va + len > hi) {
         if (cross) *cross = 1;
@@ -178,7 +280,8 @@ static int split(struct kb_cpu* cpu, uint64_t a) {
     for (uint64_t k = mid; k < n; k++) up[k] = m->pieces[i + k];
     uint8_t** keep =
         realloc(m->pieces, (size_t) kb_pieces(m->start, a) * sizeof *keep);
-    cpu->maps[cpu->nmaps++] = (struct kb_mapping){a, m->end, up, m->prot};
+    cpu->maps[cpu->nmaps++] =
+        (struct kb_mapping){a, m->end, up, m->prot, m->image};
     m->end = a;
     if (keep) m->pieces = keep;
     changed(cpu);
@@ -207,7 +310,7 @@ uint8_t* kb_span(struct kb_cpu* cpu, uint64_t va, uint64_t* len) {
     struct kb_mapping* m = find(cpu, va);
     if (!m || !m->prot) return NULL;
     uint64_t lo, hi;
-    uint8_t* p = kb_piece(m, va, &lo, &hi);
+    uint8_t* p = kb_piece(cpu, m, va, &lo, &hi);
     if (!p) return NULL;
     *len = hi - va;
     return p + (va - lo);
@@ -347,7 +450,7 @@ static struct kb_mapping* add(
     if (cpu->nmaps == (int) (sizeof cpu->maps / sizeof cpu->maps[0]))
         return NULL;
     struct kb_mapping* m = &cpu->maps[cpu->nmaps++];
-    *m = (struct kb_mapping){s, e, pieces, prot};
+    *m = (struct kb_mapping){s, e, pieces, prot, 0};
     changed(cpu);
     return m;
 }
@@ -443,6 +546,15 @@ void kb_store(struct kb_cpu* cpu, uint64_t va, uint64_t v, int w) {
     kb_store_ic(cpu, NULL, va, v, w);
 }
 
+/* what a faulting access reports: x86 gives the first byte it cannot reach
+ * (the page it ran into), AArch64 the access's own address */
+static uint64_t fault_at(struct kb_cpu* cpu, uint64_t va, int w) {
+    if (cpu->arch != KB_X86) return va;
+    for (uint64_t at = 0, k; at < (uint64_t) w; at += k)
+        if (!kb_span(cpu, va + at, &k)) return va + at;
+    return va;
+}
+
 /* the slow path of a load or store whose inline cache missed; run.c holds the
  * fast one. An access across a piece boundary goes through both pieces */
 uint64_t kb_load_ic(struct kb_cpu* cpu, struct kb_ic* ic, uint64_t va, int w) {
@@ -458,8 +570,8 @@ uint64_t kb_load_ic(struct kb_cpu* cpu, struct kb_ic* ic, uint64_t va, int w) {
         ); /* hosts are little-endian, as both guests are */
     else if (!cross || !kb_read(cpu, va, &v, (uint64_t) w)) {
         cpu->fault = "load outside the address space";
-        cpu->fault_sig = 11;
-        cpu->fault_addr = va;
+        cpu->fault_addr = fault_at(cpu, va, w);
+        cpu->fault_sig = kb_bus(cpu->fault_addr) ? 7 : 11;
         return 0;
     }
     return v;
@@ -481,7 +593,7 @@ void kb_store_ic(
         !kb_write(cpu, va, &v, (uint64_t) w)
     ) {
         cpu->fault = "store outside the address space";
-        cpu->fault_sig = 11;
-        cpu->fault_addr = va;
+        cpu->fault_addr = fault_at(cpu, va, w);
+        cpu->fault_sig = kb_bus(cpu->fault_addr) ? 7 : 11;
     }
 }

@@ -393,6 +393,19 @@ int kb_own_fd(int fd) {
     return copy < 0 ? dup(fd) : copy;
 }
 
+/* a copy of fd that stays open for the life of the guest and reaches a fork's
+ * child at the same number (kb_fork keeps the close-on-exec descriptors below
+ * 1024 across its exec); -1 when there is no such number */
+int kb_keep_fd(int fd) {
+    int base = own_base();
+    int copy = base < 0 ? -1 : fcntl(fd, F_DUPFD_CLOEXEC, base + 1);
+    if (copy >= 1024) {
+        close(copy);
+        return -1;
+    }
+    return copy;
+}
+
 FILE* kb_own_fopen(const char* path, const char* mode) {
     FILE* f = fopen(path, mode);
     int fd = f ? kb_own_fd(fileno(f)) : -1;
@@ -625,7 +638,7 @@ static int64_t mmap_anon(
     {
         for (uint64_t done = 0; done < len;) {
             uint64_t lo, hi, va = m->start + done;
-            uint8_t* p = kb_piece(m, va, &lo, &hi);
+            uint8_t* p = kb_piece(cpu, m, va, &lo, &hi);
             if (!p) return -12;
             uint64_t k = hi - va < len - done ? hi - va : len - done;
             ssize_t got = pread(

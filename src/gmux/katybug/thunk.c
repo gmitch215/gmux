@@ -13,7 +13,7 @@
  */
 
 #define MAX_OBJS 32
-#define MAX_SLOTS 40
+#define MAX_SLOTS 128
 
 static const struct {
     const char* name;
@@ -37,10 +37,21 @@ static const struct {
 #endif
 };
 
+#ifdef KB_ZLIB
+/* entries that hand the library pointers into guest structs or callbacks: a
+ * stream cannot be mirrored for an object that imports one */
+static const char* const zpoison[] = {
+    "deflateSetHeader", "inflateGetHeader", "inflateBackInit_", "inflateBack",
+    "inflateBackEnd"
+};
+#endif
+
 static struct obj {
     uint64_t base, lo, hi;
     uint8_t hdr[64];
     int seen, n;
+    int zbits, poison; /* the stream life cycle it imports; an import the
+                          stream mirror cannot serve, or slots past the table */
     struct {
         uint64_t va;
         int id;
@@ -59,12 +70,22 @@ static int id_of(
     struct kb_cpu* cpu, uint64_t strtab, uint64_t symtab, uint64_t idx
 ) {
     uint8_t sym[24];
-    char name[16];
+    char name[32] = {0};
     if (!kb_read(cpu, symtab + idx * 24, sym, 24)) return 0;
     uint64_t off = rd(sym, 4);
-    if (!kb_read(cpu, strtab + off, name, sizeof name)) return 0;
+    /* a name at the end of its mapping is read a byte at a time */
+    if (!kb_read(cpu, strtab + off, name, sizeof name))
+        for (size_t i = 0; i + 1 < sizeof name; i++)
+            if (!kb_read(cpu, strtab + off + i, name + i, 1) || !name[i]) break;
+    name[sizeof name - 1] = 0;
     for (size_t i = 0; i < sizeof wanted / sizeof *wanted; i++)
-        if (!strncmp(name, wanted[i].name, sizeof name)) return wanted[i].id;
+        if (!strcmp(name, wanted[i].name)) return wanted[i].id;
+#ifdef KB_ZLIB
+    for (int i = 0; i < KB_ZS_N; i++)
+        if (!strcmp(name, kb_zs_name[i])) return KB_THUNK_ZS + i;
+    for (size_t i = 0; i < sizeof zpoison / sizeof *zpoison; i++)
+        if (!strcmp(name, zpoison[i])) return KB_THUNK_ZPOISON;
+#endif
     return 0;
 }
 
@@ -73,7 +94,7 @@ static void relocs(
     uint64_t strtab, uint64_t symtab
 ) {
     int x86 = cpu->arch == KB_X86;
-    for (uint64_t k = 0; k + 24 <= size && o->n < MAX_SLOTS; k += 24) {
+    for (uint64_t k = 0; k + 24 <= size; k += 24) {
         uint8_t r[24];
         if (!kb_read(cpu, at + k, r, 24)) return;
         uint64_t info = rd(r + 8, 8);
@@ -87,6 +108,17 @@ static void relocs(
         if (plain && rd(r + 16, 8)) continue;
         int id = id_of(cpu, strtab, symtab, info >> 32);
         if (!id) continue;
+        if (id == KB_THUNK_ZPOISON || o->n == MAX_SLOTS) {
+            o->poison = 1;
+            continue;
+        }
+        if (id >= KB_THUNK_ZS) {
+            static const int life[4] = {
+                KB_THUNK_ZS + 4, KB_THUNK_ZS + 6, KB_THUNK_ZS + 5,
+                KB_THUNK_ZS + 7
+            };
+            for (int b = 0; b < 4; b++) o->zbits |= (id == life[b]) << b;
+        }
         o->slot[o->n].va = o->base + rd(r, 8), o->slot[o->n++].id = id;
     }
 }
@@ -122,8 +154,12 @@ static int parse(
 /* the object whose ELF header is at the start of m, parsed when new */
 static void probe(struct kb_cpu* cpu, struct kb_mapping* m) {
     uint8_t h[64], ph[56];
-    if (m->end - m->start < 4096 || !m->pieces[0]) return;
-    if (!kb_read(cpu, m->start, h, 64) || memcmp(h, "\177ELF\2\1", 6)) return;
+    if (m->end - m->start < 4096) return;
+    /* an image's first piece is not made for a look at its header */
+    if (m->pieces[0] ? !kb_read(cpu, m->start, h, 64)
+                     : !kb_image_header(cpu, m, h))
+        return;
+    if (memcmp(h, "\177ELF\2\1", 6)) return;
     uint64_t type = rd(h + 16, 2), mach = rd(h + 18, 2);
     if ((type != 2 && type != 3) || mach != (cpu->arch == KB_X86 ? 62u : 183u))
         return;
@@ -168,6 +204,17 @@ static void rescan(struct kb_cpu* cpu) {
     nobjs = keep;
 }
 
+int kb_thunk_object(
+    struct kb_cpu* cpu, uint64_t pc, uint64_t* lo, uint64_t* hi
+) {
+    if (cpu->arch != KB_X86 && cpu->arch != KB_A64) return 0;
+    if (gen != cpu->mapgen) rescan(cpu);
+    for (int i = 0; i < nobjs; i++)
+        if (pc >= objs[i].lo && pc < objs[i].hi)
+            return *lo = objs[i].lo, *hi = objs[i].hi, 1;
+    return 0;
+}
+
 /** the thunk id (KB_THUNK_*) whose implementation starts at pc, or 0 */
 int kb_thunk_at(struct kb_cpu* cpu, uint64_t pc) {
     if (cpu->arch != KB_X86 && cpu->arch != KB_A64) return 0;
@@ -181,4 +228,16 @@ int kb_thunk_at(struct kb_cpu* cpu, uint64_t pc) {
         }
     }
     return 0;
+}
+
+int kb_thunk_zok(struct kb_cpu* cpu, uint64_t caller, int inflate) {
+    if (cpu->arch != KB_X86 && cpu->arch != KB_A64) return 0;
+    if (gen != cpu->mapgen) rescan(cpu);
+    int want = inflate ? 12 : 3, ok = 0;
+    for (int i = 0; i < nobjs; i++) {
+        if (objs[i].poison) return 0;
+        if (caller >= objs[i].lo && caller < objs[i].hi)
+            ok = (objs[i].zbits & want) == want;
+    }
+    return ok;
 }

@@ -1,4 +1,5 @@
 import { execFileSync } from 'node:child_process';
+import { createHash } from 'node:crypto';
 import { mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
@@ -8,12 +9,15 @@ import { fileURLToPath } from 'node:url';
  * Writes src/gmux/katybug/libm-sigs.h: musl's exp, log and pow as a static program carries them,
  * each function's machine code in a libc.a (length, first eight bytes, FNV-1a hash) with the bits
  * the linker fills in left out (the offsets and masks of its relocations), since a table or a
- * helper sits at another address in every program.
- * `node --experimental-strip-types tests/c/katybug/libm-sigs.ts <x86 libc.a> <a64 libc.a> [llvm bin dir]`
+ * helper sits at another address in every program. Each AArch64 glibc libm.so.6 listed adds the
+ * default-version exp, log and pow as they are in that file, unmasked: the one shared object keeps
+ * its own offsets, and a build whose bytes differ is a build the kernels were not checked against.
+ * `LLVM=<llvm bin dir> node --experimental-strip-types tests/c/katybug/libm-sigs.ts <x86 libc.a> <a64 libc.a> [<aarch64 glibc libm.so.6>...]`
  */
-const [x86, a64, llvm = process.env.LLVM ?? '/opt/homebrew/opt/llvm/bin'] = process.argv.slice(2);
+const [x86, a64, ...glibcs] = process.argv.slice(2);
+const llvm = process.env.LLVM ?? '/opt/homebrew/opt/llvm/bin';
 if (!x86 || !a64) {
-	console.error('usage: libm-sigs.ts <x86 libc.a> <a64 libc.a> [llvm bin dir]');
+	console.error('usage: libm-sigs.ts <x86 libc.a> <a64 libc.a> [<aarch64 glibc libm.so.6>...]');
 	process.exit(2);
 }
 const names = ['exp', 'log', 'pow'];
@@ -98,19 +102,84 @@ for (const [arch, libc] of [
 			`static const struct libm_mask ${n}_${arch}[] = {${list.map(([o, m]) => `{${o}, 0x${m.toString(16)}u}`).join(', ')}};`
 		);
 		rows.push(
-			`\t{KB_${arch.toUpperCase()}, ${i + 8}, ${b.length}, 0x${b.readBigUInt64LE(0).toString(16).padStart(16, '0')}ull, 0x${fnv(b).toString(16).padStart(16, '0')}ull, ${n}_${arch}, ${list.length}}, /* ${n} */`
+			`\t{KB_${arch.toUpperCase()}, ${i + 8}, ${b.length}, 0x${b.readBigUInt64LE(0).toString(16).padStart(16, '0')}ull, 0x${fnv(b).toString(16).padStart(16, '0')}ull, ${n}_${arch}, ${list.length}, ${arch === 'x86' ? 'KB_LIBM_X86' : 'KB_LIBM_MUSL_A64'}}, /* ${n} */`
 		);
 		if (arch === 'x86' || arch === 'a64')
 			console.error(`${arch} ${n}: ${b.length} bytes, ${list.length} relocations`);
 	}
 }
+// a shared object's default-version dynamic symbol: its address and size
+function dynsym(f: Buffer, name: string): { addr: number; size: number } {
+	const shoff = Number(f.readBigUInt64LE(0x28));
+	const sec = (i: number) => {
+		const o = shoff + i * 64;
+		return {
+			type: f.readUInt32LE(o + 4),
+			offset: Number(f.readBigUInt64LE(o + 0x18)),
+			size: Number(f.readBigUInt64LE(o + 0x20)),
+			link: f.readUInt32LE(o + 0x28)
+		};
+	};
+	const num = f.readUInt16LE(0x3c);
+	const all = Array.from({ length: num }, (_, i) => sec(i));
+	const sym = all.find((s) => s.type === 11);
+	const ver = all.find((s) => s.type === 0x6fffffff);
+	if (!sym || !ver) throw new Error('no .dynsym or .gnu.version');
+	const str = all[sym.link];
+	for (let i = 0; i < sym.size / 24; i++) {
+		const o = sym.offset + i * 24;
+		let end = str.offset + f.readUInt32LE(o);
+		const start = end;
+		while (f[end] !== 0) end++;
+		// bit 15 of the version index marks a non-default version (exp@GLIBC_2.17 against exp@@GLIBC_2.29)
+		if (
+			f.toString('latin1', start, end) !== name ||
+			f.readUInt16LE(ver.offset + i * 2) & 0x8000
+		)
+			continue;
+		const size = Number(f.readBigUInt64LE(o + 16));
+		if (!size) continue;
+		return { addr: Number(f.readBigUInt64LE(o + 8)), size };
+	}
+	throw new Error(`no default-version ${name}`);
+}
+
+const seen = new Set<string>();
+for (const path of glibcs) {
+	const f = readFileSync(path);
+	if (f.readUInt16LE(0x12) !== 183) throw new Error(`${path} is not an AArch64 object`);
+	const id = createHash('sha256').update(f).digest('hex');
+	if (seen.has(id)) continue;
+	seen.add(id);
+	const phoff = Number(f.readBigUInt64LE(0x20));
+	const loads = Array.from({ length: f.readUInt16LE(0x38) }, (_, i) => phoff + i * 56)
+		.filter((o) => f.readUInt32LE(o) === 1)
+		.map((o) => ({
+			off: Number(f.readBigUInt64LE(o + 8)),
+			va: Number(f.readBigUInt64LE(o + 16)),
+			filesz: Number(f.readBigUInt64LE(o + 32))
+		}));
+	rows.push(`\t/* glibc AArch64 libm.so.6 sha256 ${id.slice(0, 16)} */`);
+	for (const [i, n] of names.entries()) {
+		const { addr, size } = dynsym(f, n);
+		const seg = loads.find((l) => addr >= l.va && addr + size <= l.va + l.filesz);
+		if (!seg) throw new Error(`${path} ${n}: not in a loaded segment`);
+		const at = addr - seg.va + seg.off;
+		const b = f.subarray(at, at + size);
+		rows.push(
+			`\t{KB_A64, ${i + 8}, ${b.length}, 0x${b.readBigUInt64LE(0).toString(16).padStart(16, '0')}ull, 0x${fnv(b).toString(16).padStart(16, '0')}ull, NULL, 0, KB_LIBM_GLIBC_A64}, /* ${n} */`
+		);
+		console.error(`glibc ${id.slice(0, 8)} ${n}: ${b.length} bytes at 0x${addr.toString(16)}`);
+	}
+}
+
 out.push(
 	'static const struct libm_sig {',
 	'\tint arch, id;',
 	'\tuint32_t len;',
 	'\tuint64_t head, hash;',
 	'\tconst struct libm_mask* mask;',
-	'\tint nmask;',
+	'\tint nmask, flavor;',
 	'} libm_sigs[] = {',
 	...rows,
 	'};'

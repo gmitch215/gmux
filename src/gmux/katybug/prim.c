@@ -37,8 +37,14 @@ enum
     P_ADLER32 = KB_THUNK_ADLER32,
     P_COMPRESS2 = KB_THUNK_COMPRESS2,
     P_UNCOMPRESS = KB_THUNK_UNCOMPRESS,
+    P_ZS = KB_THUNK_ZS, /* the stream entries (zstream.c), all on or all off */
+    P_ZS_LAST = KB_THUNK_ZS + KB_ZS_N - 1,
 #endif
     P_SHA256, /* by code identity, one x86-64 coreutils build */
+    P_MD5,
+    P_SHA1,
+    P_SHA512,
+    P_CKSUM, /* the loop of cksum, not a function: see k_cksum */
     P_COUNT
 };
 
@@ -64,10 +70,17 @@ static const struct sig {
     {KB_A64, 2, 48, 0x39400003b4000142ull, 0x8926cb8f6ac1507aull},  /* memcmp */
     {KB_A64, 3, 40, 0x38626804d2800002ull, 0xc2cccae4e015455dull},  /* strcmp */
     {KB_A64, 4, 184, 0x12001c21aa0003e3ull, 0x9ec8006440306e0cull}, /* memchr */
-    /* sha256_process_block of the static x86-64 coreutils 9.5 built by
-     * tests/c/katybug/userland-build.sh (Alpine 3.20, gcc -O2), up to its
-     * return: nothing in it depends on where the linker put the program */
+    /* the process_block functions of sha256, md5, sha1 and sha512 of the
+     * static x86-64 coreutils 9.5 built by tests/c/katybug/userland-build.sh
+     * (Alpine 3.20, gcc -O2), up to their return: nothing in them depends on
+     * where the linker put the program */
     {KB_X86, P_SHA256, 11154, 0xd68948f089485741ull, 0x591450e47a612a2eull},
+    {KB_X86, P_MD5, 1881, 0xfa89495741f08948ull, 0xc71dc5d40415bbe9ull},
+    {KB_X86, P_SHA1, 5127, 0x415641d189485741ull, 0x59bf0c9969e0d9e7ull},
+    {KB_X86, P_SHA512, 16132, 0xf08948f989485741ull, 0x6de4dad7fe83ad69ull},
+    /* cksum's slice-by-8 loop of the same build, its one block from the load
+     * of the first word to the jne back: the table's address is in r14 */
+    {KB_X86, P_CKSUM, 137, 0x834804528b44028bull, 0x3730d0954ba1a02aull},
 };
 
 /* how a variant's memcmp or strcmp builds its result when the sign is not all,
@@ -98,27 +111,73 @@ static const struct vsig {
 };
 
 static const char* const names[P_COUNT] = {
-    "",        "strlen",  "memcmp",    "strcmp",     "memchr", "memcpy",
-    "memmove", "memset",  "exp",       "log",        "pow",
+    "",
+    "strlen",
+    "memcmp",
+    "strcmp",
+    "memchr",
+    "memcpy",
+    "memmove",
+    "memset",
+    "exp",
+    "log",
+    "pow",
 #ifdef KB_ZLIB
-    "crc32",   "adler32", "compress2", "uncompress",
+    "crc32",
+    "adler32",
+    "compress2",
+    "uncompress",
 #endif
-    "sha256"
+    [P_SHA256] = "sha256",
+    [P_MD5] = "md5",
+    [P_SHA1] = "sha1",
+    [P_SHA512] = "sha512",
+    [P_CKSUM] = "cksum"
 };
 
 static uint64_t calls[P_COUNT], gave_up[P_COUNT];
 
+static int stream_id(int id) {
+#ifdef KB_ZLIB
+    return id >= P_ZS && id <= P_ZS_LAST;
+#else
+    (void) id;
+    return 0;
+#endif
+}
+
+static const char* pname(int id) {
+#ifdef KB_ZLIB
+    if (stream_id(id)) return kb_zs_name[id - P_ZS];
+#endif
+    return names[id];
+}
+
+/* name is a whole entry of the comma-separated list (a substring match would
+ * switch on a name that is part of a listed one) */
+static int listed(const char* list, const char* name) {
+    size_t n = strlen(name);
+    for (const char* p = strstr(list, name); p; p = strstr(p + 1, name))
+        if ((p == list || p[-1] == ',') && (p[n] == ',' || !p[n])) return 1;
+    return 0;
+}
+
 /* bit i: function i runs as a kernel; KATYBUG_PRIM is 0 (none) or a
  * comma-separated list of names, and every function when unset. The libm
- * kernels stay off in a build whose compiler fused a multiply and an add */
-int kb_prim_enabled(void) {
-    static int mask = -1;
-    if (mask < 0) {
+ * kernels stay off in a build whose compiler fused a multiply and an add. The
+ * stream entries are one switch, "zstream": an init without the rest of its
+ * life cycle would leave a stream no entry can serve */
+uint64_t kb_prim_enabled(void) {
+    static uint64_t mask;
+    static int known;
+    if (!known) {
         const char* e = getenv("KATYBUG_PRIM");
-        mask = 0;
+        known = 1;
         for (int i = 1; i < P_COUNT; i++)
-            if (!e || strstr(e, names[i])) mask |= 1 << i;
-        if (!kb_libm_ok()) mask &= ~(1 << P_EXP | 1 << P_LOG | 1 << P_POW);
+            if (!e || listed(e, stream_id(i) ? "zstream" : pname(i)))
+                mask |= 1ull << i;
+        if (!kb_libm_ok())
+            mask &= ~(1ull << P_EXP | 1ull << P_LOG | 1ull << P_POW);
     }
     return mask;
 }
@@ -164,11 +223,57 @@ static int variant(struct kb_cpu* cpu, uint64_t pc, int id) {
     return id == P_STRCMP && cpu->arch == KB_X86 ? V_BYTES : -1;
 }
 
+#ifdef KB_ZLIB
+/* compress2's bytes are the library's own (zlib-ng, Chromium's and Cloudflare's
+ * write others), so its kernel runs only for a libz that names itself stock
+ * zlib: deflate_copyright, " deflate <version> Copyright 1995-<year> Jean-loup
+ * Gailly and Mark Adler ", with a version whose output was compared byte for
+ * byte with the one built in (tests in experiments/library-thunks/scripts).
+ * Forks write another version or none; crc32, adler32 and uncompress give the
+ * same answer in every implementation, so they need no such check */
+static const char* const zlib_stock[] = {
+    "1.2.11", "1.2.13", "1.3", "1.3.1", "1.3.2"
+};
+
+static int stock_zlib(struct kb_cpu* cpu, uint64_t pc) {
+    static const char lead[] = " deflate ",
+                      tail[] = " Jean-loup Gailly and Mark Adler ";
+    uint64_t lo, hi;
+    uint8_t buf[4096 + 128];
+    if (!kb_thunk_object(cpu, pc, &lo, &hi)) return 0;
+    for (uint64_t at = lo; at < hi; at += 4096) {
+        uint64_t n = hi - at < sizeof buf ? hi - at : sizeof buf;
+        if (!kb_read(cpu, at, buf, n)) {
+            n = hi - at < 4096 ? hi - at : 4096;
+            if (!kb_read(cpu, at, buf, n)) continue;
+        }
+        for (uint64_t i = 0; i + sizeof lead - 1 < n; i++) {
+            if (memcmp(buf + i, lead, sizeof lead - 1)) continue;
+            char text[96];
+            uint64_t m = n - i - (sizeof lead - 1);
+            if (m > sizeof text - 1) m = sizeof text - 1;
+            memcpy(text, buf + i + sizeof lead - 1, m);
+            text[m] = 0;
+            char* sp = strchr(text, ' ');
+            if (!sp) continue;
+            *sp = 0;
+            if (strncmp(sp + 1, "Copyright 1995-", 15) ||
+                strncmp(sp + 20, tail, sizeof tail - 1))
+                continue;
+            for (size_t k = 0; k < sizeof zlib_stock / sizeof *zlib_stock; k++)
+                if (!strcmp(text, zlib_stock[k])) return (int) k + 1;
+        }
+    }
+    return 0;
+}
+#endif
+
 /** the function whose entry is pc (1 strlen, 2 memcmp, 3 strcmp, 4 memchr,
- * 8 exp, 9 log, 10 pow in a static musl guest, and the ones thunk.c finds by
- * name) with its result rule in the bits above 8, or 0 */
+ * 8 exp, 9 log, 10 pow in a musl guest or an AArch64 glibc build libm_sigs
+ * lists, and the ones thunk.c finds by name) with its result rule in the bits
+ * above 8 (for exp, log and pow, how the guest's code was compiled), or 0 */
 int kb_prim_at(struct kb_cpu* cpu, uint64_t pc) {
-    int on = kb_prim_enabled();
+    uint64_t on = kb_prim_enabled();
     uint8_t big[12288];
     for (size_t i = 0; on && i < sizeof sigs / sizeof *sigs; i++) {
         const struct sig* s = &sigs[i];
@@ -192,18 +297,28 @@ int kb_prim_at(struct kb_cpu* cpu, uint64_t pc) {
          i++) {
         const struct libm_sig* s = &libm_sigs[i];
         if (s->arch == cpu->arch && (on >> s->id & 1) && libm_at(cpu, pc, s))
-            return s->id;
+            return s->id | s->flavor << 8;
     }
     int t = on ? kb_thunk_at(cpu, pc) : 0;
     /* a name alone does not say how the guest's libm was compiled, and
-     * AArch64 compilers fuse multiplies and adds (glibc's does) */
+     * AArch64 compilers fuse multiplies and adds (glibc's does): only a build
+     * libm_sigs lists runs, found above wherever it is called from */
     if (t >= P_EXP && t <= P_POW && cpu->arch == KB_A64) t = 0;
+    int ver = 0;
+#ifdef KB_ZLIB
+    if (t == P_COMPRESS2 || stream_id(t))
+        ver = stock_zlib(cpu, pc), t = ver ? t : 0;
+    /* streams were compared call by call against 1.2.13, 1.3.1 and 1.3.2;
+     * 1.2.11 differs at level 0, in deflateBound and in inflateSync */
+    if (stream_id(t) && ver != 2 && ver != 4 && ver != 5) t = 0;
+#endif
     if (!t || !(on >> t & 1)) return 0;
     if (t == P_MEMCMP || t == P_STRCMP) {
         int m = variant(cpu, pc, t);
         return m < 0 ? 0 : t | (m | V_GUARD) << 8;
     }
-    return t | V_GUARD << 8;
+    /* a stream entry carries the index of the libz's version in its mode */
+    return t | (V_GUARD | (stream_id(t) ? ver - 1 : 0)) << 8;
 }
 
 static uint64_t min3(uint64_t a, uint64_t b, uint64_t c) {
@@ -463,75 +578,116 @@ static int k_memset(struct kb_cpu* cpu, uint64_t d, uint64_t c, uint64_t n) {
     return 1;
 }
 
-static const uint32_t sha256_k[64] = {
-    0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1,
-    0x923f82a4, 0xab1c5ed5, 0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3,
-    0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174, 0xe49b69c1, 0xefbe4786,
-    0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,
-    0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7, 0xc6e00bf3, 0xd5a79147,
-    0x06ca6351, 0x14292967, 0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13,
-    0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85, 0xa2bfe8a1, 0xa81a664b,
-    0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
-    0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a,
-    0x5b9cca4f, 0x682e6ff3, 0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208,
-    0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2
+/* a hash's context: nw state words of wsz bytes, then the byte count as two
+ * words (low first); block is the bytes one call of its block function takes */
+struct hash {
+    int nw, wsz, block;
+    void (*blocks32)(uint32_t*, const uint8_t*, size_t);
 };
 
-static uint32_t ror32(uint32_t x, int n) {
-    return x >> n | x << (32 - n);
-}
+static const struct hash h_sha256 = {8, 4, 64, kb_sha256_blocks};
+static const struct hash h_md5 = {4, 4, 64, kb_md5_blocks};
+static const struct hash h_sha1 = {5, 4, 64, kb_sha1_blocks};
+static const struct hash h_sha512 = {8, 8, 128, NULL};
 
-/* one 64 byte block into st */
-static void sha256_block(uint32_t st[8], const uint8_t* p) {
-    uint32_t w[64], v[8];
-    for (int i = 0; i < 16; i++)
-        w[i] = (uint32_t) p[4 * i] << 24 | (uint32_t) p[4 * i + 1] << 16 |
-               (uint32_t) p[4 * i + 2] << 8 | p[4 * i + 3];
-    for (int i = 16; i < 64; i++) {
-        uint32_t a = w[i - 15], b = w[i - 2];
-        w[i] = w[i - 16] + w[i - 7] + (ror32(a, 7) ^ ror32(a, 18) ^ a >> 3) +
-               (ror32(b, 17) ^ ror32(b, 19) ^ b >> 10);
-    }
-    memcpy(v, st, sizeof v);
-    for (int i = 0; i < 64; i++) {
-        uint32_t t1 = v[7] +
-                      (ror32(v[4], 6) ^ ror32(v[4], 11) ^ ror32(v[4], 25)) +
-                      (v[6] ^ (v[4] & (v[5] ^ v[6]))) + sha256_k[i] + w[i];
-        uint32_t t2 = (ror32(v[0], 2) ^ ror32(v[0], 13) ^ ror32(v[0], 22)) +
-                      ((v[0] & v[1]) | (v[2] & (v[0] | v[1])));
-        memmove(v + 1, v, 7 * sizeof *v);
-        v[4] += t1;
-        v[0] = t1 + t2;
-    }
-    for (int i = 0; i < 8; i++) st[i] += v[i];
-}
-
-/* sha256_process_block (buf, len, ctx) of the coreutils build in sigs: the
- * state words and the 64 bit byte count (ctx + 0 to 40) are all it writes.
- * The count goes first and the buffer is read after, so a buffer that is not
- * all there, or one that overlaps those fields, is left to the guest */
-static int k_sha256(
-    struct kb_cpu* cpu, uint64_t buf, uint64_t len, uint64_t ctx
+/* the process_block functions (buf, len, ctx) of the coreutils build in
+ * sigs: gnulib's context is the state, the count and then the buffer, and the
+ * state and count are all the function writes. The count goes first and the
+ * buffer is read after, so a buffer that is not all there, one that overlaps
+ * those fields, or a length that is not a multiple of the block (the function
+ * then reads on to the next block) is left to the guest. Nothing is written
+ * until the whole buffer has been hashed */
+static int k_hash(
+    struct kb_cpu* cpu, uint64_t buf, uint64_t len, uint64_t ctx,
+    const struct hash* h
 ) {
-    uint8_t c[40], blk[64];
-    uint32_t st[8], total[2];
-    if (len & 63 || !kb_read(cpu, ctx, c, 40) || !reach(cpu, buf, len) ||
-        (len && buf < ctx + 40 && ctx < buf + len))
+    uint8_t c[80], blk[128];
+    union {
+        uint32_t w32[8];
+        uint64_t w64[8];
+    } st;
+    uint64_t block = (uint64_t) h->block;
+    uint32_t sw = (uint32_t) (h->nw * h->wsz), cl = sw + 2 * (uint32_t) h->wsz;
+    if (len & (block - 1) || !kb_read(cpu, ctx, c, cl) ||
+        !reach(cpu, buf, len) || (len && buf < ctx + cl && ctx < buf + len))
         return 0;
-    memcpy(st, c, 32);
-    memcpy(total, c + 32, 8);
-    for (uint64_t off = 0; off < len; off += 64) {
-        const uint8_t* p = kb_host(cpu, buf + off, 64);
-        if (!p) p = kb_read(cpu, buf + off, blk, 64) ? blk : NULL;
+    memcpy(&st, c, sw);
+    for (uint64_t off = 0, k; off < len; off += k) {
+        const uint8_t* p = kb_span(cpu, buf + off, &k);
         if (!p) return 0;
-        sha256_block(st, p);
+        if (k > len - off) k = len - off;
+        if (k < block) {
+            /* a block across two pieces of host memory */
+            if (!kb_read(cpu, buf + off, blk, block)) return 0;
+            p = blk, k = block;
+        }
+        else
+            k &= ~(block - 1);
+        if (h->wsz == 8)
+            kb_sha512_blocks(st.w64, p, (size_t) (k / block));
+        else
+            h->blocks32(st.w32, p, (size_t) (k / block));
     }
-    uint32_t lo = (uint32_t) len;
-    total[0] += lo;
-    total[1] += (uint32_t) (len >> 32) + (total[0] < lo);
-    memcpy(c, st, 32);
-    memcpy(c + 32, total, 8);
-    return kb_write(cpu, ctx, c, 40);
+    memcpy(c, &st, sw);
+    if (h->wsz == 8) {
+        uint64_t total[2];
+        memcpy(total, c + sw, 16);
+        total[0] += len;
+        total[1] += total[0] < len;
+        memcpy(c + sw, total, 16);
+    }
+    else {
+        uint32_t total[2], lo = (uint32_t) len;
+        memcpy(total, c + sw, 8);
+        total[0] += lo;
+        total[1] += (uint32_t) (len >> 32) + (total[0] < lo);
+        memcpy(c + sw, total, 8);
+    }
+    return kb_write(cpu, ctx, c, cl);
+}
+
+/* cksum's loop (coreutils 9.5, the block in sigs): it reads rdx, rcx, rbx
+ * (the crc) and r14 (the table), adds 8 to rdx and loops until rdx is rcx;
+ * every other register it touches is written before it is read in each
+ * iteration, and it stores nothing. The kernel advances all but the last
+ * iteration and leaves that one to the block's own code, so the temporaries
+ * and the flags the loop leaves are its own. It takes the table from the
+ * guest, so a table of other values is still right. Left to the guest, which
+ * then faults where it always did: fewer than two iterations, rcx not an
+ * 8-byte multiple above rdx, and a table or data (the last iteration's too:
+ * a fault there would show the temporaries of the one before) not all there */
+static int k_cksum(struct kb_cpu* cpu) {
+    uint64_t* r = cpu->r;
+    uint64_t p = r[2], end = r[1], tab = r[14];
+    if (end <= p || (end - p) & 7 || end - p < 16) return 0;
+    uint64_t bytes = end - p - 8;
+    uint8_t tb[8192];
+    const uint8_t* t = kb_host(cpu, tab, sizeof tb);
+    if (!t) {
+        if (!kb_read(cpu, tab, tb, sizeof tb)) return 0;
+        t = tb;
+    }
+    if (!reach(cpu, p, end - p)) return 0;
+    uint32_t crc = (uint32_t) r[3];
+    for (uint64_t off = 0, k; off < bytes;) {
+        const uint8_t* q = kb_span(cpu, p + off, &k);
+        if (!q) return 0;
+        if (k > bytes - off) k = bytes - off;
+        if (k < 8) {
+            /* a group across two pieces of host memory */
+            uint8_t g[8];
+            if (!kb_read(cpu, p + off, g, 8)) return 0;
+            crc = kb_cksum_blocks(crc, t, g, 1);
+            off += 8;
+        }
+        else {
+            crc = kb_cksum_blocks(crc, t, q, (size_t) (k / 8));
+            off += k & ~7ull;
+        }
+    }
+    r[2] = p + bytes;
+    r[3] = crc;
+    return 1;
 }
 
 #ifdef KB_ZLIB
@@ -586,15 +742,15 @@ static int k_zlib(
  * to zero or denormals-are-zero setting is left to the guest too. Katybug's
  * SSE raises no exception flag, so an x86-64 guest sees none here either;
  * AArch64's inexact flag is set, as every call that gets this far raises it */
-static int k_libm(struct kb_cpu* cpu, int id) {
+static int k_libm(struct kb_cpu* cpu, int id, int flavor) {
     int a64 = cpu->arch == KB_A64;
     if (a64 ? cpu->fpcr & 0x03c00000 : cpu->mxcsr & 0xe040) return 0;
     double x, y, r;
     memcpy(&x, &cpu->x[0][0], 8);
     memcpy(&y, &cpu->x[1][0], 8);
-    int ok = id == P_EXP   ? kb_libm_exp(x, a64, &r)
-             : id == P_LOG ? kb_libm_log(x, a64, &r)
-                           : kb_libm_pow(x, y, a64, &r);
+    int ok = id == P_EXP   ? kb_libm_exp(x, flavor, &r)
+             : id == P_LOG ? kb_libm_log(x, flavor, &r)
+                           : kb_libm_pow(x, y, flavor, &r);
     if (!ok) return 0;
     memcpy(&cpu->x[0][0], &r, 8);
     if (a64) cpu->x[0][1] = 0, cpu->fpsr |= 16;
@@ -603,10 +759,14 @@ static int k_libm(struct kb_cpu* cpu, int id) {
 
 /** runs function id for the call being made at its entry, and returns to the
  * caller: 1 with *next the caller's pc, or 0 (nothing changed) when a page the
- * function reads is not there and the function's own code should run */
+ * function reads is not there and the function's own code should run. The
+ * cksum loop is not a call: 2 means its registers were advanced and the
+ * block's own ops run on */
 int kb_prim(struct kb_cpu* cpu, int id, uint64_t* next) {
     int mode = id >> 8 & ~V_GUARD, guard = id >> 8 & V_GUARD;
     id &= 0xff;
+    if (id == P_CKSUM)
+        return k_cksum(cpu) ? (calls[id]++, 2) : (gave_up[id]++, 0);
     uint64_t* r = cpu->r;
     int x86 = cpu->arch == KB_X86;
     uint64_t a = x86 ? r[7] : r[0], b = x86 ? r[6] : r[1], n = r[2], ret, v = 0;
@@ -631,8 +791,11 @@ int kb_prim(struct kb_cpu* cpu, int id, uint64_t* next) {
         case P_MEMCHR: ok = k_memchr(cpu, a, b, n, guard, &v); break;
         case P_EXP:
         case P_LOG:
-        case P_POW: ok = k_libm(cpu, id); break;
-        case P_SHA256: ok = k_sha256(cpu, a, b, n); break;
+        case P_POW: ok = k_libm(cpu, id, mode); break;
+        case P_SHA256: ok = k_hash(cpu, a, b, n, &h_sha256); break;
+        case P_MD5: ok = k_hash(cpu, a, b, n, &h_md5); break;
+        case P_SHA1: ok = k_hash(cpu, a, b, n, &h_sha1); break;
+        case P_SHA512: ok = k_hash(cpu, a, b, n, &h_sha512); break;
 #ifdef KB_ZLIB
         case P_CRC32:
         case P_ADLER32:
@@ -645,6 +808,12 @@ int kb_prim(struct kb_cpu* cpu, int id, uint64_t* next) {
                 (int) (x86 ? r[8] : r[4])
             );
             break;
+        default:
+            if (stream_id(id)) {
+                ok = kb_zs(cpu, id - P_ZS, mode, &v);
+                /* a guest fault: the call's own registers stay as they were */
+                if (ok == 2) return calls[id]++, *next = cpu->pc, 1;
+            }
 #endif
     }
     if (!ok) return gave_up[id]++, 0;
@@ -657,8 +826,8 @@ int kb_prim(struct kb_cpu* cpu, int id, uint64_t* next) {
                    ? v
                    : (uint32_t) v;
 #ifdef KB_ZLIB
-    else if (id >= P_CRC32 && id != P_SHA256)
-        r[0] = v; /* the sum, or 0 for Z_OK */
+    else if (id >= P_CRC32 && id < P_SHA256)
+        r[0] = v; /* the sum, or 0 for Z_OK; the hash blocks return void */
 #endif
     if (x86) r[4] += 8;
     *next = ret;
@@ -676,10 +845,14 @@ void kb_prim_report(void) {
     if (!f) return;
     fprintf(f, "katybug: prim");
     for (int i = 1; i < P_COUNT; i++)
-        fprintf(
-            f, " %s %llu (%llu gave up)", names[i],
-            (unsigned long long) calls[i], (unsigned long long) gave_up[i]
-        );
+        if (!stream_id(i) || calls[i] || gave_up[i])
+            fprintf(
+                f, " %s %llu (%llu gave up)", pname(i),
+                (unsigned long long) calls[i], (unsigned long long) gave_up[i]
+            );
+#ifdef KB_ZLIB
+    kb_zs_report(f);
+#endif
     fprintf(f, "\n");
     if (path) fclose(f);
 }

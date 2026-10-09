@@ -1437,7 +1437,7 @@ static uint64_t step(struct kb_cpu* cpu, struct kb_block* blk) {
                 break;
             case KB_PRIM: {
                 uint64_t ret;
-                if (kb_prim(cpu, (int) x->imm, &ret)) return ret;
+                if (kb_prim(cpu, (int) x->imm, &ret) == 1) return ret;
                 break;
             }
         }
@@ -1618,7 +1618,9 @@ int kb_run(struct kb_cpu* cpu) {
         if (!b) {
             /* no instruction here at all: the jump itself faulted */
             cpu->fault = "jump outside the address space";
-            if (kb_fault(cpu, 11, 1, cpu->pc)) continue;
+            if (kb_bus(cpu->pc) ? kb_fault(cpu, 7, 2, cpu->pc)
+                                : kb_fault(cpu, 11, 1, cpu->pc))
+                continue;
             break;
         }
         cpu->ipc = b->pc;
@@ -1661,7 +1663,8 @@ int kb_run(struct kb_cpu* cpu) {
             cpu->fault = NULL;
             cpu->last_fault = why;
             if (!kb_fault(
-                    cpu, s, codes[s], s == 11 ? cpu->fault_addr : cpu->ipc
+                    cpu, s, codes[s],
+                    s == 11 || s == 7 ? cpu->fault_addr : cpu->ipc
                 )) {
                 cpu->fault = why;
                 break;
