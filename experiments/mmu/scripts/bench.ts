@@ -18,7 +18,7 @@ import { Machine } from '../../../src/worker/machine/machine.ts';
  * per function, handlers that save nothing, every local saved, no handlers at fuel yields), guard and guardi (every load and store checked against a page owner table, the
  * check called and inlined), guardsi (the guard pass at GUARD_STORES inlined, to price loads), count
  * (provable.ts: which checked accesses a check outside the access could cover, counts printed), nostack
- * (plain without the stack pointer check, to price it), nofuel (plain without the loop-head fuel checks), peek (plain whose loop-head check only reads the budget, never yields), local (plain with the count of a call-free loop in a local), gnocall and lnocall (the global count and the local one with the host call at zero replaced by a refill, to price the call), simd (the program from SIMD_CENSUS, a census
+ * (plain without the stack pointer check, to price it), nofuel (plain without the loop-head fuel checks), peek (plain whose loop-head check only reads the budget, never yields), local (plain with the count of a call-free loop in a local), gnocall and lnocall (the global count and the local one with the host call at zero replaced by a refill, to price the call), rule (the pass decides the local count by loop shape), callout, colocal and cofl (the call-out form with the global count, with the rule, and with the local count forced on), lshape (the local's code shape with the global count), lcap (the local count in functions of at most LCAP, default 8000, instructions), loA to loZ (the local count only in the loops env LO_<letter> names, GMUX_FUEL_LOCAL_ONLY), simd (the program from SIMD_CENSUS, a census
  * built with EXTRA_CFLAGS=-msimd128).
  * `node --experimental-strip-types experiments/mmu/scripts/bench.ts <census dir> [rounds]`; with
  * WORK=<dir>, arms already built there are reused, so a machine without the toolchain can time them
@@ -78,7 +78,7 @@ for (const name of Object.keys(workloads)) {
 		const fueled = join(work, `${name}.${arm}.fuel.wasm`);
 		const evacuation = { o2: ['--no-handlers', '--no-flatten'], emit: ['--no-handlers', '--no-flatten', '--no-opt'], flat: ['--no-handlers'], eh: [], ehr: ['--resume'], ehrp: ['--resume'], ehrn: ['--resume', '--no-spill'], ehrs: ['--resume', '--no-fuel-sites'], ehrt: ['--resume', '--try-sites'], eht: ['--try-sites'], ehf: ['--fold'], eh1: ['--one-try'], ehn: ['--no-spill'], eha: ['--all-locals'], ehs: ['--no-fuel-sites'] }[arm];
 		if (!built(fueled)) {
-			if (arm === 'plain' || arm === 'nostack' || arm === 'nofuel' || arm === 'peek' || arm === 'local' || arm === 'gnocall' || arm === 'lnocall' || arm === 'simd') writeFileSync(file, readFileSync(source));
+			if (arm === 'plain' || arm === 'nostack' || arm === 'nofuel' || arm === 'peek' || arm === 'local' || arm === 'gnocall' || arm === 'lnocall' || arm === 'lshape' || /^lo[A-Z]$/.test(arm) || arm === 'rule' || arm === 'callout' || arm === 'colocal' || arm === 'cofl' || arm === 'lcap' || arm === 'simd') writeFileSync(file, readFileSync(source));
 			else if (evacuation) {
 				// as the host builds an evacuable program: instrumented first, so the fuel yields at loop
 				// heads are safepoints too
@@ -105,7 +105,12 @@ for (const name of Object.keys(workloads)) {
 					GMUX_NO_STACK_CHECK: arm === 'nostack' ? '1' : '',
 					GMUX_NO_FUEL: arm === 'nofuel' ? '1' : '',
 					GMUX_FUEL_PEEK: arm === 'peek' ? '1' : '',
-					GMUX_FUEL_LOCAL: arm === 'local' || arm === 'lnocall' ? '1' : '',
+					// rule and colocal leave it unset, so the pass decides by the program's loop shape
+					GMUX_FUEL_LOCAL: arm === 'rule' || arm === 'colocal' ? undefined : arm === 'local' || arm === 'lnocall' || arm === 'lshape' || arm === 'cofl' || arm === 'lcap' || /^lo[A-Z]$/.test(arm) ? '1' : '0',
+					GMUX_FUEL_FORM: arm === 'callout' || arm === 'colocal' || arm === 'cofl' ? 'callout' : '',
+					GMUX_FUEL_LSHAPE: arm === 'lshape' ? '1' : '',
+					GMUX_FUEL_LOCAL_MAXFN: arm === 'lcap' ? process.env.LCAP ?? '8000' : '',
+					GMUX_FUEL_LOCAL_ONLY: /^lo[A-Z]$/.test(arm) ? process.env[`LO_${arm.slice(2)}`] ?? '' : '',
 					GMUX_FUEL_NOCALL: arm === 'gnocall' || arm === 'lnocall' ? '1' : '',
 					GMUX_KEEP_EXPORTS:
 						arm === 'count'
@@ -149,7 +154,7 @@ const machine = new Machine({
 	initrd: new Uint8Array(readFileSync(initrd)),
 	cmdline: 'maxcpus=1 root=/dev/ram0 rootfstype=ramfs init=/init console=hvc console=ttyS0',
 	registry,
-	maximumPages: 4096,
+	maximumPages: Number(process.env.MAX_PAGES ?? 4096),
 	sha256,
 	sharedKernel: true,
 	pageIn,
@@ -223,5 +228,5 @@ for (const [name, c] of Object.entries(counts)) {
 	console.log(JSON.stringify({ workload: name, accesses: n, levels, counts: c }));
 }
 if (process.env.DEBUG) console.log(output.slice(-3000), String((machine.crashed as Error)?.stack ?? machine.crashed));
-console.log(JSON.stringify({ mmuMisses: machine.stats.mmuMisses, pageFaults: machine.stats.pageFaults, parked, fuelYields: machine.stats.fuelYields }));
+console.log(JSON.stringify({ mmuMisses: machine.stats.mmuMisses, pageFaults: machine.stats.pageFaults, parked, fuelYields: machine.stats.fuelYields, unknownExecutables: machine.stats.unknownExecutables }));
 process.exit(0);

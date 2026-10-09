@@ -601,10 +601,12 @@ function redoable(expr) {
  * first in every loop, whose statements before the call compute only the budget global and locals
  * the site does not keep. Resuming there enters the loop at its head instead of through a copy of
  * the iteration: the check runs again with the budget still negative, takes the same arm and yields
- * again, as the host import would be called again
+ * again, as the host import would be called again. In the call-out form the site is the wrapper
+ * loop's call, after the block the check branches out of; the head runs that block's check again
  */
 function headSite(loop, path, keep) {
-	const body = new E.Loop(loop).body;
+	const l = new E.Loop(loop);
+	const body = l.body;
 	if (!fuelImport || !keep || !path.length) return false;
 	const stmt = siteStmt(new E.Try(tryAt(body, path)).body);
 	const call = callOf(stmt);
@@ -612,11 +614,35 @@ function headSite(loop, path, keep) {
 	// the budget: the global the yield's result refills, right after it
 	const around = tryAt(body, path.slice(0, -1));
 	const at = path[path.length - 1];
-	if (E.getExpressionId(around) !== E.BlockId || at + 1 >= new E.Block(around).numChildren) return false;
-	const refill = new E.Block(around).getChildAt(at + 1);
+	if (E.getExpressionId(around) !== E.BlockId) return false;
+	const kids = new E.Block(around);
+	const wrapped = !path.includes('true');
+	let src = new E.LocalSet(stmt).index;
+	let next = at + 1;
+	if (wrapped && next < kids.numChildren) {
+		// the answer plus one, then the wrapper's back edge
+		const add = kids.getChildAt(next);
+		if (E.getExpressionId(add) === E.LocalSetId) {
+			const v = new E.LocalSet(add).value;
+			if (E.getExpressionId(v) !== E.BinaryId || new E.Binary(v).op !== E.AddInt32) return false;
+			const [a, b] = [new E.Binary(v).left, new E.Binary(v).right];
+			if (E.getExpressionId(a) !== E.LocalGetId || new E.LocalGet(a).index !== src) return false;
+			if (E.getExpressionId(b) !== E.ConstId || E.getExpressionInfo(b).value !== 1) return false;
+			src = new E.LocalSet(add).index;
+			next++;
+		}
+	}
+	if (next >= kids.numChildren) return false;
+	const refill = kids.getChildAt(next);
 	if (E.getExpressionId(refill) !== E.GlobalSetId) return false;
 	const value = new E.GlobalSet(refill).value;
-	if (E.getExpressionId(value) !== E.LocalGetId || new E.LocalGet(value).index !== new E.LocalSet(stmt).index) return false;
+	if (E.getExpressionId(value) !== E.LocalGetId || new E.LocalGet(value).index !== src) return false;
+	if (wrapped) {
+		const back = next + 1 === kids.numChildren - 1 && kids.getChildAt(next + 1);
+		if (!back || E.getExpressionId(back) !== E.BreakId || !l.name) return false;
+		const info = E.getExpressionInfo(back);
+		if (info.condition || info.name !== l.name) return false;
+	}
 	const budget = new E.GlobalSet(refill).name;
 	const defined = new Set();
 	const known = (x) => [...(reads(x, new Set()) ?? [-1])].every((a) => defined.has(a) || keep.has(a));
@@ -631,13 +657,38 @@ function headSite(loop, path, keep) {
 		if (id === E.GlobalSetId) return new E.GlobalSet(s).name === budget && redoable(new E.GlobalSet(s).value) && known(new E.GlobalSet(s).value);
 		return id === E.NopId;
 	};
+	// a block holding the wrapped loop, whose check branches out of it before anything else runs
+	const checks = (c) => {
+		if (E.getExpressionId(c) !== E.BlockId) return false;
+		const blk = new E.Block(c);
+		if (!blk.name || E.getExpressionType(c) !== none || !blk.numChildren) return false;
+		const inner = blk.getChildAt(0);
+		if (E.getExpressionId(inner) !== E.LoopId) return false;
+		const top = new E.Loop(inner).body;
+		if (E.getExpressionId(top) !== E.BlockId) return false;
+		for (let k = 0; k < new E.Block(top).numChildren; k++) {
+			const s = new E.Block(top).getChildAt(k);
+			if (E.getExpressionId(s) !== E.BreakId) {
+				if (!again(s)) return false;
+				continue;
+			}
+			const info = E.getExpressionInfo(s);
+			return info.name === blk.name && !!info.condition && !info.value && redoable(info.condition) && known(info.condition);
+		}
+		return false;
+	};
 	// down to the site through blocks and the check's one if, everything before it on the way redone
 	let expr = body;
 	let ifs = 0;
+	let yields = 0;
 	for (const step of path) {
 		const id = E.getExpressionId(expr);
 		if (id === E.BlockId) {
-			for (let k = 0; k < step; k++) if (!again(new E.Block(expr).getChildAt(k))) return false;
+			for (let k = 0; k < step; k++) {
+				const c = new E.Block(expr).getChildAt(k);
+				if (wrapped && !yields && checks(c)) yields++;
+				else if (!again(c)) return false;
+			}
 			expr = new E.Block(expr).getChildAt(step);
 		} else if (id === E.IfId && step === 'true' && !ifs++) {
 			const cond = new E.If(expr).condition;
@@ -645,7 +696,7 @@ function headSite(loop, path, keep) {
 			expr = new E.If(expr).ifTrue;
 		} else return false;
 	}
-	return ifs === 1 && [...defined].every((d) => !keep.has(d));
+	return (wrapped ? yields === 1 && !ifs : ifs === 1) && [...defined].every((d) => !keep.has(d));
 }
 const stats = { variants: 0, resumableSites: 0, unresumableSites: 0, headEntries: 0, inlinedSites: 0 };
 /** a loop's resume sites split into its fuel yield (see headSite), if it has one, and the rest */

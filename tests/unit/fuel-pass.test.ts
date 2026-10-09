@@ -175,6 +175,18 @@ const TOY = `(module
     end
     local.get $l1
     i32.add)
+  (func $loopres (export "loopres") (param $p0 i32) (result i32)
+    (local $l1 i32)
+    loop $L0 (result i32)
+      local.get $l1
+      i32.const 1
+      i32.add
+      local.tee $l1
+      local.get $p0
+      i32.lt_u
+      br_if $L0
+      local.get $l1
+    end)
   (func $trap (export "trap") (param $p0 i32) (result i32)
     (local $l1 i32)
     loop $L0
@@ -201,7 +213,19 @@ const TOY = `(module
   (export "budget" (global $gmux.budget)))
 `;
 
-const CASES = ['fall', 'brif', 'br', 'table', 'return', 'nested', 'outer', 'typed', 'trap', 'last'];
+const CASES = [
+	'fall',
+	'brif',
+	'br',
+	'table',
+	'return',
+	'nested',
+	'outer',
+	'typed',
+	'loopres',
+	'trap',
+	'last'
+];
 // budgets that leave a yield early, mid-loop and never in a short run
 const BUDGETS = [1, 3, 9, 100000];
 const RUNS = [1, 2, 5, 8, 9, 40];
@@ -210,16 +234,12 @@ const dir = mkdtempSync(join(tmpdir(), 'gmux-fuel-'));
 writeFileSync(join(dir, 'in.wat'), TOY);
 
 /** the toy through the fuel pass, with the counts the pass prints */
-function fueled(local: boolean) {
-	const out = join(dir, local ? 'local.wat' : 'global.wat');
-	const printed = execFileSync(
-		'scripts/ts',
-		['scripts/wasm/fuel-pass.ts', join(dir, 'in.wat'), out],
-		{
-			env: { ...process.env, GMUX_FUEL_LOCAL: local ? '1' : '' },
-			encoding: 'utf8'
-		}
-	);
+function fueled(tag: string, env: Record<string, string | undefined> = {}, wat = 'in.wat') {
+	const out = join(dir, `${tag}.wat`);
+	const printed = execFileSync('scripts/ts', ['scripts/wasm/fuel-pass.ts', join(dir, wat), out], {
+		env: { ...process.env, GMUX_FUEL_LOCAL: '0', GMUX_FUEL_FORM: '', ...env },
+		encoding: 'utf8'
+	});
 	const module = binaryen.parseText(readFileSync(out, 'utf8'));
 	module.setFeatures(binaryen.Features.MutableGlobals);
 	expect(module.validate()).toBe(1);
@@ -228,14 +248,15 @@ function fueled(local: boolean) {
 	return { wat: readFileSync(out, 'utf8'), printed, module: new WebAssembly.Module(bytes) };
 }
 
-/** what a run returns, how often it yielded and the budget global it leaves */
+/** what a run returns, how often it yielded, the budget global at each yield and the one it leaves */
 function run(module: WebAssembly.Module, name: string, budget: number, n: number) {
 	let yields = 0;
+	const atYield: number[] = [];
 	const x = new WebAssembly.Instance(module, {
 		env: {
 			yield: () => {},
 			// every yield refills with 5, as the host's does with its own budget
-			__gmux_fuel: () => (yields++, 5)
+			__gmux_fuel: () => (yields++, atYield.push(x.budget.value), 5)
 		}
 	}).exports as Record<string, any>;
 	x.set(budget);
@@ -245,44 +266,117 @@ function run(module: WebAssembly.Module, name: string, budget: number, n: number
 	} catch {
 		result = 'trap';
 	}
-	return { result, yields, budget: x.budget.value as number };
+	return { result, yields, atYield, budget: x.budget.value as number };
 }
 
 describe('fuel-pass.ts', () => {
-	const global = fueled(false);
-	const local = fueled(true);
+	const global = fueled('global');
+	const local = fueled('local', { GMUX_FUEL_LOCAL: '1' });
+	const forms = {
+		local,
+		callout: fueled('callout', { GMUX_FUEL_FORM: 'callout' }),
+		'callout+local': fueled('callout-local', {
+			GMUX_FUEL_LOCAL: '1',
+			GMUX_FUEL_FORM: 'callout'
+		})
+	};
 
 	it('keeps a local count only for loops with no call in them', () => {
-		expect(global.printed).toBe('instrumented 12 loops\n');
+		expect(global.printed).toBe('instrumented 13 loops\n');
 		// every loop but the one in $outer that calls
-		expect(local.printed).toBe('instrumented 12 loops, 11 with a local count\n');
+		expect(local.printed).toBe('instrumented 13 loops, 12 with a local count\n');
 		expect(local.wat).toContain('(local $gmux.b i32)');
+	});
+
+	it('keeps no local count in a function longer than GMUX_FUEL_LOCAL_MAXFN', () => {
+		const capped = fueled('capped', { GMUX_FUEL_LOCAL: '1', GMUX_FUEL_LOCAL_MAXFN: '3' });
+		expect(capped.printed).toBe('instrumented 13 loops, 0 with a local count\n');
+		const roomy = fueled('roomy', { GMUX_FUEL_LOCAL: '1', GMUX_FUEL_LOCAL_MAXFN: '100000' });
+		expect(roomy.wat).toBe(local.wat);
 	});
 
 	it('is the same text without GMUX_FUEL_LOCAL', () => {
 		expect(global.wat).not.toMatch(/\$gmux\.b\b/);
 	});
 
-	for (const name of CASES) {
-		it(`${name}: results, yield counts and the budget after it equal the global count's`, () => {
-			for (const budget of BUDGETS)
-				for (const n of RUNS) {
-					const want = run(global.module, name, budget, n);
-					const got = run(local.module, name, budget, n);
-					// a trap leaves the global where the loop was entered: the process is gone
-					if (name === 'trap' && want.result === 'trap') {
-						expect(got.result).toBe('trap');
-						expect(got.yields).toBe(want.yields);
-					} else expect(got, `${name}(${n}) at budget ${budget}`).toEqual(want);
-				}
-		});
-	}
+	it('wraps every loop without params or results in the call-out form', () => {
+		// $loopres has a result type and keeps today's inline check
+		expect(forms.callout.printed).toBe('instrumented 13 loops, 12 in the call-out form\n');
+		expect(forms.callout.wat).toContain('br_if $gmux.yield.1');
+		expect(forms.callout.wat).not.toMatch(/\$gmux\.b\b/);
+		expect(forms['callout+local'].printed).toBe(
+			'instrumented 13 loops, 12 with a local count, 12 in the call-out form\n'
+		);
+	});
 
-	it('yields where the global count does, over a long loop', () => {
-		for (const name of ['fall', 'nested', 'typed', 'table']) {
-			const want = run(global.module, name, 100000, 250000);
-			expect(want.yields).toBeGreaterThan(0);
-			expect(run(local.module, name, 100000, 250000)).toEqual(want);
+	for (const [form, built] of Object.entries(forms))
+		for (const name of CASES) {
+			it(`${form} ${name}: results, yield counts and the budget after it equal the global count's`, () => {
+				for (const budget of BUDGETS)
+					for (const n of RUNS) {
+						const want = run(global.module, name, budget, n);
+						const got = run(built.module, name, budget, n);
+						// a local count leaves the global where the loop was entered at a trap: the process is gone
+						if (name === 'trap' && want.result === 'trap' && form !== 'callout') {
+							expect(got.result).toBe('trap');
+							expect(got.yields).toBe(want.yields);
+						} else expect(got, `${name}(${n}) at budget ${budget}`).toEqual(want);
+					}
+			});
 		}
+
+	for (const [form, built] of Object.entries(forms))
+		it(`${form} yields where the global count does, over a long loop`, () => {
+			for (const name of ['fall', 'nested', 'typed', 'table']) {
+				const want = run(global.module, name, 100000, 250000);
+				expect(want.yields).toBeGreaterThan(0);
+				expect(run(built.module, name, 100000, 250000)).toEqual(want);
+			}
+		});
+
+	it('decides the local count by loop shape when GMUX_FUEL_LOCAL is unset, and 0 and 1 force it', () => {
+		const calls = (n: number) =>
+			`(module
+  (type $t0 (func))
+  (import "env" "yield" (func $yield (type $t0)))
+${Array.from(
+	{ length: n },
+	(_, k) => `  (func $c${k} (export "c${k}") (param $p0 i32)
+    loop $L0
+      call $yield
+      local.get $p0
+      i32.const -1
+      i32.add
+      local.tee $p0
+      br_if $L0
+    end)`
+).join('\n')}
+  (export "budget" (global $gmux.budget)))
+`;
+		writeFileSync(join(dir, 'calls.wat'), calls(3));
+		// 11 of 12 outermost loops make no call: on
+		expect(fueled('rule-on', { GMUX_FUEL_LOCAL: undefined }).printed).toBe(
+			'instrumented 13 loops, 12 with a local count\n'
+		);
+		// every loop calls: off
+		expect(fueled('rule-off', { GMUX_FUEL_LOCAL: undefined }, 'calls.wat').printed).toBe(
+			'instrumented 3 loops\n'
+		);
+		expect(fueled('forced-on', { GMUX_FUEL_LOCAL: '1' }, 'calls.wat').printed).toBe(
+			'instrumented 3 loops, 0 with a local count\n'
+		);
+		expect(fueled('forced-off', { GMUX_FUEL_LOCAL: '0' }).printed).toBe(global.printed);
+	});
+
+	it('refuses a numeric label inside a wrapped loop', () => {
+		const wat = TOY.replace('br_if $L2\n        end', 'br_if 0\n        end').replace(
+			'br $L1\n      end\n    end\n    local.get $l1)\n  (func $outer',
+			'br 1\n      end\n    end\n    local.get $l1)\n  (func $outer'
+		);
+		expect(wat).not.toBe(TOY);
+		writeFileSync(join(dir, 'numeric.wat'), wat);
+		expect(() => fueled('numeric', { GMUX_FUEL_FORM: 'callout' }, 'numeric.wat')).toThrow(
+			/numeric label/
+		);
 	});
 });
