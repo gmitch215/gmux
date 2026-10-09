@@ -8,12 +8,13 @@ here=$(cd "$(dirname "$0")" && pwd)
 root=$(cd "$here/../../.." && pwd)
 llvm=${LLVM:-/opt/homebrew/opt/llvm/bin}
 out=$(mktemp -d)
-cc -std=c11 -D_DEFAULT_SOURCE -D_DARWIN_C_SOURCE -O2 -Wall -Wextra -Werror \
-	${KATYBUG_CFLAGS:-} -o "$out/katybug" "$root"/src/gmux/katybug/*.c -lm
-cc -std=c11 -D_DEFAULT_SOURCE -D_DARWIN_C_SOURCE -O2 -Wall -Wextra -Werror -DKB_PIECE_BITS=12 \
-	-o "$out/katybug-4k" "$root"/src/gmux/katybug/*.c -lm
-cc -std=c11 -D_DEFAULT_SOURCE -D_DARWIN_C_SOURCE -O2 -Wall -Wextra -Werror -DKB_EPOCH=1 \
-	-o "$out/katybug-epoch" "$root"/src/gmux/katybug/*.c -lm
+# -DKB_ZLIB and the host's libz: the build that ships has the zlib kernels (over its own zlib sources)
+cc -std=c11 -D_DEFAULT_SOURCE -D_DARWIN_C_SOURCE -DKB_ZLIB -O2 -Wall -Wextra -Werror \
+	${KATYBUG_CFLAGS:-} -o "$out/katybug" "$root"/src/gmux/katybug/*.c -lm -lz
+cc -std=c11 -D_DEFAULT_SOURCE -D_DARWIN_C_SOURCE -DKB_ZLIB -O2 -Wall -Wextra -Werror -DKB_PIECE_BITS=12 \
+	-o "$out/katybug-4k" "$root"/src/gmux/katybug/*.c -lm -lz
+cc -std=c11 -D_DEFAULT_SOURCE -D_DARWIN_C_SOURCE -DKB_ZLIB -O2 -Wall -Wextra -Werror -DKB_EPOCH=1 \
+	-o "$out/katybug-epoch" "$root"/src/gmux/katybug/*.c -lm -lz
 cc -DKB_HOST -O2 -o "$out/guest-native" "$here/guest.c"
 flags=(-nostdlib -static -fuse-ld=lld -O2 -ffreestanding -fno-stack-protector -fno-builtin)
 "$llvm/clang" --target=x86_64-linux-gnu "${flags[@]}" -mno-sse -mno-mmx -o "$out/guest-x86" "$here/guest.c"
@@ -25,12 +26,16 @@ flags=(-nostdlib -static -fuse-ld=lld -O2 -ffreestanding -fno-stack-protector -f
 "$llvm/clang" --target=x86_64-linux-gnu "${flags[@]}" -mno-sse -mno-mmx -mno-red-zone -o "$out/slots-x86" "$here/x86-slots.c"
 "$llvm/clang" --target=x86_64-linux-gnu "${flags[@]}" -mno-sse -mno-mmx -mno-red-zone -o "$out/calls-x86" "$here/x86-calls.c"
 "$llvm/clang" --target=x86_64-linux-gnu "${flags[@]}" -mno-sse -mno-mmx -mno-red-zone -o "$out/index-x86" "$here/x86-index.c"
+"$llvm/clang" --target=x86_64-linux-gnu "${flags[@]}" -mno-sse -mno-mmx -mno-red-zone -o "$out/loops-x86" "$here/x86-loops.c"
+"$llvm/clang" --target=x86_64-linux-gnu "${flags[@]}" -mno-sse -mno-mmx -o "$out/flags-x86" "$here/x86-flags.c"
 "$llvm/clang" --target=x86_64-linux-gnu "${flags[@]}" -I"$here" -mno-sse -mno-mmx -mno-red-zone -o "$out/prim-x86" "$here/prim-faults.c"
 "$llvm/clang" --target=aarch64-linux-gnu "${flags[@]}" -I"$here" -mgeneral-regs-only -o "$out/prim-a64" "$here/prim-faults.c"
 "$llvm/clang" --target=x86_64-linux-gnu "${flags[@]}" -mno-sse -mno-mmx -o "$out/returns-x86" "$here/returns.c"
 "$llvm/clang" --target=aarch64-linux-gnu "${flags[@]}" -mgeneral-regs-only -o "$out/returns-a64" "$here/returns.c"
 "$llvm/clang" --target=x86_64-linux-gnu "${flags[@]}" -mno-sse -mno-mmx -o "$out/pieces-x86" "$here/pieces.c"
 "$llvm/clang" --target=aarch64-linux-gnu "${flags[@]}" -mgeneral-regs-only -o "$out/pieces-a64" "$here/pieces.c"
+"$llvm/clang" --target=x86_64-linux-gnu "${flags[@]}" -mno-sse -mno-mmx -o "$out/image-x86" "$here/image.c"
+"$llvm/clang" --target=aarch64-linux-gnu "${flags[@]}" -mgeneral-regs-only -o "$out/image-a64" "$here/image.c"
 "$llvm/clang" --target=x86_64-linux-gnu "${flags[@]}" -mno-sse -mno-mmx -o "$out/fds-x86" "$here/fds.c"
 "$llvm/clang" --target=aarch64-linux-gnu "${flags[@]}" -mgeneral-regs-only -o "$out/fds-a64" "$here/fds.c"
 "$llvm/clang" --target=x86_64-linux-gnu "${flags[@]}" -mno-sse -mno-mmx -o "$out/bigsend-x86" "$here/bigsend.c"
@@ -114,6 +119,14 @@ check calls-x86 "$(cat "$here/x86-calls.expected")" 0 "$out/katybug" "$out/calls
 # by a later load, and a window that ends in a PROT_NONE page or a hole, where the access faults at its own address
 check index-x86 "$(cat "$here/x86-index.expected")" 0 "$out/katybug" "$out/index-x86"
 check index-x86-small-pieces "$(cat "$here/x86-index.expected")" 0 "$out/katybug-4k" "$out/index-x86"
+# x86-loops.expected is native Linux's: loops over one base register while a window straddles a piece boundary, a page
+# goes PROT_NONE, an index runs off the mapping, a far mapping comes and goes, another thread remaps the buffer at a
+# futex wait and a signal handler remaps it
+check loops-x86 "$(cat "$here/x86-loops.expected")" 0 "$out/katybug" "$out/loops-x86"
+check loops-x86-small-pieces "$(cat "$here/x86-loops.expected")" 0 "$out/katybug-4k" "$out/loops-x86"
+# x86-flags.expected is native Linux's: the flags of a cmp, add or sub, read by a cmov after a jump through a register
+# into a block with cpuid
+check flags-x86 "$(cat "$here/x86-flags.expected")" 0 "$out/katybug" "$out/flags-x86"
 # prim-faults.expected is native Linux's on both architectures: musl's strlen, memcmp, strcmp and
 # memchr, byte for byte, called at a page end, a hole, PROT_NONE and across mappings; a kernel that
 # reaches a page it cannot read hands over to the function, which faults at the same address
@@ -127,6 +140,15 @@ for a in x86 a64; do
 	else
 		echo "FAIL prim-faults-$a-recognized"
 		failed=1
+	fi
+done
+# a name in KATYBUG_PRIM is matched whole: crc32, memchrx and a name's prefix switch no kernel on
+for e in crc32 memchrx mem; do
+	if KATYBUG_PRIM=$e KATYBUG_STATS=1 "$out/katybug" "$out/prim-x86" 2>&1 > /dev/null | grep -q 'katybug: prim'; then
+		echo "FAIL prim-names-$e"
+		failed=1
+	else
+		echo "PASS prim-names-$e"
 	fi
 done
 # returns.c: recursion, a return slot overwritten to another address, and a longjmp ten frames up;
@@ -147,6 +169,31 @@ check pieces-a64-small-pieces "$(grep -v '^rep' <<< "$pieces")" 0 "$out/katybug-
 for skew in 0 48 0,1088; do
 	check pieces-x86-skew-$skew "$pieces" 0 env KATYBUG_PIECE_SKEW=$skew "$out/katybug" "$out/pieces-x86"
 	check pieces-a64-skew-$skew "$(grep -v '^rep' <<< "$pieces")" 0 env KATYBUG_PIECE_SKEW=$skew "$out/katybug" "$out/pieces-a64"
+done
+# image.c: a guest's file fills its image a piece at a time, on first touch. Each mode runs on a copy of
+# the guest: a write to the file reaches the pieces not yet made and not the ones that were, a file
+# cut short ends a piece past its end in SIGBUS (and a call on it in EFAULT), a child forked before and
+# after each piece was touched reads the file's bytes (under fork-by-exec too, where it reads through
+# the descriptor the exec kept), a fixed mapping over the image's tail or part of a piece and an
+# mprotect or munmap in the middle of one leave the file's bytes everywhere else
+for a in x86 a64; do
+	for mode in read rewrite truncate fork replace protect; do
+		for build in katybug katybug-4k; do
+			cp "$out/image-$a" "$out/image-$a.w"
+			check image-$a-$mode-$build "$mode ok" 0 "$out/$build" "$out/image-$a.w" $mode
+		done
+		cp "$out/image-$a" "$out/image-$a.w"
+		check image-$a-$mode-fork-exec "$mode ok" 0 env KATYBUG_FORK=exec "$out/katybug" "$out/image-$a.w" $mode
+	done
+	# the pieces the guest did not touch were never made
+	cp "$out/image-$a" "$out/image-$a.w"
+	if KATYBUG_STATS=1 "$out/katybug" "$out/image-$a.w" rewrite 2>&1 > /dev/null \
+		| awk '/image pieces/ { if ($4 > 0 && $4 + 0 < $7 + 0) ok = 1 } END { exit !ok }'; then
+		echo "PASS image-$a-unfilled"
+	else
+		echo "FAIL image-$a-unfilled"
+		failed=1
+	fi
 done
 # fds.c: guest descriptors are the host's, so katybug's own (its stderr, a directory handle) sit above
 # the guest's range, which ends at the base: the limit reports it, and close, dup2, dup3 and F_DUPFD
@@ -175,7 +222,7 @@ prio=$'mknod ok\nmknod-exists ok\nmknodat-exists ok\nmknodat ok\nmknod-missing-d
 check prio-x86 "$prio" 0 "$out/katybug" "$out/prio-x86"
 check prio-a64 "$prio" 0 "$out/katybug" "$out/prio-a64"
 # libm kernels: exp, log and pow run on the guest's behalf only where glibc 2.36 and 2.39 and musl 1.2.5 return
-# the same bits. libm-tables.txt holds the hash of each table as the three define them (libm-tables.sh); the
+# the same bits (and, on AArch64, for the glibc build libm-sigs.h lists). libm-tables.txt holds the hash of each table as the three define them (libm-tables.sh); the
 # kernel's copy must be the same value for value, and libm-vectors.txt (glibc 2.36 on x86-64 without FMA,
 # glibc 2.36 and musl 1.2.5 on AArch64, run natively) must come out of the kernel bit for bit wherever it runs
 if awk 'NR > 1 && ($2 != $3 || $2 != $4 || $2 != $5) { bad = 1 } END { exit bad }' "$here/libm-tables.txt"; then
@@ -184,7 +231,7 @@ else
 	echo "FAIL libm-tables.txt: the sources' tables differ from each other or from the kernel's"
 	failed=1
 fi
-check libm-vectors $'exp 2400 inputs: x86-64 kernel ran 2288, 0 differing; AArch64 kernel ran 2288, 0 differing\nlog 2400 inputs: x86-64 kernel ran 2327, 0 differing; AArch64 kernel ran 2327, 0 differing\npow 2400 inputs: x86-64 kernel ran 1511, 0 differing; AArch64 kernel ran 1511, 0 differing' 0 \
+check libm-vectors $'exp 2400 inputs: x86-64 kernel ran 2288, 0 differing; AArch64 musl kernel ran 2288, 0 differing; AArch64 glibc kernel ran 2288, 0 differing\nlog 2400 inputs: x86-64 kernel ran 2327, 0 differing; AArch64 musl kernel ran 2327, 0 differing; AArch64 glibc kernel ran 2327, 0 differing\npow 2400 inputs: x86-64 kernel ran 1511, 0 differing; AArch64 musl kernel ran 1511, 0 differing; AArch64 glibc kernel ran 1511, 0 differing' 0 \
 	"$out/libm-kernel" "$here/libm-vectors.txt"
 # x86-cpuid.c: no FMA, AVX or FMA4 reported, so a guest's libm takes its SSE2 variants
 check cpuid-x86 $'fma 0\nosxsave 0\navx 0\nleaf7 0\nfma4 0' 0 "$out/katybug" "$out/cpuid-x86"
@@ -218,4 +265,16 @@ check signals-a64 "$(cat "$here/signals.expected")" 143 "${dfl[@]}" "$out/katybu
 ignored=$(sed '1s/ 0$/ 1/' "$here/signals.expected")
 check signals-x86-ignored "$ignored" 143 bash -c "trap '' PIPE; exec \"\$@\"" - "$out/katybug" "$out/signals-x86"
 check signals-a64-ignored "$ignored" 143 bash -c "trap '' PIPE; exec \"\$@\"" - "$out/katybug" "$out/signals-a64"
+# the block functions of the hash kernels (hash.c) against openssl, across the padding boundaries
+cc -std=c11 -D_DEFAULT_SOURCE -D_DARWIN_C_SOURCE -O2 -Wall -Wextra -Werror -o "$out/hashbench" \
+	"$root/experiments/string-kernels/hashbench.c" "$root/src/gmux/katybug/hash.c"
+for n in 0 1 3 55 56 63 64 65 111 112 119 120 128 129 256 1000; do
+	if [ $n = 0 ]; then : > "$out/hash-in"; else seq 1 1000 | head -c $n > "$out/hash-in"; fi
+	for a in md5 sha1 sha256 sha512; do
+		check hash-blocks-$a-$n "$(openssl dgst -$a < "$out/hash-in" | sed 's/.* //')" 0 \
+			bash -c '"$0" check "$1" < "$2"' "$out/hashbench" $a "$out/hash-in"
+	done
+	check hash-blocks-cksum-$n "$(cksum < "$out/hash-in")" 0 \
+		bash -c '"$0" check "$1" < "$2"' "$out/hashbench" cksum "$out/hash-in"
+done
 exit $failed
