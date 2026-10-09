@@ -1,0 +1,171 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Gregory Mitchell <me@gmitch215.xyz>
+Date: Fri, 9 Oct 2026 09:00:00 +0000
+Subject: [PATCH] wasm: hand the host thread over from a loop of syscalls and
+ wait for fewer RCU frees
+
+A cpu takes its due timer and raised interrupts, and gives the other cpus
+the host thread, only when its task yields in user mode (at a fuel yield
+every 200,000 loop iterations), blocks or idles. A loop of syscalls did
+none of these, so the grace period kthread and the tick never ran during
+it: a grace period stayed open for the whole loop and every RCU-freed
+object waited for it. The maple tree frees its nodes with kfree_rcu, so
+100,000 mmap/munmap pairs held about 51 MB (two nodes, 512 bytes, a pair)
+on a machine with 46 MB free, and the machine ran out of memory.
+
+Every 256th syscall now hands the host thread to the other cpus before it
+returns, notes the quiescent state that returning to user mode is, and
+takes the cpu's due timer and raised interrupts (take_pending_irqs and
+run_irqs, the two steps wasm_user_interrupt runs).
+
+A grace period still takes about three jiffies and a jiffy is 40,000
+syscalls under the 250 ns syscall charge, so the frees waiting for one
+could still fill a small machine. RCU now treats 100 pending callbacks
+(200 for the overload mark) as a backlog and forces the quiescent states,
+where the default is 10,000 and 20,000.
+---
+ arch/wasm/include/asm/wasm.h |  1 +
+ arch/wasm/kernel/smp.c       | 63 ++++++++++++++++++++++++++++--------
+ arch/wasm/kernel/traps.c     |  1 +
+ kernel/rcu/tree.c            |  4 +++
+ 4 files changed, 55 insertions(+), 14 deletions(-)
+
+diff --git a/arch/wasm/include/asm/wasm.h b/arch/wasm/include/asm/wasm.h
+index 3e2eb06b8..d26c7d607 100644
+--- a/arch/wasm/include/asm/wasm.h
++++ b/arch/wasm/include/asm/wasm.h
+@@ -34,6 +34,7 @@ extern void wasm_halt(void);
+ extern unsigned long long wasm_cpu_clock_get_monotonic(unsigned long long charged);
+ unsigned long long wasm_clock_now(void);
+ void wasm_charge_syscall(void);
++void wasm_syscall_yield(void);
+ 
+ /* gmux: kernel functions the host calls */
+ unsigned long wasm_user_work_pending(void);
+diff --git a/arch/wasm/kernel/smp.c b/arch/wasm/kernel/smp.c
+index f59897494..ab9f3452c 100644
+--- a/arch/wasm/kernel/smp.c
++++ b/arch/wasm/kernel/smp.c
+@@ -6,6 +6,7 @@
+ #include <linux/cpu.h>
+ #include <linux/interrupt.h>
+ #include <linux/irq_work.h>
++#include <linux/rcupdate.h>
+ #include <linux/sched/task_stack.h>
+ #include <asm/entry.h>
+ #include <asm/time.h>
+@@ -347,6 +348,29 @@ void arch_cpu_idle(void)
+ 	}
+ }
+ 
++/* this cpu's timer if it is due, then the interrupts raised to it */
++static u64 take_pending_irqs(void)
++{
++	atomic64_t *expiry_ptr = this_cpu_ptr(&local_timer_expiries);
++	long long expiry = atomic64_read(expiry_ptr);
++
++	/* an expiry of 0 is due now; TIMER_NEVER_EXPIRE is negative */
++	if (expiry >= 0LL && (expiry == 0LL || safe_now() >= expiry) &&
++	    atomic64_cmpxchg(expiry_ptr, expiry, TIMER_NEVER_EXPIRE) == expiry)
++		raise_interrupt(smp_processor_id(), WASM_IRQ_TIMER);
++
++	return (u64)atomic64_xchg(this_cpu_ptr(&raised_irqs), 0LL);
++}
++
++static void run_irqs(u64 pending)
++{
++	int irq_nr;
++
++	for (irq_nr = 0; pending; pending >>= 1, irq_nr++)
++		if (pending & 1ULL)
++			do_irq_stacked(irq_nr);
++}
++
+ /*
+  * For the host when a task yields in user mode, standing in for the interrupts that stop user code on
+  * other architectures: this cpu's timer, if due, and every interrupt raised to it run here, as if
+@@ -356,28 +380,39 @@ void arch_cpu_idle(void)
+  */
+ __visible unsigned long wasm_user_interrupt(void)
+ {
+-	atomic64_t *raised_irqs_ptr = this_cpu_ptr(&raised_irqs);
+-	atomic64_t *expiry_ptr = this_cpu_ptr(&local_timer_expiries);
+-	long long expiry = atomic64_read(expiry_ptr);
+-	u64 pending;
+-	int irq_nr;
+-
+-	/* an expiry of 0 is due now; TIMER_NEVER_EXPIRE is negative */
+-	if (expiry >= 0LL && (expiry == 0LL || safe_now() >= expiry) &&
+-	    atomic64_cmpxchg(expiry_ptr, expiry, TIMER_NEVER_EXPIRE) == expiry)
+-		raise_interrupt(smp_processor_id(), WASM_IRQ_TIMER);
++	u64 pending = take_pending_irqs();
+ 
+-	pending = (u64)atomic64_xchg(raised_irqs_ptr, 0LL);
+ 	if (pending) {
+ 		cpuflags_clear_mask(CPUFLAGS_USER_MODE);
+-		for (irq_nr = 0; pending; pending >>= 1, irq_nr++)
+-			if (pending & 1ULL)
+-				do_irq_stacked(irq_nr);
++		run_irqs(pending);
+ 		cpuflags_set_mask(CPUFLAGS_USER_MODE);
+ 	}
+ 	return read_thread_flags() & (_TIF_SIGPENDING | _TIF_NOTIFY_SIGNAL | _TIF_NEED_RESCHED);
+ }
+ 
++/*
++ * A loop of syscalls never yields in user mode, so the host thread never reaches the other cpus
++ * (the grace period kthread, the tick) and its cpu reports no quiescent state, and RCU frees pile
++ * up until memory runs out. Every SYSCALLS_PER_YIELD syscalls, one about to return hands the host
++ * thread over, notes the quiescent state that returning to user mode is, and takes the cpu's due
++ * timer and raised interrupts.
++ */
++#define SYSCALLS_PER_YIELD 256
++static DEFINE_PER_CPU(unsigned int, syscall_count);
++
++void wasm_syscall_yield(void)
++{
++	unsigned long flags;
++
++	if (__this_cpu_inc_return(syscall_count) & (SYSCALLS_PER_YIELD - 1))
++		return;
++	cpu_relax();
++	local_irq_save(flags);
++	rcu_note_context_switch(false);
++	local_irq_restore(flags);
++	run_irqs(take_pending_irqs());
++}
++
+ /*
+  * IRQ_CPU should be clear of tasks, but sometimes someone may schedule
+  * something. In severe cases (e.g. some KUnit tests that create thread pools on
+diff --git a/arch/wasm/kernel/traps.c b/arch/wasm/kernel/traps.c
+index f243bcbac..d289900ea 100644
+--- a/arch/wasm/kernel/traps.c
++++ b/arch/wasm/kernel/traps.c
+@@ -67,6 +67,7 @@ __visible int wasm_trap_unwound_kernel(void)
+ 					}					\
+ 				}						\
+ 										\
++				wasm_syscall_yield();				\
+ 				syscall_exit_to_user_mode(regs);		\
+ 										\
+ 				switch (regs->syscall_ret) {			\
+diff --git a/kernel/rcu/tree.c b/kernel/rcu/tree.c
+index 55df6d371..326c22e27 100644
+--- a/kernel/rcu/tree.c
++++ b/kernel/rcu/tree.c
+@@ -417,7 +417,11 @@ static int rcu_is_cpu_rrupt_from_idle(void)
+ 				// Maximum callbacks per rcu_do_batch ...
+ #define DEFAULT_MAX_RCU_BLIMIT 10000 // ... even during callback flood.
+ static long blimit = DEFAULT_RCU_BLIMIT;
++#ifdef CONFIG_WASM
++#define DEFAULT_RCU_QHIMARK 100   // Few frees may wait: a cpu can run for long between ticks.
++#else
+ #define DEFAULT_RCU_QHIMARK 10000 // If this many pending, ignore blimit.
++#endif
+ static long qhimark = DEFAULT_RCU_QHIMARK;
+ #define DEFAULT_RCU_QLOMARK 100   // Once only this many pending, use blimit.
+ static long qlowmark = DEFAULT_RCU_QLOMARK;
+-- 
+2.43.0
+

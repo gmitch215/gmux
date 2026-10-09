@@ -1,0 +1,59 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Gregory Mitchell <me@gmitch215.xyz>
+Date: Fri, 9 Oct 2026 09:00:00 +0000
+Subject: [PATCH] mm/nommu: keep the mapping tree's range in step with a
+ remapped VMA
+
+do_mremap changed vma->vm_end and left the tree holding the VMA at its
+old range. After a shrink, munmap of the shrunk length removed the head
+and left the old tail in the tree pointing at the freed VMA:
+/proc/self/maps kept listing it, a second munmap said "munmap of memory
+not mmapped by process", and the entry went a few changes later. A grow
+back to the old length had no entry for the added pages.
+
+A shrink now clears the tail from the tree, as vmi_shrink_vma does for
+munmap, and a grow stores the VMA over its new range.
+---
+ mm/nommu.c | 14 ++++++++++++++
+ 1 file changed, 14 insertions(+)
+
+diff --git a/mm/nommu.c b/mm/nommu.c
+index 66b8bfe99..42aaf7fc9 100644
+--- a/mm/nommu.c
++++ b/mm/nommu.c
+@@ -1586,6 +1586,7 @@ static unsigned long do_mremap(unsigned long addr,
+ 			unsigned long flags, unsigned long new_addr)
+ {
+ 	struct vm_area_struct *vma;
++	VMA_ITERATOR(vmi, current->mm, addr);
+ 
+ 	/* insanity checks first */
+ 	old_len = PAGE_ALIGN(old_len);
+@@ -1612,11 +1613,24 @@ static unsigned long do_mremap(unsigned long addr,
+ 	if (new_len > vma->vm_region->vm_end - vma->vm_region->vm_start)
+ 		return (unsigned long) -ENOMEM;
+ 
++	/* the tree holds the VMA by its range, so a new end goes there too */
++	if (new_len < old_len) {
++		if (vma_iter_clear_gfp(&vmi, vma->vm_start + new_len, vma->vm_end,
++				       GFP_KERNEL))
++			return (unsigned long) -ENOMEM;
++	} else if (new_len > old_len) {
++		vma_iter_config(&vmi, vma->vm_start, vma->vm_start + new_len);
++		if (vma_iter_prealloc(&vmi, vma))
++			return (unsigned long) -ENOMEM;
++	}
++
+ 	/* all checks complete - do it */
+ #ifdef CONFIG_WASM
+ 	wasm_owner_unmap(vma, vma->vm_start, vma->vm_end);
+ #endif
+ 	vma->vm_end = vma->vm_start + new_len;
++	if (new_len > old_len)
++		vma_iter_store_overwrite(&vmi, vma);
+ 	wasm_gen_bump(&vma->vm_mm->wasm_gen);
+ #ifdef CONFIG_WASM
+ 	wasm_owner_map(vma);
+-- 
+2.43.0
+
