@@ -24,6 +24,7 @@ COPY --chown=gmux:gmux --from=build /src/package.json /src/wrangler.jsonc /src/t
 COPY --chown=gmux:gmux --from=build /src/src ./src
 COPY --chown=gmux:gmux --from=build /src/build/kernel ./build/kernel
 COPY --chown=gmux:gmux --from=build /src/build/assets ./build/assets
+COPY --chown=gmux:gmux --from=build /src/build/router ./build/router
 
 ENV WRANGLER_SEND_METRICS=false
 USER gmux

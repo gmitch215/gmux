@@ -1,9 +1,11 @@
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
-import { ROUTER_BUILD, routerModules } from '../../scripts/wasm/router-modules.ts';
+import { RUNTIME_BUILD, hostRuntime } from '../../scripts/wasm/router-modules.ts';
 import { statxHash } from '../../src/worker/machine/machine.ts';
 import {
+	FS_COUNTERS,
+	FS_MOVES,
 	MISS,
 	ROUTE_HOOK,
 	ROUTE_KERNEL,
@@ -20,13 +22,13 @@ import {
 	statxBucket
 } from '../../src/worker/machine/router.ts';
 
-const modules = routerModules();
+const modules = hostRuntime();
 const O_DSYNC = 0o10000;
 const SYS_OPENAT = 56;
 
 describe('syscall router', () => {
 	it('places nothing in the task memory it imports', () => {
-		const bytes = readFileSync(join(ROUTER_BUILD, 'router.wasm'));
+		const bytes = readFileSync(join(RUNTIME_BUILD, 'router.wasm'));
 		const ids: number[] = [];
 		for (let at = 8; at < bytes.length;) {
 			ids.push(bytes[at++]!);
@@ -101,6 +103,7 @@ describe('syscall router', () => {
 });
 
 describe('statx hit path', () => {
+	const BLOCK = 0x1000;
 	const PATH = 0x100;
 	const BUF = 0x400;
 	const answer = new Uint8Array(256).map((_, i) => i ^ 0x5a);
@@ -108,21 +111,31 @@ describe('statx hit path', () => {
 	const rig = (verify = false) => {
 		const memory = new WebAssembly.Memory({ initial: 1, maximum: 4, shared: true });
 		const table = new StatxTable(verify);
-		// counters by index, -1 for the mount and chroot count; ats counts the kernel's reads of them
+		// the kernel's wasm_fs_block in the machine's memory: the generation, the mount and chroot
+		// count (counter -1) and the inode counters, which the hit path reads in place
+		const machine = new WebAssembly.Memory({ initial: 1, maximum: 4, shared: true });
+		const words = new DataView(machine.buffer);
+		const at = (index: number) => BLOCK + (index < 0 ? FS_MOVES : FS_COUNTERS + index * 4);
 		const kernel = {
 			view: 0x1234,
-			gen: 7,
 			views: 0,
-			gens: 0,
-			ats: 0,
-			counters: new Map<number, number>()
+			get gen() {
+				return words.getUint32(BLOCK, true);
+			},
+			set gen(value: number) {
+				words.setUint32(BLOCK, value, true);
+			},
+			counters: {
+				get: (index: number) => words.getUint32(at(index), true),
+				set: (index: number, value: number) => words.setUint32(at(index), value, true)
+			}
 		};
+		kernel.gen = 7;
 		const exports = new WebAssembly.Instance(modules.statx, {
-			env: { user: memory, table: table.memory },
+			env: { user: memory, table: table.memory, machine },
 			kernel: {
-				view: () => (kernel.views++, kernel.view),
-				gen: () => (kernel.gens++, kernel.gen),
-				at: (i: number) => (kernel.ats++, kernel.counters.get(i) ?? 0)
+				block: new WebAssembly.Global({ value: 'i32', mutable: false }, BLOCK),
+				view: () => (kernel.views++, kernel.view)
 			}
 		}).exports as { hit: (...a: number[]) => number; key: (...a: number[]) => bigint };
 		const mem = new Uint8Array(memory.buffer);
@@ -258,16 +271,17 @@ describe('statx hit path', () => {
 		expect(kernel.views).toBe(0);
 	});
 
-	it('asks the kernel for the generation only when a slot matches', () => {
+	it('asks the kernel for the view alone, and reads the generation in place', () => {
 		const { fill, hit, kernel, put } = rig();
 		put(PATH, '/never');
 		hit();
-		expect(kernel.gens).toBe(0);
 		fill('/bin/ls');
 		hit();
 		expect(kernel.views).toBe(2);
-		expect(kernel.gens).toBe(1);
-		expect(kernel.ats).toBe(0);
+		expect(hit()).toBe(0);
+		kernel.gen = 8;
+		expect(hit()).toBe(MISS);
+		expect(kernel.views).toBe(4);
 	});
 
 	describe('guarded by inode counters', () => {
@@ -287,11 +301,9 @@ describe('statx hit path', () => {
 			]);
 			expect(s.hit()).toBe(0);
 			expect(s.mem.slice(BUF, BUF + 256)).toEqual(answer);
-			// the kernel's generation, which a write anywhere moves, is not asked
+			// the kernel's generation, which a write anywhere moves, is not looked at
 			s.kernel.gen = 99;
 			expect(s.hit()).toBe(0);
-			expect(s.kernel.gens).toBe(0);
-			expect(s.kernel.ats).toBe(8);
 			expect(s.table.hits).toBe(2);
 		});
 
@@ -312,23 +324,28 @@ describe('statx hit path', () => {
 			expect(s.table.misses).toBe(4);
 		});
 
-		it('reads only as many counters as the slot lists', () => {
+		it('looks only at the counters the slot lists', () => {
 			const s = guarded([[9, 1]]);
-			s.hit();
-			expect(s.kernel.ats).toBe(2);
+			s.kernel.counters.set(10, 77);
+			s.kernel.counters.set(8, 77);
+			expect(s.hit()).toBe(0);
 			const full = guarded(Array.from({ length: STATX_GUARDS }, (_, i) => [i + 100, i]));
-			full.hit();
-			expect(full.kernel.ats).toBe(STATX_GUARDS + 1);
+			full.kernel.counters.set(STATX_GUARDS + 100, 5);
+			expect(full.hit()).toBe(0);
+			full.kernel.counters.set(100 + STATX_GUARDS - 1, 5);
+			expect(full.hit()).toBe(MISS);
 		});
 
-		it('is replaced by a refill held on the generation, which is then the one asked', () => {
+		it('is replaced by a refill held on the generation, which is then the one compared', () => {
 			const s = guarded([[5, 10]]);
 			s.fill('/usr/lib/x', { gen: 7 });
 			expect(s.table.get(statxHash(s.mem, PATH, s.kernel.view, 0, 0x7ff)!)!.guards).toEqual(
 				[]
 			);
+			s.kernel.counters.set(5, 11);
 			expect(s.hit()).toBe(0);
-			expect(s.kernel.gens).toBe(1);
+			s.kernel.gen = 8;
+			expect(s.hit()).toBe(MISS);
 		});
 	});
 });

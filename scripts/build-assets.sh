@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # the Static Assets directory: the terminal page and the xterm.js it loads, and the bootstrap
 # image a new machine restores instead of booting (scripts/bootstrap.ts; node, since the machine
-# needs JSPI), once build/kernel is staged; and build/router, which the site and bootstrap load
+# needs JSPI), once build/kernel is staged; and build/router (router, statx hit and scheduler core),
+# which the site and bootstrap load
 set -euo pipefail
 root=$(cd "$(dirname "$0")/.." && pwd)
 out=$root/build/assets/_gmux/term

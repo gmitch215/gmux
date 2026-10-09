@@ -3,14 +3,21 @@
 ;; A slot: hash, view, flags, mask, gen, ret, path length (0 when empty), has answer bytes; the 256
 ;; answer bytes at 32; the guard at 288: a count n, then n kernel counter indices (u16 at 292) and the
 ;; values they held (u32 at 308); the path at 340. With n = 0 the answer holds while `gen` is the
-;; kernel's generation; else while `gen` is the count of mount and chroot changes (counter -1) and
-;; every listed counter is what it was
+;; kernel's generation; else while `gen` is the count of mount and chroot changes and every listed
+;; counter is what it was. The kernel's counters are read in place from its wasm_fs_block, in the
+;; machine's memory (not the task's when the task has a memory of its own): generation at 0, the
+;; mount and chroot count at 4, the 4096 inode counters at 8
 (module
 	(import "env" "user" (memory $user 1 65536 shared))
 	(import "env" "table" (memory $table 1))
+	(import "env" "machine" (memory $machine 1 65536 shared))
+	(import "kernel" "block" (global $block i32))
 	(import "kernel" "view" (func $view (result i32)))
-	(import "kernel" "gen" (func $gen (result i32)))
-	(import "kernel" "at" (func $at (param i32) (result i32)))
+
+	;; inode counter i of the kernel's block
+	(func $counter (param $i i32) (result i32)
+		(i32.load $machine offset=8
+			(i32.add (global.get $block) (i32.shl (i32.and (local.get $i) (i32.const 4095)) (i32.const 2)))))
 
 	;; the cache key of the absolute path at $at, low half, and its length, high half; -1 for a
 	;; relative or unterminated one (FNV-1a with view, flags and mask folded in; statxHash in
@@ -102,18 +109,22 @@
 			(local.set $n (i32.load $table offset=288 (local.get $slot)))
 			(if (local.get $n)
 				(then
-					(br_if $miss (i32.ne (i32.load $table offset=16 (local.get $slot)) (call $at (i32.const -1))))
+					(br_if $miss
+						(i32.ne (i32.load $table offset=16 (local.get $slot))
+							(i32.load $machine offset=4 (global.get $block))))
 					(loop $guard
 						(br_if $miss
 							(i32.ne
 								(i32.load $table offset=308 (i32.add (local.get $slot) (i32.shl (local.get $i) (i32.const 2))))
-								(call $at
+								(call $counter
 									(i32.load16_u $table offset=292
 										(i32.add (local.get $slot) (i32.shl (local.get $i) (i32.const 1)))))))
 						(local.set $i (i32.add (local.get $i) (i32.const 1)))
 						(br_if $guard (i32.lt_u (local.get $i) (local.get $n)))))
 				(else
-					(br_if $miss (i32.ne (i32.load $table offset=16 (local.get $slot)) (call $gen)))))
+					(br_if $miss
+						(i32.ne (i32.load $table offset=16 (local.get $slot))
+							(i32.load $machine (global.get $block))))))
 			(if (i32.load $table offset=28 (local.get $slot))
 				(then
 					;; a buffer outside the memory is the kernel's to refuse with EFAULT

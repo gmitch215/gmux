@@ -18,8 +18,8 @@ export const KERNEL_FILES = [
 	'manifest.json'
 ];
 
-// MachineOptions.router, built by scripts/build-router.sh
-export const ROUTER_FILES = ['router.wasm', 'statx.wasm'];
+// MachineOptions.runtime, built by scripts/build-router.sh
+export const ROUTER_FILES = ['router.wasm', 'statx.wasm', 'gmux-core.wasm'];
 const router = join(root, 'build/router');
 
 const missing = KERNEL_FILES.filter((name) => !existsSync(join(from, name)));
@@ -44,8 +44,8 @@ writeFileSync(
 
 Built by \`scripts/build-linux.sh\` from the pins in \`src/sources.json\` with the patches in
 \`src/kernel/patches\`, \`src/musl/patches\` and \`src/busybox/patches\`, all shipped in this package.
-The kernel is GPL-2.0-only and BusyBox GPL-2.0-only (\`LICENSES/\`); musl is MIT. \`router.wasm\` and
-\`statx.wasm\` are built by \`scripts/build-router.sh\` from \`src/gmux/core/router\`.
+The kernel is GPL-2.0-only and BusyBox GPL-2.0-only (\`LICENSES/\`); musl is MIT; zlib, built into \`katybug.wasm\`, is under the zlib licence (\`LICENSES/Zlib.txt\`). \`router.wasm\` and
+\`statx.wasm\` are built by \`scripts/build-router.sh\` from \`src/gmux/core/router\`, and \`gmux-core.wasm\` from \`src/gmux/core\`.
 
 | file | sha256 |
 | --- | --- |

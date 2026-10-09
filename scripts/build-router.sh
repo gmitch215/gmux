@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
-# builds the syscall router (src/gmux/core/router) into a directory, default build/router: router.wasm
-# from router.c by clang and lld, statx.wasm from statx.wat by binaryen. CLANG names a clang with the
-# wasm32 target (Homebrew's llvm on a Mac)
+# builds the host runtime modules into a directory, default build/router: router.wasm from
+# src/gmux/core/router/router.c by clang and lld, statx.wasm from statx.wat by binaryen, and
+# gmux-core.wasm from src/gmux/core (scripts/build-core.sh). CLANG names a clang with the wasm32
+# target (Homebrew's llvm on a Mac)
 set -euo pipefail
 root=$(cd "$(dirname "$0")/.." && pwd)
 out=${1:-$root/build/router}
@@ -20,3 +21,4 @@ mkdir -p "$out"
 	-Wl,--import-memory,--shared-memory,--initial-memory=65536,--max-memory=4294967296 \
 	"$out/router.o" -o "$out/router.wasm"
 "$root/scripts/ts" "$root/scripts/wasm/assemble-wat.ts" "$src/statx.wat" "$out/statx.wasm"
+LLVM=${LLVM:-$(dirname "$(command -v "$clang")")} "$root/scripts/build-core.sh" "$out" > /dev/null

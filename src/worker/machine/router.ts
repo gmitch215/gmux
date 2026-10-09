@@ -12,9 +12,9 @@
  * fills the table.
  *
  * The router is `src/gmux/core/router/router.c`; the statx hit, which needs three memories, is
- * `statx.wat` beside it. `scripts/build-router.sh` builds both, and a Worker may compile wasm at
- * startup and not while it serves a request, so the host compiles them once and hands them to the
- * machine as `MachineOptions.router`.
+ * `statx.wat` beside it. `scripts/build-router.sh` builds both and the scheduler core
+ * (`src/gmux/core`), and a Worker may compile wasm at startup and not while it serves a request, so
+ * the host compiles them once and hands them to the machine as `MachineOptions.runtime`.
  */
 export const ROUTE_WATCH = 0;
 export const ROUTE_KERNEL = 1;
@@ -29,17 +29,25 @@ export const SYS_STATX = 291;
 /** what `c.5` returns when it has no answer: statx returns 0 or a negative errno */
 export const MISS = 1;
 
-/** the compiled router and statx-hit modules (build/router) */
-export interface RouterModules {
+/**
+ * the compiled host runtime modules (build/router): the syscall router, the statx hit path and the
+ * scheduler core. A machine given the core schedules with it
+ */
+export interface HostRuntime {
 	route: WebAssembly.Module;
 	statx: WebAssembly.Module;
+	core?: WebAssembly.Module;
 }
 
 // workers-types declare Module abstract; the constructor is real at startup
 const Module = WebAssembly.Module as unknown as new (bytes: BufferSource) => WebAssembly.Module;
 
-export function compileRouter(route: BufferSource, statx: BufferSource): RouterModules {
-	return { route: new Module(route), statx: new Module(statx) };
+export function compileRuntime(
+	route: BufferSource,
+	statx: BufferSource,
+	core?: BufferSource
+): HostRuntime {
+	return { route: new Module(route), statx: new Module(statx), core: core && new Module(core) };
 }
 
 /**
@@ -65,6 +73,18 @@ export const STATX_SETS = 2048;
 export const STATX_BUCKETS = 4096;
 /** the most counters one answer holds on */
 export const STATX_GUARDS = 8;
+/**
+ * where the kernel's wasm_fs_block holds what (patch 0036; its address is the export of that name):
+ * the generation at 0, then the mount and chroot count, the inode counters, the path
+ * `wasm_fs_chain` is asked about and the links it writes (mount id, inode number and mode, 12 bytes
+ * each)
+ */
+export const FS_MOVES = 4;
+export const FS_COUNTERS = 8;
+export const FS_PATH = FS_COUNTERS + 4 * STATX_BUCKETS;
+export const FS_PATH_MAX = 256;
+export const FS_CHAIN = FS_PATH + FS_PATH_MAX;
+export const FS_CHAIN_MAX = 9;
 /** the longest path a slot holds */
 export const STATX_PATH_MAX = 170;
 const GUARD_AT = 288;

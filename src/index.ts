@@ -42,5 +42,5 @@ export type {
 	SavedRunner,
 	Snapshot
 } from './worker/machine/machine.ts';
-export { compileRouter } from './worker/machine/router.ts';
-export type { RouterModules } from './worker/machine/router.ts';
+export { compileRuntime } from './worker/machine/router.ts';
+export type { HostRuntime } from './worker/machine/router.ts';
