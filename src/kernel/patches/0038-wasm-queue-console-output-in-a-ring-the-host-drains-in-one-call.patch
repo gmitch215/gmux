@@ -1,0 +1,99 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Gregory Mitchell <me@gmitch215.xyz>
+Date: Fri, 9 Oct 2026 07:00:00 +0000
+Subject: [PATCH] wasm: queue console output in a ring the host drains in one
+ call
+
+hvc_wasm_put_chars crossed into the host once per kernel put, and the
+tty layer made two puts for each line written, so a console workload
+crossed twice per line. With the ring enabled by the host the put is a
+copy into kernel memory and the host writes everything queued at its
+next pump step, before a checkpoint, at halt and panic, and when run
+returns. A put that does not fit calls the host, whose import drains the
+ring first, so order is kept; a put during an oops does the same. The
+ring and both counters live in kernel memory, so a checkpoint taken
+after a drain holds an empty ring.
+
+wasm_console_ring and wasm_console_ring_size give the host the address
+and the size; a kernel without them, or a host that never sets enabled,
+puts directly as before.
+---
+--- a/drivers/tty/hvc/hvc_wasm.c
++++ b/drivers/tty/hvc/hvc_wasm.c
+@@ -1,15 +1,72 @@
+ /* SPDX-License-Identifier: GPL-2.0-only */
+ 
+ #include <asm/irq.h>
++#include <linux/minmax.h>
++#include <linux/printk.h>
++#include <linux/spinlock.h>
++#include <linux/string.h>
+ 
+ #include "hvc_console.h"
+ 
+ extern ssize_t wasm_driver_hvc_put(const u8 *buf, size_t count);
+ extern ssize_t wasm_driver_hvc_get(u8 *buf, size_t count);
+ 
++#define HVC_WASM_RING_SIZE	(64 * 1024)
++
++/*
++ * output waits here for the host's next step, which writes the whole ring in one call; the host
++ * sets enabled and moves tail, the kernel moves head, and both count bytes and wrap at 2^32
++ */
++struct hvc_wasm_ring {
++	u32 head;
++	u32 tail;
++	u32 enabled;
++	u32 reserved;
++	u8 data[HVC_WASM_RING_SIZE];
++};
++
++static struct hvc_wasm_ring hvc_ring;
++static DEFINE_RAW_SPINLOCK(hvc_ring_lock);
++
++__visible struct hvc_wasm_ring *wasm_console_ring(void)
++{
++	return &hvc_ring;
++}
++
++__visible u32 wasm_console_ring_size(void)
++{
++	return HVC_WASM_RING_SIZE;
++}
++
+ static ssize_t hvc_wasm_put_chars(uint32_t vtermno, const u8 *buf, size_t count)
+ {
+-	return wasm_driver_hvc_put(buf, count);
++	struct hvc_wasm_ring *ring = &hvc_ring;
++	unsigned long flags;
++	ssize_t done;
++	size_t first;
++	u32 head, at;
++
++	/* a dying cpu may hold the lock; the host's put drains the ring before it writes */
++	if (!READ_ONCE(ring->enabled) || oops_in_progress)
++		return wasm_driver_hvc_put(buf, count);
++
++	raw_spin_lock_irqsave(&hvc_ring_lock, flags);
++	head = ring->head;
++	if (count > HVC_WASM_RING_SIZE - (head - READ_ONCE(ring->tail))) {
++		/* full: the host drains the ring, then writes these */
++		done = wasm_driver_hvc_put(buf, count);
++	} else {
++		at = head & (HVC_WASM_RING_SIZE - 1);
++		first = min_t(size_t, count, HVC_WASM_RING_SIZE - at);
++		memcpy(ring->data + at, buf, first);
++		memcpy(ring->data, buf + first, count - first);
++		smp_wmb();
++		WRITE_ONCE(ring->head, head + count);
++		done = count;
++	}
++	raw_spin_unlock_irqrestore(&hvc_ring_lock, flags);
++
++	return done;
+ }
+ 
+ static ssize_t hvc_wasm_get_chars(uint32_t vtermno, u8 *buf, size_t count)
+--
+2.43.0
+

@@ -1,0 +1,245 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Gregory Mitchell <me@gmitch215.xyz>
+Date: Fri, 9 Oct 2026 06:00:00 +0000
+Subject: [PATCH] wasm: put the path-query counters in one block and walk a
+ path in one call
+
+The host reads the generation, the mount and chroot count and the inode
+counters at fixed offsets of wasm_fs_block, whose address it gets as an
+export, so a cached statx needs no kernel call for them and wasm_fs_gen
+and wasm_fs_gen_at are gone.
+
+wasm_fs_chain gives the host the mount id, inode number and mode of the
+current task's root and of each prefix of a path (written to
+wasm_fs_block.path first) in one call that cannot park: it reads the
+dcache with d_hash_and_lookup and follows mounts with follow_down_one, so
+no lock that waits is taken and nothing is allocated. It stops after the
+first prefix that is not a directory or is on another mount, and before
+the first component that does not exist; ramfs and tmpfs keep every entry
+in the dcache, so a name that is not there does not exist, and another
+filesystem answers -EAGAIN for a missing name.
+---
+ arch/wasm/include/asm/wasm.h |  2 -
+ arch/wasm/mm/fsgen.c         | 23 +++-------
+ fs/namei.c                   | 89 ++++++++++++++++++++++++++++++++++++
+ include/linux/fs.h           | 30 ++++++++----
+ 4 files changed, 118 insertions(+), 26 deletions(-)
+
+diff --git a/arch/wasm/include/asm/wasm.h b/arch/wasm/include/asm/wasm.h
+index 3e2eb06b8..67caa7000 100644
+--- a/arch/wasm/include/asm/wasm.h
++++ b/arch/wasm/include/asm/wasm.h
+@@ -46,8 +46,6 @@ unsigned int wasm_current_owner(void);
+ unsigned int wasm_current_euid(void);
+ unsigned long wasm_current_mm(void);
+ unsigned long wasm_free_pages(void);
+-unsigned long wasm_fs_gen(void);
+-unsigned long wasm_fs_gen_at(unsigned int i);
+ unsigned long wasm_fs_view(void);
+ 
+ /* gmux: a fork child's own memory (arch/wasm/mm/private.c): the host fills and forgets it */
+diff --git a/arch/wasm/mm/fsgen.c b/arch/wasm/mm/fsgen.c
+index f4eac307e..8cd49fe43 100644
+--- a/arch/wasm/mm/fsgen.c
++++ b/arch/wasm/mm/fsgen.c
+@@ -7,6 +7,7 @@
+  * mount, so changes on other filesystems (a tty's times, /dev/null's) leave the generation alone.
+  * The same changes also move one of WASM_FS_BUCKETS counters by the inode number, and mount and
+  * chroot changes a count of their own, for answers that depend on the inodes of a path's components.
++ * The counters live in wasm_fs_block, whose address the host reads them at, with no call.
+  */
+ 
+ #include <linux/capability.h>
+@@ -18,25 +19,15 @@
+ #include <linux/sched.h>
+ #include <asm/wasm.h>
+ 
+-unsigned long wasm_fs_generation;
+-unsigned long wasm_fs_moves;
+-unsigned int wasm_fs_buckets[WASM_FS_BUCKETS];
++struct wasm_fs_block wasm_fs_block;
++/* the host reads the counters at these offsets (statx.wat, router.ts) */
++static_assert(offsetof(struct wasm_fs_block, moves) == 4);
++static_assert(offsetof(struct wasm_fs_block, buckets) == 8);
++static_assert(offsetof(struct wasm_fs_block, path) == 8 + 4 * WASM_FS_BUCKETS);
++static_assert(sizeof(struct wasm_fs_link) == 12);
+ /* the root filesystem, once the host has first asked; until then every inode counts */
+ struct super_block *wasm_fs_root_sb;
+ 
+-__visible unsigned long wasm_fs_gen(void)
+-{
+-	return READ_ONCE(wasm_fs_generation);
+-}
+-
+-/* bucket i of the inode counters, or with i == WASM_FS_BUCKETS the mount and chroot count */
+-__visible unsigned long wasm_fs_gen_at(unsigned int i)
+-{
+-	if (i < WASM_FS_BUCKETS)
+-		return READ_ONCE(wasm_fs_buckets[i]);
+-	return READ_ONCE(wasm_fs_moves);
+-}
+-
+ /*
+  * the current task's root dentry when its path queries depend on nothing but the path and the
+  * generation: it may search every directory (CAP_DAC_READ_SEARCH), resolves in the first mount
+diff --git a/fs/namei.c b/fs/namei.c
+index 9e5500dad..67e1226f1 100644
+--- a/fs/namei.c
++++ b/fs/namei.c
+@@ -40,6 +40,7 @@
+ #include <linux/bitops.h>
+ #include <linux/init_task.h>
+ #include <linux/uaccess.h>
++#include <linux/magic.h>
+ 
+ #include <asm/runtime-const.h>
+ 
+@@ -6403,3 +6404,91 @@ const struct inode_operations page_symlink_inode_operations = {
+ 	.get_link	= page_get_link,
+ };
+ EXPORT_SYMBOL(page_symlink_inode_operations);
++
++#ifdef CONFIG_WASM
++/*
++ * gmux: the mount id, inode number and mode of the current task's root and of each prefix of the
++ * absolute path in wasm_fs_block.path (len bytes), written to wasm_fs_block.chain, for the host's
++ * path-query cache. It reads the dcache only, takes no lock that can wait and never schedules, so
++ * the host can call it from outside a syscall. It stops after the first prefix that is not a
++ * directory (a symlink is not followed) or is on another mount than the root, and before the first
++ * component that does not exist. Returns the number of links written, at least 1, or a negative
++ * errno when the dcache cannot answer: a . or .. component, more components than the chain holds,
++ * a directory whose names the dcache does not hold whole (only ramfs and tmpfs pin every entry),
++ * or a dentry that wants a revalidation or an automount
++ */
++__visible long wasm_fs_chain(unsigned int len)
++{
++	char *path = wasm_fs_block.path;
++	struct wasm_fs_link *link = wasm_fs_block.chain;
++	struct path cur, next;
++	unsigned int i = 0;
++	int root_mnt, n = 0;
++	long ret = -EAGAIN;
++
++	if (!len || len >= WASM_FS_PATH || path[0] != '/')
++		return -EINVAL;
++	if (!current->fs)
++		return -EAGAIN;
++	path[len] = '\0';
++	get_fs_root(current->fs, &cur);
++	root_mnt = real_mount(cur.mnt)->mnt_id;
++	for (;;) {
++		struct inode *inode = d_inode(cur.dentry);
++		struct qstr name;
++		struct dentry *child;
++
++		link[n].mount = real_mount(cur.mnt)->mnt_id;
++		link[n].ino = (u32)inode->i_ino;
++		link[n].mode = inode->i_mode;
++		n++;
++		if (!S_ISDIR(inode->i_mode) || link[n - 1].mount != root_mnt) {
++			ret = n;
++			break;
++		}
++		while (i < len && path[i] == '/')
++			i++;
++		if (i == len) {
++			ret = n;
++			break;
++		}
++		name.name = (const unsigned char *)path + i;
++		while (i < len && path[i] != '/')
++			i++;
++		name.len = (const unsigned char *)path + i - name.name;
++		if (name.name[0] == '.' && (name.len == 1 || (name.len == 2 && name.name[1] == '.')))
++			break;
++		if (n == WASM_FS_CHAIN ||
++		    (cur.dentry->d_flags & (DCACHE_OP_HASH | DCACHE_OP_REVALIDATE |
++					    DCACHE_OP_WEAK_REVALIDATE)))
++			break;
++		child = d_hash_and_lookup(cur.dentry, &name);
++		if (IS_ERR(child))
++			break;
++		if (!child) {
++			unsigned long magic = cur.mnt->mnt_sb->s_magic;
++
++			if (magic == RAMFS_MAGIC || magic == TMPFS_MAGIC)
++				ret = n;
++			break;
++		}
++		if (d_is_negative(child)) {
++			dput(child);
++			ret = n;
++			break;
++		}
++		next.mnt = mntget(cur.mnt);
++		next.dentry = child;
++		while (d_mountpoint(next.dentry) && follow_down_one(&next))
++			;
++		if (next.dentry->d_flags & (DCACHE_NEED_AUTOMOUNT | DCACHE_MANAGE_TRANSIT)) {
++			path_put(&next);
++			break;
++		}
++		path_put(&cur);
++		cur = next;
++	}
++	path_put(&cur);
++	return ret;
++}
++#endif
+diff --git a/include/linux/fs.h b/include/linux/fs.h
+index 2cdbee802..20238c76b 100644
+--- a/include/linux/fs.h
++++ b/include/linux/fs.h
+@@ -1163,18 +1163,32 @@ static inline loff_t i_size_read(const struct inode *inode)
+  * with every read and write of it; the host keeps no answer about one, so they do not count
+  * (arch/wasm/mm/fsgen.c). A change also counts in the bucket of its inode number, and a mount
+  * change or chroot in wasm_fs_moves, so an answer that depends on the inodes of a path's
+- * components stays valid while others change
++ * components stays valid while others change. The counters sit in one block the host reads in
++ * place (wasm_fs_block's address is exported), with the buffers of wasm_fs_chain
+  */
+ #define WASM_FS_BUCKETS 4096
+-extern unsigned long wasm_fs_generation;
+-extern unsigned long wasm_fs_moves;
+-extern unsigned int wasm_fs_buckets[WASM_FS_BUCKETS];
++#define WASM_FS_PATH 256
++#define WASM_FS_CHAIN 9
++struct wasm_fs_link {
++	unsigned int mount;
++	unsigned int ino;
++	unsigned int mode;
++};
++struct wasm_fs_block {
++	unsigned long generation;
++	unsigned long moves;
++	unsigned int buckets[WASM_FS_BUCKETS];
++	char path[WASM_FS_PATH];
++	struct wasm_fs_link chain[WASM_FS_CHAIN];
++};
++extern struct wasm_fs_block wasm_fs_block;
+ extern struct super_block *wasm_fs_root_sb;
++long wasm_fs_chain(unsigned int len);
+ #define wasm_fs_bucket(ino) ((unsigned int)((u32)(ino) * 0x9e3779b1u) >> 20)
+ #define wasm_fs_moved()							\
+ 	do {								\
+-		WRITE_ONCE(wasm_fs_moves, wasm_fs_moves + 1);		\
+-		WRITE_ONCE(wasm_fs_generation, wasm_fs_generation + 1);	\
++		WRITE_ONCE(wasm_fs_block.moves, wasm_fs_block.moves + 1);	\
++		WRITE_ONCE(wasm_fs_block.generation, wasm_fs_block.generation + 1);	\
+ 	} while (0)
+ #define wasm_fs_changed(inode)						\
+ 	do {								\
+@@ -1182,8 +1196,8 @@ extern struct super_block *wasm_fs_root_sb;
+ 		umode_t __m = (inode)->i_mode;				\
+ 		if ((!__sb || (inode)->i_sb == __sb) &&			\
+ 		    (S_ISREG(__m) || S_ISDIR(__m) || S_ISLNK(__m) || !__m)) {	\
+-			wasm_fs_buckets[wasm_fs_bucket((inode)->i_ino)]++;	\
+-			WRITE_ONCE(wasm_fs_generation, wasm_fs_generation + 1);	\
++			wasm_fs_block.buckets[wasm_fs_bucket((inode)->i_ino)]++;	\
++			WRITE_ONCE(wasm_fs_block.generation, wasm_fs_block.generation + 1);	\
+ 		}							\
+ 	} while (0)
+ #else
+-- 
+2.43.0
+

@@ -10,8 +10,8 @@ mkdir -p "$out"
 keep=boot_command_line,init_task,initrd_start,initrd_end,get_user_stack_pointer,get_user_tls_base
 keep+=,ret_from_fork,_start,_start_secondary,raise_exception,wasm_user_work_pending
 keep+=,wasm_user_stack_low,wasm_user_stack_high,wasm_trap_unwound_kernel,wasm_user_interrupt
-keep+=,wasm_owner_table,wasm_current_owner,wasm_current_set,wasm_current_euid,wasm_current_mm,wasm_console_irq,wasm_net_irq
-keep+=,wasm_free_pages,wasm_fs_gen,wasm_fs_gen_at,wasm_fs_view,wasm_current_gens,wasm_restored
+keep+=,wasm_owner_table,wasm_current_owner,wasm_current_set,wasm_current_euid,wasm_current_mm,wasm_console_irq,wasm_console_ring,wasm_console_ring_size,wasm_net_irq
+keep+=,wasm_free_pages,wasm_fs_block,wasm_fs_view,wasm_fs_chain,wasm_current_gens,wasm_restored
 for n in 0 1 2 3 4 5 6; do keep+=",wasm_syscall_$n"; done
 wasm2wat --enable-threads "$in/vmlinux.wasm" -o "$tmp/vmlinux.wat"
 "$root/scripts/ts" "$root/scripts/wasm/strip-exports.ts" "$tmp/vmlinux.wat" "$tmp/vmlinux.min.wat" "$keep"
