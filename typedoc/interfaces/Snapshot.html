@@ -15,7 +15,7 @@
 </div></section>
 <div class="tsd-signature"><span class="tsd-signature-keyword">interface</span> <span class="tsd-kind-interface">Snapshot</span> <span class="tsd-signature-symbol">{</span><br/>    <a class="tsd-kind-property" href="#core">core</a><span class="tsd-signature-symbol">?:</span> <span class="tsd-signature-type">number</span><span class="tsd-signature-symbol">;</span><br/>    <a class="tsd-kind-property" href="#cpuzero">cpuZero</a><span class="tsd-signature-symbol">:</span> <span class="tsd-signature-type">number</span><span class="tsd-signature-symbol">;</span><br/>    <a class="tsd-kind-property" href="#dl">dl</a><span class="tsd-signature-symbol">?:</span> <a href="DlSaved.html" class="tsd-signature-type tsd-kind-interface">DlSaved</a><span class="tsd-signature-symbol">[]</span><span class="tsd-signature-symbol">;</span><br/>    <a class="tsd-kind-property" href="#input">input</a><span class="tsd-signature-symbol">:</span> <span class="tsd-signature-type">number</span><span class="tsd-signature-symbol">[]</span><span class="tsd-signature-symbol">;</span><br/>    <a class="tsd-kind-property" href="#memory">memory</a><span class="tsd-signature-symbol">:</span> <span class="tsd-signature-type">Uint8Array</span><span class="tsd-signature-symbol">;</span><br/>    <a class="tsd-kind-property" href="#now">now</a><span class="tsd-signature-symbol">:</span> <span class="tsd-signature-type">string</span><span class="tsd-signature-symbol">;</span><br/>    <a class="tsd-kind-property" href="#owners">owners</a><span class="tsd-signature-symbol">?:</span> <span class="tsd-signature-type">Uint16Array</span><span class="tsd-signature-symbol">&lt;</span><span class="tsd-signature-type">ArrayBufferLike</span><span class="tsd-signature-symbol">&gt;</span><span class="tsd-signature-symbol">;</span><br/>    <a class="tsd-kind-property" href="#ports">ports</a><span class="tsd-signature-symbol">?:</span> <span class="tsd-signature-type">number</span><span class="tsd-signature-symbol">[]</span><span class="tsd-signature-symbol">;</span><br/>    <a class="tsd-kind-property" href="#ready">ready</a><span class="tsd-signature-symbol">:</span> <span class="tsd-signature-type">number</span><span class="tsd-signature-symbol">[]</span><span class="tsd-signature-symbol">;</span><br/>    <a class="tsd-kind-property" href="#readyat">readyAt</a><span class="tsd-signature-symbol">?:</span> <span class="tsd-signature-type">number</span><span class="tsd-signature-symbol">[]</span><span class="tsd-signature-symbol">;</span><br/>    <a class="tsd-kind-property" href="#runners">runners</a><span class="tsd-signature-symbol">:</span> <a href="SavedRunner.html" class="tsd-signature-type tsd-kind-interface">SavedRunner</a><span class="tsd-signature-symbol">[]</span><span class="tsd-signature-symbol">;</span><br/>    <a class="tsd-kind-property" href="#scratch">scratch</a><span class="tsd-signature-symbol">:</span> <span class="tsd-signature-type">number</span><span class="tsd-signature-symbol">;</span><br/>    <a class="tsd-kind-property" href="#stats">stats</a><span class="tsd-signature-symbol">:</span> <a href="MachineStats.html" class="tsd-signature-type tsd-kind-interface">MachineStats</a><span class="tsd-signature-symbol">;</span><br/>    <a class="tsd-kind-property" href="#syncwrites">syncWrites</a><span class="tsd-signature-symbol">?:</span> <span class="tsd-signature-type">boolean</span><span class="tsd-signature-symbol">;</span><br/>    <a class="tsd-kind-property" href="#version">version</a><span class="tsd-signature-symbol">:</span> <span class="tsd-signature-type">1</span><span class="tsd-signature-symbol">;</span><br/><span class="tsd-signature-symbol">}</span></div><aside class="tsd-sources">
 <ul>
-<li>Defined in <a href="https://github.com/gmitch215/gmux/blob/60f091e2292d0eb1af423a1328bdd2338bbd0dfa/src/worker/machine/machine.ts#L226">machine.ts:226</a></li></ul></aside>
+<li>Defined in <a href="https://github.com/gmitch215/gmux/blob/1e4b0402f61420c014314ec2a7cb446a28f66693/src/worker/machine/machine.ts#L242">machine.ts:242</a></li></ul></aside>
 <section class="tsd-panel-group tsd-index-group">
 <section class="tsd-panel tsd-index-panel">
 <details class="tsd-index-content tsd-accordion" open><summary class="tsd-accordion-summary tsd-index-summary"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" aria-hidden="true"><use href="../assets/icons.svg#icon-chevronDown"></use></svg>
@@ -48,105 +48,105 @@
 <div class="tsd-comment tsd-typography"><p>where the C core's region sat in memory, when the machine ran one</p>
 </div><aside class="tsd-sources">
 <ul>
-<li>Defined in <a href="https://github.com/gmitch215/gmux/blob/60f091e2292d0eb1af423a1328bdd2338bbd0dfa/src/worker/machine/machine.ts#L234">machine.ts:234</a></li></ul></aside></section>
+<li>Defined in <a href="https://github.com/gmitch215/gmux/blob/1e4b0402f61420c014314ec2a7cb446a28f66693/src/worker/machine/machine.ts#L250">machine.ts:250</a></li></ul></aside></section>
 <section class="tsd-panel tsd-member">
 <h3 class="tsd-anchor-link" id="cpuzero"><span>cpu<wbr/>Zero</span><a href="#cpuzero" aria-label="Permalink" class="tsd-anchor-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="../assets/icons.svg#icon-anchor"></use></svg></a></h3>
 <div class="tsd-signature"><span class="tsd-kind-property">cpuZero</span><span class="tsd-signature-symbol">:</span> <span class="tsd-signature-type">number</span></div>
 <div class="tsd-comment tsd-typography"><p>the boot cpu's id</p>
 </div><aside class="tsd-sources">
 <ul>
-<li>Defined in <a href="https://github.com/gmitch215/gmux/blob/60f091e2292d0eb1af423a1328bdd2338bbd0dfa/src/worker/machine/machine.ts#L244">machine.ts:244</a></li></ul></aside></section>
+<li>Defined in <a href="https://github.com/gmitch215/gmux/blob/1e4b0402f61420c014314ec2a7cb446a28f66693/src/worker/machine/machine.ts#L260">machine.ts:260</a></li></ul></aside></section>
 <section class="tsd-panel tsd-member">
 <h3 class="tsd-anchor-link" id="dl"><code class="tsd-tag">Optional</code><span>dl</span><a href="#dl" aria-label="Permalink" class="tsd-anchor-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="../assets/icons.svg#icon-anchor"></use></svg></a></h3>
 <div class="tsd-signature"><span class="tsd-kind-property">dl</span><span class="tsd-signature-symbol">?:</span> <a href="DlSaved.html" class="tsd-signature-type tsd-kind-interface">DlSaved</a><span class="tsd-signature-symbol">[]</span></div>
 <div class="tsd-comment tsd-typography"><p>processes' dlopen'ed side modules</p>
 </div><aside class="tsd-sources">
 <ul>
-<li>Defined in <a href="https://github.com/gmitch215/gmux/blob/60f091e2292d0eb1af423a1328bdd2338bbd0dfa/src/worker/machine/machine.ts#L250">machine.ts:250</a></li></ul></aside></section>
+<li>Defined in <a href="https://github.com/gmitch215/gmux/blob/1e4b0402f61420c014314ec2a7cb446a28f66693/src/worker/machine/machine.ts#L266">machine.ts:266</a></li></ul></aside></section>
 <section class="tsd-panel tsd-member">
 <h3 class="tsd-anchor-link" id="input"><span>input</span><a href="#input" aria-label="Permalink" class="tsd-anchor-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="../assets/icons.svg#icon-anchor"></use></svg></a></h3>
 <div class="tsd-signature"><span class="tsd-kind-property">input</span><span class="tsd-signature-symbol">:</span> <span class="tsd-signature-type">number</span><span class="tsd-signature-symbol">[]</span></div>
 <div class="tsd-comment tsd-typography"><p>console input not yet read</p>
 </div><aside class="tsd-sources">
 <ul>
-<li>Defined in <a href="https://github.com/gmitch215/gmux/blob/60f091e2292d0eb1af423a1328bdd2338bbd0dfa/src/worker/machine/machine.ts#L238">machine.ts:238</a></li></ul></aside></section>
+<li>Defined in <a href="https://github.com/gmitch215/gmux/blob/1e4b0402f61420c014314ec2a7cb446a28f66693/src/worker/machine/machine.ts#L254">machine.ts:254</a></li></ul></aside></section>
 <section class="tsd-panel tsd-member">
 <h3 class="tsd-anchor-link" id="memory"><span>memory</span><a href="#memory" aria-label="Permalink" class="tsd-anchor-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="../assets/icons.svg#icon-anchor"></use></svg></a></h3>
 <div class="tsd-signature"><span class="tsd-kind-property">memory</span><span class="tsd-signature-symbol">:</span> <span class="tsd-signature-type">Uint8Array</span></div>
 <div class="tsd-comment tsd-typography"><p>the machine's linear memory: a view over the live memory until the caller copies it</p>
 </div><aside class="tsd-sources">
 <ul>
-<li>Defined in <a href="https://github.com/gmitch215/gmux/blob/60f091e2292d0eb1af423a1328bdd2338bbd0dfa/src/worker/machine/machine.ts#L230">machine.ts:230</a></li></ul></aside></section>
+<li>Defined in <a href="https://github.com/gmitch215/gmux/blob/1e4b0402f61420c014314ec2a7cb446a28f66693/src/worker/machine/machine.ts#L246">machine.ts:246</a></li></ul></aside></section>
 <section class="tsd-panel tsd-member">
 <h3 class="tsd-anchor-link" id="now"><span>now</span><a href="#now" aria-label="Permalink" class="tsd-anchor-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="../assets/icons.svg#icon-anchor"></use></svg></a></h3>
 <div class="tsd-signature"><span class="tsd-kind-property">now</span><span class="tsd-signature-symbol">:</span> <span class="tsd-signature-type">string</span></div>
 <div class="tsd-comment tsd-typography"><p>the kernel clock at checkpoint, in nanoseconds as a decimal string</p>
 </div><aside class="tsd-sources">
 <ul>
-<li>Defined in <a href="https://github.com/gmitch215/gmux/blob/60f091e2292d0eb1af423a1328bdd2338bbd0dfa/src/worker/machine/machine.ts#L236">machine.ts:236</a></li></ul></aside></section>
+<li>Defined in <a href="https://github.com/gmitch215/gmux/blob/1e4b0402f61420c014314ec2a7cb446a28f66693/src/worker/machine/machine.ts#L252">machine.ts:252</a></li></ul></aside></section>
 <section class="tsd-panel tsd-member">
 <h3 class="tsd-anchor-link" id="owners"><code class="tsd-tag">Optional</code><span>owners</span><a href="#owners" aria-label="Permalink" class="tsd-anchor-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="../assets/icons.svg#icon-anchor"></use></svg></a></h3>
 <div class="tsd-signature"><span class="tsd-kind-property">owners</span><span class="tsd-signature-symbol">?:</span> <span class="tsd-signature-type">Uint16Array</span><span class="tsd-signature-symbol">&lt;</span><span class="tsd-signature-type">ArrayBufferLike</span><span class="tsd-signature-symbol">&gt;</span></div>
 <div class="tsd-comment tsd-typography"><p>the kernel's page owner tags at checkpoint, which a lazy restore defers pages by</p>
 </div><aside class="tsd-sources">
 <ul>
-<li>Defined in <a href="https://github.com/gmitch215/gmux/blob/60f091e2292d0eb1af423a1328bdd2338bbd0dfa/src/worker/machine/machine.ts#L252">machine.ts:252</a></li></ul></aside></section>
+<li>Defined in <a href="https://github.com/gmitch215/gmux/blob/1e4b0402f61420c014314ec2a7cb446a28f66693/src/worker/machine/machine.ts#L268">machine.ts:268</a></li></ul></aside></section>
 <section class="tsd-panel tsd-member">
 <h3 class="tsd-anchor-link" id="ports"><code class="tsd-tag">Optional</code><span>ports</span><a href="#ports" aria-label="Permalink" class="tsd-anchor-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="../assets/icons.svg#icon-anchor"></use></svg></a></h3>
 <div class="tsd-signature"><span class="tsd-kind-property">ports</span><span class="tsd-signature-symbol">?:</span> <span class="tsd-signature-type">number</span><span class="tsd-signature-symbol">[]</span></div>
 <div class="tsd-comment tsd-typography"><p>the ports programs listened on (kernel patch 0031), once per listener</p>
 </div><aside class="tsd-sources">
 <ul>
-<li>Defined in <a href="https://github.com/gmitch215/gmux/blob/60f091e2292d0eb1af423a1328bdd2338bbd0dfa/src/worker/machine/machine.ts#L256">machine.ts:256</a></li></ul></aside></section>
+<li>Defined in <a href="https://github.com/gmitch215/gmux/blob/1e4b0402f61420c014314ec2a7cb446a28f66693/src/worker/machine/machine.ts#L272">machine.ts:272</a></li></ul></aside></section>
 <section class="tsd-panel tsd-member">
 <h3 class="tsd-anchor-link" id="ready"><span>ready</span><a href="#ready" aria-label="Permalink" class="tsd-anchor-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="../assets/icons.svg#icon-anchor"></use></svg></a></h3>
 <div class="tsd-signature"><span class="tsd-kind-property">ready</span><span class="tsd-signature-symbol">:</span> <span class="tsd-signature-type">number</span><span class="tsd-signature-symbol">[]</span></div>
 <div class="tsd-comment tsd-typography"><p>tasks ready to run, in order, by id</p>
 </div><aside class="tsd-sources">
 <ul>
-<li>Defined in <a href="https://github.com/gmitch215/gmux/blob/60f091e2292d0eb1af423a1328bdd2338bbd0dfa/src/worker/machine/machine.ts#L240">machine.ts:240</a></li></ul></aside></section>
+<li>Defined in <a href="https://github.com/gmitch215/gmux/blob/1e4b0402f61420c014314ec2a7cb446a28f66693/src/worker/machine/machine.ts#L256">machine.ts:256</a></li></ul></aside></section>
 <section class="tsd-panel tsd-member">
 <h3 class="tsd-anchor-link" id="readyat"><code class="tsd-tag">Optional</code><span>ready<wbr/>At</span><a href="#readyat" aria-label="Permalink" class="tsd-anchor-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="../assets/icons.svg#icon-anchor"></use></svg></a></h3>
 <div class="tsd-signature"><span class="tsd-kind-property">readyAt</span><span class="tsd-signature-symbol">?:</span> <span class="tsd-signature-type">number</span><span class="tsd-signature-symbol">[]</span></div>
 <div class="tsd-comment tsd-typography"><p>the same, by index into <code>runners</code>: a released task's id may name a newer task</p>
 </div><aside class="tsd-sources">
 <ul>
-<li>Defined in <a href="https://github.com/gmitch215/gmux/blob/60f091e2292d0eb1af423a1328bdd2338bbd0dfa/src/worker/machine/machine.ts#L242">machine.ts:242</a></li></ul></aside></section>
+<li>Defined in <a href="https://github.com/gmitch215/gmux/blob/1e4b0402f61420c014314ec2a7cb446a28f66693/src/worker/machine/machine.ts#L258">machine.ts:258</a></li></ul></aside></section>
 <section class="tsd-panel tsd-member">
 <h3 class="tsd-anchor-link" id="runners"><span>runners</span><a href="#runners" aria-label="Permalink" class="tsd-anchor-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="../assets/icons.svg#icon-anchor"></use></svg></a></h3>
 <div class="tsd-signature"><span class="tsd-kind-property">runners</span><span class="tsd-signature-symbol">:</span> <a href="SavedRunner.html" class="tsd-signature-type tsd-kind-interface">SavedRunner</a><span class="tsd-signature-symbol">[]</span></div>
 <div class="tsd-comment tsd-typography"><p>every task, parked</p>
 </div><aside class="tsd-sources">
 <ul>
-<li>Defined in <a href="https://github.com/gmitch215/gmux/blob/60f091e2292d0eb1af423a1328bdd2338bbd0dfa/src/worker/machine/machine.ts#L246">machine.ts:246</a></li></ul></aside></section>
+<li>Defined in <a href="https://github.com/gmitch215/gmux/blob/1e4b0402f61420c014314ec2a7cb446a28f66693/src/worker/machine/machine.ts#L262">machine.ts:262</a></li></ul></aside></section>
 <section class="tsd-panel tsd-member">
 <h3 class="tsd-anchor-link" id="scratch"><span>scratch</span><a href="#scratch" aria-label="Permalink" class="tsd-anchor-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="../assets/icons.svg#icon-anchor"></use></svg></a></h3>
 <div class="tsd-signature"><span class="tsd-kind-property">scratch</span><span class="tsd-signature-symbol">:</span> <span class="tsd-signature-type">number</span></div>
 <div class="tsd-comment tsd-typography"><p>where the unwind scratch region sat in memory</p>
 </div><aside class="tsd-sources">
 <ul>
-<li>Defined in <a href="https://github.com/gmitch215/gmux/blob/60f091e2292d0eb1af423a1328bdd2338bbd0dfa/src/worker/machine/machine.ts#L232">machine.ts:232</a></li></ul></aside></section>
+<li>Defined in <a href="https://github.com/gmitch215/gmux/blob/1e4b0402f61420c014314ec2a7cb446a28f66693/src/worker/machine/machine.ts#L248">machine.ts:248</a></li></ul></aside></section>
 <section class="tsd-panel tsd-member">
 <h3 class="tsd-anchor-link" id="stats"><span>stats</span><a href="#stats" aria-label="Permalink" class="tsd-anchor-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="../assets/icons.svg#icon-anchor"></use></svg></a></h3>
 <div class="tsd-signature"><span class="tsd-kind-property">stats</span><span class="tsd-signature-symbol">:</span> <a href="MachineStats.html" class="tsd-signature-type tsd-kind-interface">MachineStats</a></div>
 <div class="tsd-comment tsd-typography"><p>the counters at checkpoint</p>
 </div><aside class="tsd-sources">
 <ul>
-<li>Defined in <a href="https://github.com/gmitch215/gmux/blob/60f091e2292d0eb1af423a1328bdd2338bbd0dfa/src/worker/machine/machine.ts#L248">machine.ts:248</a></li></ul></aside></section>
+<li>Defined in <a href="https://github.com/gmitch215/gmux/blob/1e4b0402f61420c014314ec2a7cb446a28f66693/src/worker/machine/machine.ts#L264">machine.ts:264</a></li></ul></aside></section>
 <section class="tsd-panel tsd-member">
 <h3 class="tsd-anchor-link" id="syncwrites"><code class="tsd-tag">Optional</code><span>sync<wbr/>Writes</span><a href="#syncwrites" aria-label="Permalink" class="tsd-anchor-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="../assets/icons.svg#icon-anchor"></use></svg></a></h3>
 <div class="tsd-signature"><span class="tsd-kind-property">syncWrites</span><span class="tsd-signature-symbol">?:</span> <span class="tsd-signature-type">boolean</span></div>
 <div class="tsd-comment tsd-typography"><p>a program had opened a file with O_DSYNC</p>
 </div><aside class="tsd-sources">
 <ul>
-<li>Defined in <a href="https://github.com/gmitch215/gmux/blob/60f091e2292d0eb1af423a1328bdd2338bbd0dfa/src/worker/machine/machine.ts#L254">machine.ts:254</a></li></ul></aside></section>
+<li>Defined in <a href="https://github.com/gmitch215/gmux/blob/1e4b0402f61420c014314ec2a7cb446a28f66693/src/worker/machine/machine.ts#L270">machine.ts:270</a></li></ul></aside></section>
 <section class="tsd-panel tsd-member">
 <h3 class="tsd-anchor-link" id="version"><span>version</span><a href="#version" aria-label="Permalink" class="tsd-anchor-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="../assets/icons.svg#icon-anchor"></use></svg></a></h3>
 <div class="tsd-signature"><span class="tsd-kind-property">version</span><span class="tsd-signature-symbol">:</span> <span class="tsd-signature-type">1</span></div>
 <div class="tsd-comment tsd-typography"><p>the snapshot format</p>
 </div><aside class="tsd-sources">
 <ul>
-<li>Defined in <a href="https://github.com/gmitch215/gmux/blob/60f091e2292d0eb1af423a1328bdd2338bbd0dfa/src/worker/machine/machine.ts#L228">machine.ts:228</a></li></ul></aside></section></section></details></div>
+<li>Defined in <a href="https://github.com/gmitch215/gmux/blob/1e4b0402f61420c014314ec2a7cb446a28f66693/src/worker/machine/machine.ts#L244">machine.ts:244</a></li></ul></aside></section></section></details></div>
 <div class="col-sidebar">
 <div class="page-menu">
 <div class="tsd-navigation settings">

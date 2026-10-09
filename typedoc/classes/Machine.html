@@ -18,7 +18,7 @@ through <code>WebAssembly.promising</code>, so a pump can run exactly one task a
 resolving the task the kernel names next.</p>
 </div></section><aside class="tsd-sources">
 <ul>
-<li>Defined in <a href="https://github.com/gmitch215/gmux/blob/60f091e2292d0eb1af423a1328bdd2338bbd0dfa/src/worker/machine/machine.ts#L650">machine.ts:650</a></li></ul></aside>
+<li>Defined in <a href="https://github.com/gmitch215/gmux/blob/1e4b0402f61420c014314ec2a7cb446a28f66693/src/worker/machine/machine.ts#L771">machine.ts:771</a></li></ul></aside>
 <section class="tsd-panel-group tsd-index-group">
 <section class="tsd-panel tsd-index-panel">
 <details class="tsd-index-content tsd-accordion" open><summary class="tsd-accordion-summary tsd-index-summary"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" aria-hidden="true"><use href="../assets/icons.svg#icon-chevronDown"></use></svg>
@@ -38,6 +38,7 @@ resolving the task the kernel names next.</p>
 <section class="tsd-index-section">
 <h3 class="tsd-index-heading tsd-anchor-link" id="accessors">Accessors<a href="#accessors" aria-label="Permalink" class="tsd-anchor-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="../assets/icons.svg#icon-anchor"></use></svg></a></h3>
 <div class="tsd-index-list"><a href="#clockns" class="tsd-index-link"><svg class="tsd-kind-icon" viewBox="0 0 24 24" aria-label="Accessor"><use href="../assets/icons.svg#icon-262144"></use></svg><span>clock<wbr/>Ns</span></a>
+<a href="#corescheduling" class="tsd-index-link"><svg class="tsd-kind-icon" viewBox="0 0 24 24" aria-label="Accessor"><use href="../assets/icons.svg#icon-262144"></use></svg><span>core<wbr/>Scheduling</span></a>
 <a href="#deadline" class="tsd-index-link"><svg class="tsd-kind-icon" viewBox="0 0 24 24" aria-label="Accessor"><use href="../assets/icons.svg#icon-262144"></use></svg><span>deadline</span></a>
 <a href="#netactivity" class="tsd-index-link"><svg class="tsd-kind-icon" viewBox="0 0 24 24" aria-label="Accessor"><use href="../assets/icons.svg#icon-262144"></use></svg><span>net<wbr/>Activity</span></a>
 <a href="#openstreams" class="tsd-index-link"><svg class="tsd-kind-icon" viewBox="0 0 24 24" aria-label="Accessor"><use href="../assets/icons.svg#icon-262144"></use></svg><span>open<wbr/>Streams</span></a>
@@ -74,7 +75,7 @@ pages</p>
 <li><span><span class="tsd-kind-parameter">keep</span>: <span class="tsd-signature-type">boolean</span><span class="tsd-signature-symbol"> = false</span></span></li></ul></div>
 <h4 class="tsd-returns-title">Returns <a href="" class="tsd-signature-type tsd-kind-class">Machine</a></h4><aside class="tsd-sources">
 <ul>
-<li>Defined in <a href="https://github.com/gmitch215/gmux/blob/60f091e2292d0eb1af423a1328bdd2338bbd0dfa/src/worker/machine/machine.ts#L745">machine.ts:745</a></li></ul></aside></div></li></ul></section></section></details>
+<li>Defined in <a href="https://github.com/gmitch215/gmux/blob/1e4b0402f61420c014314ec2a7cb446a28f66693/src/worker/machine/machine.ts#L878">machine.ts:878</a></li></ul></aside></div></li></ul></section></section></details>
 <details class="tsd-panel-group tsd-member-group tsd-accordion" open><summary class="tsd-accordion-summary" data-key="section-Properties"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" aria-hidden="true"><use href="../assets/icons.svg#icon-chevronDown"></use></svg>
 <h2 class="tsd-anchor-link" id="properties-1">Properties<a href="#properties-1" aria-label="Permalink" class="tsd-anchor-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="../assets/icons.svg#icon-anchor"></use></svg></a></h2></summary>
 <section>
@@ -84,28 +85,28 @@ pages</p>
 <div class="tsd-comment tsd-typography"><p>the error that stopped the machine, if one did</p>
 </div><aside class="tsd-sources">
 <ul>
-<li>Defined in <a href="https://github.com/gmitch215/gmux/blob/60f091e2292d0eb1af423a1328bdd2338bbd0dfa/src/worker/machine/machine.ts#L717">machine.ts:717</a></li></ul></aside></section>
+<li>Defined in <a href="https://github.com/gmitch215/gmux/blob/1e4b0402f61420c014314ec2a7cb446a28f66693/src/worker/machine/machine.ts#L848">machine.ts:848</a></li></ul></aside></section>
 <section class="tsd-panel tsd-member">
 <h3 class="tsd-anchor-link" id="halted"><span>halted</span><a href="#halted" aria-label="Permalink" class="tsd-anchor-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="../assets/icons.svg#icon-anchor"></use></svg></a></h3>
 <div class="tsd-signature"><span class="tsd-kind-property">halted</span><span class="tsd-signature-symbol">:</span> <span class="tsd-signature-type">boolean</span><span class="tsd-signature-symbol"> = false</span></div>
 <div class="tsd-comment tsd-typography"><p>whether the kernel halted (<code>reboot</code>, <code>poweroff</code>)</p>
 </div><aside class="tsd-sources">
 <ul>
-<li>Defined in <a href="https://github.com/gmitch215/gmux/blob/60f091e2292d0eb1af423a1328bdd2338bbd0dfa/src/worker/machine/machine.ts#L715">machine.ts:715</a></li></ul></aside></section>
+<li>Defined in <a href="https://github.com/gmitch215/gmux/blob/1e4b0402f61420c014314ec2a7cb446a28f66693/src/worker/machine/machine.ts#L846">machine.ts:846</a></li></ul></aside></section>
 <section class="tsd-panel tsd-member">
 <h3 class="tsd-anchor-link" id="memory"><code class="tsd-tag">Readonly</code><span>memory</span><a href="#memory" aria-label="Permalink" class="tsd-anchor-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="../assets/icons.svg#icon-anchor"></use></svg></a></h3>
 <div class="tsd-signature"><span class="tsd-kind-property">memory</span><span class="tsd-signature-symbol">:</span> <span class="tsd-signature-type">Memory</span></div>
 <div class="tsd-comment tsd-typography"><p>the one memory the kernel and every process share</p>
 </div><aside class="tsd-sources">
 <ul>
-<li>Defined in <a href="https://github.com/gmitch215/gmux/blob/60f091e2292d0eb1af423a1328bdd2338bbd0dfa/src/worker/machine/machine.ts#L652">machine.ts:652</a></li></ul></aside></section>
+<li>Defined in <a href="https://github.com/gmitch215/gmux/blob/1e4b0402f61420c014314ec2a7cb446a28f66693/src/worker/machine/machine.ts#L773">machine.ts:773</a></li></ul></aside></section>
 <section class="tsd-panel tsd-member">
 <h3 class="tsd-anchor-link" id="stats"><code class="tsd-tag">Readonly</code><span>stats</span><a href="#stats" aria-label="Permalink" class="tsd-anchor-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="../assets/icons.svg#icon-anchor"></use></svg></a></h3>
 <div class="tsd-signature"><span class="tsd-kind-property">stats</span><span class="tsd-signature-symbol">:</span> <a href="../interfaces/MachineStats.html" class="tsd-signature-type tsd-kind-interface">MachineStats</a><span class="tsd-signature-symbol"> = ...</span></div>
 <div class="tsd-comment tsd-typography"><p>counters, updated as the machine runs</p>
 </div><aside class="tsd-sources">
 <ul>
-<li>Defined in <a href="https://github.com/gmitch215/gmux/blob/60f091e2292d0eb1af423a1328bdd2338bbd0dfa/src/worker/machine/machine.ts#L661">machine.ts:661</a></li></ul></aside></section></section></details>
+<li>Defined in <a href="https://github.com/gmitch215/gmux/blob/1e4b0402f61420c014314ec2a7cb446a28f66693/src/worker/machine/machine.ts#L782">machine.ts:782</a></li></ul></aside></section></section></details>
 <details class="tsd-panel-group tsd-member-group tsd-accordion" open><summary class="tsd-accordion-summary" data-key="section-Accessors"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" aria-hidden="true"><use href="../assets/icons.svg#icon-chevronDown"></use></svg>
 <h2 class="tsd-anchor-link" id="accessors-1">Accessors<a href="#accessors-1" aria-label="Permalink" class="tsd-anchor-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="../assets/icons.svg#icon-anchor"></use></svg></a></h2></summary>
 <section>
@@ -119,7 +120,18 @@ pages</p>
 </div>
 <h4 class="tsd-returns-title">Returns <span class="tsd-signature-type">bigint</span></h4><aside class="tsd-sources">
 <ul>
-<li>Defined in <a href="https://github.com/gmitch215/gmux/blob/60f091e2292d0eb1af423a1328bdd2338bbd0dfa/src/worker/machine/machine.ts#L809">machine.ts:809</a></li></ul></aside></div></li></ul></section>
+<li>Defined in <a href="https://github.com/gmitch215/gmux/blob/1e4b0402f61420c014314ec2a7cb446a28f66693/src/worker/machine/machine.ts#L947">machine.ts:947</a></li></ul></aside></div></li></ul></section>
+<section class="tsd-panel tsd-member">
+<h3 class="tsd-anchor-link" id="corescheduling"><span>core<wbr/>Scheduling</span><a href="#corescheduling" aria-label="Permalink" class="tsd-anchor-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="../assets/icons.svg#icon-anchor"></use></svg></a></h3>
+<ul class="tsd-signatures">
+<li>
+<div class="tsd-signature" id="coreschedulingcorescheduling"><span class="tsd-signature-keyword">get</span> <span class="tsd-kind-get-signature">coreScheduling</span><span class="tsd-signature-symbol">()</span><span class="tsd-signature-symbol">:</span> <span class="tsd-signature-type">boolean</span></div>
+<div class="tsd-description">
+<div class="tsd-comment tsd-typography"><p>whether the C scheduler core picks the tasks (else the TypeScript tables do)</p>
+</div>
+<h4 class="tsd-returns-title">Returns <span class="tsd-signature-type">boolean</span></h4><aside class="tsd-sources">
+<ul>
+<li>Defined in <a href="https://github.com/gmitch215/gmux/blob/1e4b0402f61420c014314ec2a7cb446a28f66693/src/worker/machine/machine.ts#L932">machine.ts:932</a></li></ul></aside></div></li></ul></section>
 <section class="tsd-panel tsd-member">
 <h3 class="tsd-anchor-link" id="deadline"><span>deadline</span><a href="#deadline" aria-label="Permalink" class="tsd-anchor-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="../assets/icons.svg#icon-anchor"></use></svg></a></h3>
 <ul class="tsd-signatures">
@@ -130,7 +142,7 @@ pages</p>
 </div>
 <h4 class="tsd-returns-title">Returns <span class="tsd-signature-type">bigint</span> <span class="tsd-signature-symbol">|</span> <span class="tsd-signature-type">null</span></h4><aside class="tsd-sources">
 <ul>
-<li>Defined in <a href="https://github.com/gmitch215/gmux/blob/60f091e2292d0eb1af423a1328bdd2338bbd0dfa/src/worker/machine/machine.ts#L804">machine.ts:804</a></li></ul></aside></div></li></ul></section>
+<li>Defined in <a href="https://github.com/gmitch215/gmux/blob/1e4b0402f61420c014314ec2a7cb446a28f66693/src/worker/machine/machine.ts#L942">machine.ts:942</a></li></ul></aside></div></li></ul></section>
 <section class="tsd-panel tsd-member">
 <h3 class="tsd-anchor-link" id="netactivity"><span>net<wbr/>Activity</span><a href="#netactivity" aria-label="Permalink" class="tsd-anchor-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="../assets/icons.svg#icon-anchor"></use></svg></a></h3>
 <ul class="tsd-signatures">
@@ -141,7 +153,7 @@ pages</p>
 </div>
 <h4 class="tsd-returns-title">Returns <span class="tsd-signature-type">number</span></h4><aside class="tsd-sources">
 <ul>
-<li>Defined in <a href="https://github.com/gmitch215/gmux/blob/60f091e2292d0eb1af423a1328bdd2338bbd0dfa/src/worker/machine/machine.ts#L3333">machine.ts:3333</a></li></ul></aside></div></li></ul></section>
+<li>Defined in <a href="https://github.com/gmitch215/gmux/blob/1e4b0402f61420c014314ec2a7cb446a28f66693/src/worker/machine/machine.ts#L3600">machine.ts:3600</a></li></ul></aside></div></li></ul></section>
 <section class="tsd-panel tsd-member">
 <h3 class="tsd-anchor-link" id="openstreams"><span>open<wbr/>Streams</span><a href="#openstreams" aria-label="Permalink" class="tsd-anchor-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="../assets/icons.svg#icon-anchor"></use></svg></a></h3>
 <ul class="tsd-signatures">
@@ -152,7 +164,7 @@ pages</p>
 </div>
 <h4 class="tsd-returns-title">Returns <span class="tsd-signature-type">number</span></h4><aside class="tsd-sources">
 <ul>
-<li>Defined in <a href="https://github.com/gmitch215/gmux/blob/60f091e2292d0eb1af423a1328bdd2338bbd0dfa/src/worker/machine/machine.ts#L3343">machine.ts:3343</a></li></ul></aside></div></li></ul></section>
+<li>Defined in <a href="https://github.com/gmitch215/gmux/blob/1e4b0402f61420c014314ec2a7cb446a28f66693/src/worker/machine/machine.ts#L3610">machine.ts:3610</a></li></ul></aside></div></li></ul></section>
 <section class="tsd-panel tsd-member">
 <h3 class="tsd-anchor-link" id="runnable"><span>runnable</span><a href="#runnable" aria-label="Permalink" class="tsd-anchor-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="../assets/icons.svg#icon-anchor"></use></svg></a></h3>
 <ul class="tsd-signatures">
@@ -163,7 +175,7 @@ pages</p>
 </div>
 <h4 class="tsd-returns-title">Returns <span class="tsd-signature-type">boolean</span></h4><aside class="tsd-sources">
 <ul>
-<li>Defined in <a href="https://github.com/gmitch215/gmux/blob/60f091e2292d0eb1af423a1328bdd2338bbd0dfa/src/worker/machine/machine.ts#L799">machine.ts:799</a></li></ul></aside></div></li></ul></section></section></details>
+<li>Defined in <a href="https://github.com/gmitch215/gmux/blob/1e4b0402f61420c014314ec2a7cb446a28f66693/src/worker/machine/machine.ts#L937">machine.ts:937</a></li></ul></aside></div></li></ul></section></section></details>
 <details class="tsd-panel-group tsd-member-group tsd-accordion" open><summary class="tsd-accordion-summary" data-key="section-Methods"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" aria-hidden="true"><use href="../assets/icons.svg#icon-chevronDown"></use></svg>
 <h2 class="tsd-anchor-link" id="methods-1">Methods<a href="#methods-1" aria-label="Permalink" class="tsd-anchor-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="../assets/icons.svg#icon-anchor"></use></svg></a></h2></summary>
 <section>
@@ -179,7 +191,7 @@ machine's memory, not a copy, so a caller persists it before dropping the machin
 </div>
 <h4 class="tsd-returns-title">Returns <span class="tsd-signature-type">Promise</span><span class="tsd-signature-symbol">&lt;</span><a href="../interfaces/Snapshot.html" class="tsd-signature-type tsd-kind-interface">Snapshot</a><span class="tsd-signature-symbol">&gt;</span></h4><aside class="tsd-sources">
 <ul>
-<li>Defined in <a href="https://github.com/gmitch215/gmux/blob/60f091e2292d0eb1af423a1328bdd2338bbd0dfa/src/worker/machine/machine.ts#L2921">machine.ts:2921</a></li></ul></aside></div></li></ul></section>
+<li>Defined in <a href="https://github.com/gmitch215/gmux/blob/1e4b0402f61420c014314ec2a7cb446a28f66693/src/worker/machine/machine.ts#L3185">machine.ts:3185</a></li></ul></aside></div></li></ul></section>
 <section class="tsd-panel tsd-member">
 <h3 class="tsd-anchor-link" id="ingress"><span>ingress</span><a href="#ingress" aria-label="Permalink" class="tsd-anchor-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="../assets/icons.svg#icon-anchor"></use></svg></a></h3>
 <ul class="tsd-signatures">
@@ -195,7 +207,7 @@ program accepts an ordinary connection. Throws when nothing listens there</p>
 <li><span><span class="tsd-kind-parameter">port</span>: <span class="tsd-signature-type">number</span></span></li></ul></div>
 <h4 class="tsd-returns-title">Returns <span class="tsd-signature-type">IngressStream</span></h4><aside class="tsd-sources">
 <ul>
-<li>Defined in <a href="https://github.com/gmitch215/gmux/blob/60f091e2292d0eb1af423a1328bdd2338bbd0dfa/src/worker/machine/machine.ts#L3356">machine.ts:3356</a></li></ul></aside></div></li></ul></section>
+<li>Defined in <a href="https://github.com/gmitch215/gmux/blob/1e4b0402f61420c014314ec2a7cb446a28f66693/src/worker/machine/machine.ts#L3623">machine.ts:3623</a></li></ul></aside></div></li></ul></section>
 <section class="tsd-panel tsd-member">
 <h3 class="tsd-anchor-link" id="listening"><span>listening</span><a href="#listening" aria-label="Permalink" class="tsd-anchor-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="../assets/icons.svg#icon-anchor"></use></svg></a></h3>
 <ul class="tsd-signatures">
@@ -210,7 +222,7 @@ program accepts an ordinary connection. Throws when nothing listens there</p>
 <li><span><span class="tsd-kind-parameter">port</span>: <span class="tsd-signature-type">number</span></span></li></ul></div>
 <h4 class="tsd-returns-title">Returns <span class="tsd-signature-type">boolean</span></h4><aside class="tsd-sources">
 <ul>
-<li>Defined in <a href="https://github.com/gmitch215/gmux/blob/60f091e2292d0eb1af423a1328bdd2338bbd0dfa/src/worker/machine/machine.ts#L3348">machine.ts:3348</a></li></ul></aside></div></li></ul></section>
+<li>Defined in <a href="https://github.com/gmitch215/gmux/blob/1e4b0402f61420c014314ec2a7cb446a28f66693/src/worker/machine/machine.ts#L3615">machine.ts:3615</a></li></ul></aside></div></li></ul></section>
 <section class="tsd-panel tsd-member">
 <h3 class="tsd-anchor-link" id="netpoll"><span>net<wbr/>Poll</span><a href="#netpoll" aria-label="Permalink" class="tsd-anchor-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="../assets/icons.svg#icon-anchor"></use></svg></a></h3>
 <ul class="tsd-signatures">
@@ -221,7 +233,7 @@ program accepts an ordinary connection. Throws when nothing listens there</p>
 </div>
 <h4 class="tsd-returns-title">Returns <span class="tsd-signature-type">void</span></h4><aside class="tsd-sources">
 <ul>
-<li>Defined in <a href="https://github.com/gmitch215/gmux/blob/60f091e2292d0eb1af423a1328bdd2338bbd0dfa/src/worker/machine/machine.ts#L3338">machine.ts:3338</a></li></ul></aside></div></li></ul></section>
+<li>Defined in <a href="https://github.com/gmitch215/gmux/blob/1e4b0402f61420c014314ec2a7cb446a28f66693/src/worker/machine/machine.ts#L3605">machine.ts:3605</a></li></ul></aside></div></li></ul></section>
 <section class="tsd-panel tsd-member">
 <h3 class="tsd-anchor-link" id="run"><span>run</span><a href="#run" aria-label="Permalink" class="tsd-anchor-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="../assets/icons.svg#icon-anchor"></use></svg></a></h3>
 <ul class="tsd-signatures">
@@ -239,7 +251,7 @@ program accepts an ordinary connection. Throws when nothing listens there</p>
 <li><span><span class="tsd-kind-parameter">budget</span>: <span class="tsd-signature-type">number</span><span class="tsd-signature-symbol"> = Infinity</span></span></li></ul></div>
 <h4 class="tsd-returns-title">Returns <span class="tsd-signature-type">Promise</span><span class="tsd-signature-symbol">&lt;</span><span class="tsd-signature-type">string</span><span class="tsd-signature-symbol">&gt;</span></h4><aside class="tsd-sources">
 <ul>
-<li>Defined in <a href="https://github.com/gmitch215/gmux/blob/60f091e2292d0eb1af423a1328bdd2338bbd0dfa/src/worker/machine/machine.ts#L3529">machine.ts:3529</a></li></ul></aside></div></li></ul></section>
+<li>Defined in <a href="https://github.com/gmitch215/gmux/blob/1e4b0402f61420c014314ec2a7cb446a28f66693/src/worker/machine/machine.ts#L3796">machine.ts:3796</a></li></ul></aside></div></li></ul></section>
 <section class="tsd-panel tsd-member">
 <h3 class="tsd-anchor-link" id="type"><span>type</span><a href="#type" aria-label="Permalink" class="tsd-anchor-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="../assets/icons.svg#icon-anchor"></use></svg></a></h3>
 <ul class="tsd-signatures">
@@ -255,7 +267,7 @@ kernel</p>
 <li><span><span class="tsd-kind-parameter">text</span>: <span class="tsd-signature-type">string</span></span></li></ul></div>
 <h4 class="tsd-returns-title">Returns <span class="tsd-signature-type">void</span></h4><aside class="tsd-sources">
 <ul>
-<li>Defined in <a href="https://github.com/gmitch215/gmux/blob/60f091e2292d0eb1af423a1328bdd2338bbd0dfa/src/worker/machine/machine.ts#L3310">machine.ts:3310</a></li></ul></aside></div></li></ul></section>
+<li>Defined in <a href="https://github.com/gmitch215/gmux/blob/1e4b0402f61420c014314ec2a7cb446a28f66693/src/worker/machine/machine.ts#L3577">machine.ts:3577</a></li></ul></aside></div></li></ul></section>
 <section class="tsd-panel tsd-member">
 <h3 class="tsd-anchor-link" id="restore"><code class="tsd-tag">Static</code><span>restore</span><a href="#restore" aria-label="Permalink" class="tsd-anchor-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="../assets/icons.svg#icon-anchor"></use></svg></a></h3>
 <ul class="tsd-signatures">
@@ -275,7 +287,7 @@ a large machine never needs a second full copy of itself to restore</p>
 <li><span><code class="tsd-tag">Optional</code><span class="tsd-kind-parameter">lazy</span>: <span class="tsd-signature-symbol">{</span><br/>    <span class="tsd-kind-property">byteLength</span><span class="tsd-signature-symbol">:</span> <span class="tsd-signature-type">number</span><span class="tsd-signature-symbol">;</span><br/>    <span class="tsd-kind-call-signature">read</span><span class="tsd-signature-symbol">(</span><br/>        <span class="tsd-kind-parameter">start</span><span class="tsd-signature-symbol">:</span> <span class="tsd-signature-type">number</span><span class="tsd-signature-symbol">,</span><br/>        <span class="tsd-kind-parameter">end</span><span class="tsd-signature-symbol">:</span> <span class="tsd-signature-type">number</span><span class="tsd-signature-symbol">,</span><br/>    <span class="tsd-signature-symbol">)</span><span class="tsd-signature-symbol">:</span> <span class="tsd-signature-type">Uint8Array</span><span class="tsd-signature-symbol">&lt;</span><span class="tsd-signature-type">ArrayBufferLike</span><span class="tsd-signature-symbol">&gt;</span> <span class="tsd-signature-symbol">|</span> <span class="tsd-signature-type">Promise</span><span class="tsd-signature-symbol">&lt;</span><span class="tsd-signature-type">Uint8Array</span><span class="tsd-signature-symbol">&lt;</span><span class="tsd-signature-type">ArrayBufferLike</span><span class="tsd-signature-symbol">&gt;</span><span class="tsd-signature-symbol">&gt;</span><span class="tsd-signature-symbol">;</span><br/><span class="tsd-signature-symbol">}</span></span></li></ul></div>
 <h4 class="tsd-returns-title">Returns <span class="tsd-signature-type">Promise</span><span class="tsd-signature-symbol">&lt;</span><a href="" class="tsd-signature-type tsd-kind-class">Machine</a><span class="tsd-signature-symbol">&gt;</span></h4><aside class="tsd-sources">
 <ul>
-<li>Defined in <a href="https://github.com/gmitch215/gmux/blob/60f091e2292d0eb1af423a1328bdd2338bbd0dfa/src/worker/machine/machine.ts#L3095">machine.ts:3095</a></li></ul></aside></div></li></ul></section>
+<li>Defined in <a href="https://github.com/gmitch215/gmux/blob/1e4b0402f61420c014314ec2a7cb446a28f66693/src/worker/machine/machine.ts#L3364">machine.ts:3364</a></li></ul></aside></div></li></ul></section>
 <section class="tsd-panel tsd-member">
 <h3 class="tsd-anchor-link" id="resume"><code class="tsd-tag">Static</code><span>resume</span><a href="#resume" aria-label="Permalink" class="tsd-anchor-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="../assets/icons.svg#icon-anchor"></use></svg></a></h3>
 <ul class="tsd-signatures">
@@ -293,7 +305,7 @@ read back</p>
 <li><span><span class="tsd-kind-parameter">snapshot</span>: <a href="../interfaces/Snapshot.html" class="tsd-signature-type tsd-kind-interface">Snapshot</a></span></li></ul></div>
 <h4 class="tsd-returns-title">Returns <span class="tsd-signature-type">Promise</span><span class="tsd-signature-symbol">&lt;</span><a href="" class="tsd-signature-type tsd-kind-class">Machine</a><span class="tsd-signature-symbol">&gt;</span></h4><aside class="tsd-sources">
 <ul>
-<li>Defined in <a href="https://github.com/gmitch215/gmux/blob/60f091e2292d0eb1af423a1328bdd2338bbd0dfa/src/worker/machine/machine.ts#L3112">machine.ts:3112</a></li></ul></aside></div></li></ul></section></section></details></div>
+<li>Defined in <a href="https://github.com/gmitch215/gmux/blob/1e4b0402f61420c014314ec2a7cb446a28f66693/src/worker/machine/machine.ts#L3381">machine.ts:3381</a></li></ul></aside></div></li></ul></section></section></details></div>
 <div class="col-sidebar">
 <div class="page-menu">
 <div class="tsd-navigation settings">
@@ -314,7 +326,7 @@ read back</p>
 <details open class="tsd-accordion tsd-page-navigation-section"><summary class="tsd-accordion-summary" data-key="section-Properties"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" aria-hidden="true"><use href="../assets/icons.svg#icon-chevronDown"></use></svg>Properties</summary>
 <div><a href="#crashed"><svg class="tsd-kind-icon" viewBox="0 0 24 24" aria-label="Property"><use href="../assets/icons.svg#icon-1024"></use></svg><span>crashed</span></a><a href="#halted"><svg class="tsd-kind-icon" viewBox="0 0 24 24" aria-label="Property"><use href="../assets/icons.svg#icon-1024"></use></svg><span>halted</span></a><a href="#memory"><svg class="tsd-kind-icon" viewBox="0 0 24 24" aria-label="Property"><use href="../assets/icons.svg#icon-1024"></use></svg><span>memory</span></a><a href="#stats"><svg class="tsd-kind-icon" viewBox="0 0 24 24" aria-label="Property"><use href="../assets/icons.svg#icon-1024"></use></svg><span>stats</span></a></div></details>
 <details open class="tsd-accordion tsd-page-navigation-section"><summary class="tsd-accordion-summary" data-key="section-Accessors"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" aria-hidden="true"><use href="../assets/icons.svg#icon-chevronDown"></use></svg>Accessors</summary>
-<div><a href="#clockns"><svg class="tsd-kind-icon" viewBox="0 0 24 24" aria-label="Accessor"><use href="../assets/icons.svg#icon-262144"></use></svg><span>clock<wbr/>Ns</span></a><a href="#deadline"><svg class="tsd-kind-icon" viewBox="0 0 24 24" aria-label="Accessor"><use href="../assets/icons.svg#icon-262144"></use></svg><span>deadline</span></a><a href="#netactivity"><svg class="tsd-kind-icon" viewBox="0 0 24 24" aria-label="Accessor"><use href="../assets/icons.svg#icon-262144"></use></svg><span>net<wbr/>Activity</span></a><a href="#openstreams"><svg class="tsd-kind-icon" viewBox="0 0 24 24" aria-label="Accessor"><use href="../assets/icons.svg#icon-262144"></use></svg><span>open<wbr/>Streams</span></a><a href="#runnable"><svg class="tsd-kind-icon" viewBox="0 0 24 24" aria-label="Accessor"><use href="../assets/icons.svg#icon-262144"></use></svg><span>runnable</span></a></div></details>
+<div><a href="#clockns"><svg class="tsd-kind-icon" viewBox="0 0 24 24" aria-label="Accessor"><use href="../assets/icons.svg#icon-262144"></use></svg><span>clock<wbr/>Ns</span></a><a href="#corescheduling"><svg class="tsd-kind-icon" viewBox="0 0 24 24" aria-label="Accessor"><use href="../assets/icons.svg#icon-262144"></use></svg><span>core<wbr/>Scheduling</span></a><a href="#deadline"><svg class="tsd-kind-icon" viewBox="0 0 24 24" aria-label="Accessor"><use href="../assets/icons.svg#icon-262144"></use></svg><span>deadline</span></a><a href="#netactivity"><svg class="tsd-kind-icon" viewBox="0 0 24 24" aria-label="Accessor"><use href="../assets/icons.svg#icon-262144"></use></svg><span>net<wbr/>Activity</span></a><a href="#openstreams"><svg class="tsd-kind-icon" viewBox="0 0 24 24" aria-label="Accessor"><use href="../assets/icons.svg#icon-262144"></use></svg><span>open<wbr/>Streams</span></a><a href="#runnable"><svg class="tsd-kind-icon" viewBox="0 0 24 24" aria-label="Accessor"><use href="../assets/icons.svg#icon-262144"></use></svg><span>runnable</span></a></div></details>
 <details open class="tsd-accordion tsd-page-navigation-section"><summary class="tsd-accordion-summary" data-key="section-Methods"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" aria-hidden="true"><use href="../assets/icons.svg#icon-chevronDown"></use></svg>Methods</summary>
 <div><a href="#checkpoint"><svg class="tsd-kind-icon" viewBox="0 0 24 24" aria-label="Method"><use href="../assets/icons.svg#icon-2048"></use></svg><span>checkpoint</span></a><a href="#ingress"><svg class="tsd-kind-icon" viewBox="0 0 24 24" aria-label="Method"><use href="../assets/icons.svg#icon-2048"></use></svg><span>ingress</span></a><a href="#listening"><svg class="tsd-kind-icon" viewBox="0 0 24 24" aria-label="Method"><use href="../assets/icons.svg#icon-2048"></use></svg><span>listening</span></a><a href="#netpoll"><svg class="tsd-kind-icon" viewBox="0 0 24 24" aria-label="Method"><use href="../assets/icons.svg#icon-2048"></use></svg><span>net<wbr/>Poll</span></a><a href="#run"><svg class="tsd-kind-icon" viewBox="0 0 24 24" aria-label="Method"><use href="../assets/icons.svg#icon-2048"></use></svg><span>run</span></a><a href="#type"><svg class="tsd-kind-icon" viewBox="0 0 24 24" aria-label="Method"><use href="../assets/icons.svg#icon-2048"></use></svg><span>type</span></a><a href="#restore"><svg class="tsd-kind-icon" viewBox="0 0 24 24" aria-label="Method"><use href="../assets/icons.svg#icon-2048"></use></svg><span>restore</span></a><a href="#resume"><svg class="tsd-kind-icon" viewBox="0 0 24 24" aria-label="Method"><use href="../assets/icons.svg#icon-2048"></use></svg><span>resume</span></a></div></details></div></details></div>
 <div class="site-menu">

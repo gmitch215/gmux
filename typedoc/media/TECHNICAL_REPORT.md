@@ -46,6 +46,11 @@ frames for user programs, paid only when a machine leaves memory.
 | Package census | **24 programs and 7 libraries** of 48 recipes build and link cleanly | `scripts/census.sh`, paisley-park |
 | Unchanged amd64 BusyBox, coreutils, bash, sqlite3 and curl under Katybug | **117 of 117** transcript lines equal native x86-64 Linux, inside a machine; 31,725-case instruction corpus equal | `tests/c/katybug/`, paisley-park reference |
 | `fork` from an unmodified C program | **5 of 5** cases, including a forking server whose handlers fork again; deployed | `tests/c/fork.c`, Free |
+| Coreutils hash tools under Katybug against native coreutils, 512 MiB | **1.02-1.08x** natively and **1.28-1.51x** in a machine under V8 (md5, sha1, sha256, sha512); `cksum` 4.67x and 5.43x | wall time over native, 5 samples a cell, paisley-park |
+| zlib's calls through Katybug in a machine, 4 MiB corpus and 32 MiB streams | one-shot calls **1.02-2.15x** native against 71-322x with the kernels off; streams **1.50-1.78x**, 46.6-68.8 times faster than with the kernels off | wall time, node V8, paisley-park |
+| Whole-program lifted regions, Katybug under V8 | gzip **7.60x** native, bzip2 13.86x, sqlite 20.12x, bash 77.40x (74% lifted) | wall time over native, paisley-park |
+| statx hit, forced miss | **36 ns** and **4,387 ns** (58 and 8,106 before) | `experiments/syscall-cost`, paisley-park |
+| Process start in the host | busy samples **-57.4%** (configure-shaped run) and **-64.8%** (fork and exec) with a finished process's instance reused | profile samples, `experiments/instances`, paisley-park |
 
 ### What Decides the Design
 
@@ -88,11 +93,13 @@ Root processes share one trust domain; non-root processes are isolated for reads
 (Isolation, below), at the cost measured there. A non-root process cannot fork (`ENOSYS`), and a
 forked child copies its parent's memory eagerly, so a shared mapping across `fork` is a copy.
 Checkpoints do not save shared instances or a fork child's own memory. The deployed machine has
-run the whole kernel patch set (30 patches) on Free: the smoke start and the 13 probes of the boot
-rig pass there, but a first start of the shipped bootstrap image prints an RCU stall dump (4 of 4
-deployments, see Checkpoints), and coreutils at 800 pages passes 2 of its first 140 tests (302 of
-516 with a 32-cpu patch that is not installed). Serving has a measurement (Serving a Guest's HTTP)
-but no slow-client, keepalive or concurrency figure. The idle-day figures for the new keeper
+run the whole kernel patch set (38 patches) on Free: the smoke start, the 19 probes of the boot rig
+and a first start of the shipped bootstrap image pass there (3 of 3, with `lo` up), but a machine
+redeployed mid-job has never survived on Free (4 of 4 tries on the real build failed: the object
+was not replaced, and after late replacements the console shows a `Kernel panic: Syscall called
+when in kernel mode`), and coreutils at 800 pages passes 331 of 516
+(339 at 1,200 pages, native 353). Serving has a measurement (Serving a Guest's HTTP) with an
+open-stream cap and a request bound but no keepalive figure. The idle-day figures for the new keeper
 defaults are read for 24 hours (Idle Machine, 24 Hours), and a short-sleep job still makes 900 s
 events. Also unmeasured: execution memoization, publication of proven responses, and energy per
 job on the wasm arms (the native and Katybug arms have a table). None of it has a number, and no
@@ -855,10 +862,60 @@ too, from a private copy of musl's code and tables (x86-64 and AArch64 musl, x86
 2,400 vectors per function with 0 differing; against musl's results `sin` and `cos` differ in 3.1%
 and stay refused, glibc's FMA variants of `exp` and `pow` differ from its non-FMA ones in
 0.06-0.07% of results, and AArch64 glibc's fused variants differ on 1 of 2,288 `exp`, 0 of 2,327
-`log` and 4 of 1,511 `pow` vectors, so that case is refused. zlib's `crc32`, `adler32`, `compress2`
-and `uncompress` are built and not shipped: +79,208 B of module (+23% of the product), and `r`
-1.07-1.11 against 50-166 without on paisley-park with the host's zlib (byte equality proven for
-zlib 1.2.13, 1.3.1 and 1.3.2).
+`log` and 4 of 1,511 `pow` vectors, so that case is refused until a build is identified: each glibc
+AArch64 `libm` now has a table row (the fused sites listed with their addresses), and exp, log and pow
+run for a listed build with 0 of 2,288, 2,327 and 1,511 checked vectors differing and 0 of
+300,000,000 random inputs per function against Debian 12 arm64's `libm` called natively (a copy of
+`libm.so.6` with one bit changed per function is refused). zlib's `crc32`, `adler32`, `compress2`
+and `uncompress` are built into the shipped module from the pinned zlib: +80,040 B plain and +78,706 B
+instrumented over the same tree without it. In a machine under node (V8 14.6, 4 MiB corpus, median of
+5 samples, 0 noisy, whole-command wall over native) they run at `r` 2.15 (`crc32` x1000), 1.02
+(`adler32` x1000) and 1.42 (`compress2` x30), against 322, 112 and 87 with the kernels off. The
+`compress2` kernel runs only when the object holding the guest's `compress2` carries stock zlib's
+copyright text with version 1.2.11, 1.2.13, 1.3, 1.3.1 or 1.3.2 (the output is byte for byte one
+result across those and across eight distributions' libz): Debian and Alpine qualify, Ubuntu 22.04 and
+24.04 and Fedora 41 do not and run in the guest.
+
+The `deflate` and `inflate` stream calls (init, the stream calls, resets and ends; `zstream.c`) run
+as host kernels over a table of 64 host `z_stream`s, with the guest's struct kept in step and every
+guest pointer read through a checked copy that returns before the host call on a fault. They are
+taken only for stock zlib 1.2.13, 1.3.1 and 1.3.2 (Debian 12, Debian 13 and Alpine 3.20 tested; 1.2.11
+differs at level 0 with a small `avail_out`, in `deflateBound` and in `inflateSync`'s adler, and
+zlib-ng differs), and an object that imports `deflateSetHeader`, `inflateGetHeader` or `inflateBack`,
+or that sets its own `zalloc` (Alpine's `curl` does), keeps its streams in the guest. Output equals
+native with the kernels off and on on both architectures: a 64 MiB gzip round trip (24,737,711 bytes
+out) and `curl --compressed` fetching a gzip and a deflate body. A stream open across a fork by exec
+is not in the child's table, so the guest's libz fails its state check with `Z_STREAM_ERROR` and one
+log line says so. On paisley-park (cpu 13, node 26.10.0, 5 samples a cell, 75 of 75 kept, quiet at most
+0.19) a 32 MiB gzip-format compress at level 1 takes 0.167 s natively, 0.298 s with the kernels and
+20.507 s without (`r` 1.78 and 122.72), and at level 9 0.762, 1.147 and 53.459 s (1.50 and 70.16):
+46.6 to 68.8 times faster than with the kernels off. The module grew 10.7 KB (inferred 0 to 3).
+
+The block functions of `md5`, `sha1`, `sha256` and `sha512` and a `cksum` loop are host kernels in
+`hash.c` (the rounds are macros with no word rotation and a rolling 16-word schedule; the earlier
+`sha256` kernel renamed its words with a `memmove` every round). On paisley-park with gcc the sha256
+block went from 180 MB/s to 732 against gnulib's 704, md5 and sha1 sit at gnulib's rate, and under V8
+the sha256 block went from 55 to 547 MB/s. Whole-tool `r` at 512 MiB against native coreutils 9.5 (5
+samples a cell, 351 samples at quiet 0.00-0.24): native Katybug md5 1.06, sha1 1.08, sha256 1.02, sha512
+1.03 and cksum 4.67; in a machine under V8 1.29, 1.49, 1.29, 1.28 and 5.43; with the kernels off,
+natively, 47.39, 242.82, 266.86, 196.18 and 230.79. Natively what remains is the wrapper (about 1.8-1.9
+us per 32 KiB call). Under V8 sha256 is bounded by the wasm block (550 MB/s against the native tool's
+696), and the V8 block bench reads below the in-machine rates for md5, sha1, sha512 and cksum (cause
+open). `cksum` is bounded by native's PCLMUL path (11,185 MB/s) against slice-by-8 (Katybug's cpuid
+reports no PCLMUL). The V8 cell hashes a 64 MiB ramfs file eight times, since a guest pipe's producer
+alone took 1.68 s of a 1.5-1.9 s sample. The AArch64 thunk checks did not run on the Mac this was
+built on.
+
+A guest's executable image is read in 64 KiB pieces when first touched instead of whole at load. A
+file changed in place reads its new bytes into the pieces not yet made; truncation makes an access to a
+piece past the end `SIGBUS`. Pages held in a machine of 800 pages on the 32-slot kernel (3 runs per
+arm, ranges not overlapping): a coreutils tool 589-599 against 382-384 (-35%), a lone `bash` 1,020-1,030
+against 976-980 (-4.5%) and `bash` with eight fork children 6,600-6,638 against 6,219-6,237 (-6.0%),
+since a fork child holds its parent's pieces. Coreutils' suite at 800 pages passes 331 of 516 with the
+lazy fill against 324 for the same kernel with the eager one and 302 for the earlier kernel, with 15
+`invoked oom-killer` lines against 29 and 56 (one run per arm at a Mac load of 5 to 13, so a 7-test
+gap is inside what one run per arm can call). At the shipped piece size a bash makes 19 of its 22
+pieces; 4 KiB pieces would hold 163 pages of bash's 338.
 
 An interpreter block guards what it assumed with one epoch compare instead of a check per access:
 the mapping generation, the code generation and the signal state. Assumption checks per 1,000 guest
@@ -902,6 +959,41 @@ looked at on a region's direct edges. Windows from interval analysis (4,080 B wi
 of the base-plus-index residue) are exact and move nothing beyond the spread (gzip's windowed share
 53.62% to 54.32%, `r` inside 3.1% on x86-64 and 5.3% under V8); a 64 KiB window never resolves from
 an unaligned base and costs 17.7% (x86-64) and 20.1% (V8).
+
+Whole-program regions (a cover of 0.999 of the profile, one form per region) lift gzip 99.8% in 16,028
+entries and run at `r` 7.60 and 7.58 under V8 (two processes; 3.93 on x86) against 18.46 for function
+regions and 99.95 interpreted; bzip2 99.7% in 413,688 entries at 13.86 and 13.91 (8.37 on x86); sqlite
+99.86% in 1,001,284 entries at 20.12 and 20.36 over 1,000,000 rows (13.81 on x86); bash 74.0% lifted
+in 24 regions (16,321,669 entries) at 77.40 and 79.04 (57.62 on x86), with 72-75% of its V8 time in the
+interpreted rest (a model figure). A one-form build equals its three-form twin within spread and is
+28-54% smaller. bzip2's top five functions as separate regions lift 93.2% but enter 6.0 million times
+and run 1.67 times slower than the whole-program region. bash's single region (3,419 blocks, 71,570 IR
+operations) does not compile: -O2 ran past 1,200 s and -O1 reached 22 GB after 17 minutes. Seeding one
+entry per source component raised sqlite's claimed share from 57.53% to 100.00% and bash's from
+96.06% to 100.00%, and a table jump is now a computed jump (2,600,295 of the 6,205,270 endings once
+labelled returns).
+
+Where the excess over the binary sits was split by arms on paisley-park (core 19, 9 rounds a cell on
+x86, 7 per V8 process, every output equal to the binary's). As built, gzip, sqlite, sha256 and bash run
+at 3.96, 13.67, 2.00 and 57.19 times the binary on x86. Mapping every guest access to a plain host
+access (a native diagnostic: a host mapping at the guest's own addresses, not a wasm layout) gives
+1.65, 6.84, 1.97 and 50.64, which removes 78.2%, 54.1%, 2.8% (inside the spread) and 11.5% of the
+excess; with live flags and form 2 added the four end at 1.58, 7.36, 1.44 and 51.61, so none reaches
+1.15 and the arms interact (sqlite's combined arm is slower than the plain-access arm alone). Live
+flags alone drop writes only on sha256 (66 of 324, `r` 2.00 to 1.74), because every access can fault
+and keeps all five flags live elsewhere. Per 1,000 guest instructions on gzip the accesses fall from
+363.1 to 132.2, accesses checked one by one from 172.7 to 0, window resolves from 42.2 to 9.4 and
+generation compares from 214.9 to 9.4, while block moves (195.7) and polls (65.4) remain. Under V8 the
+plain-access floor holds 62.4% (gzip), 42.9% (sqlite), 18.5% (sha256) and 10.1% (bash) of the as-built
+excess and the lowest `r` any arm reaches is 3.45 (gzip). The rest is V8's code for the same C: the
+plain-access arm is 1.33 to 3.16 times slower than its x86 twin, V8's bounds check and tier-up hold at
+most 17% of the gap in any arm, and bash's remainder is its 74% unlifted time. These arms are
+measurement floors, not shippable forms. The shippable counterparts, two-piece windows and loop guards
+(a loop's envelope validated at entry and revalidated after calls, syscalls, yields, handlers and
+mapping changes, with an exact side exit), are exact (264 of 264 function runs, 39 of 39
+whole-region runs). Only gzip moves, and only with both: x86 3.95 to 3.77 and V8 7.52 to 6.90 (6.0%
+and 9.5% of the excess, faster in 8 of 9 and 9 of 9 rounds); two-piece windows alone are 14.9% (x86)
+and 10.8% (V8) of the excess slower and loop guards alone are inside the same-C control's noise.
 
 Three changes cut dispatch. Block fusion decodes through direct jumps into one block; each block
 links the two successors it last saw, so most transitions skip the block hash; and a block run 64
@@ -1406,8 +1498,15 @@ The shipped bootstrap image with `ifconfig lo 127.0.0.1 up` in `rcS` (the relay 
 prints an RCU stall after its prompt on Free: 4 of 4 first starts, against 2 of 2 clean without the
 line; locally 2 of 2 on one image (gaps of 15 and 41 minutes) and 10 of 10 clean on six others. The
 dump (`t=66945` jiffies, a grace period open at the checkpoint, `rcu_sched` waiting 66,944 jiffies
-for a timer) shows an open grace period that `wasm_restored`'s reset does not cover; the cause is
-not isolated.
+for a timer) shows an open grace period that `wasm_restored`'s reset does not cover. The cause was a
+stale `jiffies` at restore, not the `lo` line: patch 0033 brings `jiffies` up to the clock before the
+reset, and a restore gate in the asset build (restore the image after a gap over 21 s and fail on any
+console output, 0.1 s) fails 10 of 100 fresh builds on the old kernel and 0 of 100 on the fixed one. A
+first start on Free with `lo` up passes 3 of 3. A redeploy of a running machine mid-job is the open
+part: `drive.ts survive` never passed on the real build on Free (9 of 9 tries before the final pipeline
+run and 4 of 4 in it: the object was not replaced, or was replaced late, and twice the console shows
+`Kernel panic - not syncing: Syscall called when in kernel mode`; a kernel without `lo` panics the
+same way, and 52 local mid-job restores did not reproduce it).
 
 On Free, each run against a fresh deployment:
 
@@ -1479,6 +1578,20 @@ workerd calling a stream's `pull` later than the specification does; after the f
 guest resets the connection after 80,030 ms with 1.4 MB unsent (the cause is not isolated; the
 native control was not run).
 
+The site bounds both ends of a request. Stalled readers of the 6,888,896-byte file at 800 pages
+(free memory 35,520 kB at boot and 28,324 with `httpd` and the file) leave, for a static file, 26,276
+kB free at 4 streams, 24,276 at 8 and 14,232 at 40; for a CGI reply that forks a shell and `cat`,
+21,860 at 4, 15,996 at 8 and 8,092 at 20, where 4 of 24 are reset and at 32 the guest shell cannot
+fork. `serve()` therefore answers 503 with `retry-after: 1` beyond 20 open streams (counted and checked
+with no await between, released in one place every end reaches), and answers 413 to a declared body
+over 256 MiB before the machine wakes and to a chunked body that crosses it (ingest costs 3.5 ms per
+MiB on paisley-park, so the memory bound alone would allow 382-390 MiB). A guest that keeps an upload
+in RAM wedges near 20 MiB. A sandboxed guest page registers no service worker in Chromium 153,
+WebKit 26.6 or Firefox 151. `serve()` runs under vitest through a seam (19 tests). BusyBox `httpd`
+serves a static file with 2 `sendfile` calls, one of which moves all 6,888,896 bytes, and on
+paisley-park (pinned, 6 runs of 100 rounds) the `wasm_net_send` crossings and their copies take
+16.1-17.2% of a 6.9 MB request's CPU, mostly the copy of the bytes.
+
 The guest and the control plane share one origin, so every proxied reply carries
 `Content-Security-Policy: sandbox allow-scripts allow-forms` (an opaque origin: a guest page cannot
 read the owner token in `localStorage`), the guest's `set-cookie` and `clear-site-data` are removed,
@@ -1492,9 +1605,22 @@ ns per step against the previous scans by 5% (a ring of 4 tasks) to 39% (54 slee
 exact (12 of 12 identical). The C core (`src/gmux/core/`, 4.3 KB of module) is a further 4.7-7.5% per
 step over the tables, beyond the spread at a ring of 56 and 54 sleepers and inside it at 4 and 32,
 and picks 1.7-2.2x faster in the isolated wake (`pickIdle` is 9.8-11.1% of samples at a ring of 56
-on the tables and 5.6% on the core). Rings of 64 and 256 tasks are not reachable in a machine:
-`vfork` fails with `Resource busy` near 57 tasks because every user task takes its own cpu slot
-(`NR_CPUS` 64), and a guest hangs in about 1 run in 6 at 56 tasks on every arm.
+on the tables and 5.6% on the core). Rings of 64 and 256 tasks were not reachable while every user
+task took its own cpu slot (`vfork` failed with `Resource busy` near 57 tasks); user tasks now share
+cpus, 256 tasks run on the 32-slot kernel, and ns per step is flat from 8 to 64 slots. At 800 pages
+96 held tasks start and exit cleanly and 100 or more run the OOM killer (about 355 kB held per
+task, 3.8 MB free at 96). The guest hang near 56 tasks, about 1 run in 6 on every arm in an earlier
+series, did not reproduce in 300 runs on the shared-cpu kernel and is open.
+
+On the folded runtime (one `runtime` option holding the router, the statx hit and the core), the core
+against the TypeScript scheduler on paisley-park (ns per step, medians of 5 rounds, all 90 samples
+quiet at most 0.05; core, TypeScript, ratio): ring of 4 1,970, 2,000, 0.985; ring of 32 1,968, 1,907,
+1.032; ring of 56 2,005, 2,058, 0.974; ring of 64 2,033, 2,143, 0.949; ring of 256 2,391, 2,468,
+0.969; 54 sleepers 1,489, 1,544, 0.964. The ranges overlap on every load, so the core is at parity with
+the TypeScript scheduler on this host; the 4.7-7.5% above was measured in an earlier run, with the
+columns the other way round from how the first copy of this table read them. A snapshot taken without
+a core region restores on the TypeScript scheduler and one taken with it restores without the core,
+keeping the region recorded.
 
 ### Idle Machine, 24 Hours
 
@@ -1504,7 +1630,10 @@ rows and about 3.5 GB-s per day; it woke hourly after its first hour, not at the
 The short-sleep job (`gzip -c` in a loop with `sleep 0.01`) used 951 requests, 11,386 rows (11.4%
 of the daily row meter) and 1,469.8 GB-s (11.3% of 13,000), with four 900 s `exceededWallTime`
 events; it was not stopped at the 16:28 UTC stop and ran to its cap of 100,000 iterations with 0
-bad checksums. The waited-time counter in the keeper did not end those events.
+bad checksums. The waited-time counter in the keeper did not end those events. The counter rounded a
+timer under a millisecond away down to a wait of zero, so a short sleep loop never counted as waiting;
+it now rounds up, and the unit tests that cover it fail on the old code. A redeployed job machine
+still hung in a 900 s event within a minute of its start, so that fix is not what ended them.
 
 ### Energy per Job
 
@@ -1546,6 +1675,15 @@ gap to a build with no fuel on gzip and bzip2, 17-20% on sed, 20-54% on gawk (wi
 of plain in one census and 0.961 in the other. The call in the loop costs more than the count: a
 build with the count and no call runs at 0.924 of plain on gzip, the read-only check with the call
 at 0.969.
+
+A static rule now picks the local count per program: a program takes it when its static share is at
+least 0.6 (gzip 0.643 does; lua 0.545 and sqlite 0.540 do not). On paisley-park (cpus 8 and 9, 3 runs of
+25 rounds, all 18 samples quiet at most 0.08) the time against the plain build is lua 0.983, gzip
+0.973, bzip2 0.922, sqlite 0.998, sed 0.999 and gawk 1.003; the same module run twice differs by up to
+1.7% on lua and under 0.5% elsewhere. A call-out form (`GMUX_FUEL_FORM=callout`) beats the rule beyond
+spread on 1 of 6 programs (bzip2 0.915) and is slower on lua (1.023), so it stays opt-in. Hoisting
+everywhere except functions above 8,000 instructions removes lua's loss (0.987) and loses on none of
+the six beyond spread.
 
 ### Asset Fetches
 
@@ -1753,6 +1891,22 @@ on nine guests, with each transform alone and on 400 random programs, and two mu
 not retargeted, locals not cleared at `end`) fail its tests. What -O0 costs is stack-slot loads and
 stores, which the planner does not touch.
 
+A native module can call a function the interpreter holds and return. At the pinned wasm3 a nested call
+from a host function already works; two wasm3 defects (the stack's extent and limit) are fixed behind
+`BURROW_REENTER=1` and the default `wasm3.wasm` is byte for byte unchanged. A pure-wasm crossing with no
+JavaScript in the loop takes 11-19 ns down and 14-15 ns up in isolation against 107-153 and 23-25
+through JavaScript, and inside a closed ladder it prices 66-107 ns against 259-317 glued. With promoted
+functions keeping interpreted callees (`LADDER_OPEN=1`), zlib's `r` is 2.38 at 87.3% of instructions
+native, 1.87 at 92.3%, 1.51 at 95.3% and 1.12 at 99.87%, with about 100 crossings a unit against 91,190
+closed; the closed rung at 86.7% moves from 4.47 glued to 3.29 direct. The all-native module against the
+untouched one in V8 (paisley-park, cpus 16 and 17, quiet at most 0.24, 9 samples a guest): a module
+rebased by a guest-base global reads 1.110 (zlib) and 1.170 (zstd), the stack-pointer entry costs
+0.000-0.010, and an immutable global holding 0 is not folded by V8 (equal to rebased). A literal
+`i32.const 0` for every base read gives 1.000 [1.000-1.010] and 1.010 [0.980-1.020], so what the
+endpoint pays is the address add; the base in each access's offset immediate gives 1.070 and 1.010 and
+is exact only for addresses proved not to wrap. Every figure is against the original wasm and not
+native Linux, and a nested `memory.grow` moves wasm3's guest base under native code (open).
+
 ---
 
 ## The Toolchain
@@ -1814,6 +1968,14 @@ compressed bytes once, and its cpio is the same.
 | path-query changes are counted by inode number as well (0029) | the statx cache dropped every answer when any `/bin` symlink's atime moved; the host keeps a fill on the counters of the inodes its path crossed |
 | generation counters for the fd table, credentials, memory map and signal handlers, with a per-task block, an exported address and `/proc/gmux_gens` (0030) | a guarded specialized path needs to know that state did not change; 0 missing bumps in 102 oracle steps, and the cost is inside the old kernel's spread on 8 marks (largest +16 ns on open-read-close) |
 | a stream relay between the host and the machine's own listeners: `hostnet.c`, four non-suspending imports, `lo` up in `rcS` (0031) | the machine's HTTP server needs inbound connections; see Serving a Guest's HTTP |
+| 32 cpus instead of 64 (0027) | each cpu slot costs 146.6 kB (2.29 wasm pages) at 800 pages, and ns per scheduler step is flat from 8 to 64 slots on 7 loads (175 samples) |
+| user tasks share the possible cpus less the interrupt cpu; the `EBUSY` and `release_thread`'s `BUG_ON`s go (0032) | each user task took a private cpu slot (one Web Worker per cpu in linux-wasm), so `vfork` failed with `Resource busy` near 57 tasks; 256 tasks now run on the 32-slot kernel in normal, `FROZEN=1`, `SHARE=1` and at `maxcpus=1` |
+| `wasm_restored` brings `jiffies` up to the clock before it resets the stall detector (0033) | a restored image kept a stale `jiffies` and the bootstrap image printed an RCU stall on Free; 10 of 100 fresh builds failed the restore gate before, 0 of 100 after |
+| a loop of syscalls yields the host thread, reports a quiescent state and services timers every 256 syscalls (0034) | the grace period behind the maple tree's `kfree_rcu` frees never finished while one task looped, so 100,000 `mmap` and `munmap` pairs killed the machine; the mark now runs uncapped (4 of 4 at 100,000, 1 of 1 at 200,000), at about 6-7 ns per syscall |
+| a nommu `mremap` keeps the mapping tree's range in step with the VMA (0035) | a shrink left the old range in the tree and a freed VMA in `/proc/self/maps` (the `maps` probe fails on the old kernel) |
+| the path-query counters live in one block exported by address, and `wasm_fs_chain` writes the mount, inode and mode of each prefix of a path in one call, with no sleeping lock and at most 9 links (0036) | the statx hit reads the generation in place and a miss fills in one call instead of one probe per component: hit 58 to 36 ns, forced miss 8,106 to 4,387 ns on paisley-park |
+| a program carries its stack ABI in a `gmux.abi` section and `exec` refuses one without the current version with `EPROTO` and a console line (0037, musl 0011) | a program built before the stack change failed with `cannot create state: not enough memory` or a segfault; the exec stub keeps the section, and the `abi` probe passes on the new kernel and fails on the old |
+| console output queues in a ring the host drains in one call (0038) | each write was a host call: on paisley-park `seq`'s CPU falls from 503.2 to 338.8 ms (0.673) and `cat`'s from 45.8 to 15.2 ms (0.332), output sha256 equal |
 
 The host boots the kernel without `nohz_full`. With it, the timekeeping cpu never stops its tick,
 so an idle machine woke the host about 220 times a second, and context tracking reads the clock
@@ -2012,6 +2174,26 @@ is bounded: 2 MiB, 2-way, paths up to 223 bytes. The router instance adds 0.8 us
 instance 2.7 us to an exec. The new router replays 947,520 calls against the old one with 0
 mismatches.
 
+Patch 0036 puts the counters in one block the statx hit reads in place and fills a miss with one
+`wasm_fs_chain` call (the mount, inode and mode of each prefix of the path, no sleeping lock). On
+paisley-park (cpus 10 and 22, 3 runs of 20,000 for the hit and miss, `ls` over 5 rounds; four of the ten
+`ls` samples read 0.60-1.03 busy cores outside and the medians with and without them agree) a hit takes
+36 ns against 58 on the control kernel (-38%), and a forced miss with fill 4,387 ns against 8,106
+(-45.9%; the kernel's own statx is 494 ns on both). An `ls -l /bin` loop of 1,000 with the cache on is
+9.9% faster than with it off on the new kernel (684.6 against 759.7 us per iteration, 11.0% on the
+control), and the churn loop is 11.4% slower with the cache on (997.8 against 895.8), so the cache
+still loses to off when files change between lookups. The init script remounts the root with
+`relatime`, since a read that stores an atime on every file would end every cached answer; both arms
+boot with it, so the cost with `relatime` off on the new kernel is not measured.
+
+A process start costs 94.8 us of host time for BusyBox on the micro-rig: `WebAssembly.Instance` 63.5,
+the environment 12.7, the router 11.2 and queries 6.7. Reusing a finished process's instance
+(`recycleInstances`, default 8, a reset costs 4.1 us) takes the instantiation samples to 0 and the busy samples of a
+configure-shaped run down 57.4% (8,483 to 3,616 samples) and of a fork and exec loop 64.8% (4,241 to
+1,491); 300 fork and exec pairs take 43.3 ms against 124.6 (36 samples, 3 rounds, all kept). It
+engages on shared-instance builds only: the production site registers the plain BusyBox, and Katybug
+and asyncified or evacuable builds cannot be reset. A failing `execve` costs 0.3-0.5 us, so the PATH-search failures of a shell are not what spawn costs.
+
 ### Threads
 
 Pthreads never worked on linux-wasm. Its variadic `__clone` read the TLS and clear-tid arguments only
@@ -2169,6 +2351,16 @@ mode ran the probe's main path instead, which started another, and the output re
 looked like memory exhaustion hanging the machine until the mode was typed at the shell by hand. The
 allocations now go through a `volatile` pointer.
 
+**A harness race read as a kernel flake.** The `isolation` probe failed in 7 of 44 runs on the
+shared-cpu kernel and 0 of 37 on the control, which read as a defect of sharing cpus. The tty echoed
+the typed script into the probe's output. With the echo off the probe fails in 0 of 40 runs. A failure that appears on one arm only needs a matched sample
+before it is attributed to the arm.
+
+**A table read with its columns swapped.** The first write-up of the scheduler comparison read the
+core's and the TypeScript scheduler's columns from an earlier run the wrong way round and concluded
+the core was slower; the earlier run had it 4.7-7.5% faster and the new one has it at parity. The
+review found it by recomputing each ratio from the table's own cells.
+
 ---
 
 ## Measurement Rules
@@ -2234,6 +2426,10 @@ allocations now go through a `volatile` pointer.
 | `experiments/katybug-profile/` | Katybug against native x86-64: timings, a CPU profile by phase, and Katybug built per flag set (`variants.sh`) |
 | `experiments/aot-oracle/` | hot blocks lifted to C and compiled into Katybug, attached by exact IR match; native attribution arms |
 | `experiments/interp-topology/`, `promotion-ladder/` | wasm3 against Katybug's IR interpreter, hosted and native; zlib with its hottest functions promoted to native code |
+| `experiments/reenter/` | native-to-interpreter re-entry, the all-native endpoint against the untouched module, and open ladder rungs |
+| `experiments/event-batching/`, `serving/` | the console ring and the host calls of a console workload; the guest's HTTP server through the site, its stream and body limits, and the send path |
+| `src/gmux/core/`, `scripts/build-router.sh`, `scripts/wasm/router-modules.ts` | the host runtime in C (syscall router, statx hit, scheduler core), built into `build/router` and loaded as one `runtime` option |
+| `src/worker/serve.ts` | the site's HTTP serving, with the open-stream cap and the request-body bound |
 
 ---
 
