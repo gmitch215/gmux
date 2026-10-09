@@ -1,0 +1,108 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Gregory Mitchell <me@gmitch215.xyz>
+Date: Fri, 9 Oct 2026 10:00:00 +0000
+Subject: [PATCH] wasm: refuse a program built for another stack layout
+
+A program built before the argument tables moved to their own mapping
+finds them at the wrong address and dies with an unrelated message (not
+enough memory, or a segfault). Programs now carry the stack layout
+version in a gmux.abi custom section, and binfmt_wasm reads it before
+begin_new_exec by walking the section headers, a few bytes each. Any
+version but WASM_STACK_ABI, including none, fails the exec with -EPROTO
+and one console line naming the program and both versions. The process
+is untouched, and -ENOEXEC is avoided because a shell would then run the
+file as a script.
+---
+ fs/binfmt_wasm.c | 55 ++++++++++++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 55 insertions(+)
+
+diff --git a/fs/binfmt_wasm.c b/fs/binfmt_wasm.c
+index f0f9d50b6..8d11dc1e2 100644
+--- a/fs/binfmt_wasm.c
++++ b/fs/binfmt_wasm.c
+@@ -41,6 +41,14 @@
+  */
+ #define WASM_STACK_RESERVE	16UL
+ 
++/*
++ * The version of the stack layout above. A program carries the one it was built for in a gmux.abi
++ * custom section (crt1.c, musl's crt_arch.h), and an exec refuses any other: a program built for
++ * another layout would read its argument tables from the wrong place. Version 0 is a program with
++ * no section. Change this with the layout, and rebuild every program.
++ */
++#define WASM_STACK_ABI		1U
++
+ /* room for the auxiliary vector below; create_wasm_tables checks it */
+ #define WASM_AUXV_SIZE		(16UL * sizeof(unsigned long))
+ 
+@@ -189,6 +197,41 @@ static bool wasm_consume_varU32_user(
+ 	return !(chunk & 0x80);
+ }
+ 
++/*
++ * The stack ABI version in the file's gmux.abi section, 0 when it has none. The sections are
++ * walked by their headers, a few bytes each, so the code and data are never read.
++ */
++static u32 wasm_stack_abi(struct file *file)
++{
++	loff_t size = i_size_read(file_inode(file));
++	loff_t pos = 8;
++	u8 head[24];
++	int count;
++
++	for (count = 0; count < 128 && pos < size; count++) {
++		loff_t at = pos;
++		ssize_t got = kernel_read(file, head, sizeof(head), &at);
++		unsigned int i = 1, shift = 0;
++		u64 len = 0;
++
++		if (got < 2)
++			break;
++		do {
++			if (i >= got || shift > 28)
++				return 0;
++			len |= (u64)(head[i] & 0x7f) << shift;
++			shift += 7;
++		} while (head[i++] & 0x80);
++
++		if (head[0] == 0 && len >= 13 && got >= i + 13 &&
++				!memcmp(head + i, "\x08" "gmux.abi", 9))
++			return head[i + 9] | head[i + 10] << 8 | head[i + 11] << 16 |
++				(u32)head[i + 12] << 24;
++		pos += i + len;
++	}
++	return 0;
++}
++
+ static int load_wasm_file(struct linux_binprm *bprm, unsigned long extra_stack)
+ {
+ 	unsigned long data_start = 0; /* Will contain data and bss */
+@@ -204,6 +247,7 @@ static int load_wasm_file(struct linux_binprm *bprm, unsigned long extra_stack)
+ 	u8 subsection_id;
+ 	unsigned int subsection_length;
+ 	unsigned long subsection_end;
++	u32 abi;
+ 
+ 	/* Related to WASM_DYLINK_MEMINFO parsing: */
+ 	bool has_meminfo = false;
+@@ -251,6 +295,17 @@ static int load_wasm_file(struct linux_binprm *bprm, unsigned long extra_stack)
+ 	if (whole_size < (unsigned long)(parsed - bprm->buf))
+ 		return -ENOEXEC;
+ 
++	/*
++	 * Before begin_new_exec, so a refusal fails the exec and leaves the process as it was. Not
++	 * -ENOEXEC: a shell would try the file as a script.
++	 */
++	abi = wasm_stack_abi(bprm->file);
++	if (abi != WASM_STACK_ABI) {
++		pr_err("exec %s: it is built for stack ABI %u (0: built before the word), this kernel runs %u; rebuild it\n",
++			bprm->filename, abi, WASM_STACK_ABI);
++		return -EPROTO;
++	}
++
+ 	/*
+ 	 * This would be a placed to check RLIMITs, but since Wasm can allocate
+ 	 * as much memory it wants on its own stack that makes little sense.
+-- 
+2.43.0
+

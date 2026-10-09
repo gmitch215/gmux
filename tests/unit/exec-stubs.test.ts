@@ -100,6 +100,41 @@ describe('exec stubs', () => {
 	});
 });
 
+describe('the stack abi section', () => {
+	// where clang puts it: after the code, as a custom section the program's link kept
+	const ABI = [0, 13, ...name('gmux.abi'), 1, 0, 0, 0];
+	const WORD = new Uint8Array([...MAGIC, ...DYLINK, ...CODE, ...ABI]);
+	const sha = (bytes: Uint8Array) => createHash('sha256').update(bytes).digest('hex');
+
+	it('is copied into the stub, between dylink.0 and the key', () => {
+		const small = stub(WORD)!;
+		expect(small.length).toBe(
+			8 + DYLINK.length + ABI.length + 2 + name('gmux.exec').length + 32
+		);
+		expect([...small.subarray(0, 8 + DYLINK.length + ABI.length)]).toEqual([
+			...MAGIC,
+			...DYLINK,
+			...ABI
+		]);
+	});
+
+	it('leaves a program built without it with no section, and the key the hash of the file', () => {
+		const old = stub(PROGRAM)!;
+		expect(old.length).toBe(8 + DYLINK.length + 2 + name('gmux.exec').length + 32);
+		expect(Buffer.from(old).includes(Buffer.from('gmux.abi'))).toBe(false);
+		expect(stubHash(old)).toBe(sha(PROGRAM));
+		expect(stubHash(stub(WORD)!)).toBe(sha(WORD));
+	});
+
+	it('is the only section a stub may carry between dylink.0 and the key', () => {
+		const small = stub(WORD)!;
+		for (let n = 0; n < small.length; n++) expect(stubHash(small.subarray(0, n))).toBeNull();
+		const renamed = small.slice();
+		renamed[8 + DYLINK.length + 4] = renamed[8 + DYLINK.length + 4]! ^ 1;
+		expect(stubHash(renamed)).toBeNull();
+	});
+});
+
 describe('staging another katybug', () => {
 	const sha = (bytes: Uint8Array) => createHash('sha256').update(bytes).digest('hex');
 	// the same program with 36 KiB of data and bss: one page more than the build's 16 KiB one

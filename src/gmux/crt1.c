@@ -7,6 +7,10 @@ int __libc_start_main(
     int (*)(), int, char**, void (*)(), void (*)(), void (*)()
 );
 
+// the stack abi the kernel checks at exec (WASM_STACK_ABI); clang makes a
+// section only from asm
+__asm__(".section .custom_section.gmux.abi,\"\",@\n.int32 1\n");
+
 void _start_c(long* p) {
     int argc = p[0];
     char** argv = (void*) (p + 1);

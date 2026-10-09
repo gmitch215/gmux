@@ -1,19 +1,29 @@
 import { gunzipSync, gzipSync } from 'fflate';
 import { createHash } from 'node:crypto';
 import { readFileSync, writeFileSync } from 'node:fs';
-import { concat, readLeb, text, uleb, utf8 } from './binary.ts';
+import { concat, readLeb, sections, text, uleb, utf8 } from './binary.ts';
 import { entry } from './cpio.ts';
 
 /**
- * Rewrites an initramfs so each wasm executable is a stub: its header, its dylink.0 section (all
- * binfmt_wasm reads) and a gmux.exec section holding the SHA-256 of the full file, the registry key.
+ * Rewrites an initramfs so each wasm executable is a stub: its header, its dylink.0 section, its
+ * gmux.abi section if it has one (all binfmt_wasm reads) and a gmux.exec section holding the SHA-256
+ * of the full file, the registry key.
  * The host already holds the compiled module, so a machine no longer keeps the code in its RAM.
  * The output is gzip from fflate, whose bytes are the same on every platform and runtime.
  * `exec-stubs.ts <initramfs.cpio.gz> <out>`
  */
 const MAGIC = Uint8Array.of(0, 0x61, 0x73, 0x6d, 1, 0, 0, 0);
 
-/** a program's stub: its header, dylink.0 and the gmux.exec key; null for a file binfmt_wasm does not run */
+const ABI = utf8.encode('\x08gmux.abi');
+
+/** the whole gmux.abi custom section (id, size, contents), or null when the program has none */
+function abiSection(data: Uint8Array): Uint8Array | null {
+	for (const [id, start, body, end] of sections(data))
+		if (id === 0 && ABI.every((b, i) => data[body + i] === b)) return data.subarray(start, end);
+	return null;
+}
+
+/** a program's stub: its header, dylink.0, gmux.abi and the gmux.exec key; null for a file binfmt_wasm does not run */
 export function stub(data: Uint8Array): Uint8Array | null {
 	if (data.length < 10 || data[8] !== 0 || MAGIC.some((b, i) => data[i] !== b)) return null;
 	const [size, body] = readLeb(data, 9);
@@ -26,6 +36,7 @@ export function stub(data: Uint8Array): Uint8Array | null {
 	return concat([
 		MAGIC,
 		data.subarray(8, body + size),
+		abiSection(data) ?? new Uint8Array(),
 		Uint8Array.of(0),
 		uleb(payload.length),
 		payload

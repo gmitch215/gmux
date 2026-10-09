@@ -1,0 +1,29 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Gregory Mitchell <me@gmitch215.xyz>
+Date: Fri, 9 Oct 2026 10:00:00 +0000
+Subject: [PATCH] wasm: record the stack ABI a program is built for
+
+binfmt_wasm refuses a program that does not carry the stack layout
+version it runs. crt_arch.h emits the gmux.abi custom section with the
+version, which the program's link keeps.
+---
+ arch/wasm/crt_arch.h | 3 +++
+ 1 file changed, 3 insertions(+)
+
+diff --git a/arch/wasm/crt_arch.h b/arch/wasm/crt_arch.h
+index 48e06fb..2173743 100644
+--- a/arch/wasm/crt_arch.h
++++ b/arch/wasm/crt_arch.h
+@@ -26,6 +26,9 @@ int main(int argc, char *argv[], char *envp[])
+  * TODO: fix this hack by refactoring musl and moving things into a .S file.
+  */
+ #ifndef SHARED
++/* the stack ABI binfmt_wasm checks at exec; clang makes a custom section only from asm */
++__asm__(".section .custom_section.gmux.abi,\"\",@\n.int32 1\n");
++
+ void _start(void)
+ {
+ 	void _start_c(/* no prototype on purpose */);
+-- 
+2.43.0
+
