@@ -6,7 +6,7 @@ import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
 import { uleb } from '../../scripts/wasm/binary.ts';
 import { stub } from '../../scripts/wasm/exec-stubs.ts';
-import { routerModules } from '../../scripts/wasm/router-modules.ts';
+import { hostRuntime } from '../../scripts/wasm/router-modules.ts';
 import { Ingress, READ_BUFFER, type NetStats } from '../../src/worker/machine/ingress.ts';
 import {
 	Machine,
@@ -16,6 +16,10 @@ import {
 	type SyncedFile
 } from '../../src/worker/machine/machine.ts';
 import {
+	FS_CHAIN,
+	FS_COUNTERS,
+	FS_MOVES,
+	FS_PATH,
 	MISS,
 	ROUTE_HOOK,
 	ROUTE_KERNEL,
@@ -25,7 +29,7 @@ import {
 	statxBucket
 } from '../../src/worker/machine/router.ts';
 
-const ROUTER = routerModules();
+const RUNTIME = hostRuntime();
 
 const PARK_IMPORTS = [
 	'wasm_serialize_tasks',
@@ -134,7 +138,7 @@ function rig(options: Partial<MachineOptions> = {}) {
 		sha256: (bytes) => String.fromCharCode(bytes[0] ?? 0),
 		now: () => clock.ns,
 		write: (text) => (output += text),
-		router: ROUTER,
+		runtime: RUNTIME,
 		...options
 	};
 	const sleep = async (ms: number) => {
@@ -199,6 +203,20 @@ describe('Machine', () => {
 		expect(waits).toBeLessThanOrEqual(2);
 	});
 
+	it('never waits 0 ms for a timer that is still ahead, so the host can count the time skipped', async () => {
+		const r = rig();
+		const machine = new Machine({ ...r.machineOptions, now: () => 0n });
+		const seen: number[] = [];
+		const sleep = async (ms: number) => void seen.push(ms);
+		await machine.run(() => r.output().includes('parent ok'), sleep, 20_000);
+		seen.length = 0;
+		machine.type('x');
+		await machine.run(() => r.output().includes('echo:x'), sleep, 20_000);
+		// the pump's own yield every yieldEvery steps is the only 0
+		expect(seen.filter((ms) => ms > 0).length).toBeGreaterThan(0);
+		expect(seen.every((ms) => Number.isInteger(ms))).toBe(true);
+	});
+
 	it('moves a standing clock by the time the kernel charges, and not by reading it', async () => {
 		const r = rig();
 		const machine = new Machine({ ...r.machineOptions, now: () => 0n });
@@ -230,6 +248,124 @@ describe('Machine', () => {
 		await r.run(machine, () => r.output().includes('echo:k'));
 		expect(r.output()).toContain('echo:k');
 		expect(machine.crashed).toBeNull();
+	});
+
+	describe('console ring', () => {
+		// the kernel's three puts while it boots
+		const BOOT = 'boot\nchild\nparent ok\n';
+		const words = (m: Machine) => new Uint32Array(m.memory.buffer, 0x1e000, 4);
+		const bytes = (m: Machine) => new Uint8Array(m.memory.buffer, 0x1e010, 0x400);
+		const boot = async (options: Partial<MachineOptions> = {}) => {
+			const r = rig(options);
+			const machine = new Machine(r.machineOptions);
+			await r.run(machine, () => r.output().includes('parent ok'));
+			return { r, machine };
+		};
+
+		it('takes the kernel puts into the ring and writes them from the host without a put call', async () => {
+			const { r, machine } = await boot();
+			expect(r.output()).toBe(BOOT);
+			expect(machine.stats.consolePuts).toBe(0);
+			expect(machine.stats.consoleDrains).toBeGreaterThan(0);
+			expect(machine.stats.consoleDrainBytes).toBe(BOOT.length);
+			expect(words(machine)[2]).toBe(1);
+		});
+
+		it('writes the same bytes with the ring off, one put each', async () => {
+			const on = await boot();
+			const off = await boot({ consoleRing: false });
+			expect(off.r.output()).toBe(on.r.output());
+			expect(off.machine.stats.consolePuts).toBe(3);
+			expect(off.machine.stats.consoleDrains).toBe(0);
+			expect(words(off.machine)[2]).toBe(0);
+		});
+
+		it('counts head and tail in bytes, and leaves the ring empty after every run', async () => {
+			const { r, machine } = await boot();
+			expect(words(machine)[0]).toBe(BOOT.length);
+			expect(words(machine)[1]).toBe(BOOT.length);
+			machine.type('k');
+			await r.run(machine, () => r.output().includes('echo:k'));
+			expect(words(machine)[0]).toBe(BOOT.length + 6);
+			expect(words(machine)[1]).toBe(BOOT.length + 6);
+		});
+
+		it('sends a put that does not fit to the host after the queued bytes, and queues the next', async () => {
+			const { r, machine } = await boot();
+			const start = r.output().length;
+			machine.type('g');
+			await r.run(machine, () => r.output().includes('C'.repeat(600)));
+			expect(r.output().slice(start)).toBe(
+				`echo:g${'A'.repeat(600)}${'B'.repeat(600)}${'C'.repeat(600)}`
+			);
+			expect(machine.stats.consolePuts).toBe(1);
+			expect(machine.stats.consolePutBytes).toBe(600);
+			expect(machine.stats.consoleDrainPeak).toBeGreaterThanOrEqual(606);
+		});
+
+		it('wraps a put around the end of the ring', async () => {
+			const r = rig();
+			const machine = new Machine(r.machineOptions);
+			words(machine)[0] = 1020;
+			words(machine)[1] = 1020;
+			await r.run(machine, () => r.output().includes('parent ok'));
+			expect(r.output()).toBe(BOOT);
+			expect(words(machine)[0]).toBe(1020 + BOOT.length);
+			expect(words(machine)[1]).toBe(1020 + BOOT.length);
+			expect(bytes(machine)[0]).toBe('\n'.charCodeAt(0));
+		});
+
+		it('drains what the kernel queued when run returns, even for a step that ended the run', async () => {
+			const { r, machine } = await boot();
+			machine.type('k');
+			expect(await r.run(machine, () => r.output().includes('echo:k'))).toBe('until');
+			expect(words(machine)[0]).toBe(words(machine)[1]);
+		});
+
+		it('writes the queued bytes before it halts', async () => {
+			const { r, machine } = await boot();
+			machine.type('q');
+			expect(await r.run(machine, () => false)).toBe('halted');
+			expect(r.output()).toBe(`${BOOT}echo:q`);
+		});
+
+		it('keeps the output queued before a panic', async () => {
+			const { r, machine } = await boot();
+			machine.type('e');
+			await r.run(machine, () => r.output().includes('before panic'));
+			expect(r.output()).toBe(`${BOOT}echo:ebefore panic\n`);
+			expect(words(machine)[0]).toBe(words(machine)[1]);
+		});
+
+		it('drains before a checkpoint, so a restore neither loses nor repeats a byte', async () => {
+			const { r, machine } = await boot({ asyncify: true });
+			const text = 'queued just before the checkpoint\n';
+			const ring = words(machine);
+			bytes(machine).set(new TextEncoder().encode(text), ring[0]! & 0x3ff);
+			ring[0] = ring[0]! + text.length;
+			const snapshot = await machine.checkpoint();
+			expect(r.output()).toBe(`${BOOT}${text}`);
+			const view = new DataView(snapshot.memory.buffer, snapshot.memory.byteOffset);
+			expect(view.getUint32(0x1e000, true)).toBe(view.getUint32(0x1e004, true));
+			const restored = await Machine.restore(r.machineOptions, snapshot);
+			restored.type('s');
+			await r.run(restored, () => r.output().includes('parent back ok'));
+			expect(r.output()).toBe(`${BOOT}${text}echo:schild ok\nparent back ok\n`);
+		});
+
+		it('turns the ring off on a restore into a machine that asks for none', async () => {
+			const { r, machine } = await boot({ asyncify: true });
+			const snapshot = await machine.checkpoint();
+			const restored = await Machine.restore(
+				{ ...r.machineOptions, consoleRing: false },
+				snapshot
+			);
+			restored.type('k');
+			await r.run(restored, () => r.output().includes('echo:k'));
+			expect(words(restored)[2]).toBe(0);
+			expect(restored.stats.consolePuts).toBe(snapshot.stats.consolePuts + 2);
+			expect(restored.stats.consoleDrains).toBe(snapshot.stats.consoleDrains);
+		});
 	});
 
 	it('delivers a signal whose handler blocks, to a program that links no clone code', async () => {
@@ -279,6 +415,162 @@ describe('Machine', () => {
 				await expect(machine.checkpoint()).rejects.toThrow(/shared program instances/);
 		});
 	}
+
+	describe('recycled instances', () => {
+		const setup = (options: Partial<MachineOptions> = {}) => {
+			const r = rig({
+				sharedKernel: true,
+				registry: new Map([['S', toyShared()]]),
+				...options
+			});
+			const machine = new Machine(r.machineOptions);
+			let echoes = 0;
+			// the kernel releases the task at 0x854 when input next arrives; its stack unwinds in a few ticks
+			const release = async (id: number, on = machine) => {
+				new DataView(on.memory.buffer).setUint32(0x854, id, true);
+				on.type(' ');
+				echoes++;
+				await r.run(on, () => (r.output().match(/echo: /g) ?? []).length === echoes);
+				await new Promise((done) => setTimeout(done, 5));
+			};
+			const spawn = async (key: string, total: number, on = machine) => {
+				on.type(key);
+				await r.run(
+					on,
+					() => (r.output().match(/shared (ok|bad)/g) ?? []).length === total
+				);
+			};
+			return { r, machine, release, spawn };
+		};
+
+		for (const size of [8, 0]) {
+			it(`${size ? 'hands a finished process its instance again' : 'instantiates every exec when the pool is off'}, with the same transcript`, async () => {
+				const { r, machine, release, spawn } = setup({ recycleInstances: size });
+				await r.run(machine, () => r.output().includes('parent ok'));
+				await spawn('w', 2);
+				await release(3);
+				await release(5);
+				await spawn('w', 4);
+				expect(r.output().match(/shared ok\n/g)).toHaveLength(4);
+				expect(r.output()).not.toContain('shared bad');
+				expect(machine.stats.userExecs).toBe(size ? 2 : 4);
+				expect(machine.stats.recycledStarts).toBe(size ? 2 : 0);
+				expect(machine.stats.recycleReturns).toBe(size ? 2 : 0);
+			});
+		}
+
+		it('keeps no more idle instances than the pool size', async () => {
+			const { r, machine, release, spawn } = setup({ recycleInstances: 1 });
+			await r.run(machine, () => r.output().includes('parent ok'));
+			await spawn('w', 2);
+			await release(3);
+			await release(5);
+			await spawn('w', 4);
+			expect(machine.stats.recycleReturns).toBe(1);
+			expect(machine.stats.recycledStarts).toBe(1);
+			expect(machine.stats.userExecs).toBe(3);
+			expect(r.output()).not.toContain('shared bad');
+		});
+
+		it('leaves an instance made for another table start in the pool and instantiates', async () => {
+			const { r, machine, release, spawn } = setup();
+			await r.run(machine, () => r.output().includes('parent ok'));
+			await spawn('p', 1);
+			await release(3);
+			await spawn('w', 3);
+			expect(machine.stats.recycledStarts).toBe(0);
+			expect(machine.stats.userExecs).toBe(3);
+			expect(r.output()).not.toContain('shared bad');
+		});
+
+		it('copies the pristine data image to an exec and leaves a clone, which shares live data, alone, each on an instance of its own kind', async () => {
+			const { r, machine, release, spawn } = setup();
+			await r.run(machine, () => r.output().includes('parent ok'));
+			await spawn('w', 2);
+			await release(3);
+			await release(5);
+			const bytes = new Uint8Array(machine.memory.buffer);
+			const enter = (clone: boolean) => {
+				const runner = (machine as any).runner('t', { kind: 'secondary', idle: 0 });
+				runner.instance = (machine as any).shared;
+				runner.user = {
+					module: (machine as any).options.registry.get('S'),
+					hash: 'S',
+					dataStart: 0x10000,
+					tableStart: 0
+				};
+				(machine as any).enterProgram(runner, clone);
+				return runner;
+			};
+			bytes.fill(0xaa, 0x10000, 0x10010);
+			// a clone starts on an instance of its own kind: none is idle yet, so this one is new
+			const first = enter(true);
+			expect(first.recycled.clone).toBe(true);
+			expect(machine.stats.recycledStarts).toBe(0);
+			expect(bytes.subarray(0x10000, 0x10010)).toEqual(new Uint8Array(16).fill(0xaa));
+			const clones = first.recycled;
+			(machine as any).retire(first);
+			// an exec takes one of the two exec instances, never the clone's, and gets the pristine image
+			const exec = enter(false);
+			expect(exec.recycled.clone).toBe(false);
+			expect(machine.stats.recycledStarts).toBe(1);
+			// the image the first process started from, then toy-shared's data relocation of it
+			expect(bytes[0x10000]).toBe(0);
+			expect(new DataView(machine.memory.buffer).getUint32(0x10004, true)).toBe(0x10000);
+			// and the next clone takes the clone's, leaving the live data alone
+			bytes.fill(0xaa, 0x10000, 0x10010);
+			const again = enter(true);
+			expect(again.recycled).toBe(clones);
+			expect(machine.stats.recycledStarts).toBe(2);
+			expect(bytes.subarray(0x10000, 0x10010)).toEqual(new Uint8Array(16).fill(0xaa));
+		});
+
+		it("never gives a process on a fork child's own memory a pooled instance", async () => {
+			const { r, machine, release, spawn } = setup();
+			await r.run(machine, () => r.output().includes('parent ok'));
+			await spawn('w', 2);
+			await release(3);
+			await release(5);
+			(machine as any).privateMemories.set(
+				1,
+				new WebAssembly.Memory({ initial: 2, maximum: 64, shared: true })
+			);
+			await spawn('w', 4);
+			expect(machine.stats.recycledStarts).toBe(0);
+			expect(machine.stats.userExecs).toBe(4);
+		});
+
+		it('checkpoints with idle instances pooled, saves none, and refills after a restore', async () => {
+			const { r, machine, release, spawn } = setup({ asyncify: true });
+			await r.run(machine, () => r.output().includes('parent ok'));
+			await spawn('w', 2);
+			await release(3);
+			await release(5);
+			expect(machine.stats.recycleReturns).toBe(2);
+			const snapshot = await machine.checkpoint();
+			const restored = await Machine.restore(r.machineOptions, snapshot);
+			await spawn('w', 4, restored);
+			// the pool did not travel: both processes instantiated, then went back to it
+			expect(restored.stats.userExecs).toBe(4);
+			expect(restored.stats.recycledStarts).toBe(0);
+			await release(3, restored);
+			await release(5, restored);
+			expect(restored.stats.recycleReturns).toBe(4);
+			await spawn('w', 6, restored);
+			expect(restored.stats.recycledStarts).toBe(2);
+			expect(r.output()).not.toContain('shared bad');
+		});
+
+		it('leaves a program that is not a share build to its own instance each time', async () => {
+			const r = rig({ sharedKernel: true, registry: new Map([['U', toyUser()]]) });
+			const machine = new Machine(r.machineOptions);
+			await r.run(machine, () => r.output().includes('parent ok'));
+			machine.type('u');
+			await r.run(machine, () => r.output().includes('user back'));
+			expect(machine.stats.recycledStarts).toBe(0);
+			expect(machine.stats.recycleReturns).toBe(0);
+		});
+	});
 
 	it('kills a task whose code traps with the signal Linux sends, and keeps the machine running', async () => {
 		const r = rig({ sharedKernel: true, registry: new Map([['F', toyUser('toy-fault.wat')]]) });
@@ -1055,68 +1347,68 @@ describe('Machine', () => {
 			expect(snapshot.syncWrites).toBe(true);
 		});
 
+		it('asks for the runtime option when a feature needs the router', () => {
+			for (const option of [
+				{ syscallCache: true as const },
+				{ countSyscalls: true },
+				{ fileSync: async () => {} }
+			])
+				expect(
+					() => new Machine({ ...rig(option).machineOptions, runtime: undefined })
+				).toThrow(/MachineOptions\.runtime/);
+		});
+
+		it('refuses a statx cache over a kernel with no wasm_fs_block', async () => {
+			const r = rig({
+				sharedKernel: true,
+				syscallCache: true,
+				registry: new Map([['T', toyUser('toy-statx.wat')]])
+			});
+			const machine = new Machine(r.machineOptions);
+			const exp = (machine as any).exp.bind(machine);
+			(machine as any).exp = (runner: unknown) => ({
+				...exp(runner),
+				wasm_fs_block: undefined
+			});
+			await r.run(machine, () => r.output().includes('parent ok'));
+			machine.type('t');
+			expect(await r.run(machine, () => r.output().includes('handled'))).toBe('crashed');
+			expect(String(machine.crashed)).toMatch(/patch 0036/);
+		});
+
 		describe('statx cache', () => {
-			// without counters the toy kernel is one with patch 0022 only
-			const statxRig = (syscallCache: true | 'verify', counters = true) => {
+			const statxRig = (syscallCache: true | 'verify') => {
 				const r = rig({
 					sharedKernel: true,
 					syscallCache,
 					registry: new Map([['T', toyUser('toy-statx.wat')]])
 				});
 				const machine = new Machine(r.machineOptions);
-				if (!counters) {
-					const exp = (machine as any).exp.bind(machine);
-					(machine as any).exp = (runner: unknown) => ({
-						...exp(runner),
-						wasm_fs_gen_at: undefined
-					});
-				}
 				const set = (at: number, v: number) =>
 					new DataView(machine.memory.buffer).setUint32(at, v, true);
 				return { r, machine, set };
 			};
-			// the toy kernel's counter of an inode number, and its mount count
-			const counter = (ino: number) => 0x1400 + (statxBucket(ino) & 0xff) * 4;
-			const MOUNTS = 0x870;
-
-			it('answers a repeated absolute statx from the host until the generation moves', async () => {
-				const { r, machine, set } = statxRig(true, false);
-				await r.run(machine, () => r.output().includes('parent ok'));
-				machine.type('t');
-				await r.run(machine, () => r.output().includes('handled'));
-				// the first asks the kernel, and the fill asks where / is; the second is a hit; the
-				// relative path goes to the kernel
-				expect(word(machine, 0x860)).toBe(3);
-				expect(new DataView(machine.memory.buffer).getBigUint64(0x3000 + 40, true)).toBe(
-					5n
-				);
-				set(0x858, 7);
-				machine.type('r');
-				await r.run(machine, () => r.output().includes('user back'));
-				// the refill asks the kernel once: where / is was kept
-				expect(word(machine, 0x860)).toBe(4);
-				expect(machine.stats).toMatchObject({
-					statxHits: 2,
-					statxMisses: 3,
-					statxFills: 2,
-					statxFineFills: 0,
-					statxMismatches: 0
-				});
-			});
+			// the toy kernel's wasm_fs_block: the generation, the mount count and the inode counters
+			const BLOCK = 0x18000;
+			const MOUNTS = BLOCK + FS_MOVES;
+			const counter = (ino: number) => BLOCK + FS_COUNTERS + statxBucket(ino) * 4;
 
 			it('holds an answer on the inodes its path crossed, and not on the generation', async () => {
 				const { r, machine, set } = statxRig(true);
 				await r.run(machine, () => r.output().includes('parent ok'));
 				machine.type('t');
 				await r.run(machine, () => r.output().includes('handled'));
-				// the kernel's answer, the probes of "/", "/toy" and "/toy/file", and the relative path
-				expect(word(machine, 0x860)).toBe(5);
+				// the kernel's answer and the relative path; the fill walks the path in one call
+				expect(word(machine, 0x860)).toBe(2);
+				expect(new DataView(machine.memory.buffer).getBigUint64(0x3000 + 40, true)).toBe(
+					5n
+				);
 				expect(machine.stats).toMatchObject({
 					statxHits: 1,
 					statxMisses: 2,
 					statxFills: 1,
 					statxFineFills: 1,
-					statxProbes: 3
+					statxChains: 1
 				});
 				// the toy's view is 1, and the program asks with no flags and the basic mask
 				const hash = statxHash(new Uint8Array(machine.memory.buffer), 0x750, 1, 0, 0x7ff)!;
@@ -1125,11 +1417,11 @@ describe('Machine', () => {
 					[10, 11, 12].map(statxBucket)
 				);
 				// a write anywhere, and a change to an inode that is not on the path
-				set(0x858, 7);
+				set(BLOCK, 7);
 				set(counter(99), 1);
 				machine.type('r');
 				await r.run(machine, () => r.output().includes('user back'));
-				expect(word(machine, 0x860)).toBe(5);
+				expect(word(machine, 0x860)).toBe(2);
 				expect(machine.stats).toMatchObject({
 					statxHits: 3,
 					statxMisses: 2,
@@ -1151,14 +1443,14 @@ describe('Machine', () => {
 				set(at(), 1);
 				machine.type('r');
 				await r.run(machine, () => r.output().includes('user back'));
-				// the kernel's answer and the probes of "/toy" and "/toy/file" (the root's was kept)
-				expect(word(machine, 0x860)).toBe(8);
+				// the refill asks the kernel once and walks the path once
+				expect(word(machine, 0x860)).toBe(3);
 				expect(machine.stats).toMatchObject({
 					statxHits: 2,
 					statxMisses: 3,
 					statxFills: 2,
 					statxFineFills: 2,
-					statxProbes: 5
+					statxChains: 2
 				});
 			});
 
@@ -1177,17 +1469,50 @@ describe('Machine', () => {
 					probes: Record<string, Probe>,
 					flags = AT_SYMLINK_NOFOLLOW
 				) => {
+					const memory = new WebAssembly.Memory({ initial: 1 });
+					const bytes = new Uint8Array(memory.buffer);
+					const view = new DataView(memory.buffer);
 					const asked: string[] = [];
-					const host = {
-						statxProbe: async (_m: unknown, _s: number, _t: number, path: string) => {
-							asked.push(path);
-							return probes[path];
+					// what wasm_fs_chain writes: the root, then each prefix up to a missing one, a
+					// file or another mount; an unanswered prefix is not one the dcache can answer
+					const kernel = {
+						wasm_fs_chain(len: number) {
+							const parts = new TextDecoder()
+								.decode(bytes.subarray(FS_PATH, FS_PATH + len))
+								.split('/')
+								.filter(Boolean);
+							const links = [root];
+							for (let i = 1; i <= parts.length; i++) {
+								const path = `/${parts.slice(0, i).join('/')}`;
+								asked.push(path);
+								const probe = probes[path];
+								if (probe === undefined) break;
+								if (probe === null) return -11;
+								links.push(probe);
+								if (
+									(probe.mode & 0o170000) !== 0o040000 ||
+									probe.mount !== root.mount
+								)
+									break;
+							}
+							links.forEach((link, i) => {
+								view.setUint32(FS_CHAIN + i * 12, link.mount, true);
+								view.setUint32(FS_CHAIN + i * 12 + 4, link.ino, true);
+								view.setUint32(FS_CHAIN + i * 12 + 8, link.mode, true);
+							});
+							return links.length;
 						}
 					};
+					const host = {
+						stats: { statxChains: 0 },
+						fsBlockAt: 0,
+						memory,
+						viewsOf: () => ({ bytes, view }),
+						exp: () => kernel
+					};
 					const walk = (Machine.prototype as any).statxChain as Function;
-					return walk
-						.call(host, null, 0, 0, { name, flags }, result, root)
-						.then((inos: number[] | null) => ({ inos, asked }));
+					const path = new TextEncoder().encode(name);
+					return { inos: walk.call(host, null, { path, flags }, result), asked };
 				};
 				const tree = {
 					'/usr': entry(3),
@@ -1256,13 +1581,13 @@ describe('Machine', () => {
 				await r.run(machine, () => r.output().includes('handled'));
 				const me = [...(machine as any).runners.values()].find((x: any) => x.instance);
 				const kernel = (machine as any).exp(me);
-				const hit = new WebAssembly.Instance(ROUTER.statx, {
-					env: { user: machine.memory, table: (machine as any).fsCache.memory },
-					kernel: {
-						view: kernel.wasm_fs_view,
-						gen: kernel.wasm_fs_gen,
-						at: kernel.wasm_fs_gen_at
-					}
+				const hit = new WebAssembly.Instance(RUNTIME.statx, {
+					env: {
+						user: machine.memory,
+						table: (machine as any).fsCache.memory,
+						machine: machine.memory
+					},
+					kernel: { block: kernel.wasm_fs_block, view: kernel.wasm_fs_view }
 				}).exports.hit as (...args: number[]) => number;
 				const ask = (buf: number) => hit(0, 0, 291, -100, 0x750, 0, 0x7ff, buf);
 				const size = machine.memory.buffer.byteLength;
@@ -1416,7 +1741,7 @@ describe('Machine', () => {
 				h[n] = (_sp: number, _tls: number, nr: number) => (seen.push(`h${nr}`), 0);
 			}
 			const router = (cache: boolean, answer: number) =>
-				new WebAssembly.Instance(ROUTER.route, {
+				new WebAssembly.Instance(RUNTIME.route, {
 					k: k as WebAssembly.ModuleImports,
 					h: h as WebAssembly.ModuleImports,
 					c: {

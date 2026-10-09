@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import {
 	BadGateway,
+	BodyTooLarge,
 	MAX_HEAD,
 	parseHead,
 	requestBytes,
@@ -103,6 +104,36 @@ describe('requestBytes', () => {
 		expect(text.endsWith('\r\n\r\n5\r\nhello\r\n10\r\n0123456789abcdef\r\n0\r\n\r\n')).toBe(
 			true
 		);
+	});
+
+	it('sends a body of exactly the bound and throws for one byte more, whichever way it is framed', async () => {
+		const chunks = (...parts: string[]) =>
+			new ReadableStream<Uint8Array>({
+				start(controller) {
+					for (const part of parts) controller.enqueue(encode(part));
+					controller.close();
+				}
+			});
+		const post = (body: BodyInit, headers: Record<string, string> = {}) =>
+			new Request('http://site.test/up', {
+				method: 'POST',
+				body,
+				headers,
+				// @ts-expect-error duplex is a Node and workerd request option
+				duplex: 'half'
+			});
+		const run = async (request: Request, max: number) => {
+			let text = '';
+			for await (const chunk of requestBytes(request, max))
+				text += new TextDecoder().decode(chunk);
+			return text;
+		};
+		expect(await run(post('abcdefgh', { 'content-length': '8' }), 8)).toContain('abcdefgh');
+		expect(await run(post(chunks('abcd', 'efgh')), 8)).toContain('4\r\nefgh\r\n');
+		await expect(run(post('abcdefghi', { 'content-length': '9' }), 8)).rejects.toBeInstanceOf(
+			BodyTooLarge
+		);
+		await expect(run(post(chunks('abcd', 'efghi')), 8)).rejects.toBeInstanceOf(BodyTooLarge);
 	});
 
 	it('gives a POST with no body a zero length', async () => {

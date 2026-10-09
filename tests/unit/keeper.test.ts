@@ -2,7 +2,7 @@ import binaryen from 'binaryen';
 import { readFileSync } from 'node:fs';
 import { describe, expect, it } from 'vitest';
 import { sqlite } from '../../experiments/write-back/scripts/sqlite.ts';
-import { routerModules } from '../../scripts/wasm/router-modules.ts';
+import { hostRuntime } from '../../scripts/wasm/router-modules.ts';
 import { bootstrapOf, CHUNK, packImage, type BootstrapIndex } from '../../src/worker/bootstrap.ts';
 import { encodeSnapshot } from '../../src/worker/durable.ts';
 import {
@@ -19,7 +19,7 @@ import {
 import { Machine } from '../../src/worker/machine/machine.ts';
 import { MIN_SPAN_MS, type Decision } from '../../src/worker/thermal.ts';
 
-const ROUTER = routerModules();
+const RUNTIME = hostRuntime();
 
 const PARK_IMPORTS = [
 	'wasm_serialize_tasks',
@@ -77,7 +77,7 @@ function rig(options: { asyncify?: boolean; sql?: ReturnType<typeof sqlite> } = 
 			maximumPages: 64,
 			sharedKernel: true,
 			asyncify: options.asyncify !== false,
-			router: ROUTER,
+			runtime: RUNTIME,
 			sha256: (bytes) => String.fromCharCode(bytes[0] ?? 0),
 			now: () => clock.ns,
 			write: (text) => (output += text)
@@ -384,6 +384,24 @@ describe('Keeper', () => {
 				const attended = keeper.turn(5000);
 				for (let i = 0; i < 600; i++) await sleep(10);
 				expect(attended()).toBe(false);
+			});
+
+			it('ends an unattended turn on the time its timers skipped, with the host clock standing still', async () => {
+				const r = rig();
+				const frozen: KeeperHost = {
+					...r.host,
+					options: () => ({ ...r.host.options(), now: () => 0n })
+				};
+				const keeper = new Keeper(frozen, {}, { turnEnd: 'over' });
+				const { machine } = await keeper.open();
+				const quiet = keeper.sleeper(async () => {});
+				await machine.run(() => r.output().includes('parent ok'), quiet, 20_000);
+				// the toy idles on 1 ms timers: 40 of them are a 40 ms budget, far under the step floor
+				const stop = keeper.turn(40, true);
+				let waits = 0;
+				const sleep = keeper.sleeper(async () => void waits++);
+				expect(await machine.run(stop, sleep, 20_000)).toBe('until');
+				expect(waits).toBeLessThan(60);
 			});
 
 			it('never ends an attended turn, or at a yield', async () => {

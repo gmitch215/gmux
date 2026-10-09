@@ -7,6 +7,9 @@ export class BadGateway extends Error {}
 /** thrown when the machine says nothing for too long; the site turns it into a 504 */
 export class GatewayTimeout extends Error {}
 
+/** thrown when a request body runs past its bound; the site turns it into a 413 */
+export class BodyTooLarge extends Error {}
+
 const HOP_BY_HOP = [
 	'connection',
 	'keep-alive',
@@ -30,9 +33,13 @@ const encoder = new TextEncoder();
 /**
  * A request as HTTP/1.1 for a program in the machine: the head, then the body as it arrives, framed
  * by its Content-Length or chunked. Hop-by-hop headers are dropped and the connection is closed
- * after the response, which is how the response is framed when it carries no length
+ * after the response, which is how the response is framed when it carries no length. A body that
+ * runs past `maxBytes` throws BodyTooLarge before the byte that crosses the bound is sent
  */
-export async function* requestBytes(request: Request): AsyncGenerator<Uint8Array> {
+export async function* requestBytes(
+	request: Request,
+	maxBytes = Infinity
+): AsyncGenerator<Uint8Array> {
 	const url = new URL(request.url);
 	const connection = (request.headers.get('connection') ?? '')
 		.split(',')
@@ -59,11 +66,17 @@ export async function* requestBytes(request: Request): AsyncGenerator<Uint8Array
 	yield encoder.encode(head);
 	if (request.body === null) return;
 	const reader = request.body.getReader();
+	let total = 0;
 	try {
 		for (;;) {
 			const { done, value } = await reader.read();
 			if (done) break;
 			if (!value.length) continue;
+			total += value.length;
+			if (total > maxBytes) {
+				await reader.cancel().catch(() => {});
+				throw new BodyTooLarge(`the request body is over ${maxBytes} bytes`);
+			}
 			if (!chunked) yield value;
 			else {
 				yield encoder.encode(`${value.length.toString(16)}\r\n`);

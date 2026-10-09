@@ -3,16 +3,21 @@ import { DlProcess, dylinkInfo, type DlMisses, type DlSaved, type DlView } from 
 import { clear, copyIn, copyOut, Domain, EFAULT, READ, stringLength, WRITE } from './domain.ts';
 import { Ingress, type IngressStream } from './ingress.ts';
 import {
+	FS_CHAIN,
+	FS_COUNTERS,
+	FS_MOVES,
+	FS_PATH,
 	MISS,
 	ROUTE_HOOK,
 	ROUTE_KERNEL,
 	ROUTE_WATCH,
 	ROUTE_WRITES,
 	STATX_GUARDS,
+	STATX_PATH_MAX,
 	statxBucket,
 	StatxTable,
 	WRITE_CALLS,
-	type RouterModules
+	type HostRuntime
 } from './router.ts';
 
 /** a regular file as a program's fsync left it, or as a restore writes it back */
@@ -49,12 +54,6 @@ export interface MachineOptions {
 	initrd: Uint8Array;
 	/** the kernel command line; boot without `nohz_full` (see the technical report) */
 	cmdline: string;
-	/**
-	 * `gmux-core.wasm`, compiled (scripts/build-core.sh): the scheduler's idle table and deadline
-	 * minimum run in C over the machine's memory, in pages reserved before the kernel boots. Without
-	 * it the same decisions run in TypeScript
-	 */
-	core?: WebAssembly.Module;
 	/** precompiled user programs keyed by the hex SHA-256 of their bytes */
 	registry: Map<string, WebAssembly.Module>;
 	/**
@@ -62,6 +61,13 @@ export interface MachineOptions {
 	 * bases, stack pointer and globals swapped at each switch (needs `sharedKernel`; no checkpoints)
 	 */
 	shareInstances?: boolean;
+	/**
+	 * the most idle instances kept for each share build (scripts/wasm/share.ts) that no process is
+	 * using: a finished process's instance goes back and is reset for the next exec of its program
+	 * (globals, relocations, TLS base, pristine data). 0 turns it off; the default is 8. Needs
+	 * `sharedKernel`; nothing pooled is saved by a checkpoint
+	 */
+	recycleInstances?: number;
 	/**
 	 * builds of the registry's programs that check every load and store against the kernel's page
 	 * owner table (scripts/wasm/guard-pass.ts), by the same hash. A task whose effective uid is not 0 runs
@@ -76,6 +82,12 @@ export interface MachineOptions {
 	log?: (line: string) => void;
 	/** console output, as the kernel writes it */
 	write?: (text: string) => void;
+	/**
+	 * whether the kernel queues console output in a ring the host drains (kernel patch 0038): one
+	 * `write` for everything queued since the last pump step instead of one per kernel put. Default
+	 * true; a kernel without the ring puts directly
+	 */
+	consoleRing?: boolean;
 	/** the hex SHA-256 of an executable without an exec stub, to find it in `registry` */
 	sha256: (bytes: Uint8Array) => string;
 	/** log every task switch and release through `log` */
@@ -142,10 +154,14 @@ export interface MachineOptions {
 	 */
 	countSyscalls?: boolean | ((call: SyscallCall) => void);
 	/**
-	 * the syscall router and the statx hit path, compiled (`scripts/build-router.sh`); required with
-	 * `fileSync`, `restoreFiles`, `syscallCache` or `countSyscalls`
+	 * the host runtime modules, compiled (`scripts/build-router.sh`): the syscall router and the statx
+	 * hit path, required with `fileSync`, `restoreFiles`, `syscallCache` or `countSyscalls`, and the
+	 * scheduler core, whose idle table and deadline minimum then run in C over the machine's memory
+	 * in pages reserved before the kernel boots (without it the same decisions run in TypeScript). A
+	 * snapshot taken without the core's region restores on the TypeScript scheduler, which picks the
+	 * same task
 	 */
-	router?: RouterModules;
+	runtime?: HostRuntime;
 	/**
 	 * wasm side modules a process asked for that the registry did not hold, by executable hash. Pass
 	 * the same map to the next machine to carry the record across runs
@@ -273,6 +289,7 @@ const SYS_GETPID = 172;
 const SYS_GETTID = 178;
 const SYS_CLONE = 220;
 const SYS_EXECVE = 221;
+const RECYCLE_DEFAULT = 8;
 const SYS_MUNMAP = 215;
 const SYS_MMAP = 222;
 const SYS_PRLIMIT64 = 261;
@@ -391,6 +408,8 @@ interface Runner {
 	/** the shared instance its program runs on, and its values there while it is parked */
 	shared?: SharedProgram | null;
 	sharedSaved?: number[] | null;
+	/** the pooled instance its program runs on, which goes back to the pool when the program ends */
+	recycled?: Pooled | null;
 	/** the running user program, for signal delivery */
 	program: {
 		exports: Record<string, any>;
@@ -471,16 +490,95 @@ interface SharedProgram {
 	tableStart: number;
 }
 
+/** what the host asks of a module at every exec, read once */
+interface ModuleFacts {
+	/** the gmux.share section: a shareable program's data and bss bytes */
+	share: number | null;
+	/** the gmux.data section: the data the program needs mapped */
+	data: number | null;
+	table: number;
+	tlb: boolean;
+	guard: boolean;
+	/** a share build whose instance a finished process can hand to the next one */
+	recyclable: boolean;
+}
+
+const FACTS = new WeakMap<WebAssembly.Module, ModuleFacts>();
+
+// what userEnv gives every program; an import outside it needs a loader or a guard of its own
+const PLAIN_IMPORTS = new Set([
+	'memory',
+	'__memory_base',
+	'__stack_pointer',
+	'__indirect_function_table',
+	'__table_base',
+	'__table_base32',
+	'__wasm_abort',
+	'__gmux_stack_move',
+	'__gmux_fuel',
+	'__gmux_vfork',
+	'__gmux_fork',
+	'__gmux_vfork_exec',
+	'__gmux_vfork_exit',
+	...[0, 1, 2, 3, 4, 5, 6].map((n) => `__wasm_syscall_${n}`)
+]);
+
+function moduleFacts(module: WebAssembly.Module): ModuleFacts {
+	let facts = FACTS.get(module);
+	if (facts) return facts;
+	const word = (name: string) => {
+		const note = WebAssembly.Module.customSections(module, name)[0];
+		return note ? new DataView(note).getUint32(0, true) : null;
+	};
+	const imports = WebAssembly.Module.imports(module);
+	const exports = WebAssembly.Module.exports(module);
+	const has = (name: string) => imports.some((i) => i.module === 'gmux' && i.name === name);
+	const share = word('gmux.share');
+	const tlb = has('tlb');
+	const guard = has('table');
+	facts = {
+		share,
+		data: word('gmux.data'),
+		table: word('gmux.table') ?? 4096,
+		tlb,
+		guard,
+		recyclable:
+			share !== null &&
+			!tlb &&
+			!guard &&
+			imports.every((i) => i.module === 'env' && PLAIN_IMPORTS.has(i.name)) &&
+			// a program that forks, checkpoints or unwinds keeps frames an instance reset would drop
+			!exports.some((e) => e.name === 'gmux_ckpt' || e.name.startsWith('asyncify_'))
+	};
+	FACTS.set(module, facts);
+	return facts;
+}
+
 function shareable(module: WebAssembly.Module): boolean {
-	return WebAssembly.Module.customSections(module, 'gmux.share').length > 0;
+	return moduleFacts(module).share !== null;
 }
 
 /** a shareable program's data and bss, from its gmux.share section */
 function sharedDataSize(module: WebAssembly.Module): number {
-	return new DataView(WebAssembly.Module.customSections(module, 'gmux.share')[0]!).getUint32(
-		0,
-		true
-	);
+	return moduleFacts(module).share!;
+}
+
+/** a finished process's instance, made ready again for the next process of its program */
+interface Pooled {
+	module: WebAssembly.Module;
+	memory: WebAssembly.Memory;
+	exports: Record<string, any>;
+	memoryBase: WebAssembly.Global;
+	stackPointer: WebAssembly.Global;
+	/** the exported mutable globals, and their values right after instantiation */
+	globals: WebAssembly.Global[];
+	initial: number[];
+	tlsOffset: number;
+	tableStart: number;
+	/** made for a clone, whose start function ran over its parent's live data */
+	clone: boolean;
+	/** taken from the pool for this process: its start function will not write the data image */
+	reused: boolean;
 }
 
 /** the registry key an exec stub carries (scripts/wasm/exec-stubs.ts), or null for a full file */
@@ -498,7 +596,14 @@ export function stubHash(bytes: Uint8Array): string | null {
 	const dylink = leb();
 	p += dylink;
 	if (bytes[p++] !== 0) return null;
-	const end = leb() + p;
+	let size = leb();
+	// a stub of a program that carries the stack abi has that section before the key's
+	if (String.fromCharCode(...bytes.subarray(p, p + 9)) === '\x08gmux.abi') {
+		p += size;
+		if (bytes[p++] !== 0) return null;
+		size = leb();
+	}
+	const end = size + p;
 	const name = leb();
 	if (end !== bytes.length || end - p - name !== 32) return null;
 	if (String.fromCharCode(...bytes.subarray(p, p + name)) !== 'gmux.exec') return null;
@@ -506,8 +611,7 @@ export function stubHash(bytes: Uint8Array): string | null {
 }
 
 function tableEntries(module: WebAssembly.Module): number {
-	const note = WebAssembly.Module.customSections(module, 'gmux.table')[0];
-	return note ? new DataView(note).getUint32(0, true) : 4096;
+	return moduleFacts(module).table;
 }
 
 /** a trap in wasm code, or its stack running out; not an error the host threw */
@@ -586,10 +690,27 @@ export interface MachineStats {
 	restoreHooks: number;
 	/** processes that joined a shared program instance instead of instantiating */
 	sharedEntries: number;
+	/** execs that took a finished process's instance instead of instantiating */
+	recycledStarts: number;
+	/** finished processes' instances kept for the next exec of their program */
+	recycleReturns: number;
 	/** the console driver's reads from the host */
 	consoleReads: number;
 	/** input interrupts raised to the console */
 	consoleRaises: number;
+	/** the console driver's calls into the host (each one a `write` call), and the bytes they carried */
+	consolePuts: number;
+	consolePutBytes: number;
+	/** drains of the console ring that found bytes (each one a `write` call), the bytes, and the most one took */
+	consoleDrains: number;
+	consoleDrainBytes: number;
+	consoleDrainPeak: number;
+	/** pump steps: one pass of the pump's loop, whether it ran a task or waited */
+	pumpSteps: number;
+	/** `sleep` calls the pump made: yields every `yieldEvery` steps and waits for a timer */
+	hostSleeps: number;
+	/** the kernel's reaches into another process's pages (`wasm_user_touch`) */
+	userTouches: number;
 	/** executables the registry did not hold, by hash and size */
 	unknownExecutables: string[];
 	/** side modules a process asked dlopen for that the registry did not hold: library hash for executable hash */
@@ -606,9 +727,9 @@ export interface MachineStats {
 	statxHits: number;
 	statxMisses: number;
 	statxFills: number;
-	/** the fills held on inode counters (kernel patch 0029) and the probes they and the others cost */
+	/** the fills held on inode counters (kernel patch 0029) and the kernel walks (0036) they cost */
 	statxFineFills: number;
-	statxProbes: number;
+	statxChains: number;
 	/** with `syscallCache: 'verify'`: answers the cache held that the kernel then contradicted */
 	statxMismatches: number;
 	/** with `countSyscalls`: calls by syscall number */
@@ -678,8 +799,18 @@ export class Machine {
 		freePages: 0,
 		restoreHooks: 0,
 		sharedEntries: 0,
+		recycledStarts: 0,
+		recycleReturns: 0,
 		consoleReads: 0,
 		consoleRaises: 0,
+		consolePuts: 0,
+		consolePutBytes: 0,
+		consoleDrains: 0,
+		consoleDrainBytes: 0,
+		consoleDrainPeak: 0,
+		pumpSteps: 0,
+		hostSleeps: 0,
+		userTouches: 0,
 		unknownExecutables: [],
 		dlMisses: [],
 		interpretedStarts: [],
@@ -690,7 +821,7 @@ export class Machine {
 		statxMisses: 0,
 		statxFills: 0,
 		statxFineFills: 0,
-		statxProbes: 0,
+		statxChains: 0,
 		statxMismatches: 0,
 		syscalls: {},
 		userCopies: 0,
@@ -718,6 +849,8 @@ export class Machine {
 
 	private readonly options: MachineOptions;
 	private running = false;
+	/** kernel patch 0038's ring: head, tail, enabled and a spare word, then the bytes; undefined until looked up */
+	private ringView: { words: Uint32Array; data: Uint8Array } | null | undefined;
 	// its stacks are bytes in a snapshot; only Machine.restore continues it
 	private spent = false;
 	private checkpointing = false;
@@ -768,9 +901,9 @@ export class Machine {
 			options.syscallCache ||
 			options.countSyscalls
 		) {
-			if (!options.router)
+			if (!options.runtime)
 				throw new Error(
-					'fileSync, restoreFiles, syscallCache and countSyscalls need MachineOptions.router'
+					'fileSync, restoreFiles, syscallCache and countSyscalls need MachineOptions.runtime'
 				);
 			this.route = new WebAssembly.Global(
 				{ value: 'i32', mutable: true },
@@ -793,6 +926,11 @@ export class Machine {
 				}
 			});
 		}
+	}
+
+	/** whether the C scheduler core picks the tasks (else the TypeScript tables do) */
+	get coreScheduling(): boolean {
+		return this.core !== null;
 	}
 
 	/** whether a task is ready to run, which a machine with no timer to wait on can still have */
@@ -1004,6 +1142,7 @@ export class Machine {
 				const me = owner();
 				me.halted = true;
 				self.halted = true;
+				self.drainConsole();
 				self.log(`halt from ${me.name}`);
 				return new Promise<number>(() => {
 					const signal = self.suspended;
@@ -1013,6 +1152,7 @@ export class Machine {
 			}),
 			wasm_panic: (msg: number) => {
 				const text = self.cstring(msg);
+				self.drainConsole();
 				self.log(`kernel panic: ${text}`);
 				throw new Trap('panic');
 			},
@@ -1058,6 +1198,9 @@ export class Machine {
 				return count;
 			},
 			wasm_driver_hvc_put: (buffer: number, count: number) => {
+				self.drainConsole();
+				self.stats.consolePuts++;
+				self.stats.consolePutBytes += count;
 				self.options.write?.(self.decoder.decode(self.bytes(buffer, buffer + count)));
 				return count;
 			},
@@ -1141,9 +1284,10 @@ export class Machine {
 				);
 			},
 			// the kernel is about to read or write another process's pages (kernel patch 0021)
-			wasm_user_touch: new WebAssembly.Suspending((addr: number, len: number) =>
-				self.fillDeferredRange(addr >>> 0, len >>> 0)
-			),
+			wasm_user_touch: new WebAssembly.Suspending((addr: number, len: number) => {
+				self.stats.userTouches++;
+				return self.fillDeferredRange(addr >>> 0, len >>> 0);
+			}),
 			wasm_user_forget: (mm: number) => {
 				self.privateMemories.delete(mm >>> 0);
 				self.forkChildren.delete(mm >>> 0);
@@ -1192,10 +1336,9 @@ export class Machine {
 				module = interpreted;
 			}
 		}
-		const needs = WebAssembly.Module.customSections(module, 'gmux.data')[0];
-		const mapped = dylinkInfo(bytes)?.memorySize;
-		if (needs && mapped !== undefined) {
-			const size = new DataView(needs).getUint32(0, true);
+		const size = moduleFacts(module).data;
+		const mapped = size === null ? undefined : dylinkInfo(bytes)?.memorySize;
+		if (size !== null && mapped !== undefined) {
 			// the kernel maps the stub's size by whole pages (binfmt_wasm)
 			if (size > Math.ceil(mapped / 0x1000) * 0x1000) {
 				this.stats.unknownExecutables.push(
@@ -1268,7 +1411,7 @@ export class Machine {
 
 	private finished(runner: Runner, error?: unknown) {
 		// an abandoned stack was not running: the pump waits on another task
-		if (error instanceof Abandoned) return;
+		if (error instanceof Abandoned) return this.retire(runner);
 		if (error && !(error instanceof Trap && error.kind === 'panic')) {
 			this.crashed = error;
 			this.log(`${runner.name} crashed: ${String((error as Error)?.stack ?? error)}`);
@@ -1298,8 +1441,8 @@ export class Machine {
 		);
 		// before _start: the kernel grows its RAM to the memory maximum and leaves no room after it
 		if (this.options.asyncify) this.ensureScratch();
-		if (this.options.core)
-			this.startCore(this.memory.grow(coreRegionPages(this.options.core)) * 0x10000);
+		const core = this.options.runtime?.core;
+		if (core) this.startCore(this.memory.grow(coreRegionPages(core)) * 0x10000);
 		await this.enter(runner, () => WebAssembly.promising(exports._start)(), '_start');
 	}
 
@@ -1338,10 +1481,15 @@ export class Machine {
 		}
 	}
 
-	/** a fresh instance of the task's user program over the shared memory */
+	/**
+	 * a fresh instance of the task's user program over the shared memory. `start` says whether it
+	 * is an exec or a clone, the two starts a recycled instance can stand in for (a fork child and a
+	 * restore pass none, and always get an instance of their own)
+	 */
 	private program(
 		runner: Runner,
-		stackPointer: number
+		stackPointer: number,
+		start?: 'exec' | 'clone'
 	): { ux: Record<string, any>; global: WebAssembly.Global; dl?: DlView } {
 		const user = runner.user!;
 		if (
@@ -1352,6 +1500,14 @@ export class Machine {
 		)
 			return this.sharedProgram(runner, stackPointer);
 		runner.shared = null;
+		if (
+			start &&
+			this.shared &&
+			(this.options.recycleInstances ?? RECYCLE_DEFAULT) > 0 &&
+			moduleFacts(user.module).recyclable &&
+			this.userMemory(runner) === this.memory
+		)
+			return this.recycledProgram(runner, stackPointer, start === 'clone');
 		const global = new WebAssembly.Global({ value: 'i32', mutable: true }, stackPointer);
 		const base = (value: number, mutable = false) =>
 			new WebAssembly.Global({ value: 'i32', mutable }, value);
@@ -1431,14 +1587,107 @@ export class Machine {
 		return { ux: s.exports, global: s.stackPointer };
 	}
 
+	/**
+	 * a finished process's instance of the program, reset to what a new one starts as: the exported
+	 * globals, the bases and stack pointer, the global relocations and (for an exec) the TLS base. An
+	 * exec's pristine data image goes back in enterProgram. An exec and a clone each have a pool of
+	 * their own, because a start function that finds the parent's live data (a clone) leaves the
+	 * image alone and sets one global less than a start on zeroed pages. An instance made for another
+	 * table base or memory is left in the pool
+	 */
+	private recycledProgram(
+		runner: Runner,
+		stackPointer: number,
+		clone: boolean
+	): { ux: Record<string, any>; global: WebAssembly.Global } {
+		const user = runner.user!;
+		const pools = clone ? this.clonePool : this.pool;
+		const idle = pools.get(user.module);
+		let p: Pooled | undefined;
+		if (idle)
+			for (let i = idle.length - 1; i >= 0; i--)
+				if (idle[i]!.tableStart === user.tableStart && idle[i]!.memory === this.memory) {
+					p = idle.splice(i, 1)[0];
+					break;
+				}
+		if (p) {
+			p.memoryBase.value = user.dataStart;
+			p.stackPointer.value = stackPointer;
+			p.globals.forEach((g, i) => (g.value = p!.initial[i]!));
+			this.hostCalling = true;
+			try {
+				p.exports.__wasm_apply_global_relocs();
+				if (!clone) p.exports.__set_tls_base?.(user.dataStart + p.tlsOffset);
+			} finally {
+				this.hostCalling = false;
+			}
+			p.reused = true;
+			this.stats.recycledStarts++;
+		} else {
+			const g = (value: number) =>
+				new WebAssembly.Global({ value: 'i32', mutable: true }, value);
+			const [memoryBase, stack] = [g(user.dataStart), g(stackPointer)];
+			const tableBase = new WebAssembly.Global(
+				{ value: 'i32', mutable: false },
+				user.tableStart
+			);
+			// a clone's start function must leave the parent's data alone for reuse to match it
+			const size = sharedDataSize(user.module);
+			const before =
+				clone && !this.cloneChecked.has(user.module)
+					? new Uint8Array(this.memory.buffer, user.dataStart, size).slice()
+					: null;
+			const exports = this.instantiateUser(
+				runner,
+				this.userEnv(runner, stack, memoryBase, tableBase)
+			).exports as Record<string, any>;
+			if (before) {
+				const after = new Uint8Array(this.memory.buffer, user.dataStart, size);
+				this.cloneChecked.set(
+					user.module,
+					before.every((b, i) => b === after[i])
+				);
+			}
+			const own = Object.keys(exports)
+				.filter((k) => /^gmux_g\d+$/.test(k))
+				.map((k) => exports[k] as WebAssembly.Global);
+			p = {
+				module: user.module,
+				memory: this.memory,
+				exports,
+				memoryBase,
+				stackPointer: stack,
+				globals: own,
+				initial: own.map((x) => Number(x.value)),
+				tlsOffset: (exports.__get_tls_base?.() ?? user.dataStart) - user.dataStart,
+				tableStart: user.tableStart,
+				clone,
+				reused: false
+			};
+		}
+		runner.recycled = p;
+		return { ux: p.exports, global: p.stackPointer };
+	}
+
+	/** the program ended (an exec replaced it, or its task unwound): its instance goes back */
+	private retire(runner: Runner) {
+		const p = runner.recycled;
+		if (!p) return;
+		runner.recycled = null;
+		if (p.clone && !this.cloneChecked.get(p.module)) return;
+		const pools = p.clone ? this.clonePool : this.pool;
+		let idle = pools.get(p.module);
+		if (!idle) pools.set(p.module, (idle = []));
+		if (idle.length >= (this.options.recycleInstances ?? RECYCLE_DEFAULT)) return;
+		idle.push(p);
+		this.stats.recycleReturns++;
+	}
+
 	private instantiateUser(runner: Runner, env: Record<string, unknown>): WebAssembly.Instance {
 		const user = runner.user!;
+		const facts = moduleFacts(user.module);
 		const imports: WebAssembly.Imports = { env: env as WebAssembly.ModuleImports };
-		if (
-			WebAssembly.Module.imports(user.module).some(
-				(i) => i.module === 'gmux' && i.name === 'tlb'
-			)
-		) {
+		if (facts.tlb) {
 			// 4 bytes of page table for each 4 KiB page the machine's memory can grow to
 			const pages = (this.options.maximumPages ?? 2048) * 16;
 			const tlb = new WebAssembly.Memory({ initial: Math.ceil((pages * 4) / 0x10000) });
@@ -1448,11 +1697,7 @@ export class Machine {
 				this.mmuFault(tlb, address)
 			);
 		}
-		if (
-			WebAssembly.Module.imports(user.module).some(
-				(i) => i.module === 'gmux' && i.name === 'table'
-			)
-		) {
+		if (facts.guard) {
 			// scripts/wasm/guard-pass.ts: loads and stores checked against the kernel's page owner
 			// table and the process's set of shared regions
 			const kernel = this.exp(runner);
@@ -1552,17 +1797,25 @@ export class Machine {
 					this.syscallHook(this.shared ? this.current! : runner, sp, tls, nr, args)
 			);
 		}
-		const modules = this.options.router!;
-		// the hit path reads the task's memory and the table, and asks the kernel for the view and
-		// the generation
+		const modules = this.options.runtime!;
+		// the hit path reads the task's memory and the table, asks the kernel for the view, and reads
+		// the kernel's counters in place from the machine's memory
+		const block = kernel.wasm_fs_block as WebAssembly.Global | undefined;
+		if (this.fsCache && !block)
+			throw new Error(
+				'syscallCache needs a kernel with patch 0036 (no wasm_fs_block export)'
+			);
+		if (block) this.fsBlockAt = Number(block.value) >>> 0;
 		const hit = this.fsCache
 			? new WebAssembly.Instance(modules.statx, {
-					env: { user: env.memory as WebAssembly.Memory, table: this.fsCache.memory },
+					env: {
+						user: env.memory as WebAssembly.Memory,
+						table: this.fsCache.memory,
+						machine: this.memory
+					},
 					kernel: {
-						view: kernel.wasm_fs_view as WebAssembly.ImportValue,
-						gen: kernel.wasm_fs_gen as WebAssembly.ImportValue,
-						// a kernel without patch 0029 has no counters: statxFill then keeps no fine answers
-						at: (kernel.wasm_fs_gen_at ?? (() => 0)) as WebAssembly.ImportValue
+						block: block!,
+						view: kernel.wasm_fs_view as WebAssembly.ImportValue
 					}
 				}).exports.hit
 			: () => MISS;
@@ -1660,7 +1913,7 @@ export class Machine {
 						...args
 					)
 				) | 0;
-			if (query) await this.statxFill(me, sp, tls, query, result, args[4]! >>> 0);
+			if (query) this.statxFill(me, query, result, args[4]! >>> 0);
 			if (this.options.countSyscalls) this.reportCall(me, nr, args, result);
 			if (result < 0) return result;
 			if (sync === SYS_OPENAT && args[2]! & O_DSYNC) {
@@ -1693,56 +1946,114 @@ export class Machine {
 		const kernel = this.exp(me);
 		const view = Number(kernel.wasm_fs_view?.() ?? 0) >>> 0;
 		if (!view) return null;
-		const mem = new Uint8Array(this.userMemory(me).buffer);
+		const mem = this.viewsOf(this.userMemory(me)).bytes;
 		const at = args[1]! >>> 0;
 		const hash = statxHash(mem, at, view, args[2]!, args[3]!);
 		if (hash === null) return null;
-		const path = mem.slice(at, mem.indexOf(0, at));
 		return {
 			hash,
-			path,
-			// one char per byte, for the ancestor walk
-			name: String.fromCharCode(...path),
+			path: mem.slice(at, mem.indexOf(0, at)),
 			view,
 			flags: args[2]!,
 			mask: args[3]!,
-			gen: Number(kernel.wasm_fs_gen()) >>> 0
+			gen: this.fsGeneration()
 		};
 	}
 
-	/** each view's "/": its mount id and inode number */
-	private readonly rootInfo = new Map<number, { mount: number; ino: number; mode: number }>();
+	/** views over a memory's current buffer, made again only when the memory has grown */
+	private readonly memoryViews = new WeakMap<
+		WebAssembly.Memory,
+		{ buffer: ArrayBufferLike; bytes: Uint8Array; view: DataView }
+	>();
+
+	private viewsOf(memory: WebAssembly.Memory) {
+		const buffer = memory.buffer;
+		let views = this.memoryViews.get(memory);
+		if (views?.buffer !== buffer)
+			this.memoryViews.set(
+				memory,
+				(views = { buffer, bytes: new Uint8Array(buffer), view: new DataView(buffer) })
+			);
+		return views;
+	}
+
+	/** where the kernel's wasm_fs_block is in the machine's memory (0 until a task asks) */
+	private fsBlockAt = 0;
+
+	/** the kernel's path-query generation, read in place */
+	private fsGeneration(): number {
+		return this.viewsOf(this.memory).view.getUint32(this.fsBlockAt, true);
+	}
+
+	/** the kernel's count of mount and chroot changes (-1), or of changes to the inodes of bucket `i` */
+	private fsCounter(index: number): number {
+		const view = this.viewsOf(this.memory).view;
+		return index < 0
+			? view.getUint32(this.fsBlockAt + FS_MOVES, true)
+			: view.getUint32(this.fsBlockAt + FS_COUNTERS + index * 4, true);
+	}
 
 	/**
-	 * keeps the kernel's answer to a statx when nothing changed while it was asked and the lookup
-	 * ended on the root mount (a proc or sysfs answer changes with no timestamp moving). Only answers
-	 * that follow from the path are kept: success, ENOENT and ENOTDIR, never EFAULT. A kernel with
-	 * patch 0029 holds an answer on the counters of the inodes its path crossed, so a change anywhere
-	 * else leaves it; any other answer holds on the kernel's whole generation
+	 * keeps the kernel's answer to a statx when nothing changed while it was asked, on the counters
+	 * of the inodes its path crossed (kernel patch 0036's wasm_fs_chain walks them in one call), so a
+	 * change anywhere else leaves it. Only answers that follow from the path are kept: success,
+	 * ENOENT and ENOTDIR, never EFAULT, and only when the lookup stayed on the root mount with no
+	 * symlink, `.` or `..` to follow (a proc or sysfs answer changes with no timestamp moving)
 	 */
-	private async statxFill(
+	private statxFill(
 		me: Runner,
-		sp: number,
-		tls: number,
 		q: NonNullable<ReturnType<Machine['statxQuery']>>,
 		result: number,
 		buf: number
 	) {
-		const kernel = this.exp(me);
-		const gen = () => Number(kernel.wasm_fs_gen()) >>> 0;
-		const at: ((index: number) => number) | undefined = kernel.wasm_fs_gen_at;
-		if ((result !== 0 && result !== -2 && result !== -20) || gen() !== q.gen) return;
-		const bytes =
-			result === 0 ? new Uint8Array(this.userMemory(me).buffer).slice(buf, buf + 256) : null;
+		if (
+			(result !== 0 && result !== -2 && result !== -20) ||
+			q.path.length > STATX_PATH_MAX ||
+			this.fsGeneration() !== q.gen
+		)
+			return;
+		const user = this.viewsOf(this.userMemory(me));
+		const bytes = result === 0 ? user.bytes.subarray(buf, buf + 256) : null;
 		// a device, fifo or socket's times move without the generation (kernel patch 0022)
-		const type = bytes ? new DataView(bytes.buffer).getUint16(28, true) & S_IFMT : 0;
+		const type = bytes ? user.view.getUint16(buf + 28, true) & S_IFMT : 0;
 		if (bytes && !(bytes[0]! & 1 && [0o100000, S_IFDIR, S_IFLNK].includes(type))) return;
+		if (this.options.syscallCache === 'verify') this.statxCompare(q, result, bytes);
+		const inos = this.statxChain(me, q, result);
+		if (!inos) return;
+		const { view, flags, mask, path } = q;
+		const guards = [...new Set(inos.map(statxBucket))].map((b): [number, number] => [
+			b,
+			this.fsCounter(b)
+		]);
+		if (
+			this.fsCache!.set(q.hash, {
+				view,
+				flags,
+				mask,
+				path,
+				gen: this.fsCounter(-1),
+				guards,
+				ret: result,
+				bytes
+			})
+		) {
+			this.stats.statxFills++;
+			this.stats.statxFineFills++;
+		}
+	}
+
+	/** counts the answer the table holds for this query when the kernel's differs from it */
+	private statxCompare(
+		q: NonNullable<ReturnType<Machine['statxQuery']>>,
+		result: number,
+		bytes: Uint8Array | null
+	) {
 		const held = this.fsCache!.get(q.hash);
 		if (
 			held &&
 			(held.guards?.length
-				? Number(at!(-1)) >>> 0 === held.gen &&
-					held.guards.every(([index, value]) => Number(at!(index)) >>> 0 === value)
+				? this.fsCounter(-1) === held.gen &&
+					held.guards.every(([index, value]) => this.fsCounter(index) === value)
 				: held.gen === q.gen) &&
 			held.view === q.view &&
 			held.flags === q.flags &&
@@ -1752,56 +2063,6 @@ export class Machine {
 			(held.ret !== result || (bytes && !bytes.every((b, i) => b === held.bytes?.[i])))
 		)
 			this.stats.statxMismatches++;
-		// a task's "/" is its root dentry, the view, whatever is mounted over it later
-		let root = this.rootInfo.get(q.view);
-		if (!root) {
-			const probe = await this.statxProbe(me, sp, tls, '/', 0);
-			if (!probe) return;
-			this.rootInfo.set(q.view, (root = probe));
-		}
-		const inos = at ? await this.statxChain(me, sp, tls, q, result, root) : null;
-		if (!inos) {
-			let mount: number | null | undefined =
-				bytes && new DataView(bytes.buffer).getUint32(0, true) & STATX_MNT_ID
-					? Number(new DataView(bytes.buffer).getBigUint64(144, true))
-					: undefined;
-			if (bytes && mount === undefined) {
-				const probe = await this.statxProbe(me, sp, tls, q.name, q.flags);
-				mount = probe ? probe.mount : probe;
-			}
-			// a missing path: the nearest ancestor that exists holds the lookup's last mount
-			for (let p = q.name; mount === undefined && p !== '/';) {
-				p = p.slice(0, p.lastIndexOf('/')) || '/';
-				const probe = await this.statxProbe(me, sp, tls, p, 0);
-				mount = probe ? probe.mount : probe;
-			}
-			if (mount !== root.mount) return;
-		}
-		// the counters are read with nothing awaited between them and the generation check
-		const guards = inos
-			? [...new Set(inos.map(statxBucket))].map((b): [number, number] => [
-					b,
-					Number(at!(b)) >>> 0
-				])
-			: undefined;
-		const stamp = inos ? Number(at!(-1)) >>> 0 : q.gen;
-		if (gen() !== q.gen) return;
-		const { view, flags, mask, path } = q;
-		if (
-			this.fsCache!.set(q.hash, {
-				view,
-				flags,
-				mask,
-				path,
-				gen: stamp,
-				guards,
-				ret: result,
-				bytes
-			})
-		) {
-			this.stats.statxFills++;
-			if (inos) this.stats.statxFineFills++;
-		}
 	}
 
 	/**
@@ -1810,60 +2071,40 @@ export class Machine {
 	 * and few enough to guard. A missing path ends at the last prefix that exists, a file with more
 	 * path after it at that file. Null otherwise
 	 */
-	private async statxChain(
+	private statxChain(
 		me: Runner,
-		sp: number,
-		tls: number,
 		q: NonNullable<ReturnType<Machine['statxQuery']>>,
-		result: number,
-		root: { mount: number; ino: number }
+		result: number
 	) {
-		const parts = q.name.split('/').filter(Boolean);
-		if (parts.some((part) => part === '.' || part === '..') || parts.length >= STATX_GUARDS)
-			return null;
-		const inos = [root.ino];
-		for (let i = 1; i <= parts.length; i++) {
-			const path = `/${parts.slice(0, i).join('/')}`;
-			const probe = await this.statxProbe(me, sp, tls, path, AT_SYMLINK_NOFOLLOW);
-			if (probe === undefined) return result === -2 ? inos : null;
-			if (probe === null || probe.mount !== root.mount) return null;
-			inos.push(probe.ino);
-			const kind = probe.mode & S_IFMT;
-			const last = i === parts.length;
+		const { path } = q;
+		let parts = 0;
+		for (let i = 0; i < path.length; i++)
+			if (path[i] !== 0x2f && (i === 0 || path[i - 1] === 0x2f)) parts++;
+		if (parts >= STATX_GUARDS) return null;
+		const block = this.viewsOf(this.memory);
+		block.bytes.set(path, this.fsBlockAt + FS_PATH);
+		this.stats.statxChains++;
+		const n = Number(this.exp(me).wasm_fs_chain!(path.length)) | 0;
+		if (n < 1) return null;
+		const link = (i: number, field: number) =>
+			block.view.getUint32(this.fsBlockAt + FS_CHAIN + i * 12 + field * 4, true);
+		const root = link(0, 0);
+		const inos = [link(0, 1)];
+		for (let i = 1; i < n; i++) {
+			if (link(i, 0) !== root) return null;
+			inos.push(link(i, 1));
+			const kind = link(i, 2) & S_IFMT;
+			const last = i === parts;
 			if (
 				kind === S_IFLNK &&
-				!(last && q.flags & AT_SYMLINK_NOFOLLOW && !q.name.endsWith('/'))
+				!(last && q.flags & AT_SYMLINK_NOFOLLOW && path[path.length - 1] !== 0x2f)
 			)
 				return null;
 			if (kind !== S_IFDIR && !last) return result === -20 ? inos : null;
 		}
-		return result === -2 ? null : inos;
-	}
-
-	/**
-	 * mount id, inode number and mode of `path` by a statx the hook makes below the task's stack
-	 * pointer; undefined when the path does not resolve, null when the answer cannot be had
-	 */
-	private async statxProbe(me: Runner, sp: number, tls: number, path: string, flags: number) {
-		this.stats.statxProbes++;
-		const at = (sp - 8192) & ~15;
-		const low = Number(this.exp(me).wasm_user_stack_low?.(sp) ?? 0) >>> 0;
-		if (at < low) return null;
-		const mem = new Uint8Array(this.userMemory(me).buffer);
-		for (let i = 0; i < path.length; i++) mem[at + i] = path.charCodeAt(i);
-		mem[at + path.length] = 0;
-		const statx = at + 4608;
-		// the region is free stack; a signal frame the call might push goes below it
-		const mask = STATX_MNT_ID | STATX_INO | STATX_TYPE;
-		const r = await this.sys(me, at, tls, SYS_STATX, AT_FDCWD, at, flags, mask, statx);
-		if (r === -2 || r === -20) return undefined;
-		const view = new DataView(this.userMemory(me).buffer);
-		if (r < 0 || (view.getUint32(statx, true) & mask) !== mask) return null;
-		return {
-			mount: Number(view.getBigUint64(statx + 144, true)),
-			ino: view.getUint32(statx + 32, true),
-			mode: view.getUint16(statx + 28, true)
-		};
+		// every prefix resolved, or the next component does not exist
+		const missing = n < parts + 1;
+		return missing === (result === -2) ? inos : null;
 	}
 
 	/** a synchronous-looking kernel call in the task's context, which may park it */
@@ -2319,7 +2560,12 @@ export class Machine {
 			this.dls.delete(runner.user!.dataStart);
 			this.forkSpills.delete(Number(kernel.wasm_current_mm?.() ?? 0) >>> 0);
 		}
-		const made = this.program(runner, kernel.get_user_stack_pointer());
+		this.retire(runner);
+		const made = this.program(
+			runner,
+			kernel.get_user_stack_pointer(),
+			clone ? 'clone' : 'exec'
+		);
 		const ux = made.ux;
 		runner.program = {
 			exports: ux,
@@ -2344,6 +2590,18 @@ export class Machine {
 						sharedDataSize(runner.user!.module)
 					).slice();
 				else if (s) new Uint8Array(this.memory.buffer).set(s.template!, at);
+				const r = runner.recycled;
+				if (r) {
+					const module = runner.user!.module;
+					const image = this.pristine.get(module);
+					// a new instance's start function wrote the image on the zeroed pages of this exec
+					if (!image)
+						this.pristine.set(
+							module,
+							new Uint8Array(this.memory.buffer, at, sharedDataSize(module)).slice()
+						);
+					else if (r.reused) new Uint8Array(this.memory.buffer).set(image, at);
+				}
 				ux.__wasm_apply_data_relocs?.();
 				// the start function copies the main thread's TLS image but leaves its pointers to the loader
 				ux.__wasm_apply_tls_relocs?.();
@@ -2791,6 +3049,12 @@ export class Machine {
 	private dlMisses: DlMisses;
 	/** shared instances, by program hash */
 	private sharedPrograms = new Map<string, SharedProgram>();
+	/** idle instances of share builds, by module, and each build's data image before relocation */
+	private pool = new Map<WebAssembly.Module, Pooled[]>();
+	private clonePool = new Map<WebAssembly.Module, Pooled[]>();
+	private pristine = new Map<WebAssembly.Module, Uint8Array>();
+	/** whether a clone's start function left the parent's data as it found it, by module */
+	private cloneChecked = new Map<WebAssembly.Module, boolean>();
 	/** pages a lazy restore has not written yet, by owner tag, and where they come from */
 	private deferred = new Map<number, number[]>();
 	private deferredSource:
@@ -2919,6 +3183,8 @@ export class Machine {
 	 * machine's memory, not a copy, so a caller persists it before dropping the machine
 	 */
 	async checkpoint(): Promise<Snapshot> {
+		// the snapshot holds an empty console ring, so a restore neither loses nor repeats a byte
+		this.drainConsole();
 		// a task the kernel released can still hold a turn in the ready queue, which a live machine
 		// gives it; dropped from the snapshot, a cpu waits forever for the switch it would make
 		const all = [
@@ -2938,6 +3204,9 @@ export class Machine {
 		if (!this.options.asyncify || !this.shared)
 			throw new Error('checkpoint needs asyncify and a shared kernel');
 		if (this.running) throw new Error('checkpoint while the pump runs');
+		// idle instances hold no machine state: the snapshot leaves them out and a restore refills
+		this.pool.clear();
+		this.clonePool.clear();
 		// its stacks are already bytes, or are being made so: a second snapshot would hold none of them
 		if (this.spent || this.checkpointing)
 			throw new Error('checkpoint: this machine has checkpointed already');
@@ -3179,12 +3448,10 @@ export class Machine {
 		machine.input = [...snapshot.input];
 		machine.net.restore(snapshot.ports);
 		machine.scratch = snapshot.scratch;
-		if (options.core) {
-			if (snapshot.core === undefined)
-				throw new Error(
-					'restore: the snapshot has no core region; restore without options.core'
-				);
-			machine.startCore(snapshot.core);
+		// a snapshot with no region (taken before the core was bundled) keeps the TypeScript scheduler
+		if (snapshot.core !== undefined) {
+			if (options.runtime?.core) machine.startCore(snapshot.core);
+			else machine.coreBase = snapshot.core;
 		}
 		machine.instantiate(machine.cpuZero);
 		for (const saved of snapshot.dl ?? []) machine.dlProcess(saved.dataStart).load(saved);
@@ -3391,7 +3658,7 @@ export class Machine {
 	/** starts the C core over the pages at `base`, which the machine reserved before the kernel booted */
 	private startCore(base: number) {
 		this.coreBase = base;
-		this.core = loadCore(this.options.core!, this.memory, base);
+		this.core = loadCore(this.options.runtime!.core!, this.memory, base);
 	}
 
 	/** tables for the idle cpus a restore brought back, in the order `runners` lists them */
@@ -3534,11 +3801,59 @@ export class Machine {
 		if (this.spent)
 			throw new Error('run: this machine checkpointed; continue from Machine.restore');
 		this.running = true;
+		// drained before `until` looks, so it sees output the moment its step ends
+		const stop = () => {
+			this.drainConsole();
+			return until();
+		};
 		try {
-			return await this.pump(until, sleep, budget);
+			return await this.pump(stop, sleep, budget);
 		} finally {
+			this.drainConsole();
 			this.running = false;
 		}
+	}
+
+	/** kernel patch 0038: writes what the kernel queued in the console ring, and keeps the ring as the host wants it */
+	private drainConsole() {
+		const ring = this.consoleRingView();
+		if (!ring) return;
+		const { words, data } = ring;
+		const head = Atomics.load(words, 0);
+		const tail = Atomics.load(words, 1);
+		if (head !== tail) {
+			const size = data.length;
+			const count = (head - tail) >>> 0;
+			const at = tail & (size - 1);
+			// slices of the shared memory are copied out, which a TextDecoder needs
+			const bytes = new Uint8Array(Math.min(count, size));
+			const first = Math.min(bytes.length, size - at);
+			bytes.set(data.subarray(at, at + first));
+			bytes.set(data.subarray(0, bytes.length - first), first);
+			// moved before the write, so a write that calls back into the machine cannot drain it twice
+			Atomics.store(words, 1, head);
+			this.stats.consoleDrains++;
+			this.stats.consoleDrainBytes += bytes.length;
+			this.stats.consoleDrainPeak = Math.max(this.stats.consoleDrainPeak, bytes.length);
+			this.options.write?.(this.decoder.decode(bytes));
+		}
+		const wanted = this.options.consoleRing === false ? 0 : 1;
+		if (Atomics.load(words, 2) !== wanted) Atomics.store(words, 2, wanted);
+	}
+
+	/** the console ring's words and bytes once the kernel is instantiated, null when it exports none */
+	private consoleRingView() {
+		if (this.ringView !== undefined) return this.ringView;
+		if (!this.cpuZero.instance) return null;
+		const kernel = this.exp(this.cpuZero);
+		const at: number | undefined = kernel.wasm_console_ring?.();
+		const size: number | undefined = kernel.wasm_console_ring_size?.();
+		if (!at || !size || size & (size - 1)) return (this.ringView = null);
+		const buffer = this.memory.buffer;
+		return (this.ringView = {
+			words: new Uint32Array(buffer, at, 4),
+			data: new Uint8Array(buffer, at + 16, size)
+		});
 	}
 
 	private async pump(
@@ -3554,7 +3869,11 @@ export class Machine {
 		let steps = 0;
 		while (!until() && !this.halted && !this.crashed && steps++ < budget) {
 			// idle cpus with a raised interrupt or a due timer go first, or a spinner starves them
-			if (steps % (this.options.yieldEvery ?? 2000) === 0) await sleep(0);
+			this.stats.pumpSteps++;
+			if (steps % (this.options.yieldEvery ?? 2000) === 0) {
+				this.stats.hostSleeps++;
+				await sleep(0);
+			}
 			this.clock = this.now() + (this.options.stepNs ?? 50_000n);
 			let next = this.pickIdle();
 			if (next) next.idle = null;
@@ -3562,7 +3881,10 @@ export class Machine {
 			if (!next) {
 				const deadline = this.nextDeadline();
 				if (deadline === null) return 'deadlock: nothing runnable and no timer armed';
-				const ms = Number((deadline - this.now()) / 1000000n);
+				// rounded up: a timer under a millisecond away is still time the machine skips, and a
+				// wait counted as 0 let a short-sleep loop hold an unattended turn open
+				const ms = Math.ceil(Number(deadline - this.now()) / 1e6);
+				this.stats.hostSleeps++;
 				await sleep(Math.max(0, ms));
 				// an idle machine that waited for its next timer has reached it, whether or not the host
 				// clock moved meanwhile (a deployed Worker's stands still while code runs)

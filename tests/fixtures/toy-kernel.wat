@@ -4,6 +4,7 @@
 	(import "env" "wasm_serialize_tasks" (func $switch (param i32 i32) (result i32)))
 	(import "env" "wasm_idle_wait" (func $idle (param i32 i64)))
 	(import "env" "wasm_halt" (func $halt))
+	(import "env" "wasm_panic" (func $panic (param i32)))
 	(import "env" "wasm_driver_hvc_put" (func $put (param i32 i32) (result i32)))
 	(import "env" "wasm_driver_hvc_get" (func $get (param i32 i32) (result i32)))
 	(import "env" "wasm_user_mode_tail" (func $tail (param i32)))
@@ -73,8 +74,28 @@
 	(data (i32.const 0x510) "clock stuck\n")
 	(data (i32.const 0x520) "user interrupt\n")
 	(data (i32.const 0x550) "console irq\n")
+	(data (i32.const 0x580) "before panic\n")
+	(data (i32.const 0x590) "toy panic\00")
 
-	(func $say (param $at i32) (param $len i32) (drop (call $put (local.get $at) (local.get $len))))
+	;; kernel patch 0038's console ring at 0x1e000: head, tail, enabled, a spare word, then 1 KiB of data
+	(func (export "wasm_console_ring") (result i32) (i32.const 0x1e000))
+	(func (export "wasm_console_ring_size") (result i32) (i32.const 0x400))
+	;; a put goes into the ring when the host enabled it and the bytes fit, else to the host, which drains the ring first
+	(func $say (param $at i32) (param $len i32)
+		(local $head i32) (local $off i32) (local $first i32)
+		(if (i32.or
+				(i32.eqz (i32.load (i32.const 0x1e008)))
+				(i32.gt_u (local.get $len)
+					(i32.sub (i32.const 0x400)
+						(i32.sub (i32.load (i32.const 0x1e000)) (i32.load (i32.const 0x1e004))))))
+			(then (drop (call $put (local.get $at) (local.get $len))) (return)))
+		(local.set $head (i32.load (i32.const 0x1e000)))
+		(local.set $off (i32.and (local.get $head) (i32.const 0x3ff)))
+		(local.set $first (i32.sub (i32.const 0x400) (local.get $off)))
+		(if (i32.gt_u (local.get $first) (local.get $len)) (then (local.set $first (local.get $len))))
+		(memory.copy (i32.add (i32.const 0x1e010) (local.get $off)) (local.get $at) (local.get $first))
+		(memory.copy (i32.const 0x1e010) (i32.add (local.get $at) (local.get $first)) (i32.sub (local.get $len) (local.get $first)))
+		(i32.store (i32.const 0x1e000) (i32.add (local.get $head) (local.get $len))))
 
 	(func $check (param $id i32) (param $ok i32) (param $okLen i32) (param $bad i32) (param $badLen i32)
 		(if (i32.eq (global.get $current) (local.get $id))
@@ -131,6 +152,26 @@
 							(drop (call $create (i32.const 1) (i32.const 5) (i32.const 0x490) (i32.const 0x730) (i32.const 0x734) (i32.const 0x20000) (i32.const 0)))
 							(drop (call $switch (i32.const 1) (i32.const 3)))
 							(drop (call $switch (i32.const 1) (i32.const 5)))))
+					;; "p" runs program "S" once at table start 4, as an exec at another table start does
+					(if (i32.eq (i32.load8_u (i32.const 0x600)) (i32.const 112))
+						(then
+							(drop (call $create (i32.const 1) (i32.const 3) (i32.const 0x490) (i32.const 0x730) (i32.const 0x734) (i32.const 0x10000) (i32.const 4)))
+							(drop (call $switch (i32.const 1) (i32.const 3)))))
+					;; "g" prints 600 bytes of "A", of "B" and of "C" in one step: the second does not fit
+					;; the ring after the first, so it goes to the host and the third fits again
+					(if (i32.eq (i32.load8_u (i32.const 0x600)) (i32.const 103))
+						(then
+							(memory.fill (i32.const 0x1f000) (i32.const 65) (i32.const 600))
+							(call $say (i32.const 0x1f000) (i32.const 600))
+							(memory.fill (i32.const 0x1f000) (i32.const 66) (i32.const 600))
+							(call $say (i32.const 0x1f000) (i32.const 600))
+							(memory.fill (i32.const 0x1f000) (i32.const 67) (i32.const 600))
+							(call $say (i32.const 0x1f000) (i32.const 600))))
+					;; "e" prints a line and panics, as the kernel does
+					(if (i32.eq (i32.load8_u (i32.const 0x600)) (i32.const 101))
+						(then
+							(call $say (i32.const 0x580) (i32.const 13))
+							(call $panic (i32.const 0x590))))
 					;; "y" runs program "Y", which fsyncs
 					(if (i32.eq (i32.load8_u (i32.const 0x600)) (i32.const 121))
 						(then (drop (call $create (i32.const 1) (i32.const 3) (i32.const 0x490) (i32.const 0x740) (i32.const 0x744) (i32.const 0x10000) (i32.const 0)))))
@@ -245,14 +286,32 @@
 	(func (export "wasm_user_stack_low") (param $at i32) (result i32)
 		(select (i32.const 0x5000) (local.get $at)
 			(i32.and (i32.ge_u (local.get $at) (i32.const 0x9000)) (i32.lt_u (local.get $at) (i32.const 0xa000)))))
-	;; kernel patch 0022: the path-query generation at 0x858 and the view at 0x85c
-	(func (export "wasm_fs_gen") (result i32) (i32.load (i32.const 0x858)))
+	;; kernel patch 0036: wasm_fs_block at 0x18000 (the path-query generation, the mount and chroot
+	;; count at 4, the 4096 inode counters at 8, the path at 0x1c008, the links at 0x1c108) and the view
+	;; at 0x85c
+	(global (export "wasm_fs_block") i32 (i32.const 0x18000))
 	(func (export "wasm_fs_view") (result i32) (i32.load (i32.const 0x85c)))
-	;; kernel patch 0029: the mount and chroot count (index -1) at 0x870, else counter i & 0xff at
-	;; 0x1400 + 4 * i
-	(func (export "wasm_fs_gen_at") (param $i i32) (result i32)
-		(if (i32.eq (local.get $i) (i32.const -1)) (then (return (i32.load (i32.const 0x870)))))
-		(i32.load (i32.add (i32.const 0x1400) (i32.shl (i32.and (local.get $i) (i32.const 0xff)) (i32.const 2)))))
+	;; wasm_fs_chain: the toy fs has the root (inode 10), "/toy" (11) and "/toy/file" (12), told apart
+	;; by the length of the path; any other length is not one the dcache can answer
+	(func (export "wasm_fs_chain") (param $len i32) (result i32)
+		(local $n i32)
+		(local.set $n
+			(select (i32.const 1)
+				(select (i32.const 2)
+					(select (i32.const 3) (i32.const 0) (i32.eq (local.get $len) (i32.const 9)))
+					(i32.eq (local.get $len) (i32.const 4)))
+				(i32.eq (local.get $len) (i32.const 1))))
+		(if (i32.eqz (local.get $n)) (then (return (i32.const -11))))
+		(i32.store (i32.const 0x1c108) (i32.const 0))
+		(i32.store (i32.const 0x1c10c) (i32.const 10))
+		(i32.store (i32.const 0x1c110) (i32.const 0x41ed))
+		(i32.store (i32.const 0x1c114) (i32.const 0))
+		(i32.store (i32.const 0x1c118) (i32.const 11))
+		(i32.store (i32.const 0x1c11c) (i32.const 0x41ed))
+		(i32.store (i32.const 0x1c120) (i32.const 0))
+		(i32.store (i32.const 0x1c124) (i32.const 12))
+		(i32.store (i32.const 0x1c128) (i32.const 0x81a4))
+		(local.get $n))
 	(data (i32.const 0x85c) "\01")
 	(data (i32.const 0x864) "\05")
 	(func (export "wasm_user_stack_high") (param $at i32) (result i32)
