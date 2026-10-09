@@ -1,0 +1,26 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: gmux <gmux@localhost>
+Date: Sun, 4 Oct 2026 06:49:34 +0000
+Subject: [PATCH] wasm: give a machine 32 cpus instead of 64
+
+Each user task takes a cpu of its own (user_task_set_affinity), so the cpu count is the most tasks that can run at once. Each possible cpu costs a percpu area, sysfs nodes and hash buckets: 32 fewer free about 1,000 pages of an 800-page machine.
+---
+ arch/wasm/Kconfig | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/arch/wasm/Kconfig b/arch/wasm/Kconfig
+index abc88f30a..8694de470 100644
+--- a/arch/wasm/Kconfig
++++ b/arch/wasm/Kconfig
+@@ -77,7 +77,7 @@ config HZ
+ config NR_CPUS
+ 	int
+ 	range 1 8192
+-	default 64
++	default 32
+ 
+ config GENERIC_CSUM
+ 	def_bool y
+-- 
+2.43.0
+

@@ -1,0 +1,109 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Gregory Mitchell <me@gmitch215.xyz>
+Date: Thu, 8 Oct 2026 09:00:00 +0000
+Subject: [PATCH] wasm: let user tasks share cpus
+
+A user task owned a cpu until it exited, so a machine held at most
+NR_CPUS - 2 tasks and vfork failed with EBUSY past that. A task may now
+run on any cpu but the interrupt cpu, and release_thread has no cpu to
+give back.
+
+A task that set an affinity mask of more than one cpu and exited hit
+the BUG_ON in release_thread and panicked the machine; with no cpu to
+give back there is nothing left to assert.
+---
+ arch/wasm/kernel/process.c | 56 +++++++-------------------------------
+ 1 file changed, 10 insertions(+), 46 deletions(-)
+
+diff --git a/arch/wasm/kernel/process.c b/arch/wasm/kernel/process.c
+index ac4cd4611..73409c154 100644
+--- a/arch/wasm/kernel/process.c
++++ b/arch/wasm/kernel/process.c
+@@ -40,8 +40,6 @@ __visible unsigned long wasm_user_stack_high(unsigned long sp)
+ 	return user_stack_bound(sp, true);
+ }
+ 
+-static cpumask_t user_cpus = CPU_MASK_NONE;
+-
+ struct task_struct *__sched
+ __switch_to(struct task_struct *prev_task, struct task_struct *next_task)
+ {
+@@ -120,50 +118,24 @@ __switch_to(struct task_struct *prev_task, struct task_struct *next_task)
+ 
+ static int user_task_set_affinity(struct task_struct *p)
+ {
+-	/*
+-	 * TODO: This function needs a review of proper approach and locking!
+-	 * It's probably best to take a step back and think about how this
+-	 * should be implemented properly in the first place, instead of adding
+-	 * band aid on top of about every line that violates this and that. That
+-	 * includes fixing release_thread() and garbage collecting unused CPUs.
+-	 *
+-	 * We may also have to move kthreads to IRQ_CPU (with an option of the
+-	 * boot cpu before IRQ_CPU is up) in case they risk getting blocked.
+-	 */
++	cpumask_t mask;
+ 	int retval;
+-	int cpu;
+ 
+ 	/* Kthreads can be allowed to run on any online CPU. */
+ 	if (p->flags & PF_KTHREAD)
+ 		return 0;
+ 
+-hack:
+-	cpu = cpumask_first_zero(&user_cpus);
+-	if (cpu >= nr_cpu_ids)
+-		return -EBUSY;
+-
+-	if(cpu == IRQ_CPU) {
+-		/* TODO: We should mark IRQ_CPU as taken at boot instead. */
+-		cpumask_set_cpu(cpu, &user_cpus);
+-		goto hack;
+-	}
+-
+-	if (!cpu_online(cpu)) {
+-		BUG_ON(!cpu_possible(cpu));
+-
+-		/* We should add_cpu(cpu) if we properly supported hotplug... */
+-		retval = cpu_device_up(get_cpu_device(cpu));
+-		if (retval)
+-			return retval;
+-	}
+-
+-	cpumask_set_cpu(cpu, &user_cpus);
++	/*
++	 * User tasks share every cpu but IRQ_CPU, which stays clear of them so
++	 * that it can take interrupts. A task owns no cpu, so there is no
++	 * limit on how many run and nothing to give back when one exits.
++	 */
++	cpumask_copy(&mask, cpu_possible_mask);
++	cpumask_clear_cpu(IRQ_CPU, &mask);
+ 
+-	retval = set_cpus_allowed_ptr(p, cpumask_of(cpu));
+-	if (retval) {
+-		cpumask_clear_cpu(cpu, &user_cpus);
++	retval = set_cpus_allowed_ptr(p, &mask);
++	if (retval)
+ 		return retval;
+-	}
+ 
+ 	p->flags |= PF_NO_SETAFFINITY;
+ 
+@@ -275,14 +247,6 @@ void start_thread(struct pt_regs *regs, unsigned long stack_pointer)
+ 
+ void release_thread(struct task_struct *dead_task)
+ {
+-	/* TODO: This code also needs review, like user_task_set_affinity(). */
+-	if (!(dead_task->flags & PF_KTHREAD)) {
+-		BUG_ON(dead_task->nr_cpus_allowed != 1);
+-		BUG_ON(cpumask_first(&dead_task->cpus_mask)
+-			!= task_thread_info(dead_task)->cpu);
+-		cpumask_clear_cpu(task_thread_info(dead_task)->cpu, &user_cpus);
+-	}
+-
+ 	wasm_release_task(dead_task);
+ }
+ 
+-- 
+2.43.0
+
