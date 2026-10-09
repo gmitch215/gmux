@@ -47,10 +47,61 @@ const probes = [
 			['zlib 1.3.1', 'crc32 273b7535', 'compressed 639 bytes (rc 0), adler32 99df58be', 'round trip same (rc 0)'].every((l) => o.includes(l)) &&
 			passes(8)(o)
 	],
-	['posix', 'ifconfig lo 127.0.0.1 up; mkdir -p /lua-tests; posix', passes(30)]
+	['posix', 'ifconfig lo 127.0.0.1 up; mkdir -p /lua-tests; posix', passes(30)],
+	['maps', 'maps', passes(12)],
+	[
+		'abi',
+		'abi; /bin/abi-old child; echo "shell rc $?"',
+		(o) =>
+			[
+				'exec /bin/abi-old: it is built for stack ABI 0 (0: built before the word), this kernel runs 1; rebuild it',
+				"sh: can't execute '/bin/abi-old': Protocol error",
+				'shell rc 2'
+			].every((l) => o.includes(l)) && passes(5)(o)
+	],
+	['affinity', 'affinity; echo "affinity rc $?"', (o) => o.includes('affinity rc 0') && passes(5)(o)],
+	[
+		'tasks',
+		'mkdir -p /tasks; mkfifo /tasks/go; i=0; ' +
+			'{ while [ $i -lt 96 ]; do cat /tasks/go > /dev/null & i=$((i+1)); done; } 2> /tasks/err; ' +
+			'count() { n=0; for d in /proc/[0-9]*; do read c < $d/comm; [ "$c" = cat ] && n=$((n+1)); done; }; ' +
+			'k=0; count; while [ $n -lt 96 ] && [ $k -lt 50 ]; do sleep 0.1; count; k=$((k+1)); done; ' +
+			'[ $n -eq 96 ] && echo "PASS 96 tasks alive" || echo "FAIL $n tasks alive"; ' +
+			'[ -s /tasks/err ] && echo "FAIL vfork: $(head -n 1 /tasks/err)" || echo "PASS no vfork failure"; ' +
+			'grep MemFree /proc/meminfo; echo x > /tasks/go; wait; ' +
+			'[ $? -eq 0 ] && echo "PASS wait returned" || echo "FAIL wait"',
+		passes(3)
+	],
+	[
+		'serve',
+		'mkdir -p /www/cgi-bin; echo served-$((6*7)) > /www/n.txt; ' +
+			"printf '#!/bin/sh\\necho Content-Type: text/plain\\necho\\necho cgi-served-%s\\n' $((6*7)) > /www/cgi-bin/hi.cgi; " +
+			'chmod +x /www/cgi-bin/hi.cgi; httpd -p 8081 -h /www; sleep 1; ' +
+			'wget -q -O - http://127.0.0.1:8081/n.txt; wget -q -O - http://127.0.0.1:8081/cgi-bin/hi.cgi; ' +
+			'wget -q -O /dev/null http://127.0.0.1:8081/missing || echo "missing rc $?"',
+		(o) => ['served-42', 'cgi-served-42', 'missing rc 1'].every((l) => o.includes(l))
+	],
+	[
+		'timers',
+		'mkdir -p /tm; { while :; do :; done; } & b=$!; ' +
+			'for i in 1 2 3 4 5 6 7 8; do ' +
+			'( read a _ < /proc/uptime; sleep 1; read e _ < /proc/uptime; echo "SLEEP $i $a $e" ) > /tm/s$i & done; ' +
+			'sleep 0.5; echo "BUSY $(cat /proc/$b/stat)"; ' +
+			'for f in /proc/[0-9]*/stat; do { read -r l < $f; } 2> /dev/null; case $l in *"(sleep)"*) echo "SLEEPING $l";; esac; done; ' +
+			'sleep 1.5; kill $b; wait; cat /tm/s*',
+		(o) => {
+			// the lateness bound of tests/c/run.ts is not applied: the Free clock moves only at written syncs
+			const busy = o.match(/^BUSY (.*)$/m);
+			const cpu = (line) => line.slice(line.lastIndexOf(')') + 2).split(' ')[36];
+			const asleep = [...o.matchAll(/^SLEEPING (.*)$/gm)].map((m) => cpu(m[1]));
+			return !!busy && (o.match(/^SLEEP \d+ /gm) ?? []).length === 8 && asleep.length > 0 && asleep.every((c) => c === cpu(busy[1]));
+		}
+	]
 ];
 // fork needs resumable frames; PROT_NONE mappings take real memory without an MMU
 const blocked = new Set(['ipc_sem', 'pthread_atfork-errno-clobber', 'pthread_exit-dtor', 'pthread_create-oom']);
+// the amd64 userland needs more guest pages than the default
+const pages = { userland: 2400 };
 const libcTests = (process.env.LIBC_TESTS ?? '').split(' ').filter(Boolean);
 // ONLY="posix dl" runs just those
 const only = (process.env.ONLY ?? '').split(' ').filter(Boolean);
@@ -73,7 +124,7 @@ for (const [label, cmd, check] of cases) {
 		name = `suite-${label}-${Date.now()}`;
 		await get('/burn?iters=3e8');
 		// the amd64 userland needs room: every katybug image is one contiguous block without an MMU
-		const boot = await get(`/boot?pages=${label === 'userland' ? 2400 : 1200}&wall=20000`);
+		const boot = await get(`/boot?pages=${pages[label] ?? 1200}&cpus=${label === 'timers' ? 2 : 3}&wall=20000`);
 		if (!boot.instance) {
 			resets++;
 			continue;
