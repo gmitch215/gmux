@@ -138,19 +138,29 @@ $(document).ready(function() { init_codefold(1); });
 <div class="line"><a id="l00047" name="l00047"></a><span class="lineno">   47</span>} <a class="code hl_struct" href="../../d4/d6e/structkb__pow__log__data.html">kb_pow_log_data</a>;</div>
 </div>
 <div class="line"><a id="l00048" name="l00048"></a><span class="lineno">   48</span> </div>
-<div class="line"><a id="l00049" name="l00049"></a><span class="lineno">   49</span><span class="comment">/* exp, log and pow as glibc and musl compute them in the normal cases. Each</span></div>
-<div class="line"><a id="l00050" name="l00050"></a><span class="lineno">   50</span><span class="comment"> * returns 1 with the value in *out, or 0 for an input or a result outside</span></div>
-<div class="line"><a id="l00051" name="l00051"></a><span class="lineno">   51</span><span class="comment"> * them (non-finite, zero, subnormal, a result that would set errno or raise</span></div>
-<div class="line"><a id="l00052" name="l00052"></a><span class="lineno">   52</span><span class="comment"> * underflow or overflow, an exact tie in the argument reduction), where the</span></div>
-<div class="line"><a id="l00053" name="l00053"></a><span class="lineno">   53</span><span class="comment"> * caller runs the guest&#39;s own code. fused is 0 for the code as built without a</span></div>
-<div class="line"><a id="l00054" name="l00054"></a><span class="lineno">   54</span><span class="comment"> * fused multiply-add (x86-64) and 1 as built with one (AArch64) */</span></div>
-<div class="line"><a id="l00055" name="l00055"></a><span class="lineno">   55</span><span class="keywordtype">int</span> kb_libm_exp(<span class="keywordtype">double</span> x, <span class="keywordtype">int</span> fused, <span class="keywordtype">double</span>* out);</div>
-<div class="line"><a id="l00056" name="l00056"></a><span class="lineno">   56</span><span class="keywordtype">int</span> kb_libm_log(<span class="keywordtype">double</span> x, <span class="keywordtype">int</span> fused, <span class="keywordtype">double</span>* out);</div>
-<div class="line"><a id="l00057" name="l00057"></a><span class="lineno">   57</span><span class="keywordtype">int</span> kb_libm_pow(<span class="keywordtype">double</span> x, <span class="keywordtype">double</span> y, <span class="keywordtype">int</span> fused, <span class="keywordtype">double</span>* out);</div>
-<div class="line"><a id="l00058" name="l00058"></a><span class="lineno">   58</span><span class="comment">/* 1 when a*b + c is rounded twice here, as the kernels need */</span></div>
-<div class="line"><a id="l00059" name="l00059"></a><span class="lineno">   59</span><span class="keywordtype">int</span> kb_libm_ok(<span class="keywordtype">void</span>);</div>
-<div class="line"><a id="l00060" name="l00060"></a><span class="lineno">   60</span> </div>
-<div class="line"><a id="l00061" name="l00061"></a><span class="lineno">   61</span><span class="preprocessor">#endif</span></div>
+<div class="line"><a id="l00049" name="l00049"></a><span class="lineno">   49</span><span class="comment">/* how the guest&#39;s libm was compiled: without a fused multiply-add (x86-64),</span></div>
+<div class="line"><a id="l00050" name="l00050"></a><span class="lineno">   50</span><span class="comment"> * with one at the sites the source writes as fma (musl on AArch64, built with</span></div>
+<div class="line"><a id="l00051" name="l00051"></a><span class="lineno">   51</span><span class="comment"> * -ffp-contract=off), and glibc 2.36 on AArch64 (Debian 12), where gcc fused</span></div>
+<div class="line"><a id="l00052" name="l00052"></a><span class="lineno">   52</span><span class="comment"> * more than that and rounds a tie in the argument reduction away from zero */</span></div>
+<div class="line"><a id="l00053" name="l00053"></a><span class="lineno">   53</span><span class="keyword">enum</span></div>
+<div class="line"><a id="l00054" name="l00054"></a><span class="lineno">   54</span>{</div>
+<div class="line"><a id="l00055" name="l00055"></a><span class="lineno">   55</span>    KB_LIBM_X86,</div>
+<div class="line"><a id="l00056" name="l00056"></a><span class="lineno">   56</span>    KB_LIBM_MUSL_A64,</div>
+<div class="line"><a id="l00057" name="l00057"></a><span class="lineno">   57</span>    KB_LIBM_GLIBC_A64</div>
+<div class="line"><a id="l00058" name="l00058"></a><span class="lineno">   58</span>};</div>
+<div class="line"><a id="l00059" name="l00059"></a><span class="lineno">   59</span> </div>
+<div class="line"><a id="l00060" name="l00060"></a><span class="lineno">   60</span><span class="comment">/* exp, log and pow as glibc and musl compute them in the normal cases. Each</span></div>
+<div class="line"><a id="l00061" name="l00061"></a><span class="lineno">   61</span><span class="comment"> * returns 1 with the value in *out, or 0 for an input or a result outside</span></div>
+<div class="line"><a id="l00062" name="l00062"></a><span class="lineno">   62</span><span class="comment"> * them (non-finite, zero, subnormal, a result that would set errno or raise</span></div>
+<div class="line"><a id="l00063" name="l00063"></a><span class="lineno">   63</span><span class="comment"> * underflow or overflow, an exact tie in the argument reduction except for</span></div>
+<div class="line"><a id="l00064" name="l00064"></a><span class="lineno">   64</span><span class="comment"> * KB_LIBM_GLIBC_A64), where the caller runs the guest&#39;s own code */</span></div>
+<div class="line"><a id="l00065" name="l00065"></a><span class="lineno">   65</span><span class="keywordtype">int</span> kb_libm_exp(<span class="keywordtype">double</span> x, <span class="keywordtype">int</span> flavor, <span class="keywordtype">double</span>* out);</div>
+<div class="line"><a id="l00066" name="l00066"></a><span class="lineno">   66</span><span class="keywordtype">int</span> kb_libm_log(<span class="keywordtype">double</span> x, <span class="keywordtype">int</span> flavor, <span class="keywordtype">double</span>* out);</div>
+<div class="line"><a id="l00067" name="l00067"></a><span class="lineno">   67</span><span class="keywordtype">int</span> kb_libm_pow(<span class="keywordtype">double</span> x, <span class="keywordtype">double</span> y, <span class="keywordtype">int</span> flavor, <span class="keywordtype">double</span>* out);</div>
+<div class="line"><a id="l00068" name="l00068"></a><span class="lineno">   68</span><span class="comment">/* 1 when a*b + c is rounded twice here, as the kernels need */</span></div>
+<div class="line"><a id="l00069" name="l00069"></a><span class="lineno">   69</span><span class="keywordtype">int</span> kb_libm_ok(<span class="keywordtype">void</span>);</div>
+<div class="line"><a id="l00070" name="l00070"></a><span class="lineno">   70</span> </div>
+<div class="line"><a id="l00071" name="l00071"></a><span class="lineno">   71</span><span class="preprocessor">#endif</span></div>
 <div class="ttc" id="astructkb__exp__data_html"><div class="ttname"><a href="../../df/d0c/structkb__exp__data.html">kb_exp_data</a></div><div class="ttdef"><b>Definition</b> libm.h:16</div></div>
 <div class="ttc" id="astructkb__log__data_html"><div class="ttname"><a href="../../d8/dcf/structkb__log__data.html">kb_log_data</a></div><div class="ttdef"><b>Definition</b> libm.h:27</div></div>
 <div class="ttc" id="astructkb__pow__log__data_html"><div class="ttname"><a href="../../d4/d6e/structkb__pow__log__data.html">kb_pow_log_data</a></div><div class="ttdef"><b>Definition</b> libm.h:40</div></div>
