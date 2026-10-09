@@ -1,0 +1,82 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Gregory Mitchell <me@gmitch215.xyz>
+Date: Thu, 8 Oct 2026 09:00:00 +0000
+Subject: [PATCH] wasm: bring jiffies up to the clock on restore
+
+A restored machine keeps the jiffies of its checkpoint until its first
+timer tick catches them up by the whole gap. wasm_restored reset the
+RCU stall detector before that, so a grace period that ended and a new
+one that began ahead of the first tick was stamped with the old jiffies
+(record_gp_stall_check_time also clears the reset), and the tick then
+reported the gap as a stall: "rcu_sched self-detected stall on CPU" and
+a dump of every cpu, with fqs=0 and the grace-period kthread starved.
+
+wasm_restored now advances jiffies to the clock first, through
+wasm_update_jiffies in kernel/time/tick-sched.c, and calls
+rcu_cpu_stall_reset with interrupts off, as its comment requires.
+---
+ arch/wasm/kernel/restored.c |  7 +++++++
+ kernel/time/tick-sched.c    | 12 ++++++++++++
+ 2 files changed, 19 insertions(+)
+
+diff --git a/arch/wasm/kernel/restored.c b/arch/wasm/kernel/restored.c
+index 441f2e091..20f37ea5c 100644
+--- a/arch/wasm/kernel/restored.c
++++ b/arch/wasm/kernel/restored.c
+@@ -4,6 +4,7 @@
+  * (a shipped image, a copied store), and the host clock ran on over the pause.
+  */
+ 
++#include <linux/irqflags.h>
+ #include <linux/nmi.h>
+ #include <linux/rcupdate.h>
+ #include <linux/string.h>
+@@ -11,16 +12,22 @@
+ 
+ extern ssize_t wasm_random_get_bytes(u8 *buffer, ssize_t count);
+ void wasm_crng_fork(const void *id, size_t len);
++void wasm_update_jiffies(void);
+ 
+ __visible void wasm_restored(void)
+ {
++	unsigned long flags;
+ 	u8 id[32];
+ 
+ 	/* no two copies draw the same random numbers */
+ 	if (wasm_random_get_bytes(id, (ssize_t)sizeof(id)) == (ssize_t)sizeof(id))
+ 		wasm_crng_fork(id, sizeof(id));
+ 	memzero_explicit(id, sizeof(id));
++	/* a grace period begun before the first tick would take the checkpoint's jiffies */
++	local_irq_save(flags);
++	wasm_update_jiffies();
+ 	/* the pause is not a stall */
+ 	rcu_cpu_stall_reset();
++	local_irq_restore(flags);
+ 	touch_all_softlockup_watchdogs();
+ }
+diff --git a/kernel/time/tick-sched.c b/kernel/time/tick-sched.c
+index d1f27df1e..23d6c9294 100644
+--- a/kernel/time/tick-sched.c
++++ b/kernel/time/tick-sched.c
+@@ -222,6 +222,18 @@ static bool tick_limited_update_jiffies64(struct tick_sched *ts, ktime_t now)
+ 	return true;
+ }
+ 
++#ifdef CONFIG_WASM
++/* gmux: the host restored a machine long after its checkpoint (arch/wasm/kernel/restored.c) */
++void wasm_update_jiffies(void)
++{
++	unsigned long flags;
++
++	local_irq_save(flags);
++	tick_do_update_jiffies64(ktime_get());
++	local_irq_restore(flags);
++}
++#endif
++
+ #define MAX_STALLED_JIFFIES 5
+ 
+ static void tick_sched_do_timer(struct tick_sched *ts, ktime_t now)
+-- 
+2.43.0
+
