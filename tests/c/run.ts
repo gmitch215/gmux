@@ -1,17 +1,27 @@
 import { execFileSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { existsSync, mkdtempSync, readdirSync, readFileSync, statSync } from 'node:fs';
+import {
+	existsSync,
+	mkdtempSync,
+	readdirSync,
+	readFileSync,
+	statSync,
+	writeFileSync
+} from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { concat, sections, text } from '../../scripts/wasm/binary.ts';
 import { appendCpio } from '../../scripts/wasm/cpio-append.ts';
 import { inputs } from '../../scripts/wasm/inputs.ts';
+import { hostRuntime } from '../../scripts/wasm/router-modules.ts';
 import { Machine } from '../../src/worker/machine/machine.ts';
 import { hostOnly, leaks, SURFACE, watch } from './authority.ts';
 
 /**
  * Boots build/kernel with the tests/c probes from build/probes and checks each one's output;
- * GMUX_BUILD points at another build, FROZEN=1 stops the host clock, CORE=<gmux-core.wasm> runs the
- * scheduler's tables in C.
+ * GMUX_BUILD points at another build, FROZEN=1 stops the host clock. The scheduler core from
+ * build/router runs the scheduler's tables in C; CORE=0 runs them in TypeScript and
+ * CORE=<gmux-core.wasm> runs another core build.
  * `node --experimental-strip-types tests/c/run.ts [probe...]`
  */
 interface Probe {
@@ -33,6 +43,8 @@ interface Probe {
 	evacuate?: boolean | string[];
 	/** the machine's memory in 64 KiB pages: a probe that sets it boots a machine of its own */
 	pages?: number;
+	/** the machine's `maxcpus=`: a probe that sets it boots a machine of its own */
+	maxcpus?: number;
 	/** problems the host finds in the probe's output, beyond its lines and PASS count */
 	check?: (section: string) => string[];
 }
@@ -70,6 +82,32 @@ function gensCheck(section: string): string[] {
 	return problems;
 }
 
+/**
+ * 8 `sleep 1` and a busy loop on one cpu (the `timers` probe): each sleeper's end-to-end time from
+ * /proc/uptime, which has 10 ms steps; the lateness is that time less the second asked for. The
+ * bound is the latest sleeper of the same probe on a kernel where the busy task has a cpu to itself
+ * (192 sleepers over 8 runs in each of normal, FROZEN and SHARE: 30 ms)
+ */
+const TIMERS_LATE_MS = 30;
+function timersCheck(section: string): string[] {
+	const late = [...section.matchAll(/^SLEEP \d+ (\d+\.\d+) (\d+\.\d+)$/gm)]
+		.map((m) => Math.round((Number(m[2]) - Number(m[1]) - 1) * 100) * 10)
+		.sort((a, b) => a - b);
+	// field 39 of /proc/<pid>/stat is the cpu the task last ran on
+	const cpu = (line: string) => line.slice(line.lastIndexOf(')') + 2).split(' ')[36];
+	const busy = section.match(/^BUSY (.*)$/m);
+	const asleep = [...section.matchAll(/^SLEEPING (.*)$/gm)].map((m) => cpu(m[1]!));
+	const problems: string[] = [];
+	if (late.length !== 8) problems.push(`${late.length} of 8 sleepers finished`);
+	if (late.at(-1)! > TIMERS_LATE_MS) problems.push(`a sleeper was ${late.at(-1)} ms late`);
+	if (!busy || !asleep.length || asleep.some((c) => c !== cpu(busy[1]!)))
+		problems.push('the sleepers and the busy task are not on one cpu');
+	console.log(
+		`timers: lateness ms ${late.join(' ')}; ${asleep.length} sleepers seen on cpu ${asleep[0]}`
+	);
+	return problems;
+}
+
 const probes: Record<string, Probe> = {
 	// SECURITY.md: root is trusted with the machine; a non-root task runs its guarded build, which
 	// checks loads and stores, and reaches a shared mapping (System V, POSIX, a file, anonymous)
@@ -93,6 +131,9 @@ const probes: Record<string, Probe> = {
 	// host segment; caught at the stack's own bound, not by running off the end of memory
 	stack: { lines: [], passes: 5, host: 'fault: stack overflow' },
 	time: { lines: [], passes: 5 },
+	// a nommu mremap keeps the mapping tree's range in step with the VMA, and 100,000 mmap/munmap
+	// pairs leave no pile of slab behind an RCU grace period, in the memory a Free isolate holds
+	maps: { lines: [], pages: 800, passes: 12 },
 	// the kernel's generation counters (patch 0030) against the state they guard, after each call of a
 	// scripted sequence in this task, a thread, a fork child and an exec
 	gens: { evacuate: true, lines: ['SUMMARY'], passes: 9, check: gensCheck },
@@ -175,6 +216,53 @@ const probes: Record<string, Probe> = {
 			'echo "prim libm kernels $(grep -c \'prim.* exp [1-9].* log [1-9].* pow [1-9]\' /tmp/pm)"',
 		lines: ['4.4816890703380645 2.3025850929940459 1.4142135623730951', 'prim libm kernels 1']
 	},
+	// katybug ran crc32, adler32, compress2 and uncompress of a dynamic amd64 program over Alpine's libz
+	// (experiments/library-thunks/scripts/zlib-guest.sh stages it) as host kernels, over the zlib built into
+	// katybug.wasm; the sums are the native run's
+	zlib: {
+		program: null,
+		files: {
+			'/lib/ld-musl-x86_64.so.1': 'katybug/zlib/ld-musl-x86_64.so.1',
+			'/lib/libz.so.1': 'katybug/zlib/libz.so.1',
+			'/bin/zbench': 'katybug/zlib/zbench'
+		},
+		cmd:
+			'zbench corpus /tmp/c; export KATYBUG_STATS=1 KATYBUG_PRIM_LOG=/tmp/pz; ' +
+			'zbench run crc 2 /tmp/c; zbench run adl 2 /tmp/c; zbench run def 1 /tmp/c; zbench run inf 1 /tmp/c; ' +
+			"echo \"prim zlib kernels $(grep -c ' crc32 [1-9]' /tmp/pz) $(grep -c ' adler32 [1-9]' /tmp/pz) " +
+			"$(grep -c ' compress2 [1-9]' /tmp/pz) $(grep -c ' uncompress [1-9]' /tmp/pz)\"",
+		lines: [
+			'crc 2 3327425700',
+			'adl 2 7114156529',
+			'def 1 398521',
+			'inf 1 1048784',
+			'prim zlib kernels 1 1 4 1'
+		]
+	},
+	// the stream entries (deflateInit_ to inflateCodesUsed) of the same program over a guest z_stream: each mode's
+	// output (checksum and length) is the native run's, and a stream open across the machine's fork (which sends
+	// guest memory only) fails in the child's libz with Z_STREAM_ERROR
+	zstream: {
+		program: null,
+		files: {
+			'/lib/ld-musl-x86_64.so.1': 'katybug/zlib/ld-musl-x86_64.so.1',
+			'/lib/libz.so.1': 'katybug/zlib/libz.so.1',
+			'/bin/zbench': 'katybug/zlib/zbench'
+		},
+		cmd:
+			'export KATYBUG_STATS=1 KATYBUG_PRIM_LOG=/tmp/pz; ' +
+			'for m in stream-misc alloc fault fork; do zbench $m | cksum; done; zbench gzrun cd 2 6 4096; ' +
+			"echo \"prim zstream kernels $(grep -c ' deflate [1-9]' /tmp/pz) $(grep -c ' inflate [1-9]' /tmp/pz) " +
+			"$(grep -c 'zstream lost [1-9]' /tmp/pz)\"",
+		lines: [
+			'3923843301 2297457',
+			'993302787 349',
+			'315487918 652',
+			'4270157107 438',
+			'gzrun cd mib 2 level 6 chunk 4096 in 2097152 out 753028 crc_in 73213365 crc_out ddf25199 back 2097152 crc_back 73213365 rc 1 same 1',
+			'prim zstream kernels 6 3 1'
+		]
+	},
 	// the console shell is interactive: a redirected group or loop reads its file to the end, not the
 	// terminal after its first command (src/busybox/patches/0001)
 	shell: {
@@ -211,6 +299,25 @@ const probes: Record<string, Probe> = {
 		evacuate: true,
 		lines: ['exec from a fork child'],
 		passes: 26
+	},
+	// sendfile and splice from a file to a socket over lo, to a forked receiver that hashes what arrives;
+	// the lines are the native build's output on x86-64 Linux
+	sendfile: {
+		setup: 'ifconfig lo 127.0.0.1 up',
+		evacuate: true,
+		lines: [
+			'sendfile with an offset: 1048576 bytes, fnv 720170d29ea12e6e, offset 1048576, position 0',
+			'sendfile on the file position: 1048576 bytes, fnv 720170d29ea12e6e, offset -1, position 1048576',
+			'sendfile of a range: 70000 bytes, fnv cde816ca3d36219d, offset 82345, position 0',
+			'sendfile of more than is left: 48576 bytes, fnv 2abd2d4bfaeba3fb, offset 1048576, position 0',
+			'splice file to pipe to socket: 1048576 bytes, fnv 720170d29ea12e6e, offset 1048576, position 0',
+			'splice of a range: 70000 bytes, fnv cde816ca3d36219d, offset 82345, position 0',
+			'read and write: 1048576 bytes, fnv 720170d29ea12e6e, offset 1048576, position 0',
+			'sendfile to a bad descriptor: -1 errno 9',
+			'sendfile from a socket: -1 errno 107',
+			'sendfile of no bytes: 0; past the end: 0'
+		],
+		passes: 10
 	},
 	// zlib as a side module (dlopen/dlsym); the first lines are the same program's native output
 	// against the same zlib
@@ -281,16 +388,85 @@ const probes: Record<string, Probe> = {
 	},
 	// an 800-page machine (what a Free isolate holds) with 10 MB of files in memory runs 106 execs, as
 	// a coreutils run's link loop does; each exec maps a stack of 32 pages, a page of arguments and a
-	// data block of its own, and blocks of 64 pages must still be free after them
+	// data block of its own, and blocks of 64 pages must still be free after them. Then every way an
+	// exec can fail (missing path, a directory, no permission, a shebang to a missing interpreter, a
+	// long path, a program the host refuses, ETXTBSY, an argument too long) returns its errno, an
+	// x86-64 ELF still runs through katybug, and 1,200 failures leave no pages behind
 	exec: {
 		program: null,
 		pages: 800,
+		programs: { '/bin/execfail': 'probes/execfail.wasm' },
+		files: { '/bin/hello-x86': 'katybug/hello-x86' },
 		setup: 'dd if=/dev/zero of=/tmp/fill bs=1M count=10 2> /dev/null',
 		cmd:
 			'i=0; n=0; while [ $i -lt 106 ]; do ln -s x /tmp/l$i && n=$((n+1)); i=$((i+1)); done; ' +
 			'echo "linked $n"; ' +
-			'awk \'{ for (i = 11; i <= 19; i++) if ($i > 0) big += $i } END { print big ? "order 6 free" : "no order 6" }\' /proc/buddyinfo',
-		lines: ['linked 106', 'order 6 free']
+			'awk \'{ for (i = 11; i <= 19; i++) if ($i > 0) big += $i } END { print big ? "order 6 free" : "no order 6" }\' /proc/buddyinfo; ' +
+			'execfail',
+		lines: [
+			'linked 106',
+			'order 6 free',
+			'missing file -> 2',
+			'a directory -> 13',
+			'shebang to a missing interpreter -> 2',
+			'not a program -> 8',
+			'a path of 4999 bytes -> 36',
+			'busy for writing -> 26',
+			'the host refuses it -> 211',
+			'an argument of 139999 bytes -> 7',
+			'x86-64 through katybug -> 0',
+			'300 rounds of four failures: 0 wrong,'
+		],
+		passes: 17
+	},
+	// a program without the stack abi word (abi-old: abi with its gmux.abi section cut out, so a build
+	// from before the word) fails its exec with EPROTO and one console line, and an 800-page machine
+	// runs 200 refusals, each followed by an exec
+	abi: {
+		pages: 800,
+		programs: { '/bin/abi-old': 'probes/abi-old.wasm' },
+		cmd: 'abi; /bin/abi-old child; echo "shell rc $?"',
+		lines: [
+			'exec /bin/abi-old: it is built for stack ABI 0 (0: built before the word), this kernel runs 1; rebuild it',
+			"sh: can't execute '/bin/abi-old': Protocol error",
+			'shell rc 2'
+		],
+		passes: 5
+	},
+	// user tasks share the cpus (patch 0032): 256 tasks each blocked opening a fifo are all alive at
+	// once, as /proc counts them, and exit when it is written
+	tasks: {
+		program: null,
+		pages: 4096,
+		cmd:
+			'mkdir -p /tasks; mkfifo /tasks/go; i=0; ' +
+			'{ while [ $i -lt 256 ]; do cat /tasks/go > /dev/null & i=$((i+1)); done; } 2> /tasks/err; ' +
+			'count() { n=0; for d in /proc/[0-9]*; do read c < $d/comm; [ "$c" = cat ] && n=$((n+1)); done; }; ' +
+			'k=0; count; while [ $n -lt 256 ] && [ $k -lt 50 ]; do sleep 0.1; count; k=$((k+1)); done; ' +
+			'[ $n -eq 256 ] && echo "PASS 256 tasks alive" || echo "FAIL $n tasks alive"; ' +
+			'[ -s /tasks/err ] && echo "FAIL vfork: $(head -n 1 /tasks/err)" || echo "PASS no vfork failure"; ' +
+			'grep MemFree /proc/meminfo; echo x > /tasks/go; wait; ' +
+			'[ $? -eq 0 ] && echo "PASS wait returned" || echo "FAIL wait"',
+		lines: [],
+		passes: 3
+	},
+	// a thread cannot change its affinity; a program may set a mask of several cpus and exit (the
+	// kernel once panicked in release_thread)
+	affinity: { cmd: 'affinity; echo "affinity rc $?"', lines: ['affinity rc 0'], passes: 5 },
+	// sleepers and a busy task on the one user cpu (maxcpus=2: the interrupt cpu and one more): each
+	// sleeper's timer fires when the busy task next yields in user mode
+	timers: {
+		program: null,
+		maxcpus: 2,
+		cmd:
+			'mkdir -p /tm; { while :; do :; done; } & b=$!; ' +
+			'for i in 1 2 3 4 5 6 7 8; do ' +
+			'( read a _ < /proc/uptime; sleep 1; read e _ < /proc/uptime; echo "SLEEP $i $a $e" ) > /tm/s$i & done; ' +
+			'sleep 0.5; echo "BUSY $(cat /proc/$b/stat)"; ' +
+			'for f in /proc/[0-9]*/stat; do { read -r l < $f; } 2> /dev/null; case $l in *"(sleep)"*) echo "SLEEPING $l";; esac; done; ' +
+			'sleep 1.5; kill $b; wait; cat /tm/s*',
+		lines: [],
+		check: timersCheck
 	}
 };
 
@@ -324,7 +500,9 @@ const fileEntries = (name: string) =>
 
 // SHARE=1: every program that can be shared runs each of its processes on one instance
 const share = !!process.env.SHARE;
-const busybox = read(share ? 'kernel/busybox.share.wasm' : 'kernel/busybox.wasm');
+// RECYCLE=1: the same share builds, each process on an instance of its own that a finished one hands on
+const recycle = !!process.env.RECYCLE;
+const busybox = read(share || recycle ? 'kernel/busybox.share.wasm' : 'kernel/busybox.wasm');
 const manifest = JSON.parse(readFileSync(join(build, 'kernel/manifest.json'), 'utf8'));
 // a kernel staged from other patches than this tree's fails probes for reasons the tree does not have
 if (!manifest.inputs)
@@ -341,6 +519,14 @@ const registry = new Map([[manifest.busybox as string, new WebAssembly.Module(bu
 if (manifest.katybug)
 	registry.set(manifest.katybug, new WebAssembly.Module(read('kernel/katybug.wasm')));
 const scratch = mkdtempSync(join(tmpdir(), 'gmux-probes-'));
+if (names.includes('abi')) {
+	const whole = read('probes/abi.wasm');
+	const kept = [whole.subarray(0, 8)];
+	for (const [id, start, body, end] of sections(whole))
+		if (id !== 0 || text.decode(whole.subarray(body + 1, body + 9)) !== 'gmux.abi')
+			kept.push(whole.subarray(start, end));
+	writeFileSync(join(build, 'probes/abi-old.wasm'), concat(kept));
+}
 const program = (name: string) =>
 	probes[name]!.program === null ? null : (probes[name]!.program ?? `probes/${name}.wasm`);
 // [path in the machine, path under build/, probe]
@@ -381,7 +567,7 @@ for (const [to, path, name] of added) {
 		);
 		runs = `${fueled}.evac`;
 	}
-	if (share && !evacuated) {
+	if ((share || recycle) && !evacuated) {
 		// share.ts refuses programs that call dlopen, and a forking program's frames are its own
 		// instance's; those keep an instance each
 		try {
@@ -442,7 +628,8 @@ appendCpio(join(build, 'kernel/initramfs.bin'), initrd, [
 ]);
 
 // one line per probe: the tty cuts a canonical line at 4095 bytes; stdin stays off the typed lines
-async function boot(group: string[], maximumPages: number) {
+// (stty -echo: input that reaches the tty while a probe runs is echoed into the probe's output)
+async function boot(group: string[], maximumPages: number, maxcpus = 3) {
 	const script = group
 		.map(
 			(name) =>
@@ -455,7 +642,7 @@ async function boot(group: string[], maximumPages: number) {
 	const machine = new Machine({
 		vmlinux: new WebAssembly.Module(read('kernel/vmlinux.wasm')),
 		initrd: new Uint8Array(readFileSync(initrd)),
-		cmdline: 'maxcpus=3 root=/dev/ram0 rootfstype=ramfs init=/init console=hvc console=ttyS0',
+		cmdline: `maxcpus=${maxcpus} root=/dev/ram0 rootfstype=ramfs init=/init console=hvc console=ttyS0`,
 		registry,
 		maximumPages,
 		sha256,
@@ -464,15 +651,18 @@ async function boot(group: string[], maximumPages: number) {
 		guarded,
 		// FROZEN=1: a host clock that never moves, as a deployed Worker's while code runs
 		...(process.env.FROZEN ? { now: () => 0n } : {}),
-		...(process.env.CORE
-			? { core: new WebAssembly.Module(readFileSync(process.env.CORE)) }
-			: {}),
+		runtime: {
+			...hostRuntime(join(root, 'build/router'), { core: !process.env.CORE }),
+			...(process.env.CORE && process.env.CORE !== '0'
+				? { core: new WebAssembly.Module(readFileSync(process.env.CORE)) }
+				: {})
+		},
 		log: (line) => hostLog.push(line),
 		write: (text) => {
 			output += text;
 			if (!typed && output.includes('# ')) {
 				typed = true;
-				machine.type(`${script}\necho "== DONE-$((6*7))"\n`);
+				machine.type(`stty -echo\n${script}\necho "== DONE-$((6*7))"\n`);
 			}
 		}
 	});
@@ -486,14 +676,15 @@ async function boot(group: string[], maximumPages: number) {
 const authority = names.includes('authority');
 const planted = authority ? await hostOnly() : [];
 const seen = authority ? watch() : null;
-const shared = names.filter((name) => !probes[name]!.pages);
-const own = names.filter((name) => probes[name]!.pages);
+const shared = names.filter((name) => !probes[name]!.pages && !probes[name]!.maxcpus);
+const own = names.filter((name) => probes[name]!.pages || probes[name]!.maxcpus);
 const boots = new Map<string, Awaited<ReturnType<typeof boot>>>();
 if (shared.length) {
 	const main = await boot(shared, 4096);
 	for (const name of shared) boots.set(name, main);
 }
-for (const name of own) boots.set(name, await boot([name], probes[name]!.pages!));
+for (const name of own)
+	boots.set(name, await boot([name], probes[name]!.pages ?? 4096, probes[name]!.maxcpus));
 const machine = [...boots.values()].at(-1)!.machine;
 const mainMachine = shared.length ? boots.get(shared[0]!)!.machine : machine;
 
@@ -518,7 +709,7 @@ if (seen) {
 let failed = 0;
 for (const name of names) {
 	const { output, hostLog } = boots.get(name)!;
-	const at = output.lastIndexOf(`\n== ${name}`);
+	const at = output.lastIndexOf(`== ${name}\r\n`);
 	const section = at < 0 ? '' : output.slice(at, output.indexOf('== end', at));
 	const { lines, passes = 0, host } = probes[name]!;
 	const problems = [
