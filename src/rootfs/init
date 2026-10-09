@@ -1,6 +1,8 @@
 #!/bin/sh
 # linux-wasm's init, plus gmux's boot script: init -s is single-user mode, which skips rcS
 mount -t proc none /proc
+# a read stores an atime on every file, which ends every cached path answer; relatime stores one when it is stale
+mount -o remount,relatime /
 mount -t sysfs none /sys
 # devtmpfs does not mount itself over an initramfs; without it /dev/null is a file that fills RAM
 mkdir -p /dev
