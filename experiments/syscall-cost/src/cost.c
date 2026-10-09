@@ -9,6 +9,7 @@
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <sys/syscall.h>
+#include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -29,9 +30,75 @@ static int dirs(long n) {
     return 0;
 }
 
+static int made(const char* path, int mode, const char* text) {
+    int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, mode);
+    if (fd < 0 || write(fd, text, strlen(text)) < 0) return -1;
+    return close(fd);
+}
+
+/* a child that returns from vfork, runs `what` and exits; the parent waits */
+static long spawn(long n, const char* what) {
+    char* argv[] = {(char*) what, NULL};
+    char* envp[] = {NULL};
+    long sink = 0;
+    for (long i = 0; i < n; i++) {
+        int st;
+        pid_t pid = vfork();
+        if (pid == 0) {
+            if (what) execve(what, argv, envp);
+            _exit(0);
+        }
+        sink += waitpid(pid, &st, 0) == pid;
+    }
+    return sink;
+}
+
+/* cost <n> spawn: the process-start calls, n/20 of each (a spawn is about 300
+ * us) */
+static int spawns(long n) {
+    long m = n / 20 > 200 ? n / 20 : 200;
+    char* envp[] = {NULL};
+    char* argv[] = {"x", NULL};
+    long sink = 0;
+    if (made("/tmp/noexec", 0644, "x\n") || made("/tmp/junk", 0755, "junk\n"))
+        return 1;
+
+    mark("loop", m);
+    for (long i = 0; i < m; i++) sink += i;
+    mark("end", sink & 1);
+
+    mark("execve-enoent", m);
+    for (long i = 0; i < m; i++) sink += execve("/bin/nosuch", argv, envp);
+    mark("end", sink & 1);
+
+    mark("execve-eacces-file", m);
+    for (long i = 0; i < m; i++) sink += execve("/tmp/noexec", argv, envp);
+    mark("end", sink & 1);
+
+    mark("execve-eacces-dir", m);
+    for (long i = 0; i < m; i++) sink += execve("/bin", argv, envp);
+    mark("end", sink & 1);
+
+    mark("execve-enoexec", m);
+    for (long i = 0; i < m; i++) sink += execve("/tmp/junk", argv, envp);
+    mark("end", sink & 1);
+
+    mark("vfork-exit", m);
+    sink += spawn(m, NULL);
+    mark("end", sink & 1);
+
+    mark("vfork-exec-true", m);
+    sink += spawn(m, "/bin/true");
+    mark("end", sink & 1);
+
+    printf("cost done\n");
+    return 0;
+}
+
 int main(int argc, char** argv) {
     long n = argc > 1 ? atol(argv[1]) : 20000;
     if (argc > 2 && !strcmp(argv[2], "getdents")) return dirs(n);
+    if (argc > 2 && !strcmp(argv[2], "spawn")) return spawns(n);
     static char buf[65536];
     long sink = 0;
     struct stat st;
@@ -61,11 +128,8 @@ int main(int argc, char** argv) {
     }
     mark("end", sink & 1);
 
-    // capped: freed vmas wait for an rcu grace period, and ~100000 of them
-    // outrun the 58 MiB machine
-    long maps = n < 20000 ? n : 20000;
-    mark("mmap-munmap", maps);
-    for (long i = 0; i < maps; i++) {
+    mark("mmap-munmap", n);
+    for (long i = 0; i < n; i++) {
         void* p = mmap(
             0, 65536, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0
         );

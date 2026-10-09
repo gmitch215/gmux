@@ -1,7 +1,7 @@
 import { createHash } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
-import { routerModules } from '../../../scripts/wasm/router-modules.ts';
+import { hostRuntime } from '../../../scripts/wasm/router-modules.ts';
 import { Machine } from '../../../src/worker/machine/machine.ts';
 
 /**
@@ -99,6 +99,7 @@ const RETAIN = [
 		'stat -c %n /usr/p/q2/none'
 	),
 	retain('unmount', 'umount /usr/p/q2', false, 'stat -c %n /usr/c/bin/busybox'),
+	retain('path on another mount', ':', false, 'stat -c %n /proc'),
 	retain(
 		'symlink retarget',
 		'rm -f /tmp/l1; ln -s /etc /tmp/l1',
@@ -123,7 +124,7 @@ async function session(syscallCache: boolean | 'verify') {
 		sha256,
 		sharedKernel: true,
 		syscallCache,
-		router: routerModules(),
+		runtime: hostRuntime(),
 		write: (text) => (output += text)
 	});
 	const run = async (until: () => boolean) => {
@@ -144,15 +145,15 @@ async function session(syscallCache: boolean | 'verify') {
 		const end = text.indexOf(`${marker}B2\n`);
 		return text.slice(text.lastIndexOf(`\n${marker}A2\n`, end) + 1, end);
 	};
-	// statxFineFills and statxProbes are absent from a host before patch 0029's
+	// statxFineFills and statxChains are absent from a host before patch 0029's
 	const count = () => {
-		const s = machine.stats as Machine['stats'] & { statxFineFills?: number; statxProbes?: number };
+		const s = machine.stats as Machine['stats'] & { statxFineFills?: number; statxChains?: number };
 		return {
 			hits: s.statxHits,
 			misses: s.statxMisses,
 			fills: s.statxFills,
 			fine: s.statxFineFills ?? 0,
-			probes: s.statxProbes ?? 0
+			chains: s.statxChains ?? 0
 		};
 	};
 	const since = (a: ReturnType<typeof count>) => {
@@ -162,7 +163,7 @@ async function session(syscallCache: boolean | 'verify') {
 			misses: b.misses - a.misses,
 			fills: b.fills - a.fills,
 			fine: b.fine - a.fine,
-			probes: b.probes - a.probes
+			chains: b.chains - a.chains
 		};
 	};
 	// a timed loop of n iterations with the counters it moved

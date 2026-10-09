@@ -2,7 +2,7 @@ import binaryen from 'binaryen';
 import { createHash } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
-import { routerModules } from '../../../scripts/wasm/router-modules.ts';
+import { hostRuntime } from '../../../scripts/wasm/router-modules.ts';
 import { Machine } from '../../../src/worker/machine/machine.ts';
 
 /**
@@ -10,7 +10,7 @@ import { Machine } from '../../../src/worker/machine/machine.ts';
  * could save. A: a wasm loop calling an import that is plain JS, a Suspending async function, and a
  * Suspending function that awaits a `promising` call of a wasm export (a hook that asks the kernel
  * and a probe). B: in a machine with `syscallCache: 'verify'` (every statx is a miss), the time in the
- * hook, in statxQuery, in statxFill and in its probes, as monkeypatched wrappers see it. GMUX_BUILD
+ * hook, in statxQuery, in statxFill and in its kernel walk, as monkeypatched wrappers see it. GMUX_BUILD
  * names the kernel. `node --experimental-strip-types experiments/syscall-cost/scripts/miss.ts [n]`
  */
 const n = Number(process.argv[2] ?? 300);
@@ -75,7 +75,7 @@ const machine = new Machine({
 	sha256,
 	sharedKernel: true,
 	syscallCache: 'verify',
-	router: routerModules(),
+	runtime: hostRuntime(),
 	write: (text) => (output += text)
 });
 const spent: Record<string, { calls: number; ms: number }> = {};
@@ -98,7 +98,7 @@ const wrap = (name: string, only?: (args: unknown[]) => boolean) => {
 wrap('syscallHook', (args) => args[3] === 291);
 wrap('statxQuery');
 wrap('statxFill');
-wrap('statxProbe');
+wrap('statxChain');
 const run = async (until: () => boolean) => {
 	await machine.run(
 		() => until(),
@@ -113,23 +113,23 @@ const calls = spent.syscallHook!.calls;
 const per = (name: string) => +((spent[name]!.ms * 1e6) / calls).toFixed(0);
 const hook = per('syscallHook');
 const fill = per('statxFill');
-const probe = per('statxProbe');
+const chain = per('statxChain');
 const query = per('statxQuery');
 console.log(
 	JSON.stringify({
 		part: 'B',
 		statxCalls: calls,
-		probes: spent.statxProbe!.calls,
-		probesPerCall: +(spent.statxProbe!.calls / calls).toFixed(2),
+		chains: spent.statxChain!.calls,
+		chainsPerCall: +(spent.statxChain!.calls / calls).toFixed(2),
 		perCallNs: {
 			hook,
 			query,
 			fill,
-			probes: probe,
-			fillBookkeeping: fill - probe,
+			chain,
+			fillBookkeeping: fill - chain,
 			kernelViaHook: hook - fill - query
 		},
-		perProbeNs: +((spent.statxProbe!.ms * 1e6) / Math.max(1, spent.statxProbe!.calls)).toFixed(0)
+		perChainNs: +((spent.statxChain!.ms * 1e6) / Math.max(1, spent.statxChain!.calls)).toFixed(0)
 	})
 );
 // #endregion

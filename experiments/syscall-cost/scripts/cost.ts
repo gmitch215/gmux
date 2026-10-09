@@ -5,7 +5,7 @@ import { Session } from 'node:inspector/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { appendCpio } from '../../../scripts/wasm/cpio-append.ts';
-import { routerModules } from '../../../scripts/wasm/router-modules.ts';
+import { hostRuntime } from '../../../scripts/wasm/router-modules.ts';
 import { Machine } from '../../../src/worker/machine/machine.ts';
 
 /**
@@ -15,6 +15,7 @@ import { Machine } from '../../../src/worker/machine/machine.ts';
  * most samples (VMLINUX names a kernel built with its name section, for kernel function names).
  * GMUX_BUILD picks the build, as tests/c/run.ts does. CACHE=1 answers repeated absolute statx from the
  * host (MachineOptions.syscallCache, with a kernel that has patch 0022), CACHE=verify checks it.
+ * SPAWN=1 times the process-start calls instead (failing execve, vfork and exit, vfork and exec).
  * `node --experimental-strip-types experiments/syscall-cost/scripts/cost.ts <cost.wasm> [n] [rounds]`
  */
 const root = new URL('../../../', import.meta.url).pathname;
@@ -41,10 +42,10 @@ const machine = new Machine({
 		[manifest.busybox, new WebAssembly.Module(readFileSync(join(kernel, 'busybox.wasm')))],
 		[sha256(new Uint8Array(readFileSync(plain))), new WebAssembly.Module(readFileSync(join(work, 'cost.fuel.wasm')))]
 	]),
-	maximumPages: 1024,
+	maximumPages: 4096,
 	sha256,
 	sharedKernel: true,
-	router: routerModules(),
+	runtime: hostRuntime(undefined, { core: process.env.CORE !== '0' }),
 	syscallCache: process.env.CACHE === "verify" ? "verify" : process.env.CACHE === "1",
 	write: (text) => {
 		const at = performance.now();
@@ -61,7 +62,7 @@ const machine = new Machine({
 const run = async (until: () => boolean) => {
 	const t = Date.now();
 	await machine.run(
-		() => until() || Date.now() - t > 120_000,
+		() => until() || Date.now() - t > Number(process.env.STUCK_MS ?? 120_000),
 		(ms) => new Promise((r) => setTimeout(r, Math.min(ms, 5)))
 	);
 	if (!until()) throw new Error(`stuck: ${output.match(/mark \S+ \d+/g)?.join(" | ")} ${output.slice(-300)}`);
@@ -95,11 +96,18 @@ if (process.env.PROFILE === 'getdents') {
 	process.exit(0);
 }
 const perCall = new Map<string, number[]>();
+let redo = 0;
 for (let r = 0; r < Number(rounds); r++) {
 	marks.length = 0;
 	const start = output.length;
-	machine.type(`cost ${n}\n`);
+	machine.type(`cost ${n}${process.env.SPAWN ? ' spawn' : ''}\n`);
 	await run(() => output.slice(start).includes('cost done'));
+	// a start where the guest reads its count as 0 times nothing: run the round again
+	if (marks.some(([name, count]) => name !== 'end' && count === 0)) {
+		if (++redo > 50) throw new Error('the guest keeps reading a count of 0');
+		r--;
+		continue;
+	}
 	let loop = 0;
 	for (let i = 0; i + 1 < marks.length; i += 2) {
 		const [name, count, begin] = marks[i]!;
@@ -112,6 +120,7 @@ const median = (xs: number[]) => [...xs].sort((a, b) => a - b)[xs.length >> 1]!;
 console.log(
 	JSON.stringify(Object.fromEntries([...perCall].map(([k, v]) => [k, Math.round(median(v))])))
 );
+if (process.env.SPAWN) console.log(JSON.stringify({ rounds: Object.fromEntries(perCall) }));
 console.log(JSON.stringify({ unit: 'host ns per call, median of rounds', crashed: String(machine.crashed) }));
 const { statxHits, statxMisses, statxFills, statxMismatches } = machine.stats;
 console.log(JSON.stringify({ statxHits, statxMisses, statxFills, statxMismatches }));

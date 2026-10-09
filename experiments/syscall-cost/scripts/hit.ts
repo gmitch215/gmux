@@ -1,12 +1,13 @@
 import binaryen from 'binaryen';
-import { routerModules } from '../../../scripts/wasm/router-modules.ts';
+import { hostRuntime } from '../../../scripts/wasm/router-modules.ts';
 import { StatxTable, SYS_STATX } from '../../../src/worker/machine/router.ts';
 
 /**
  * Nanoseconds per statx hit by the number of kernel counters the answer is held on (0: the kernel's
  * whole generation), from a wasm loop calling the hit export, so a hit costs what the router's tail
- * call into it costs. The kernel's three exports are a wasm stub, since a JS import would add its own
- * crossing. GMUX_BUILD names the router build.
+ * call into it costs. The kernel's view export is a wasm stub, since a JS import would add its own
+ * crossing, and its counters are read in place from a memory of zeros. GMUX_BUILD names the router
+ * build.
  * `node --experimental-strip-types experiments/syscall-cost/scripts/hit.ts [calls] [rounds]`
  */
 const calls = Number(process.argv[2] ?? 5_000_000);
@@ -20,18 +21,18 @@ const wasm = (wat: string) => {
 	return new WebAssembly.Module(bytes);
 };
 const kernel = new WebAssembly.Instance(
-	wasm(`(module
-		(memory 1)
-		(func (export "view") (result i32) (i32.const 0x1234))
-		(func (export "gen") (result i32) (i32.const 0))
-		(func (export "at") (param i32) (result i32)
-			(i32.load (i32.shl (i32.and (local.get 0) (i32.const 1023)) (i32.const 2)))))`)
+	wasm(`(module (func (export "view") (result i32) (i32.const 0x1234)))`)
 ).exports as Record<string, WebAssembly.ExportValue>;
 const user = new WebAssembly.Memory({ initial: 1, maximum: 4, shared: true });
+// the kernel's wasm_fs_block at 0 of a memory of zeros: generation 0 and every counter 0
+const machine = new WebAssembly.Memory({ initial: 1, maximum: 4, shared: true });
 const table = new StatxTable(false);
-const statx = new WebAssembly.Instance(routerModules().statx, {
-	env: { user, table: table.memory },
-	kernel: { view: kernel.view as Function, gen: kernel.gen as Function, at: kernel.at as Function }
+const statx = new WebAssembly.Instance(hostRuntime().statx, {
+	env: { user, table: table.memory, machine },
+	kernel: {
+		block: new WebAssembly.Global({ value: 'i32', mutable: false }, 0),
+		view: kernel.view as Function
+	}
 }).exports as { hit: Function; key: (...a: number[]) => bigint };
 const driver = new WebAssembly.Instance(
 	wasm(`(module

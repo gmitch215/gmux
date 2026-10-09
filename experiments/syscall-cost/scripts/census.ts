@@ -4,7 +4,7 @@ import { Session } from 'node:inspector/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { appendCpio } from '../../../scripts/wasm/cpio-append.ts';
-import { routerModules } from '../../../scripts/wasm/router-modules.ts';
+import { hostRuntime } from '../../../scripts/wasm/router-modules.ts';
 import { Machine, type SyscallCall } from '../../../src/worker/machine/machine.ts';
 
 /**
@@ -14,6 +14,7 @@ import { Machine, type SyscallCall } from '../../../src/worker/machine/machine.t
  *   MODE=count (default): MachineOptions.countSyscalls; prints one JSON object: counts by number,
  *     processes, open-to-close shapes, read-only opens of system files and their paths
  *   MODE=profile: --cpu-prof style sampling of the workload (counting off), samples by category
+ *   MODE=wall: the workload's wall time, no counting and no profiler
  *   MODE=stat: the system paths the workload opened (a counted run), their size, mtime and ctime
  *     before and after a second run in a fresh machine
  * GMUX_BUILD picks the build (default build/), VMLINUX a kernel with a name section, N the loop
@@ -106,15 +107,23 @@ if (workload === 'userland') {
 }
 appendCpio(join(kernel, 'initramfs.bin'), join(work, 'initramfs.cpio'), files);
 
+// ARM names what the timed arms differ in: BUSYBOX=share runs the share build of BusyBox, RECYCLE=<n>
+// sets MachineOptions.recycleInstances, SHARE_INSTANCES=1 sets shareInstances
+const shareBuild = process.env.BUSYBOX === 'share';
 const registry = new Map<string, WebAssembly.Module>([
-	[manifest.busybox, new WebAssembly.Module(readFileSync(join(kernel, 'busybox.wasm')))]
+	[
+		manifest.busybox,
+		new WebAssembly.Module(
+			readFileSync(join(kernel, shareBuild ? 'busybox.share.wasm' : 'busybox.wasm'))
+		)
+	]
 ]);
 if (manifest.katybug)
 	registry.set(manifest.katybug, new WebAssembly.Module(readFileSync(join(kernel, 'katybug.wasm'))));
 const vmlinux = new WebAssembly.Module(
 	readFileSync(process.env.VMLINUX ?? join(kernel, 'vmlinux.wasm'))
 );
-const router = routerModules();
+const runtime = hostRuntime();
 const initrd = new Uint8Array(readFileSync(join(work, 'initramfs.cpio')));
 
 async function boot(count: boolean | ((call: SyscallCall) => void)) {
@@ -127,7 +136,11 @@ async function boot(count: boolean | ((call: SyscallCall) => void)) {
 		maximumPages: 4096,
 		sha256,
 		sharedKernel: true,
-		...(count ? { router, countSyscalls: count } : {}),
+		shareInstances: process.env.SHARE_INSTANCES === '1',
+		...(process.env.RECYCLE === undefined
+			? {}
+			: { recycleInstances: Number(process.env.RECYCLE) }),
+		...(count ? { runtime, countSyscalls: count } : {}),
 		write: (text) => (output += text)
 	});
 	const run = async (until: () => boolean, limit = 1_800_000) => {
@@ -336,6 +349,27 @@ if (mode === 'stat') {
 	process.exit(0);
 }
 
+if (mode === 'wall') {
+	const m = await boot(false);
+	const t0 = performance.now();
+	const printed = await m.exec(`{ ${runner}; } < /dev/null`);
+	const ms = performance.now() - t0;
+	const s = m.machine.stats;
+	console.log(
+		JSON.stringify({
+			workload,
+			n,
+			wallMs: +ms.toFixed(1),
+			programs: s.userExecs + s.recycledStarts + s.sharedEntries,
+			execs: { userExecs: s.userExecs, recycledStarts: s.recycledStarts, recycleReturns: s.recycleReturns },
+			arm: { busybox: shareBuild ? 'share' : 'plain', recycle: process.env.RECYCLE ?? 'default', shareInstances: process.env.SHARE_INSTANCES === '1' },
+			outputEnd: printed.replace(/\r/g, '').slice(-40),
+			crashed: String(m.machine.crashed)
+		})
+	);
+	process.exit(0);
+}
+
 // profile: samples of the workload alone, by what the leaf frame is and whether a syscall entry is
 // on its stack
 const m = await boot(false);
@@ -345,7 +379,7 @@ await session.post('Profiler.enable');
 await session.post('Profiler.setSamplingInterval', { interval: 100 });
 await session.post('Profiler.start');
 const t0 = performance.now();
-await m.exec(`{ ${runner}; } < /dev/null`);
+const printed = await m.exec(`{ ${runner}; } < /dev/null`);
 const ms = performance.now() - t0;
 const { profile } = await session.post('Profiler.stop');
 type Node = { id: number; callFrame: { functionName: string; url: string }; children?: number[] };
@@ -358,6 +392,8 @@ for (const x of nodes.values())
 	if (/^wasm_syscall_\d$/.test(x.callFrame.functionName)) kernelUrls.add(x.callFrame.url);
 const cats = new Map<string, number>();
 const entries = new Map<string, number>();
+const entryLeaf = new Map<string, Map<string, number>>();
+const entryIncl = new Map<string, Map<string, number>>();
 const outside = new Map<string, number>();
 const kernelLeaf = new Map<string, number>();
 const hostLeaf = new Map<string, number>();
@@ -375,13 +411,16 @@ for (const id of profile.samples ?? []) {
 		const entry = stack.findLastIndex((name) => /^wasm_syscall_\d$/.test(name));
 		cat = entry >= 0 ? 'vmlinux under wasm_syscall_*' : 'vmlinux, not under a syscall';
 		// the kernel's name for the call (its __se_sys_ frame), else the frames under the entry
-		if (entry >= 0)
-			bump(
-				entries,
+		if (entry >= 0) {
+			const call =
 				stack.findLast((name) => name.startsWith('__se_sys_'))?.slice(9) ??
-					`? ${stack.slice(Math.max(entry - 2, 0), entry).reverse().join(' > ')}`
-			);
-		else bump(outside, stack.slice(-3).reverse().join(' > '));
+				`? ${stack.slice(Math.max(entry - 2, 0), entry).reverse().join(' > ')}`;
+			bump(entries, call);
+			// self time by function under the call, and the samples that have a function anywhere under it
+			bump(entryLeaf.get(call) ?? entryLeaf.set(call, new Map()).get(call)!, f.functionName);
+			const incl = entryIncl.get(call) ?? entryIncl.set(call, new Map()).get(call)!;
+			for (const name of new Set(stack.slice(0, entry))) bump(incl, name);
+		} else bump(outside, stack.slice(-3).reverse().join(' > '));
 		bump(kernelLeaf, f.functionName);
 	} else if (f.url.startsWith('wasm://')) {
 		cat = 'user programs (wasm)';
@@ -406,9 +445,35 @@ console.log(
 		),
 		topKernelLeaves: top(kernelLeaf, 12),
 		topSyscallEntries: top(entries, 30),
+		// CALLS=execve,exit_group,clone names the calls whose self and inclusive samples are listed
+		byCall: Object.fromEntries(
+			(process.env.CALLS ?? 'execve,exit_group,clone').split(',').map((call) => [
+				call,
+				{
+					samples: entries.get(call) ?? 0,
+					self: top(entryLeaf.get(call) ?? new Map(), 25),
+					inclusive: top(entryIncl.get(call) ?? new Map(), 40)
+				}
+			])
+		),
 		topOutsideSyscalls: top(outside, 10),
-		topHostLeaves: top(hostLeaf, 25),
+		topHostLeaves: top(hostLeaf, 60),
 		topUserLeaves: top(userLeaf, 5),
+		arm: {
+			busybox: shareBuild ? 'share' : 'plain',
+			recycle: process.env.RECYCLE ?? 'default',
+			shareInstances: process.env.SHARE_INSTANCES === '1'
+		},
+		programs:
+			m.machine.stats.userExecs + m.machine.stats.recycledStarts + m.machine.stats.sharedEntries,
+		execs: {
+			userExecs: m.machine.stats.userExecs,
+			recycledStarts: m.machine.stats.recycledStarts,
+			recycleReturns: m.machine.stats.recycleReturns,
+			sharedEntries: m.machine.stats.sharedEntries
+		},
+		outputSha: sha256(new TextEncoder().encode(printed.replace(/\r/g, ''))),
+		outputEnd: printed.replace(/\r/g, '').slice(-40),
 		crashed: String(m.machine.crashed)
 	})
 );
