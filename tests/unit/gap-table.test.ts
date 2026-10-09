@@ -24,9 +24,30 @@ describe('gap table', () => {
 		});
 	});
 
+	it('reads the rows with the two window columns that region.sh writes now', () => {
+		const rows = parseExtra(
+			[`${header},win_idx,win_slow`, 'gzip,dir,2,2000,4,3,10,60,30,10,200,50,7,1'].join('\n')
+		);
+		expect(rows).toHaveLength(1);
+		expect(rows[0]).toMatchObject({ insns: 2000, polls: 50 });
+	});
+
+	it('reads the failed resolves and the loop revalidations of a 16-column row', () => {
+		const [e] = parseExtra(
+			[
+				`${header},win_idx,win_slow,win_fail,reval`,
+				'gzip,dir,2,2000,4,3,10,60,30,10,200,50,7,1,40,6'
+			].join('\n')
+		);
+		expect(e).toMatchObject({ winFail: 40, reval: 6 });
+		expect(perThousand(e!)).toMatchObject({ failed: 20, revalidations: 3 });
+	});
+
 	it('turns the counts into figures per 1,000 guest instructions', () => {
 		const [e] = parseExtra('gzip,dir,2,2000,4,3,10,60,30,10,200,50');
 		expect(perThousand(e!)).toEqual({
+			failed: 0,
+			revalidations: 0,
 			windowShare: 0.7,
 			accesses: 50,
 			checked: 15,

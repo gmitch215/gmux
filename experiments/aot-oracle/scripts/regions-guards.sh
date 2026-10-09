@@ -40,7 +40,7 @@ check() {
 		read -r addr size < <("$llvm/llvm-nm" -S -n --defined-only "$out/$g" | awk -v f="$fn" '$4 == f { print $1, $2 }')
 		ranges=(--ranges="0x$addr-$(printf '0x%x' $((0x$addr + 0x$size)))")
 	fi
-	"$node" --no-warnings --experimental-strip-types "$here/lift.ts" --temps --windows --regs --slots ${ranges[@]+"${ranges[@]}"} "$out/aot-$g.c" 1 "$big" 2> "$out/aot-$g.log"
+	"$node" --no-warnings --experimental-strip-types "$here/lift.ts" --temps --windows --regs --slots ${LIFT_FLAGS:-} ${ranges[@]+"${ranges[@]}"} "$out/aot-$g.c" 1 "$big" 2> "$out/aot-$g.log"
 	$cc -DKB_AOT -DKB_COUNT -I"$K" -I"$here/../src" -o "$out/aot-$g" "$K"/*.c "$out/aot-$g.c" -lm
 	for regs in 0 1 2; do
 		rc=0

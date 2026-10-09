@@ -41,13 +41,16 @@ export function parseWasm(text: string): Row[] {
 		.map((c) => ({ arm: c[1]!, first: Number(c[2]), ms: Number(c[4]) }));
 }
 
-/** region.sh rows: workload,arm,regs,output,insns,rd,wr,lifted%,entries,rss -> the lifted share per `arm:form` */
+/**
+ * region.sh rows (workload,arm,regs,output,insns,rd,wr,lifted%,entries,rss) and region-arms.sh rows (the same first
+ * eight columns, then the category counters, entries and opt: 28 columns) -> the lifted share per `arm:form`
+ */
 export function parseCounts(text: string): Map<string, { lifted: number; entries: number }> {
 	const out = new Map<string, { lifted: number; entries: number }>();
 	for (const line of text.split('\n')) {
 		const f = line.split(',');
-		if (f.length !== 10 || f[3] !== 'exact') continue;
-		out.set(`${f[1]}:${f[2]}`, { lifted: parseFloat(f[7]!) / 100, entries: Number(f[8]) });
+		if ((f.length !== 10 && f.length !== 28) || f[3] !== 'exact') continue;
+		out.set(`${f[1]}:${f[2]}`, { lifted: parseFloat(f[7]!) / 100, entries: Number(f[f.length === 10 ? 8 : 26]) });
 	}
 	return out;
 }

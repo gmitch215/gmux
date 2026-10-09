@@ -20,6 +20,13 @@ describe('region table', () => {
 		expect(counts.get('fnc:0')).toEqual({ lifted: 0.8, entries: 180 });
 	});
 
+	it('reads region-arms.sh rows too, with the entries from their own column', () => {
+		const row =
+			'gzip,all999,2,exact,736939089,1.7,6.9,99.8%,0.5,0.5,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,111.0,5.5,19.5,0.0,188.2,58.4,16028,O2';
+		expect(parseCounts(row).get('all999:2')).toEqual({ lifted: 0.998, entries: 16028 });
+		expect(parseCounts(row.replace('exact', 'abcd1234 DIFFERS from 00000000')).size).toBe(0);
+	});
+
 	it('reads the rows both timing scripts print, stamps and all', () => {
 		const native = [
 			'| arm | ms per run | median ms | spread | r | load1 per run |',

@@ -20,20 +20,20 @@ node=${NODE:-node}
 mode=${REGIONS:-each}
 T=$root/tests/c/katybug
 K=$root/src/gmux/katybug
-cc="cc -std=c11 -D_DEFAULT_SOURCE -D_DARWIN_C_SOURCE -O1"
+cc="${CC:-cc} -std=c11 -D_DEFAULT_SOURCE -D_DARWIN_C_SOURCE -O1 ${CC_EXTRA:-}"
 flags=(--target=x86_64-linux-gnu -nostdlib -static -fuse-ld=lld -O2 -ffreestanding -fno-stack-protector -fno-builtin)
 source_of() {
-	case $1 in faults) echo x86-faults.c ;; prim) echo prim-faults.c ;; regs) echo x86-regs.c ;; slots) echo x86-slots.c ;; calls) echo x86-calls.c ;; index) echo x86-index.c ;; *) echo "$1.c" ;; esac
+	case $1 in faults) echo x86-faults.c ;; prim) echo prim-faults.c ;; regs) echo x86-regs.c ;; slots) echo x86-slots.c ;; calls) echo x86-calls.c ;; index) echo x86-index.c ;; loops) echo x86-loops.c ;; flags) echo x86-flags.c ;; *) echo "$1.c" ;; esac
 }
 flags_of() {
-	case $1 in regs) echo "" ;; slots | calls | index) echo "-mno-sse -mno-mmx -mno-red-zone" ;; prim) echo "-I$T -mno-sse -mno-mmx -mno-red-zone" ;; *) echo "-mno-sse -mno-mmx" ;; esac
+	case $1 in regs) echo "" ;; slots | calls | index | loops) echo "-mno-sse -mno-mmx -mno-red-zone" ;; prim) echo "-I$T -mno-sse -mno-mmx -mno-red-zone" ;; *) echo "-mno-sse -mno-mmx" ;; esac
 }
 epoch_cc=
 epoch_lift=
 [ "${KB_EPOCH:-0}" = 1 ] && epoch_cc=-DKB_EPOCH=1
 [ "${EPOCHS:-${KB_EPOCH:-0}}" = 1 ] && epoch_lift=--epochs
 guests=("$@")
-[ "${#guests[@]}" -gt 0 ] || guests=(guest signals faults prim returns pieces fds regs slots calls index)
+[ "${#guests[@]}" -gt 0 ] || guests=(guest signals faults prim returns pieces fds regs slots calls index loops flags)
 $cc -o "$out/hot" -DKB_HOT "$K"/*.c -lm
 $cc -o "$out/plain" "$K"/*.c -lm
 checked=0

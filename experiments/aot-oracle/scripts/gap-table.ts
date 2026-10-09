@@ -21,13 +21,16 @@ export interface Extra {
 	grpAcc: number;
 	cont: number;
 	polls: number;
+	// resolves that failed and loop windows resolved again after a syscall or call (the 16-column rows)
+	winFail: number;
+	reval: number;
 }
 
 export function parseExtra(text: string): Extra[] {
 	const last = new Map<string, Extra>();
 	for (const line of text.split('\n')) {
 		const f = line.split(',');
-		if (f.length !== 12 || !/^\d+$/.test(f[3]!)) continue;
+		if (![12, 14, 16].includes(f.length) || !/^\d+$/.test(f[3]!)) continue;
 		const n = f.slice(3).map(Number);
 		last.set(`${f[0]}:${f[1]}:${f[2]}`, {
 			workload: f[0]!,
@@ -41,7 +44,9 @@ export function parseExtra(text: string): Extra[] {
 			chkAcc: n[5]!,
 			grpAcc: n[6]!,
 			cont: n[7]!,
-			polls: n[8]!
+			polls: n[8]!,
+			winFail: n[11] ?? 0,
+			reval: n[12] ?? 0
 		});
 	}
 	return [...last.values()];
@@ -60,19 +65,21 @@ export function perThousand(e: Extra) {
 		moves: k(e.cont),
 		polls: k(e.polls),
 		calls: k(e.calls),
-		entries: k(e.entries)
+		entries: k(e.entries),
+		failed: k(e.winFail),
+		revalidations: k(e.reval)
 	};
 }
 
 if (process.argv[1]?.endsWith('gap-table.ts')) {
-	console.log('| workload | arm:form | accesses | windowed or grouped | checked | window resolves | generation compares | block moves | pending polls | direct calls | entries |');
-	console.log('| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |');
+	console.log('| workload | arm:form | accesses | windowed or grouped | checked | window resolves | failed resolves | generation compares | revalidations | block moves | pending polls | direct calls | entries |');
+	console.log('| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |');
 	for (const path of process.argv.slice(2))
 		for (const e of parseExtra(readFileSync(path, 'utf8'))) {
 			const p = perThousand(e);
 			const f = (v: number) => v.toFixed(1);
 			console.log(
-				`| ${e.workload} | ${e.arm}:${e.regs} | ${f(p.accesses)} | ${(100 * p.windowShare).toFixed(1)}% | ${f(p.checked)} | ${f(p.resolves)} | ${f(p.genCompares)} | ${f(p.moves)} | ${f(p.polls)} | ${f(p.calls)} | ${p.entries.toFixed(3)} |`
+				`| ${e.workload} | ${e.arm}:${e.regs} | ${f(p.accesses)} | ${(100 * p.windowShare).toFixed(1)}% | ${f(p.checked)} | ${f(p.resolves)} | ${f(p.failed)} | ${f(p.genCompares)} | ${f(p.revalidations)} | ${f(p.moves)} | ${f(p.polls)} | ${f(p.calls)} | ${p.entries.toFixed(3)} |`
 			);
 		}
 }

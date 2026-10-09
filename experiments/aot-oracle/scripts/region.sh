@@ -5,12 +5,16 @@
 # form). sepN, dirN and mrgN take the function and its hottest callee (N = 2) or all its hot callees (N = 3): sep
 # is a region per function with the interpreter between them, dir the same regions with direct calls between
 # them (lift.ts --calls), nio the same with each callee out of line (--noinline), mrg one merged region (mrg3 is
-# fnc; none for a workload with only one callee). Per arm,
+# fnc; none for a workload with only one callee). With N = 5 the arms take the five functions with the most self
+# ops (functions.ts --emit-top=5), no callees: mrg5 is them in one region. An arm named <arm>+o<N> (nio5+o2) is
+# that arm lifted with --only=N, one form in the build. Per arm,
 # on a Linux x86-64 host: the lifted C (aot-<arm>-<workload>.c, where ladder-wasm.sh finds it), a native Katybug
 # build, its output against the binary's, the counters per 1,000 guest instructions (entries are region entries),
 # peak RSS, and the byte sizes. counts-extra.csv carries the rest of the counters, counts-epochs.csv the epoch guard's, exits-*.txt the pcs regions leave at.
 # KB_EPOCH=1 builds the arms with the epoch guard (-DKB_EPOCH=1); an arm named <arm>+ep (fn+ep) is that arm lifted
 # with --epochs, which needs it; <arm>+b (fnc+b) is that arm lifted with --bounds, <arm>+b4 with --bounds=4080 (no index window wider than the memory plan's span).
+# <arm>+id is the arm lifted with --identity and built with -DKB_IDENTITY (a runtime that maps guests at their own
+# addresses), <arm>+lv with --flags=live, <arm>+nf with --flags=none; they go before +o<N>: nio24+id+lv+o2.
 # usage: [ARMS="fn fnc all sep2 dir2 mrg2 sep3 dir3"] [KB_EPOCH=1] region.sh <bin dir with busybox-amd64, coreutils, sqlite3, bash> <out dir> <workload> [rank of the function, 0]
 set -euo pipefail
 here=$(cd "$(dirname "$0")" && pwd)
@@ -35,46 +39,70 @@ build -o "$out/hot" -DKB_HOT "$K"/*.c
 build -o "$out/plain" -DKB_COUNT "$K"/*.c
 build -o "$out/interp" "$K"/*.c
 # no traces in the dump: a promoted block is never traced, so the blocks it matches are the plain ones
-KATYBUG_SEGMENTS=1 KATYBUG_HOT=$out/hot-$w sh -c "$(cmd "$out/hot" "$w")" > /dev/null 2>&1
+# a dump already in the out dir is kept: two dumps of one workload differ, and every arm of it lifts from the same one
+compgen -G "$out/hot-$w/*.hot" > /dev/null || KATYBUG_SEGMENTS=1 KATYBUG_HOT=$out/hot-$w sh -c "$(cmd "$out/hot" "$w")" > /dev/null 2>&1
 hot=$(ls -S "$out/hot-$w"/*.hot | head -1)
 fn=$(fns --emit="$rank" "$fine")
 fnc=$(fns --emit="$rank+callees" "$fine")
 mapfile -t split3 < <(fns --emit-split="$rank" "$fine")
 mapfile -t split2 < <(fns --emit-split="$rank:1" "$fine")
+mapfile -t top5 < <(fns --emit-top=5 "$fine")
 {
 	echo "fn   $fn"
 	echo "fnc  $fnc"
 	printf 'split3 %s\n' "${split3[@]}"
 	printf 'split2 %s\n' "${split2[@]}"
+	printf 'top5 %s\n' "${top5[@]}"
 } | tee "$out/ranges-$w.txt"
 arms=${ARMS:-fn fnc all sep2 dir2 mrg2 sep3 dir3}
 # a workload with one hot callee has no separate three-function arms, and its pair merged is fnc
-[ "${#split3[@]}" -gt 2 ] || arms=$(printf '%s\n' $arms | grep -v '3$' | grep -v '^mrg2$' | tr '\n' ' ')
+[ "${#split3[@]}" -gt 2 ] || arms=$(printf '%s\n' $arms | grep -v '[a-z]3$' | grep -v '^mrg2$' | tr '\n' ' ')
 lifts=(--temps --windows --regs --slots)
 # the lifter's arguments for an arm, after the flags: out.c, coverage, dumps
 arm_lift() {
 	local arm=$1 c=$out/aot-$1-$w.c
 	local specs=() r
 	local lifts=("${lifts[@]}")
+	# an arm named <arm>+o<N> is the same region with the one form N in the build (--only=N)
+	case $arm in *+o?) lifts+=(--only="${arm: -1}") ;; esac
+	arm=${arm%+o?}
+	# +id is lift.ts --identity (built with -DKB_IDENTITY), +lv is --flags=live, +nf is --flags=none
+	case $arm in *+nf) lifts+=(--flags=none) ;; *+lv) lifts+=(--flags=live) ;; esac
+	arm=${arm%+nf}
+	arm=${arm%+lv}
+	case $arm in *+id) lifts+=(--identity) ;; esac
+	arm=${arm%+id}
 	# an arm named <arm>+ep is the same region lifted with --epochs, built with -DKB_EPOCH=1
 	case $arm in *+ep) lifts+=(--epochs) ;; esac
 	arm=${arm%+ep}
+	# +lg is --loop-guards and +b2 is --bounds=two (nio24+b2+lg+o1)
+	case $arm in *+lg) lifts+=(--loop-guards) ;; esac
+	arm=${arm%+lg}
 	# an arm named <arm>+b is the same region lifted with --bounds (accesses with an index bound in windows)
-	case $arm in *+b) lifts+=(--bounds) ;; *+b4) lifts+=(--bounds=4080) ;; esac
+	case $arm in *+b) lifts+=(--bounds) ;; *+b4) lifts+=(--bounds=4080) ;; *+b2) lifts+=(--bounds=two) ;; esac
 	arm=${arm%+b4}
+	arm=${arm%+b2}
 	arm=${arm%+b}
-	case $arm in
-		*2) for r in "${split2[@]}"; do specs+=("$hot@$r"); done ;;
-		*3) for r in "${split3[@]}"; do specs+=("$hot@$r"); done ;;
+	# the number on the end of sep/dir/nio/mrg is how many functions: 2 and 3 are the hottest callees, 4 and up the top N
+	local n=${arm##*[!0-9]} topn=()
+	case $n in
+		2) for r in "${split2[@]}"; do specs+=("$hot@$r"); done ;;
+		3) for r in "${split3[@]}"; do specs+=("$hot@$r"); done ;;
+		?*)
+			mapfile -t topn < <(fns --emit-top="$n" "$fine")
+			printf 'top%s %s\n' "$n" "${topn[@]}" >> "$out/ranges-$w.txt"
+			for r in "${topn[@]}"; do specs+=("$hot@$r"); done
+			;;
 	esac
 	case $arm in
 		fn) lift "${lifts[@]}" --ranges="$fn" "$c" 1 "$hot" ;;
 		fnc) lift "${lifts[@]}" --ranges="$fnc" "$c" 1 "$hot" ;;
 		all) lift "${lifts[@]}" "$c" 0.99 "$hot" ;;
-		sep?) lift "${lifts[@]}" "$c" 1 "${specs[@]}" ;;
-		dir?) lift "${lifts[@]}" --calls "$c" 1 "${specs[@]}" ;;
-		nio?) lift "${lifts[@]}" --calls --noinline "$c" 1 "${specs[@]}" ;;
-		mrg?) lift "${lifts[@]}" --ranges="$(IFS=,; echo "${split2[*]}")" "$c" 1 "$hot" ;;
+		sep*) lift "${lifts[@]}" "$c" 1 "${specs[@]}" ;;
+		dir*) lift "${lifts[@]}" --calls "$c" 1 "${specs[@]}" ;;
+		nio*) lift "${lifts[@]}" --calls --noinline "$c" 1 "${specs[@]}" ;;
+		mrg[4-9]* | mrg[1-9][0-9]*) lift "${lifts[@]}" --ranges="$(IFS=,; echo "${topn[*]}")" "$c" 1 "$hot" ;;
+		mrg*) lift "${lifts[@]}" --ranges="$(IFS=,; echo "${split2[*]}")" "$c" 1 "$hot" ;;
 	esac
 }
 for arm in $arms; do arm_lift "$arm" 2> "$out/lift-$arm-$w.log"; done
@@ -86,9 +114,14 @@ rss() { /usr/bin/time -f %M sh -c "$1" 2>&1 > /dev/null | tail -n 1; }
 echo "$w,interp,-,-,-,-,-,-,-,$(rss "$(cmd "$out/interp" "$w")")"
 echo "$w,binary,-,-,-,-,-,-,-,$(rss "$(cmd "" "$w")")"
 for arm in $arms; do
-	build -o "$out/aot-$arm-$w" -DKB_COUNT -DKB_EPOCH="${KB_EPOCH:-0}" -DKB_AOT -I"$K" -I"$here/../src" "$K"/*.c "$out/aot-$arm-$w.c"
-	build -o "$out/run-$arm-$w" -DKB_EPOCH="${KB_EPOCH:-0}" -DKB_AOT -I"$K" -I"$here/../src" "$K"/*.c "$out/aot-$arm-$w.c"
-	for regs in 0 1 2; do
+	ident=()
+	case $arm in *+id*) ident=(-DKB_IDENTITY) ;; esac
+	build -o "$out/aot-$arm-$w" -DKB_COUNT -DKB_EPOCH="${KB_EPOCH:-0}" -DKB_AOT "${ident[@]}" -I"$K" -I"$here/../src" "$K"/*.c "$out/aot-$arm-$w.c"
+	build -o "$out/run-$arm-$w" -DKB_EPOCH="${KB_EPOCH:-0}" -DKB_AOT "${ident[@]}" -I"$K" -I"$here/../src" "$K"/*.c "$out/aot-$arm-$w.c"
+	# a one-form arm ignores KATYBUG_REGS
+	forms="0 1 2"
+	case $arm in *+o?) forms=0 ;; esac
+	for regs in $forms; do
 		got=$(KATYBUG_REGS=$regs sh -c "$(cmd "$out/aot-$arm-$w" "$w")" 2> /dev/null | md)
 		[ "$got" = "$want" ] && got=exact || got="$got DIFFERS from $want"
 		: > "$out/$w-$arm-$regs.count"

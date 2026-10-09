@@ -5,7 +5,7 @@ cmd() {
 	case $2 in
 		sha256) echo "$p $bin/coreutils --coreutils-prog=sha256sum $out/in" ;;
 		factor) echo "$p $bin/busybox-amd64 seq 1000000000000 1000000020000 | $p $bin/coreutils --coreutils-prog=factor" ;;
-		sqlite) echo "$p $bin/sqlite3 :memory: 'with recursive c(x) as (select 1 union all select x+1 from c where x<100000) select count(*), sum(x*x) % 1000003 from c;'" ;;
+		sqlite) echo "$p $bin/sqlite3 :memory: 'with recursive c(x) as (select 1 union all select x+1 from c where x<${SQLITE_ROWS:-100000}) select count(*), sum(x*x) % 1000003 from c;'" ;;
 		gzip) echo "$p $bin/busybox-amd64 gzip -9 -c $out/in" ;;
 		bzip2) echo "$p $bin/busybox-amd64 bzip2 -9 -c $out/in" ;;
 		curl) echo "$p $bin/curl -s file://$out/in" ;;

@@ -43,6 +43,21 @@ describe('follow', () => {
 		]);
 	});
 
+	it('bounds a 15-bit mask on 2-byte entries to a window one piece wide', () => {
+		const code = [
+			ins('MOVI', 32, 0, 0, 0x7fffn),
+			ins('AND', 33, 1, 32),
+			ins('MOVI', 34, 0, 0, 1n),
+			ins('SHL', 35, 33, 34),
+			ins('ADD', 36, 7, 35),
+			ins('LD', 8, 36, 0, 0n, 2)
+		];
+		const [f] = follow(code, op, true);
+		expect(f).toMatchObject({ root: 7, lo: 0n, hi: 65534n, w: 2 });
+		// the access's last byte is the window's end: 65,536 bytes, a whole piece, which crosses a boundary from any base that is not aligned
+		expect(f!.hi - f!.lo + BigInt(f!.w)).toBe(65536n);
+	});
+
 	it('does not take a mask loaded from memory for a bound', () => {
 		const code = [ins('LD', 32, 5, 0, 0n), ins('AND', 33, 1, 32), ...address(33), load];
 		expect(follow(code, op, true).filter((f) => f.root === 7)).toEqual([]);

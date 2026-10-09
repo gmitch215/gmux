@@ -5,6 +5,7 @@
 # binary's in each form it can run, and prints region.sh's columns plus regs.sh's counters per 1,000 guest
 # instructions, one csv row per form. Reuses the dumps in the out dir and makes them when they are not there.
 # CLANG_TIMEOUT (seconds, 600) per clang run; past it at -O2 the arm is built at -O1 (same limit) and the row says so.
+# CC_EXTRA adds clang flags to both builds (-DKB_IDENTITY for lift.ts --identity).
 # usage: region-arms.sh <bin dir with busybox-amd64, coreutils, sqlite3, bash, curl> <out dir> <workload> <arm> <ranges> <cover> <forms> [lift flags...]
 # e.g. region-arms.sh bin k9/r gzip fnc0 fnc 1 0 --temps --windows
 set -euo pipefail
@@ -45,13 +46,14 @@ case $ranges in
 esac
 "$node" --no-warnings --experimental-strip-types "$here/lift.ts" "$@" "${range[@]}" "$out/aot-$arm-$w.c" "$cover" "$hot" 2> "$out/lift-$arm-$w.log"
 inc=(-I"$K" -I"$here/../src")
+read -ra extra <<< "${CC_EXTRA:-}"
 opt=-O2
 compile() { # output, extra flags
 	local o=$1
 	shift
-	if ! timeout "${CLANG_TIMEOUT:-600}" clang -std=c11 -D_DEFAULT_SOURCE $opt "$@" "${inc[@]}" -DKB_AOT "$K"/*.c "$out/aot-$arm-$w.c" -o "$o" -lm; then
+	if ! timeout "${CLANG_TIMEOUT:-600}" clang -std=c11 -D_DEFAULT_SOURCE $opt "$@" "${extra[@]}" "${inc[@]}" -DKB_AOT "$K"/*.c "$out/aot-$arm-$w.c" -o "$o" -lm; then
 		opt=-O1
-		timeout "${CLANG_TIMEOUT:-600}" clang -std=c11 -D_DEFAULT_SOURCE $opt "$@" "${inc[@]}" -DKB_AOT "$K"/*.c "$out/aot-$arm-$w.c" -o "$o" -lm
+		timeout "${CLANG_TIMEOUT:-600}" clang -std=c11 -D_DEFAULT_SOURCE $opt "$@" "${extra[@]}" "${inc[@]}" -DKB_AOT "$K"/*.c "$out/aot-$arm-$w.c" -o "$o" -lm
 	fi
 }
 compile "$out/aot-$arm-$w" -DKB_COUNT

@@ -29,6 +29,8 @@ static long sys6(long n, long a, long b, long c, long d, long e, long f) {
 #define A 0x30000000L /* two pages, then two PROT_NONE pages */
 #define B 0x40000000L /* one page, then a hole */
 #define C 0x50000000L /* four pages */
+#define D 0x60000000L /* 0x14000 bytes: a piece and a quarter */
+#define E 0x70000000L /* 0x20000 bytes: two pieces */
 
 long gmask = 0x3ff;
 long masks[4] = {0x3ff, 0x5ff, 0xf, 0x3ff};
@@ -177,6 +179,58 @@ __asm__(
     " jb 1b\n"
     " ret\n"
     ".size tbl, .-tbl\n"
+
+    /* a 15-bit index on 2-byte entries: a 64 KiB window that starts below a
+       piece boundary and ends above it */
+    ".globl two\n.type two,@function\ntwo:\n"
+    " xor %ecx, %ecx\n"
+    " xor %eax, %eax\n"
+    "1: lea (%rcx,%rcx,8), %rdx\n"
+    " lea (%rcx,%rdx,4), %rdx\n"
+    " and $0x7fff, %rdx\n"
+    " movzwl (%rdi,%rdx,2), %r8d\n"
+    " add %r8, %rax\n"
+    " mov %cx, (%rdi,%rdx,2)\n"
+    " inc %rcx\n"
+    " cmp %rsi, %rcx\n"
+    " jb 1b\n"
+    " ret\n"
+    ".size two, .-two\n"
+
+    /* the same over a mapping that ends inside the window: the window does not
+       resolve and the accesses past the end fault at their own addresses */
+    ".globl two_edge\n.type two_edge,@function\ntwo_edge:\n"
+    " xor %ecx, %ecx\n"
+    " xor %eax, %eax\n"
+    "1: lea (%rcx,%rcx,8), %rdx\n"
+    " lea (%rcx,%rdx,4), %rdx\n"
+    " and $0x7fff, %rdx\n"
+    " xor %r8d, %r8d\n"
+    " movzwl (%rdi,%rdx,2), %r8d\n"
+    ".globl two_edge_resume\ntwo_edge_resume:\n"
+    " add %r8, %rax\n"
+    " inc %rcx\n"
+    " cmp %rsi, %rcx\n"
+    " jb 1b\n"
+    " ret\n"
+    ".size two_edge, .-two_edge\n"
+
+    /* 8-byte entries from a base 4 bytes below a piece boundary: element 0
+       straddles it */
+    ".globl strad\n.type strad,@function\nstrad:\n"
+    " xor %ecx, %ecx\n"
+    " xor %eax, %eax\n"
+    "1: mov %rcx, %rdx\n"
+    " shl $11, %rdx\n"
+    " and $0x1fff, %rdx\n"
+    " mov (%rdi,%rdx,8), %r8\n"
+    " add %r8, %rax\n"
+    " mov %rcx, (%rdi,%rdx,8)\n"
+    " inc %rcx\n"
+    " cmp %rsi, %rcx\n"
+    " jb 1b\n"
+    " ret\n"
+    ".size strad, .-strad\n"
 );
 
 long fill(long base, long n);
@@ -187,6 +241,10 @@ long ldmask(long base, long n);
 long cmpb(long base, long n);
 long last(long base, long n);
 long tbl(long b, long t, long n);
+long two(long base, long n);
+long two_edge(long base, long n);
+long strad(long base, long n);
+void two_edge_resume(void);
 void restore_rt(void);
 void edge_ld_resume(void);
 void edge_st_resume(void);
@@ -268,6 +326,10 @@ void index_main(long* sp) {
     sys6(NR_MMAP, B, 2 * 4096, 3, MAP_FIXED_ANON, -1, 0);
     sys(NR_MUNMAP, B + 4096, 4096, 0);
     sys6(NR_MMAP, C, 4 * 4096, 3, MAP_FIXED_ANON, -1, 0);
+    sys6(NR_MMAP, D, 0x14000, 3, MAP_FIXED_ANON, -1, 0);
+    sys6(NR_MMAP, E, 0x20000, 3, MAP_FIXED_ANON, -1, 0);
+    for (int i = 0; i < 0x20000 / 8; i++) ((long*) E)[i] = i * 0x9e3779b1L + 7;
+    for (int i = 0; i < 0x14000 / 8; i++) ((long*) D)[i] = i * 0x85ebca6bL + 3;
     for (int i = 0; i < 256; i++) table[i] = i * i + 5;
     for (int i = 0; i < 600; i++)
         bytes[i] = (unsigned char) (i * 37 + (i >> 3));
@@ -304,6 +366,18 @@ void index_main(long* sp) {
     if (pick(only, "tbl")) {
         long r = tbl((long) bytes, (long) table, 600);
         line("tbl", r, 0, 0);
+    }
+    if (pick(only, "two")) {
+        long r = two(E + 0xc000, 3000);
+        line("two", r, sum((long*) E, 0x20000 / 8), 0);
+    }
+    if (pick(only, "two_edge")) {
+        faulting("two_edge D", two_edge, D + 0xc000, 3000, two_edge_resume);
+        faulting("two_edge E", two_edge, E + 0xc000, 3000, two_edge_resume);
+    }
+    if (pick(only, "strad")) {
+        long r = strad(E + 0xfffc, 400);
+        line("strad", r, sum((long*) E, 0x20000 / 8), 0);
     }
     sys(NR_WRITE, 1, (long) out, used);
     sys(NR_EXIT, 0, 0, 0);

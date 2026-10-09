@@ -169,7 +169,22 @@ static inline __attribute__((always_inline)) int aot_muldiv(
     return kb_divide(kind == 7, w, rax, rdx, v);
 }
 
-/* attribution arms, unsafe outside a measurement: -DAOT_NO_SIGNAL_CHECK moves
+/* lift.ts --identity: the host bytes of a guest address. The default is the
+   address itself, for a runtime that maps guests at their own addresses
+   (-DKB_IDENTITY in mem.c) */
+#ifndef AOT_HOST
+    #ifdef KB_WINDOW
+/* the guest lives in one block of the program's own memory at its own offsets
+   (mem.c under -DKB_IDENTITY -DKB_WINDOW=<bytes>); an access is the block's
+   address plus the low 32 bits of the guest address */
+extern uint8_t kb_window[] __attribute__((visibility("hidden")));
+        #define AOT_HOST(va) (kb_window + (uint32_t) (va))
+    #else
+        #define AOT_HOST(va) ((uint8_t*) (uintptr_t) (va))
+    #endif
+#endif
+
+/* attribution arms, unsafe outside a measurement:-DAOT_NO_SIGNAL_CHECK moves
    between lifted blocks without looking for a pending signal (the verification
    check stays: an unmatched block has no IR to run), -DAOT_NO_RANGE_CHECK
    trusts a load or store's cached mapping whenever its generation holds */
@@ -185,7 +200,7 @@ static inline __attribute__((always_inline)) int aot_muldiv(
 struct aot_stat {
     uint64_t win_enter, win_acc, chk_acc, grp_acc, cont, polls;
     uint64_t ep_in, ep_slow, ep_back;
-    uint64_t win_idx, win_slow;
+    uint64_t win_idx, win_slow, win_fail, reval;
 };
 static struct aot_stat aot_stat;
     #define AOT_STAT(f, n) (aot_stat.f += (n))
@@ -244,6 +259,78 @@ static struct aot_stat aot_stat;
 #else
     #define AOT_SLOW(q, gen, va, w)                                            \
         ((q)->gen != (gen) || (va) - (q)->lo > (q)->span - (w))
+#endif
+
+/* a resolve that fails (the span is not in one accessible piece) is counted
+   where the lifted code makes it */
+#ifdef KB_COUNT
+static inline uint8_t* aot_host_ic(
+    struct kb_cpu* cpu, struct kb_ic* ic, uint64_t va, uint64_t len
+) {
+    uint8_t* p = kb_host_ic(cpu, ic, va, len);
+    aot_stat.win_fail += !p;
+    return p;
+}
+    #define kb_host_ic aot_host_ic
+#endif
+
+/* lift.ts --bounds=two: a window of len bytes from va that may cross one piece
+   boundary. Returns the host bytes of va's piece; *h1 is the next piece's and
+   *bd the guest address where it starts, or (uint64_t) -1 when the window ends
+   in the first. NULL when either piece does not resolve */
+static inline __attribute__((always_inline)) uint8_t* aot_open2(
+    struct kb_cpu* cpu, struct kb_ic* q0, struct kb_ic* q1, uint32_t gen,
+    uint64_t va, uint64_t len, uint8_t** h1, uint64_t* bd
+) {
+    uint8_t* p = q0->gen == gen && va - q0->lo < q0->span
+                     ? q0->host + (va - q0->lo)
+                     : kb_host_ic(cpu, q0, va, 1);
+    if (!p) return NULL;
+    uint64_t end = q0->lo + q0->span;
+    if (va + len <= end) {
+        *bd = ~0ull;
+        return p;
+    }
+    uint64_t need = va + len - end;
+    uint8_t* r =
+        q1->gen == gen && need <= q1->span && end - q1->lo <= q1->span - need
+            ? q1->host + (end - q1->lo)
+            : kb_host_ic(cpu, q1, end, need);
+    if (!r) return NULL;
+    *h1 = r;
+    *bd = end;
+    return p;
+}
+
+/* the host address of an access at a, w bytes wide, in a two-piece window that
+   starts at va (host h0) with its second piece at bd (host h1); NULL when the
+   window did not resolve or the access straddles the boundary */
+#define AOT_PICK2(a, w, va, h0, h1, bd)                                        \
+    ((h0) ? ((a) >= (bd)         ? (h1) + ((a) - (bd))                         \
+             : (a) + (w) <= (bd) ? (h0) + ((a) - (va))                         \
+                                 : NULL)                                       \
+          : NULL)
+
+/* -DAOT_LOOP_CHECK: a loop window used after the mapping generation moved past
+   the one it was resolved at stops the run (a verification build of the loop
+   guards' revalidation) */
+#ifdef AOT_LOOP_CHECK
+    #define AOT_LCHK_FAIL()                                                    \
+        do {                                                                   \
+            fprintf(stderr, "katybug: loop window used past a remap\n");       \
+            abort();                                                           \
+        } while (0)
+    #define AOT_LCHK(q)                                                        \
+        do {                                                                   \
+            if ((q)->gen != gen) AOT_LCHK_FAIL();                              \
+        } while (0)
+    #define AOT_LCHK1(q, bd)                                                   \
+        do {                                                                   \
+            if ((bd) != ~0ull && (q)->gen != gen) AOT_LCHK_FAIL();             \
+        } while (0)
+#else
+    #define AOT_LCHK(q) ((void) 0)
+    #define AOT_LCHK1(q, bd) ((void) 0)
 #endif
 
 /* -DKB_COUNT: a region's own cpu traffic (entry loads, exit stores, spills
@@ -333,7 +420,7 @@ __attribute__((destructor)) static void aot_stat_report(void) {
         f,
         "katybug aot: win_enter %llu win_acc %llu chk_acc %llu grp_acc %llu "
         "cont %llu polls %llu ep_in %llu ep_slow %llu ep_back %llu "
-        "win_idx %llu win_slow %llu\n",
+        "win_idx %llu win_slow %llu win_fail %llu reval %llu\n",
         (unsigned long long) aot_stat.win_enter,
         (unsigned long long) aot_stat.win_acc,
         (unsigned long long) aot_stat.chk_acc,
@@ -343,7 +430,9 @@ __attribute__((destructor)) static void aot_stat_report(void) {
         (unsigned long long) aot_stat.ep_slow,
         (unsigned long long) aot_stat.ep_back,
         (unsigned long long) aot_stat.win_idx,
-        (unsigned long long) aot_stat.win_slow
+        (unsigned long long) aot_stat.win_slow,
+        (unsigned long long) aot_stat.win_fail,
+        (unsigned long long) aot_stat.reval
     );
     fclose(f);
 }

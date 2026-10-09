@@ -3,7 +3,8 @@
 # the flags ladder.sh builds it with), and the host's instrumented build of every wasm program in the
 # out dir (katybug-*.wasm, f-*.wasm) as <name>.inst.wasm, in the census image (wabt, node).
 # usage: ladder-wasm.sh <linux-wasm dir> <llvm install> <out dir with f-*.wasm> <dir with aot-<arm>-<workload>.c> [arms]
-# (CPUSETS="0,1 2,3" runs one build stream per set, four cpus each)
+# (CPUSETS="0,1 2,3" runs one build stream per set, four cpus each; ID_FLAGS adds flags to arms named <..>+id<..>,
+# the lifter's --identity builds, e.g. "-DKB_IDENTITY -DKB_WINDOW=16777216" for the window runtime)
 set -euo pipefail
 here=$(cd "$(dirname "$0")" && pwd)
 root=$(cd "$here/../../.." && pwd)
@@ -20,6 +21,7 @@ flags() {
 	case $1 in
 		A | B | B0) echo "$base -DKB_TRACE=1 -DAOT_POLL=0" ;;
 		C | C0) echo "$base -DAOT_POLL=0" ;;
+		*+id*) echo "$base ${ID_FLAGS:-}" ;;
 		*) echo "$base" ;;
 	esac
 }
