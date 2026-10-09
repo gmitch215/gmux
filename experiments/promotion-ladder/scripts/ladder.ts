@@ -121,7 +121,8 @@ if (mode === 'prepare') {
 	const given = a3 ? (JSON.parse(readFileSync(a3, 'utf8')) as Record<string, string[]>) : null;
 	if (given) {
 		for (const [label, names] of Object.entries(given)) rungs.push({ target: 0, set: new Set(names), share: shareOf(new Set(names)), label });
-		rungs.push({ target: 1, set: new Set(fns.filter((fn) => !fn.wide).map((fn) => fn.name)), share: 1, label: 'native' });
+		// LADDER_NATIVE_END=0 leaves out the all-native rung, which cannot be built from a function that grows memory
+		if (process.env.LADDER_NATIVE_END !== '0') rungs.push({ target: 1, set: new Set(fns.filter((fn) => !fn.wide).map((fn) => fn.name)), share: 1, label: 'native' });
 		for (const r of rungs) r.target = r.share;
 	}
 	for (; !given; ) {
@@ -135,6 +136,10 @@ if (mode === 'prepare') {
 	}
 
 	const byName = new Map(fns.map((fn) => [fn.name, fn]));
+	// LADDER_OPEN=1: a promoted function may call an interpreted one; the native module then holds a wrapper for it that
+	// enters wasm3 through the host's call_at import, and wasm3 exports an entry stub (ie_<name>) per such function
+	const open = process.env.LADDER_OPEN === '1';
+	const elemRefs = new Set([...head, ...tail].filter((l) => /^\s*\(elem\b/.test(l)).flatMap((l) => [...l.matchAll(/\$([A-Za-z0-9_.]+)/g)].map((m) => m[1]!)));
 	// imports go right after the types, ahead of the table, memory and globals wasm-tools prints next
 	const importAt = head.findLastIndex((l) => /^ {2}\(type/.test(l)) + 1;
 	const manifest = rungs.map((rung, k) => {
@@ -144,6 +149,15 @@ if (mode === 'prepare') {
 			for (const c of callees.get(fn.name)!)
 				if (byName.get(c)?.wide && rung.set.has(c) && !rung.set.has(fn.name)) throw new Error(`rung ${k}: ${fn.name} is interpreted and calls the promoted wide function ${c}`);
 		const entered = promoted.filter((n) => !byName.get(n)!.wide);
+		// the interpreted functions native code reaches: a direct callee of a promoted function, or a table entry
+		const cold = open
+			? fns
+					.filter((fn) => !rung.set.has(fn.name) && (elemRefs.has(fn.name) || [...rung.set].some((p) => callees.get(p)!.has(fn.name))))
+					.map((fn) => {
+						if (fn.wide) throw new Error(`rung ${k}: native code reaches the interpreted wide function ${fn.name}`);
+						return fn.name;
+					})
+			: [];
 		// wasm3's side: each entered function becomes a thunk passing the stack pointer first
 		const interpHead = [...head];
 		interpHead.splice(
@@ -158,12 +172,50 @@ if (mode === 'prepare') {
 		const interpFns = fns.map((fn) =>
 			entered.includes(fn.name) ? { ...fn, locals: [], body: ['    global.get $__stack_pointer', ...paramList(fn), `    call $nat_${fn.name}`] } : fn
 		);
-		writeFileSync(join(out, `rung${k}.interp.wasm`), wasmTools(['parse', '-o', '/dev/stdout'], [...interpHead, ...interpFns.flatMap(emit), ...tail].join('\n')));
+		// an entry stub per interpreted function native code reaches: it sets the stack pointer to native's and puts it back
+		const stubs = cold.flatMap((n) => {
+			const fn = byName.get(n)!;
+			if (fn.params > 7) throw new Error(`${n}: ${fn.params} parameters, call_at takes eight arguments with the stack pointer`);
+			const params = ['i32', ...Array.from({ length: fn.params }, () => 'i32')].join(' ');
+			return [
+				`  (func $ie_${n} (export "ie_${n}") (param ${params})${fn.result ? ' (result i32)' : ''}`,
+				'    (local $save i32) (local $r i32)',
+				'    global.get $__stack_pointer',
+				'    local.set $save',
+				'    local.get 0',
+				'    global.set $__stack_pointer',
+				...Array.from({ length: fn.params }, (_, i) => `    local.get ${i + 1}`),
+				`    call $${n}`,
+				...(fn.result ? ['    local.set $r'] : []),
+				'    local.get $save',
+				'    global.set $__stack_pointer',
+				...(fn.result ? ['    local.get $r'] : []),
+				'  )'
+			];
+		});
+		writeFileSync(join(out, `rung${k}.interp.wasm`), wasmTools(['parse', '-o', '/dev/stdout'], [...interpHead, ...interpFns.flatMap(emit), ...stubs, ...tail].join('\n')));
 
 		// the native side: wasm3's memory, every access at base + address, entries that set the stack pointer
 		const own = (l: string) => !/^ {2}\((memory|export|data) /.test(l);
-		const nativeHead = [...head.slice(0, importAt), '  (import "env" "memory" (memory 1))', '  (import "env" "base" (global $gbase i32))', ...head.slice(importAt).filter(own)];
-		const rebased = fns.map((fn) => {
+		const coldImports = cold.length
+			? ['  (import "interp" "call_at" (func $call_at (param i32 i32 i32 i32 i32 i32 i32 i32 i32) (result i32)))', ...cold.map((n) => `  (import "interp" "h_${n}" (global $h_${n} i32))`)]
+			: [];
+		const nativeHead = [...head.slice(0, importAt), '  (import "env" "memory" (memory 1))', '  (import "env" "base" (global $gbase i32))', ...coldImports, ...head.slice(importAt).filter(own)];
+		// an interpreted function the native side calls is a wrapper that enters wasm3 at the live frame's top
+		const wrapper = (fn: Fn): Fn => ({
+			...fn,
+			locals: [],
+			body: [
+				`    global.get $h_${fn.name}`,
+				'    global.get $__stack_pointer',
+				...paramList(fn),
+				...Array.from({ length: 7 - fn.params }, () => '    i32.const 0'),
+				'    call $call_at',
+				...(fn.result ? [] : ['    drop'])
+			]
+		});
+		const rebased = fns.filter((fn) => !open || rung.set.has(fn.name) || cold.includes(fn.name)).map((fn) => {
+			if (open && !rung.set.has(fn.name)) return wrapper(fn);
 			const body: string[] = [];
 			for (const l of fn.body) {
 				if (/^\s*memory\.(size|grow|copy|fill)/.test(l)) throw new Error(`${fn.name}: ${l.trim()} cannot be rebased`);
@@ -198,6 +250,7 @@ if (mode === 'prepare') {
 			target: rung.target,
 			share: rung.share,
 			promoted,
+			cold,
 			imports: Object.fromEntries(entered.map((n) => [n, `${byName.get(n)!.result ? 'i' : 'v'}(${'i'.repeat(byName.get(n)!.params + 1)})`]))
 		};
 	});
@@ -213,6 +266,7 @@ if (mode === 'run') {
 	const [out, burrowDist, roundsArg = '3'] = [a1, a2, a3];
 	const rounds = Number(roundsArg);
 	const { rungs } = JSON.parse(readFileSync(join(out, 'rungs.json'), 'utf8'));
+	if (rungs.some((r: { cold?: string[] }) => r.cold?.length)) throw new Error('this directory has open rungs: run it with experiments/reenter/scripts/mixed.ts');
 	const { createInterpreter } = await import(`${burrowDist}/interpret.js`);
 	const wasm3Module = new WebAssembly.Module(readFileSync(`${burrowDist}/vendor/wasm3.wasm`));
 	const n = Number(process.env.N ?? 2);
