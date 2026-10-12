@@ -906,6 +906,20 @@ reports no PCLMUL). The V8 cell hashes a 64 MiB ramfs file eight times, since a 
 alone took 1.68 s of a 1.5-1.9 s sample. The AArch64 thunk checks did not run on the Mac this was
 built on.
 
+A whole digest stream can run on the host's own crypto instead. `digest.c` recognizes the stream
+function of the pinned coreutils by its bytes at the first block call and proves the context a
+private local of that frame (the caller's bytes and return offset, the stack distance, one thread, no
+signal handler, the context still at its initial state); the machine's `__gmux_digest` import then
+feeds `node:crypto`'s `createHash` from a view of guest memory, and anything not proven private stays
+on the block kernels. A fork inside a stream copies the open digest under a ticket the parent owns; a
+checkpoint waits until no stream is open. On eight distinct 64 MiB files in a machine under V8
+(paisley-park, 5 samples a cell, every digest equal to native) `r` against native coreutils is sha1
+0.73, sha256 0.40 and sha512 0.83, under 1.0 on every sample, and md5 1.06 (node's md5 alone runs
+1,197-1,230 MB/s against coreutils' 1,044; the rest is the machine's reads and calls). Deployed on
+Free, one file of 64 or 112 MiB, sha256 is 0.84-0.86 and the others 1.59-3.23, bounded by Free's
+`createHash` rates (md5 461-488, sha512 328-373 MB/s). Through a pipe from `busybox head` every tool
+is 2.37-4.42: the producer alone takes 0.733 s in the machine.
+
 A guest's executable image is read in 64 KiB pieces when first touched instead of whole at load. A
 file changed in place reads its new bytes into the pieces not yet made; truncation makes an access to a
 piece past the end `SIGBUS`. Pages held in a machine of 800 pages on the 32-slot kernel (3 runs per
@@ -916,6 +930,19 @@ lazy fill against 324 for the same kernel with the eager one and 302 for the ear
 `invoked oom-killer` lines against 29 and 56 (one run per arm at a Mac load of 5 to 13, so a 7-test
 gap is inside what one run per arm can call). At the shipped piece size a bash makes 19 of its 22
 pieces; 4 KiB pieces would hold 163 pages of bash's 338.
+
+Image mappings now use 16 KiB pieces and every other mapping 64 KiB (`bits` per mapping). Against a
+64 KiB control on the same kernel (3 runs per arm, ranges not overlapping) a lone `bash` holds 897.3
+pages against 973.7 (-7.8%), a coreutils tool 278.3 against 388.7 (-28.4%) and `bash` with eight
+children 5,567.7 against 6,189.0 (-10.0%); coreutils' pass count does not move (326.3 against 327.7
+over three runs, in-arm spreads 9 and 12). A private file mapping is read the same way, on first
+touch, so a write to the file reaches the pages not yet read and a page past a cut is `SIGBUS`, as
+Linux's `MAP_PRIVATE` behaves. Read-only pieces can also be the file's own pages, shared between
+processes until a write copies one (`KB_SHARE`): two processes mapping one file in a machine get the
+same kernel region, a lone `bash` holds 721.3 pages and a fork sends 63-80% fewer bytes, but each
+fork child maps those pieces again and a `$(true)` loop forks 4.4% slower (4.596 against 4.402 ms per
+fork; 57.7 us natively), so the shipped build keeps it off. A fork child starts with no decoded
+blocks and decodes 5,423 again for that loop (1.13 ms natively).
 
 An interpreter block guards what it assumed with one epoch compare instead of a check per access:
 the mapping generation, the code generation and the signal state. Assumption checks per 1,000 guest
