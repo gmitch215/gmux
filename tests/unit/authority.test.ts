@@ -38,6 +38,7 @@ describe('the host side of guest root', () => {
 			'env.wasm_driver_hvc_put',
 			'env.__wasm_syscall_6',
 			'env.__gmux_fuel',
+			'env.__gmux_digest',
 			'gmux.table'
 		])
 			expect(name).toMatch(SURFACE);

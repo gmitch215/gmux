@@ -26,7 +26,7 @@ export async function hostOnly(): Promise<string[]> {
 
 /** the imports a guest instance may take: the kernel's drivers and a program's syscall surface */
 export const SURFACE =
-	/^env\.(memory|wasm_\w+|__indirect_function_table|__stack_pointer|__memory_base|__table_base|__wasm_syscall_[0-6]|__wasm_abort|__gmux_(fuel|fork|stack_move|vfork|vfork_exec|vfork_exit|dlprep|dlopen|dlsym|dlclose|dlerror|denied|mmu_miss|mmu_fault))$|^gmux\.(table|tag|set)$/;
+	/^env\.(memory|wasm_\w+|__indirect_function_table|__stack_pointer|__memory_base|__table_base|__wasm_syscall_[0-6]|__wasm_abort|__gmux_(fuel|fork|digest|stack_move|vfork|vfork_exec|vfork_exit|dlprep|dlopen|dlsym|dlclose|dlerror|denied|mmu_miss|mmu_fault))$|^gmux\.(table|tag|set)$/;
 
 export interface Watch {
 	memories: WebAssembly.Memory[];

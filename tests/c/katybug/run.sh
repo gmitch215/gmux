@@ -13,8 +13,15 @@ cc -std=c11 -D_DEFAULT_SOURCE -D_DARWIN_C_SOURCE -DKB_ZLIB -O2 -Wall -Wextra -We
 	${KATYBUG_CFLAGS:-} -o "$out/katybug" "$root"/src/gmux/katybug/*.c -lm -lz
 cc -std=c11 -D_DEFAULT_SOURCE -D_DARWIN_C_SOURCE -DKB_ZLIB -O2 -Wall -Wextra -Werror -DKB_PIECE_BITS=12 \
 	-o "$out/katybug-4k" "$root"/src/gmux/katybug/*.c -lm -lz
+cc -std=c11 -D_DEFAULT_SOURCE -D_DARWIN_C_SOURCE -DKB_ZLIB -O2 -Wall -Wextra -Werror -DKB_IMAGE_PIECE_BITS=16 \
+	-o "$out/katybug-i64" "$root"/src/gmux/katybug/*.c -lm -lz
 cc -std=c11 -D_DEFAULT_SOURCE -D_DARWIN_C_SOURCE -DKB_ZLIB -O2 -Wall -Wextra -Werror -DKB_EPOCH=1 \
 	-o "$out/katybug-epoch" "$root"/src/gmux/katybug/*.c -lm -lz
+# sharing read-only pieces between processes is off in the build that ships (a fork maps them again)
+for v in ":" "-4k:-DKB_PIECE_BITS=12" "-i64:-DKB_IMAGE_PIECE_BITS=16"; do
+	cc -std=c11 -D_DEFAULT_SOURCE -D_DARWIN_C_SOURCE -DKB_ZLIB -O2 -Wall -Wextra -Werror -DKB_SHARE=1 ${v#*:} \
+		-o "$out/katybug-share${v%%:*}" "$root"/src/gmux/katybug/*.c -lm -lz
+done
 cc -DKB_HOST -O2 -o "$out/guest-native" "$here/guest.c"
 flags=(-nostdlib -static -fuse-ld=lld -O2 -ffreestanding -fno-stack-protector -fno-builtin)
 "$llvm/clang" --target=x86_64-linux-gnu "${flags[@]}" -mno-sse -mno-mmx -o "$out/guest-x86" "$here/guest.c"
@@ -34,8 +41,8 @@ flags=(-nostdlib -static -fuse-ld=lld -O2 -ffreestanding -fno-stack-protector -f
 "$llvm/clang" --target=aarch64-linux-gnu "${flags[@]}" -mgeneral-regs-only -o "$out/returns-a64" "$here/returns.c"
 "$llvm/clang" --target=x86_64-linux-gnu "${flags[@]}" -mno-sse -mno-mmx -o "$out/pieces-x86" "$here/pieces.c"
 "$llvm/clang" --target=aarch64-linux-gnu "${flags[@]}" -mgeneral-regs-only -o "$out/pieces-a64" "$here/pieces.c"
-"$llvm/clang" --target=x86_64-linux-gnu "${flags[@]}" -mno-sse -mno-mmx -o "$out/image-x86" "$here/image.c"
-"$llvm/clang" --target=aarch64-linux-gnu "${flags[@]}" -mgeneral-regs-only -o "$out/image-a64" "$here/image.c"
+"$llvm/clang" --target=x86_64-linux-gnu "${flags[@]}" -mno-sse -mno-mmx -Wl,-z,max-page-size=65536 -Wl,-z,separate-code -o "$out/image-x86" "$here/image.c"
+"$llvm/clang" --target=aarch64-linux-gnu "${flags[@]}" -mgeneral-regs-only -Wl,-z,max-page-size=65536 -Wl,-z,separate-code -o "$out/image-a64" "$here/image.c"
 "$llvm/clang" --target=x86_64-linux-gnu "${flags[@]}" -mno-sse -mno-mmx -o "$out/fds-x86" "$here/fds.c"
 "$llvm/clang" --target=aarch64-linux-gnu "${flags[@]}" -mgeneral-regs-only -o "$out/fds-a64" "$here/fds.c"
 "$llvm/clang" --target=x86_64-linux-gnu "${flags[@]}" -mno-sse -mno-mmx -o "$out/bigsend-x86" "$here/bigsend.c"
@@ -135,7 +142,7 @@ for a in x86 a64; do
 	check prim-faults-$a-interpreted "$(cat "$here/prim-faults.expected")" 0 env KATYBUG_PRIM=0 "$out/katybug" "$out/prim-$a"
 	check prim-faults-$a-memchr-only "$(cat "$here/prim-faults.expected")" 0 env KATYBUG_PRIM=memchr "$out/katybug" "$out/prim-$a"
 	# the kernels ran (the stats line counts each function's calls), or the checks above prove nothing
-	if KATYBUG_STATS=1 "$out/katybug" "$out/prim-$a" 2>&1 > /dev/null | grep -q 'prim strlen [1-9].* memcmp [1-9].* strcmp [1-9].* memchr [1-9]'; then
+	if KATYBUG_STATS=1 "$out/katybug" "$out/prim-$a" 2>&1 > /dev/null | grep 'prim strlen [1-9].* memcmp [1-9].* strcmp [1-9].* memchr [1-9]' > /dev/null; then
 		echo "PASS prim-faults-$a-recognized"
 	else
 		echo "FAIL prim-faults-$a-recognized"
@@ -144,7 +151,7 @@ for a in x86 a64; do
 done
 # a name in KATYBUG_PRIM is matched whole: crc32, memchrx and a name's prefix switch no kernel on
 for e in crc32 memchrx mem; do
-	if KATYBUG_PRIM=$e KATYBUG_STATS=1 "$out/katybug" "$out/prim-x86" 2>&1 > /dev/null | grep -q 'katybug: prim'; then
+	if KATYBUG_PRIM=$e KATYBUG_STATS=1 "$out/katybug" "$out/prim-x86" 2>&1 > /dev/null | grep 'katybug: prim' > /dev/null; then
 		echo "FAIL prim-names-$e"
 		failed=1
 	else
@@ -175,15 +182,22 @@ done
 # cut short ends a piece past its end in SIGBUS (and a call on it in EFAULT), a child forked before and
 # after each piece was touched reads the file's bytes (under fork-by-exec too, where it reads through
 # the descriptor the exec kept), a fixed mapping over the image's tail or part of a piece and an
-# mprotect or munmap in the middle of one leave the file's bytes everywhere else
+# mprotect or munmap in the middle of one leave the file's bytes everywhere else. The share modes
+# do the same on a read-only array, whose pieces are the file's own pages until written: a store or
+# a read() copies one piece, a fork, an mprotect or munmap, the parent's exit and a cut file leave
+# the other holders and the file's bytes alone. The fshare modes run the same on a private file
+# mapping the guest makes of the same bytes
 for a in x86 a64; do
-	for mode in read rewrite truncate fork replace protect; do
-		for build in katybug katybug-4k; do
+	for mode in read rewrite truncate fork replace protect share sharewrite sharefork shareprot shareexit sharerewrite sharetruncate \
+		fshare fsharewrite fsharefork fshareprot fshareexit fsharerewrite fsharetruncate; do
+		for build in katybug katybug-4k katybug-i64 katybug-epoch katybug-share katybug-share-4k katybug-share-i64; do
 			cp "$out/image-$a" "$out/image-$a.w"
 			check image-$a-$mode-$build "$mode ok" 0 "$out/$build" "$out/image-$a.w" $mode
 		done
-		cp "$out/image-$a" "$out/image-$a.w"
-		check image-$a-$mode-fork-exec "$mode ok" 0 env KATYBUG_FORK=exec "$out/katybug" "$out/image-$a.w" $mode
+		for build in katybug katybug-share; do
+			cp "$out/image-$a" "$out/image-$a.w"
+			check image-$a-$mode-$build-fork-exec "$mode ok" 0 env KATYBUG_FORK=exec "$out/$build" "$out/image-$a.w" $mode
+		done
 	done
 	# the pieces the guest did not touch were never made
 	cp "$out/image-$a" "$out/image-$a.w"
@@ -192,6 +206,37 @@ for a in x86 a64; do
 		echo "PASS image-$a-unfilled"
 	else
 		echo "FAIL image-$a-unfilled"
+		failed=1
+	fi
+	# read-only pieces are the file's own pages until written: shared when read, one copy per piece written
+	# (only in a build with sharing on; nothing is shared at 4 KiB pieces, which are below the size of a
+	# file mapping; the file mapping modes share more than the three pieces the guest's own image does)
+	for want in "share katybug-share 0 3" "sharewrite katybug-share 3 3" "sharewrite katybug-share-i64 3 3" \
+		"share katybug-share-4k -1 0" "share katybug -1 0" "fshare katybug-share 0 5" "fsharewrite katybug-share 3 5" \
+		"fsharewrite katybug-share-i64 3 5" "fshare katybug-share-4k -1 0" "fshare katybug -1 0"; do
+		set -- $want
+		cp "$out/image-$a" "$out/image-$a.w"
+		if KATYBUG_STATS=1 "$out/$2" "$out/image-$a.w" $1 2>&1 > /dev/null | awk -v want="$3" -v min="$4" '
+			/image pieces/ { s = $(NF - 2) + 0; c = $NF + 0
+				ok = want < 0 ? (s == 0 && c == 0) : (s >= min && c == want) } END { exit !ok }'; then
+			echo "PASS image-$a-$1-$2-shared"
+		else
+			echo "FAIL image-$a-$1-$2-shared"
+			failed=1
+		fi
+	done
+	# an image's pieces are 16 KiB: four times as many as at 64 KiB, and fewer pages held
+	for build in katybug katybug-i64; do
+		cp "$out/image-$a" "$out/image-$a.w"
+		KATYBUG_STATS=1 "$out/$build" "$out/image-$a.w" rewrite 2>&1 > /dev/null \
+			| awk '/image pieces/ { print $7 + 0, $12 }' > "$out/image-$a-$build.pieces"
+	done
+	if awk 'NR == FNR { n16 = $1; p16 = $2; next } { n64 = $1; p64 = $2 }
+		END { exit !(n16 >= 3 * n64 && n16 <= 4 * n64 + 3 && p16 < p64) }' \
+		"$out/image-$a-katybug.pieces" "$out/image-$a-katybug-i64.pieces"; then
+		echo "PASS image-$a-piece-size"
+	else
+		echo "FAIL image-$a-piece-size: $(cat "$out/image-$a-katybug.pieces") against $(cat "$out/image-$a-katybug-i64.pieces")"
 		failed=1
 	fi
 done
@@ -245,7 +290,8 @@ for a in x86 a64; do
 	check epochs-$a-segments-1 "$epochs" 0 env KATYBUG_SEGMENTS=1 "$out/katybug" "$out/epochs-$a"
 	check epochs-$a-guard "$epochs" 0 "$out/katybug-epoch" "$out/epochs-$a"
 	check epochs-$a-guard-segments-1 "$epochs" 0 env KATYBUG_SEGMENTS=1 "$out/katybug-epoch" "$out/epochs-$a"
-	if KATYBUG_STATS=1 "$out/katybug" "$out/epochs-$a" 2>&1 > /dev/null | grep -q '[1-9][0-9]* traces'; then
+	# grep reads to the end: a -q that exits on its match leaves the later report lines a SIGPIPE, which pipefail fails
+	if KATYBUG_STATS=1 "$out/katybug" "$out/epochs-$a" 2>&1 > /dev/null | grep '[1-9][0-9]* traces' > /dev/null; then
 		echo "PASS epochs-$a-traced"
 	else
 		echo "FAIL epochs-$a-traced"

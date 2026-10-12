@@ -1,5 +1,6 @@
 import binaryen from 'binaryen';
 import { execFileSync } from 'node:child_process';
+import { createHash } from 'node:crypto';
 import { mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -1202,6 +1203,121 @@ describe('Machine', () => {
 			machine.type('s');
 			await r.run(machine, () => r.output().includes('parent back ok'));
 			expect(r.output()).toContain('parent back ok');
+		});
+	});
+
+	describe('host digests', () => {
+		const sha256abc = 'ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad';
+		const word = (m: Machine, at: number) => new DataView(m.memory.buffer).getInt32(at, true);
+		const hex = (m: Machine) =>
+			Buffer.from(m.memory.buffer.slice(0x14100, 0x14120)).toString('hex');
+		const started = async (options: Partial<MachineOptions> = {}) => {
+			const r = rig({
+				asyncify: true,
+				registry: new Map([['Y', toyUser('toy-digest.wat', true)]]),
+				digest: (algorithm) => createHash(algorithm),
+				...options
+			});
+			const machine = new Machine(r.machineOptions);
+			await r.run(machine, () => r.output().includes('parent ok'));
+			machine.type('y');
+			await r.run(machine, () => word(machine, 0x1420c) !== 0);
+			return { r, machine };
+		};
+
+		it('refuses a checkpoint while a program has one open, and finishes it after', async () => {
+			const { r, machine } = await started();
+			expect(word(machine, 0x14200)).toBeGreaterThan(0);
+			await expect(machine.checkpoint()).rejects.toThrow('a host digest is open');
+			machine.type('r');
+			await r.run(machine, () => r.output().includes('user back'));
+			expect(word(machine, 0x14204)).toBe(32);
+			expect(hex(machine)).toBe(sha256abc);
+			expect(machine.stats.digests).toBe(1);
+			expect(machine.stats.digestBytes).toBe(3);
+			const snapshot = await machine.checkpoint();
+			expect(snapshot.runners.some((s) => s.program)).toBe(true);
+		});
+
+		it('answers an id the task did not open, and an address past the memory, with an error', async () => {
+			const { machine } = await started();
+			expect(word(machine, 0x14208)).toBe(-1);
+			expect(word(machine, 0x1420c)).toBe(-1);
+		});
+
+		it('declines to open one without a digest option', async () => {
+			const { r, machine } = await started({ digest: undefined });
+			expect(word(machine, 0x14200)).toBe(-1);
+			machine.type('r');
+			await r.run(machine, () => r.output().includes('user back'));
+			expect(word(machine, 0x14204)).toBe(-1);
+			expect(machine.stats.digests).toBe(0);
+			await machine.checkpoint();
+		});
+
+		it('copies an open digest for a fork child, which only a child of the owner can claim', async () => {
+			const { r, machine } = await started();
+			const call = (
+				me: { id: number; parent?: number },
+				op: number,
+				a: number,
+				b = 0,
+				c = 0
+			) => machine['hostDigest'](me as never, op, a, b, c);
+			const owner = { id: 3 };
+			const id = word(machine, 0x14200);
+			const ticket = call(owner, 4, id);
+			expect(ticket).toBeGreaterThan(id);
+			expect(call({ id: 7 }, 5, ticket)).toBe(-1);
+			expect(call({ id: 8, parent: 4 }, 5, ticket)).toBe(-1);
+			expect(call(owner, 5, ticket)).toBe(-1);
+			expect(call(owner, 1, ticket, 0x14000, 3)).toBe(-1);
+			expect(call({ id: 9, parent: 3 }, 4, id)).toBe(-1);
+			const child = { id: 9, parent: 3 };
+			expect(call(child, 5, ticket)).toBe(ticket);
+			expect(call(child, 5, ticket)).toBe(-1);
+			expect(call(child, 2, ticket, 0x14300)).toBe(32);
+			expect(Buffer.from(machine.memory.buffer.slice(0x14300, 0x14320)).toString('hex')).toBe(
+				sha256abc
+			);
+			machine.type('r');
+			await r.run(machine, () => r.output().includes('user back'));
+			expect(hex(machine)).toBe(sha256abc);
+			expect(machine.stats.digests).toBe(2);
+		});
+
+		it('stops a task copying digests for forks nobody claims, and drops them with it', async () => {
+			const { machine } = await started();
+			const id = word(machine, 0x14200);
+			const tickets = Array.from({ length: 16 }, () =>
+				machine['hostDigest']({ id: 3 } as never, 4, id, 0, 0)
+			);
+			expect(tickets.every((t) => t > 0)).toBe(true);
+			expect(machine['hostDigest']({ id: 3 } as never, 4, id, 0, 0)).toBe(-1);
+			machine['release'](3);
+			expect(machine['digests'].size).toBe(0);
+		});
+
+		it('provides every host import the program build allows (cc-strict)', () => {
+			const strict = readFileSync(
+				new URL('../../scripts/cc-strict', import.meta.url),
+				'utf8'
+			);
+			const allowed = /allowed='\^\((.*)\)\$'/.exec(strict)![1].split('|');
+			const hosts = allowed.filter((name) => /^__gmux_[a-z_]+$/.test(name));
+			const machine = readFileSync(
+				new URL('../../src/worker/machine/machine.ts', import.meta.url),
+				'utf8'
+			);
+			expect(hosts).toContain('__gmux_digest');
+			for (const name of hosts) expect(machine).toContain(`'${name}'`);
+		});
+
+		it("drops a task's digests when the kernel releases it", async () => {
+			const { machine } = await started();
+			expect(machine['digests'].size).toBe(1);
+			machine['release'](3);
+			expect(machine['digests'].size).toBe(0);
 		});
 	});
 

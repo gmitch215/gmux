@@ -13,6 +13,7 @@
     #define NR_FTRUNCATE 77
     #define NR_WAIT4 61
     #define NR_EXIT 60
+    #define NR_PIPE 22
     #define FORK() sys6(57, 0, 0, 0, 0, 0, 0)
     #define OPEN_RW(path) sys6(2, (long) (path), 2, 0, 0, 0, 0)
 static long sys6(long n, long a, long b, long c, long d, long e, long f) {
@@ -42,6 +43,7 @@ __asm__(".globl _start\n_start:\n xor %rbp, %rbp\n mov %rsp, %rdi\n and $-16, "
     #define NR_FTRUNCATE 46
     #define NR_WAIT4 260
     #define NR_EXIT 93
+    #define NR_PIPE 59
     #define FORK() sys6(220, 17, 0, 0, 0, 0, 0)
     #define OPEN_RW(path) sys6(56, -100, (long) (path), 2, 0, 0, 0)
 static long sys6(long n, long a, long b, long c, long d, long e, long f) {
@@ -75,11 +77,18 @@ static uint8_t big[NB * PIECE]
     __attribute__((aligned(PIECE))) = {BLOCK(0), BLOCK(1), BLOCK(2), BLOCK(3),
                                        BLOCK(4), BLOCK(5), BLOCK(6), BLOCK(7)};
 
+/* the same in a read-only segment: pieces of it are the file's own pages until
+ * something writes them */
+static const uint8_t rbig[NB * PIECE]
+    __attribute__((aligned(PIECE))) = {BLOCK(0), BLOCK(1), BLOCK(2), BLOCK(3),
+                                       BLOCK(4), BLOCK(5), BLOCK(6), BLOCK(7)};
+
 #define PROT_RWX 7
 #define MAP_FIXED_ANON 0x32 /* MAP_PRIVATE | MAP_FIXED | MAP_ANONYMOUS */
 
 static int failed;
 static long self_fd;
+static const char* mode_name;
 
 static void say(const char* s) {
     long n = 0;
@@ -93,9 +102,12 @@ static void report(const char* name, int ok) {
     failed |= !ok;
 }
 
-/* bytes [from, to) of block k are what the file holds there (or zero) */
-static int block_is(int k, unsigned long from, unsigned long to, int zero) {
-    volatile const uint8_t* p = big + (unsigned long) k * PIECE;
+/* bytes [from, to) of block k of base are what the file holds there (or zero)
+ */
+static int blocks_are(
+    const uint8_t* base, int k, unsigned long from, unsigned long to, int zero
+) {
+    volatile const uint8_t* p = base + (unsigned long) k * PIECE;
     for (unsigned long i = from; i < to; i++) {
         uint8_t want = (uint8_t) (0x40 + k);
         if (i == 0) want = 'K';
@@ -106,6 +118,18 @@ static int block_is(int k, unsigned long from, unsigned long to, int zero) {
         if (p[i] != want) return 0;
     }
     return 1;
+}
+
+static int block_is(int k, unsigned long from, unsigned long to, int zero) {
+    return blocks_are(big, k, from, to, zero);
+}
+
+/* the read-only pieces under test: the image's own, or a file mapping of the
+ * same bytes (fmap) */
+static const uint8_t* volatile rbase = rbig;
+
+static int rblock_is(int k, unsigned long from, unsigned long to, int zero) {
+    return blocks_are(rbase, k, from, to, zero);
 }
 
 /* where the file holds the byte at va, from its own program headers */
@@ -298,16 +322,292 @@ static int mode_protect(void) {
            child(protected_ok) == 0;
 }
 
+static volatile uint8_t* rw(unsigned long off) {
+    return (volatile uint8_t*) rbase + off;
+}
+
+__attribute__((noinline)) static int peek_at(unsigned long off) {
+    return *rw(off);
+}
+
+/* through a pointer, so every call is the one load instruction and its cache */
+static int (*volatile peeker)(unsigned long) = peek_at;
+
+#define peek(off) peeker(off)
+
+/* a store and then a load in one block: the load's cache may hold a shared
+ * piece the store is about to copy */
+__attribute__((noinline)) static int store_load(
+    volatile uint8_t* s, volatile uint8_t* l, uint8_t v
+) {
+    *s = v;
+    return *l;
+}
+
+static int (*volatile store_loader)(
+    volatile uint8_t*, volatile uint8_t*, uint8_t
+) = store_load;
+
+static int rblocks_ok(void) {
+    for (int k = 0; k < NB; k++)
+        if (!rblock_is(k, 0, PIECE, 0)) return 0;
+    return 1;
+}
+
+/* pieces of a read-only segment read in any order give the file's bytes, and a
+ * system call that reads one is served */
+static int mode_share(void) {
+    static const int order[NB] = {3, 0, 6, 1, 7, 2, 5, 4};
+    for (int i = 0; i < NB; i++)
+        if (!rblock_is(order[i], 0, 16, 0)) return 0;
+    long nul = OPEN_RW("/dev/null");
+    return nul >= 0 && rblocks_ok() &&
+           sys6(NR_WRITE, nul, (long) (rbase + 2 * PIECE), 16, 0, 0, 0) == 16;
+}
+
+/* a store and a read() into pieces already read change those bytes only, in
+ * this process */
+static int mode_sharewrite(void) {
+    if (!rblock_is(1, 0, 16, 0) || !rblock_is(2, 0, 16, 0) ||
+        !rblock_is(3, 0, 16, 0))
+        return 0;
+    if (!rblock_is(6, 0, 16, 0) ||
+        store_loader((volatile uint8_t*) big + 8, rw(6 * PIECE + 20), 1) !=
+            0x46 ||
+        store_loader(rw(6 * PIECE + 20), rw(6 * PIECE + 20), 0x99) != 0x99)
+        return 0;
+    if (peek(PIECE + 100) != 0x41)
+        return 0; /* the load's cache holds the shared piece */
+    *rw(PIECE + 100) = 0x99;
+    if (peek(PIECE + 100) != 0x99 || !rblock_is(1, 0, 100, 0) ||
+        !rblock_is(1, 101, PIECE, 0))
+        return 0;
+    uint8_t want[8];
+    if (sys6(NR_PREAD, self_fd, (long) want, 8, 0, 0, 0) != 8 ||
+        sys6(
+            NR_PREAD, self_fd, (long) (rbase + 2 * PIECE + 0x200), 8, 0, 0, 0
+        ) != 8)
+        return 0;
+    for (int i = 0; i < 8; i++)
+        if (*rw(2 * PIECE + 0x200 + (unsigned long) i) != want[i]) return 0;
+    return rblock_is(2, 0, 0x200, 0) && rblock_is(2, 0x208, PIECE, 0) &&
+           rblock_is(3, 0, PIECE, 0) && rblock_is(4, 0, PIECE, 0);
+}
+
+static int child_reads(void) {
+    return !rblocks_ok();
+}
+
+static int child_writes(void) {
+    for (unsigned long i = 0; i < PIECE; i++) *rw(PIECE + i) = 0xee;
+    for (unsigned long i = 0; i < PIECE; i++)
+        if (*rw(PIECE + i) != 0xee) return 1;
+    return 0;
+}
+
+static int pipe_fd[2];
+
+/* waits until the parent has written (and so copied the piece it shares), then
+ * reads the file's bytes */
+static int child_late(void) {
+    char c;
+    if (!rblock_is(3, 0, 16, 0)) return 1;
+    sys6(NR_READ, pipe_fd[0], (long) &c, 1, 0, 0, 0);
+    return !rblock_is(3, 0, PIECE, 0);
+}
+
+/* a child forked while pieces are shared reads the file's bytes and what it
+ * writes is its own; the parent writing after the fork changes nothing for it
+ */
+static int mode_sharefork(void) {
+    for (int k = 0; k < NB; k++) {
+        if (!rblock_is(k, 0, 16, 0) || child(child_reads) != 0) return 0;
+    }
+    if (child(child_writes) != 0 || !rblock_is(1, 0, PIECE, 0)) return 0;
+    if (sys6(NR_PIPE, (long) pipe_fd, 0, 0, 0, 0, 0)) return 0;
+    long pid = FORK();
+    if (pid < 0) return 0;
+    if (pid == 0) sys6(NR_EXIT, child_late(), 0, 0, 0, 0, 0);
+    *rw(3 * PIECE + 5) = 0x77;
+    int status = -1;
+    sys6(NR_WRITE, pipe_fd[1], (long) "x", 1, 0, 0, 0);
+    if (sys6(NR_WAIT4, pid, (long) &status, 0, 0, 0, 0) != pid) return 0;
+    return !(status & 0x7f) && !((status >> 8) & 0xff) &&
+           *rw(3 * PIECE + 5) == 0x77;
+}
+
+/* mprotect and munmap across shared pieces: both halves of a split piece keep
+ * the file's bytes, and what is gone or without access faults */
+static int mode_shareprot(void) {
+    unsigned long b = (unsigned long) rbase;
+    if (!rblock_is(1, 0, 16, 0) || !rblock_is(2, 0, 16, 0) ||
+        !rblock_is(3, 0, 16, 0))
+        return 0;
+    if (sys6(NR_MUNMAP, (long) (b + PIECE + 0x1000), 0x1000, 0, 0, 0, 0))
+        return 0;
+    target = rbase + PIECE + 0x1000;
+    if (child(touch_hole) != 111) return 0;
+    if (!rblock_is(1, 0, 0x1000, 0) || !rblock_is(1, 0x2000, PIECE, 0))
+        return 0;
+    if (sys6(NR_MPROTECT, (long) (b + 2 * PIECE + 0x3000), 0x2000, 0, 0, 0, 0))
+        return 0;
+    target = rbase + 2 * PIECE + 0x3000;
+    if (child(touch_hole) != 111) return 0;
+    if (!rblock_is(2, 0, 0x3000, 0) || !rblock_is(2, 0x5000, PIECE, 0))
+        return 0;
+    if (sys6(
+            NR_MPROTECT, (long) (b + 2 * PIECE + 0x3000), 0x2000, PROT_RWX, 0,
+            0, 0
+        ) ||
+        !rblock_is(2, 0, PIECE, 0))
+        return 0;
+    if (sys6(NR_MUNMAP, (long) (b + 3 * PIECE), PIECE, 0, 0, 0, 0)) return 0;
+    target = rbase + 3 * PIECE;
+    if (child(touch_hole) != 111) return 0;
+    *rw(PIECE + 0x2000) = 0x55;
+    return *rw(PIECE + 0x2000) == 0x55 && rblock_is(1, 0x2001, PIECE, 0) &&
+           rblock_is(4, 0, PIECE, 0);
+}
+
+/* the process that first read a piece exits while its child still holds the
+ * shared piece: the child goes on reading the file's bytes (it reports, as the
+ * parent leaves at once) */
+static int mode_shareexit(void) {
+    if (!rblock_is(0, 0, 16, 0) || !rblock_is(5, 0, 16, 0)) return 0;
+    if (sys6(NR_PIPE, (long) pipe_fd, 0, 0, 0, 0, 0)) return 0;
+    long pid = FORK();
+    if (pid < 0) return 0;
+    if (pid == 0) {
+        char c;
+        sys6(NR_CLOSE, pipe_fd[1], 0, 0, 0, 0, 0);
+        sys6(NR_READ, pipe_fd[0], (long) &c, 1, 0, 0, 0);
+        report(mode_name, rblocks_ok());
+        sys6(NR_EXIT, failed, 0, 0, 0, 0, 0);
+    }
+    sys6(NR_EXIT, 0, 0, 0, 0, 0, 0);
+    return 0;
+}
+
+/* a write to the file reaches pieces not yet made; one already read may show
+ * it or not (as Linux's MAP_PRIVATE leaves it), and the rest of it never
+ * changes */
+static int mode_sharerewrite(void) {
+    if (!rblock_is(0, 0, 16, 0)) return 0;
+    long f0 = file_offset(rbig), f5 = file_offset(rbig + 5 * PIECE);
+    uint8_t nw[4] = {'N', 'E', 'W', 9};
+    if (f0 < 0 || f5 < 0 ||
+        sys6(NR_PWRITE, self_fd, (long) nw, 4, f0, 0, 0) != 4 ||
+        sys6(NR_PWRITE, self_fd, (long) nw, 4, f5, 0, 0) != 4)
+        return 0;
+    if (*rw(5 * PIECE) != 'N' || *rw(5 * PIECE + 1) != 'E' ||
+        *rw(5 * PIECE + 2) != 'W' || *rw(5 * PIECE + 3) != 9 ||
+        !rblock_is(5, 4, PIECE, 0))
+        return 0;
+    int old = rblock_is(0, 0, 4, 0);
+    int new = *rw(0) == 'N' && *rw(1) == 'E' && *rw(2) == 'W' && *rw(3) == 9;
+    return (old || new) && rblock_is(0, 4, PIECE, 0);
+}
+
+/* a file cut short below its data ends a piece of data that needs a page past
+ * the cut in SIGBUS (and a call on it in EFAULT) as before, with read-only
+ * pieces shared; those, and the ones not yet read, are before the cut and
+ * read */
+static int mode_sharetruncate(void) {
+    for (int k = 0; k < 3; k++)
+        if (!rblock_is(k, 0, 16, 0)) return 0;
+    long f6 = file_offset(big + 6 * PIECE);
+    if (f6 < 0 || sys6(NR_FTRUNCATE, self_fd, f6 + 100, 0, 0, 0, 0)) return 0;
+    if (child(touch_7) != 107 || child(write_from_7) != 0) return 0;
+    return rblocks_ok() && block_is(4, 0, PIECE, 0) && block_is(0, 0, PIECE, 0);
+}
+
+#define PROT_R 1
+#define PROT_RW 3
+#define MAP_PRIVATE 2
+
+/* the file's bytes under p, mapped read-only and private and then made
+ * writable: the pieces are the file's own until written */
+static int fmap(const void* p) {
+    long f = file_offset(p);
+    long a =
+        f < 0 ? f
+              : sys6(NR_MMAP, 0, NB * PIECE, PROT_R, MAP_PRIVATE, self_fd, f);
+    if (a < 0 && a > -4096) return 0;
+    if (sys6(NR_MPROTECT, a, NB * PIECE, PROT_RW, 0, 0, 0)) return 0;
+    rbase = (const uint8_t*) a;
+    return 1;
+}
+
+static int fmode_share(void) {
+    return fmap(rbig) && mode_share();
+}
+
+static int fmode_sharewrite(void) {
+    return fmap(rbig) && mode_sharewrite();
+}
+
+static int fmode_sharefork(void) {
+    return fmap(rbig) && mode_sharefork();
+}
+
+static int fmode_shareprot(void) {
+    return fmap(rbig) && mode_shareprot();
+}
+
+static int fmode_shareexit(void) {
+    return fmap(rbig) && mode_shareexit();
+}
+
+static int fmode_sharerewrite(void) {
+    return fmap(rbig) && mode_sharerewrite();
+}
+
+static int write_from_target(void) {
+    return sys6(NR_WRITE, 1, (long) target, 1, 0, 0, 0) != -14;
+}
+
+/* a mapping of the data's file range, cut short: the piece of it that needs a
+ * page past the cut is SIGBUS and EFAULT, those before it read */
+static int fmode_sharetruncate(void) {
+    if (!fmap(big)) return 0;
+    for (int k = 0; k < 3; k++)
+        if (!rblock_is(k, 0, 16, 0)) return 0;
+    long f6 = file_offset(big + 6 * PIECE);
+    if (f6 < 0 || sys6(NR_FTRUNCATE, self_fd, f6 + 100, 0, 0, 0, 0)) return 0;
+    target = rbase + 7 * PIECE;
+    if (child(touch) != 107 || child(write_from_target) != 0) return 0;
+    return rblock_is(0, 0, PIECE, 0) && rblock_is(4, 0, PIECE, 0) &&
+           rblock_is(5, 0, PIECE, 0);
+}
+
 long image_main(long* sp) {
     const char* mode = (const char*) sp[2];
+    mode_name = mode;
     self_fd = OPEN_RW(sp[1]);
     static const struct {
         const char* name;
         int (*fn)(void);
     } modes[] = {
-        {"read", mode_read},         {"rewrite", mode_rewrite},
-        {"truncate", mode_truncate}, {"fork", mode_fork},
-        {"replace", mode_replace},   {"protect", mode_protect},
+        {"read", mode_read},
+        {"rewrite", mode_rewrite},
+        {"truncate", mode_truncate},
+        {"fork", mode_fork},
+        {"replace", mode_replace},
+        {"protect", mode_protect},
+        {"share", mode_share},
+        {"sharewrite", mode_sharewrite},
+        {"sharefork", mode_sharefork},
+        {"shareprot", mode_shareprot},
+        {"shareexit", mode_shareexit},
+        {"sharerewrite", mode_sharerewrite},
+        {"sharetruncate", mode_sharetruncate},
+        {"fshare", fmode_share},
+        {"fsharewrite", fmode_sharewrite},
+        {"fsharefork", fmode_sharefork},
+        {"fshareprot", fmode_shareprot},
+        {"fshareexit", fmode_shareexit},
+        {"fsharerewrite", fmode_sharerewrite},
+        {"fsharetruncate", fmode_sharetruncate},
     };
     for (unsigned i = 0; i < sizeof modes / sizeof modes[0]; i++) {
         const char* a = modes[i].name;
