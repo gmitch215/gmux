@@ -74,33 +74,38 @@ export function v8Report(tsv: string): string[] {
 	const cells = new Map<string, number[]>();
 	const quiet = new Map<string, number>();
 	const failed = new Map<string, number>();
+	const hosted = new Map<string, number>();
 	for (const r of lines(tsv)) {
-		const [arm, tool, mib, , ms, q0, q1, ok] = r as string[];
+		const [arm, tool, mib, , ms, q0, q1, ok, , , digests] = r as string[];
 		const key = [arm, tool, mib].join('\t');
 		cells.set(key, [...(cells.get(key) ?? []), Number(ms) / 1000]);
 		quiet.set(key, Math.max(quiet.get(key) ?? 0, Number(q0), Number(q1)));
 		failed.set(key, (failed.get(key) ?? 0) + (ok === '1' ? 0 : 1));
+		hosted.set(key, Math.max(hosted.get(key) ?? 0, Number(digests ?? 0)));
 	}
-	const med = (arm: string, tool: string, mib: number) => {
+	const med = (arm: string, tool: string, mib: number | string) => {
 		const v = cells.get([arm, tool, mib].join('\t'));
 		return v ? median(v) : NaN;
 	};
-	const out = ['| arm | tool | MiB | n | wall median s | min-max | MB/s | max quiet | failed |', '| --- | --- | --- | --- | --- | --- | --- | --- | --- |'];
+	const out = ['| arm | tool | MiB | n | wall median s | min-max | MB/s | max quiet | failed | host digests |', '| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |'];
 	for (const [key, v] of cells) {
 		const [arm, tool, mib] = key.split('\t') as [string, string, string];
 		const m = median(v);
-		out.push(`| ${arm} | ${tool} | ${mib} | ${v.length} | ${f(m)} | ${f(Math.min(...v))}-${f(Math.max(...v))} | ${Number(mib) ? f((Number(mib) * 1.048576) / m, 1) : '-'} | ${f(quiet.get(key)!, 2)} | ${failed.get(key)} |`);
+		const total = mib === 'd8' || mib === 'p512' ? 512 : Number(mib);
+		out.push(`| ${arm} | ${tool} | ${mib} | ${v.length} | ${f(m)} | ${f(Math.min(...v))}-${f(Math.max(...v))} | ${total ? f((total * 1.048576) / m, 1) : '-'} | ${f(quiet.get(key)!, 2)} | ${failed.get(key)} | ${hosted.get(key)} |`);
 	}
-	out.push('', '| tool | MiB | arm | wall r | r net of start-up | r net of the read floor |', '| --- | --- | --- | --- | --- | --- |');
+	// d8 is eight distinct 64 MiB files and p512 a 512 MiB stream (a pipe in the machine): for p512 the floor is the producer alone
+	out.push('', '| tool | MiB | arm | wall r | r net of start-up | r net of the read floor | vs kernel | floor s (guest / native) |', '| --- | --- | --- | --- | --- | --- | --- | --- |');
 	for (const tool of new Set([...cells.keys()].map((k) => k.split('\t')[1]!)).values())
-		for (const mib of [1, 64, 512])
-			for (const arm of ['off', 'kernel']) {
+		for (const mib of [1, 64, 512, 'd8', 'p512'])
+			for (const arm of ['off', 'kernel', 'host']) {
 				const w = med(arm, tool, mib);
 				const n = med('native', tool, mib);
 				if (!Number.isFinite(w) || !Number.isFinite(n)) continue;
 				const net = (w - med(arm, tool, 0)) / (n - med('native', tool, 0));
 				const floor = (w - med('gen-guest', 'dd', mib)) / (n - med('gen-native', 'dd', mib));
-				out.push(`| ${tool} | ${mib} | ${arm} | ${f(w / n, 2)} | ${f(net, 2)} | ${f(floor, 2)} |`);
+				const k = med('kernel', tool, mib);
+				out.push(`| ${tool} | ${mib} | ${arm} | ${f(w / n, 2)} | ${f(net, 2)} | ${f(floor, 2)} | ${f(w / k, 2)} | ${f(med('gen-guest', 'dd', mib))} / ${f(med('gen-native', 'dd', mib))} |`);
 			}
 	return out;
 }

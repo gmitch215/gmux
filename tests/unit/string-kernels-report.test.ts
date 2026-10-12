@@ -94,9 +94,38 @@ describe('hash report', () => {
 		].join('\n');
 		const out = v8Report(tsv);
 		expect(out.find((l) => l.startsWith('| md5sum | 64 | kernel'))).toBe(
-			'| md5sum | 64 | kernel | 8.70 | 8.18 | 9.23 |'
+			'| md5sum | 64 | kernel | 8.70 | 8.18 | 9.23 | 1.00 | 0.400 / 0.050 |'
 		);
 		expect(out.some((l) => l.startsWith('| md5sum | 1 |'))).toBe(false);
+		expect(out.join('\n')).not.toMatch(/NaN|Infinity/);
+	});
+
+	it('reads the host arm, eight distinct files and the stream against the producer alone', () => {
+		const vrow = (arm: string, tool: string, mib: string, ms: number, digests = 0) =>
+			[arm, tool, mib, 0, ms, 0.1, 0.1, 1, 'abcd1234', 0, digests].join('\t');
+		const tsv = [
+			'arm\ttool\tmib\trep\tms\tquiet_before\tquiet_after\tok\tdigest\tstatus\thost_digests',
+			vrow('gen-native', 'dd', 'd8', 40),
+			vrow('gen-guest', 'dd', 'd8', 60),
+			vrow('native', 'sha256sum', 'd8', 780),
+			vrow('kernel', 'sha256sum', 'd8', 1040),
+			vrow('host', 'sha256sum', 'd8', 310, 8),
+			vrow('gen-native', 'dd', 'p512', 30),
+			vrow('gen-guest', 'dd', 'p512', 730),
+			vrow('native', 'sha256sum', 'p512', 780),
+			vrow('host', 'sha256sum', 'p512', 1170, 1)
+		].join('\n');
+		const out = v8Report(tsv);
+		expect(out.find((l) => l.startsWith('| host | sha256sum | d8 |'))).toBe(
+			'| host | sha256sum | d8 | 1 | 0.310 | 0.310-0.310 | 1731.8 | 0.10 | 0 | 8 |'
+		);
+		expect(out.find((l) => l.startsWith('| sha256sum | d8 | host'))).toBe(
+			'| sha256sum | d8 | host | 0.40 | - | 0.34 | 0.30 | 0.060 / 0.040 |'
+		);
+		// the producer's 0.730 s comes off the stream's wall before the ratio
+		expect(out.find((l) => l.startsWith('| sha256sum | p512 | host'))).toBe(
+			'| sha256sum | p512 | host | 1.50 | - | 0.59 | - | 0.730 / 0.030 |'
+		);
 		expect(out.join('\n')).not.toMatch(/NaN|Infinity/);
 	});
 });
