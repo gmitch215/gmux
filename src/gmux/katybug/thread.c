@@ -283,7 +283,7 @@ int64_t kb_futex(struct kb_cpu* cpu, const uint64_t* a) {
     uint64_t word = a[0], word2 = a[4];
     int op = (int) (a[1] & 127);
     uint32_t val = (uint32_t) a[2], val3 = (uint32_t) a[5];
-    if (!kb_host(cpu, word, 4)) return -14;
+    if (!kb_host_r(cpu, word, 4)) return -14;
     switch (op) {
         case 0: /* wait, a relative timeout */
         case 9: /* wait_bitset, an absolute one */
@@ -337,7 +337,7 @@ int64_t kb_futex(struct kb_cpu* cpu, const uint64_t* a) {
         }
         case 5: /* wake_op */
         {
-            if (!kb_host(cpu, word2, 4)) return -14;
+            if (!kb_host_r(cpu, word2, 4)) return -14;
             int kind = (int) (val3 >> 28) & 7, cmp = (int) (val3 >> 24) & 15;
             int32_t oparg = (int32_t) (val3 << 8) >> 20,
                     cmparg = (int32_t) (val3 << 20) >> 20;

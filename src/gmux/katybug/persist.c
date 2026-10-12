@@ -79,7 +79,7 @@ uint64_t kb_code_hash(struct kb_cpu* cpu, const struct kb_block* b, int* ok) {
         }
         h = fnv((const uint8_t*) &lo, 8, h);
         for (uint64_t done = 0, k; *ok && done < len; done += k) {
-            const uint8_t* p = kb_span(cpu, lo + done, &k);
+            const uint8_t* p = kb_span_r(cpu, lo + done, &k);
             if (!p)
                 *ok = 0;
             else {

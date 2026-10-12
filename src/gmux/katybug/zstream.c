@@ -191,7 +191,7 @@ static void drop(struct zs* z) {
 /* how many of [va, va + want) the guest has mapped, from its start */
 static uint64_t reach_n(struct kb_cpu* cpu, uint64_t va, uint64_t want) {
     uint64_t n = 0, k;
-    while (n < want && va + n >= va && kb_span(cpu, va + n, &k)) n += k;
+    while (n < want && va + n >= va && kb_span_r(cpu, va + n, &k)) n += k;
     return n < want ? n : want;
 }
 

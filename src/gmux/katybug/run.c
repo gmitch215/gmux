@@ -242,7 +242,7 @@ static uint64_t string_bulk(struct kb_cpu* cpu, int stos, int w, uint64_t n) {
     if (n > (1u << 20) / (unsigned) w) n = (1u << 20) / (unsigned) w;
     uint64_t len = n * (uint64_t) w, kd, ks = len;
     uint8_t* d = kb_span(cpu, r[7], &kd);
-    uint8_t* s = stos ? NULL : kb_span(cpu, r[6], &ks);
+    const uint8_t* s = stos ? NULL : kb_span_r(cpu, r[6], &ks);
     if (!d || (!stos && !s)) return 0;
     if (kd < len) len = kd;
     if (ks < len) len = ks;
@@ -826,7 +826,7 @@ static void traffic(const struct kb_block* b, int* rd, int* wr) {
 #endif
 
 /* decodes and plans the code at b->pc into b; nonzero when there is none */
-static int translate(struct kb_cpu* cpu, struct kb_block* b) {
+static int translate_block(struct kb_cpu* cpu, struct kb_block* b) {
     b->codegen = cpu->codegen;
     int bad = cpu->arch == KB_X86   ? kb_x86_block(cpu, b)
               : cpu->arch == KB_A64 ? kb_a64_block(cpu, b)
@@ -869,6 +869,35 @@ static int translate(struct kb_cpu* cpu, struct kb_block* b) {
     }
     cpu->decoded++;
     return 0;
+}
+
+#ifdef KB_DECODE_TIME
+static uint64_t decode_ns;
+
+static int translate(struct kb_cpu* cpu, struct kb_block* b) {
+    struct timespec t0, t1;
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+    int bad = translate_block(cpu, b);
+    clock_gettime(CLOCK_MONOTONIC, &t1);
+    decode_ns += (uint64_t) ((t1.tv_sec - t0.tv_sec) * 1000000000ll +
+                             (t1.tv_nsec - t0.tv_nsec));
+    return bad;
+}
+#else
+    #define translate translate_block
+#endif
+
+/** the blocks this process decoded (and with KB_DECODE_TIME the time they
+ * took) */
+void kb_decode_report(const struct kb_cpu* cpu) {
+    fprintf(
+        kb_log, "katybug: decoded %llu blocks",
+        (unsigned long long) cpu->decoded
+    );
+#ifdef KB_DECODE_TIME
+    fprintf(kb_log, " in %llu us", (unsigned long long) decode_ns / 1000);
+#endif
+    fprintf(kb_log, "\n");
 }
 
 static void cold_caches(struct kb_block* b) {
@@ -1157,8 +1186,15 @@ static uint64_t step(struct kb_cpu* cpu, struct kb_block* blk) {
                 );
                 CHECK();
                 break;
-            case KB_ST:
-                store(cpu, ic++, B + (uint64_t) x->imm, r[x->a], x->w);
+            case KB_ST: store(cpu, ic++, B + (uint64_t) x->imm, r[x->a], x->w);
+#if KB_EPOCH
+                /* a store may copy a shared piece, which the later loads of
+                 * this block must not read from the old one */
+                if (blk->mapgen != cpu->mapgen) {
+                    cold_caches(blk);
+                    blk->mapgen = cpu->mapgen;
+                }
+#endif
                 CHECK();
                 break;
             case KB_FLAGS:

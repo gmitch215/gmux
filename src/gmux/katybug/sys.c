@@ -109,7 +109,9 @@ static int64_t io_batch(
     int64_t off, uint64_t* done
 ) {
     struct iovec iov[256];
-    int n = len ? kb_iov(cpu, va, len, iov, 256) : 0;
+    int n = !len ? 0
+            : wr ? kb_iov_r(cpu, va, len, iov, 256)
+                 : kb_iov(cpu, va, len, iov, 256);
     if (n < 0) return -14;
     *done = 0;
     for (int i = 0; i < n; i++) *done += iov[i].iov_len;
@@ -631,11 +633,16 @@ static int64_t mmap_anon(
                                  : kb_free_at(
                                        cpu, cpu->mmap_next, len
                                    ); /* MAP_FIXED replaces what is there */
-    struct kb_mapping* m = kb_map(cpu, at, len, prot ? (int) prot : 0);
+    int file = !(flags & 0x20) && fd >= 0;
+    struct kb_mapping* m =
+        file && (flags & 2)
+            ? kb_map_bits(cpu, at, len, (int) prot, KB_IMAGE_PIECE_BITS)
+            : kb_map(cpu, at, len, (int) prot);
     if (!m) return -12;
     if (!(flags & 0x10)) cpu->mmap_next = m->end + 4096;
-    if (!(flags & 0x20) && fd >= 0) /* a file mapping, private: read it in */
-    {
+    if (file && !((flags & 2) && kb_file_map(
+                                     cpu, m, (int) fd, off, (int) prot
+                                 ))) { /* read it in now */
         for (uint64_t done = 0; done < len;) {
             uint64_t lo, hi, va = m->start + done;
             uint8_t* p = kb_piece(cpu, m, va, &lo, &hi);

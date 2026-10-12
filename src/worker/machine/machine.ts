@@ -47,6 +47,13 @@ export interface SyscallCall {
 /**
  * what a machine is built from: the kernel, its initramfs and command line, the programs it may run
  */
+/** the part of a node:crypto `Hash` a machine uses for `MachineOptions.digest` */
+export interface HostDigest {
+	update(data: Uint8Array): unknown;
+	digest(): Uint8Array;
+	copy(): HostDigest;
+}
+
 export interface MachineOptions {
 	/** the kernel, compiled (`kernel/vmlinux.wasm`) */
 	vmlinux: WebAssembly.Module;
@@ -90,6 +97,12 @@ export interface MachineOptions {
 	consoleRing?: boolean;
 	/** the hex SHA-256 of an executable without an exec stub, to find it in `registry` */
 	sha256: (bytes: Uint8Array) => string;
+	/**
+	 * a host digest for a program's whole md5, sha1, sha256 or sha512 stream (katybug's digest
+	 * recognizer, `__gmux_digest`): node:crypto's `createHash` fits. Without it a program hashes with
+	 * its own code. A machine with a digest open cannot checkpoint: a host digest has no state to save
+	 */
+	digest?: (algorithm: 'md5' | 'sha1' | 'sha256' | 'sha512') => HostDigest;
 	/** log every task switch and release through `log` */
 	trace?: boolean;
 	/**
@@ -348,6 +361,8 @@ const SIGSEGV = 11;
 const SIGCHLD = 17;
 // the mapping a forking program's frames spill into, one per process
 const FORK_SPILL = 1 << 20;
+// copies of open digests a task has made for fork children that have not claimed them yet
+const MAX_DIGEST_TICKETS = 16;
 const SIG_UNBLOCK = 1;
 
 /**
@@ -445,6 +460,8 @@ interface Runner {
 	vfork: Vfork | null;
 	/** the vfork whose child this runner is, while it holds the parent's stack */
 	vforkOf: Vfork | null;
+	/** the task that forked this one, which stays after the child's exec */
+	parent?: number;
 	/** its process's page owner tag, when a lazy restore has its pages to bring in */
 	tag?: number;
 	/** inside the syscall router's host hook, whose JS frame a checkpoint cannot carry */
@@ -506,7 +523,7 @@ interface ModuleFacts {
 const FACTS = new WeakMap<WebAssembly.Module, ModuleFacts>();
 
 // what userEnv gives every program; an import outside it needs a loader or a guard of its own
-const PLAIN_IMPORTS = new Set([
+export const PLAIN_IMPORTS = new Set([
 	'memory',
 	'__memory_base',
 	'__stack_pointer',
@@ -520,6 +537,7 @@ const PLAIN_IMPORTS = new Set([
 	'__gmux_fork',
 	'__gmux_vfork_exec',
 	'__gmux_vfork_exit',
+	'__gmux_digest',
 	...[0, 1, 2, 3, 4, 5, 6].map((n) => `__wasm_syscall_${n}`)
 ]);
 
@@ -758,6 +776,9 @@ export interface MachineStats {
 	filesRestored: number;
 	/** `restoreFiles` the kernel refused, with its error */
 	fileRestoreErrors: string[];
+	/** whole digests a program had the host finish (`MachineOptions.digest`), and the bytes they took */
+	digests: number;
+	digestBytes: number;
 }
 
 /**
@@ -838,7 +859,9 @@ export class Machine {
 		netBytesOut: 0,
 		netBackpressure: 0,
 		filesRestored: 0,
-		fileRestoreErrors: []
+		fileRestoreErrors: [],
+		digests: 0,
+		digestBytes: 0
 	};
 	/** the streams hosts open to the machine's listeners (kernel patch 0031) */
 	private readonly net = new Ingress(this.stats, () => this.raiseNet());
@@ -1354,6 +1377,7 @@ export class Machine {
 		if (this.options.trace) this.log(`release ${dead} ${this.runners.get(dead)?.name}`);
 		const runner = this.runners.get(dead);
 		if (!runner) return;
+		this.dropDigests(dead);
 		if (runner === this.current) runner.kill = true;
 		else {
 			this.unindex(runner);
@@ -1777,8 +1801,11 @@ export class Machine {
 			),
 			__gmux_vfork_exit: new WebAssembly.Suspending((status: number) =>
 				this.vforkTerminal(SYS_EXIT_GROUP, [status])
-			)
+			),
+			__gmux_digest: (op: number, a: number, b: number, c: number) =>
+				this.hostDigest(this.shared ? this.current! : runner, op, a, b, c)
 		};
+		this.dropDigests(runner.id);
 		if (!this.route) {
 			for (let n = 0; n <= 6; n++) env[`__wasm_syscall_${n}`] = kernel[`wasm_syscall_${n}`];
 			return env;
@@ -2752,6 +2779,7 @@ export class Machine {
 		const vfork = this.pendingVforks.splice(at, 1)[0]!;
 		vfork.child = runner;
 		runner.vforkOf = vfork;
+		runner.parent = vfork.parent.id;
 		return true;
 	}
 
@@ -2887,6 +2915,7 @@ export class Machine {
 		if (!fork) return false;
 		this.forkChildren.delete(mm);
 		runner.forkOf = fork;
+		runner.parent = fork.parent.id;
 		return true;
 	}
 
@@ -3130,6 +3159,75 @@ export class Machine {
 		return (this.lastDomain = domain);
 	}
 
+	/** the host digests programs have open, by the id `__gmux_digest` gave out, and the task that opened each */
+	private readonly digests = new Map<
+		number,
+		{ owner: number; hash: HostDigest; ticket?: boolean }
+	>();
+	private nextDigest = 1;
+
+	/**
+	 * katybug's `__gmux_digest(op, a, b, c)`: 0 opens a digest of algorithm a (1 md5, 2 sha1, 3 sha256, 4
+	 * sha512) and returns its id, 1 hashes the c bytes at address b into digest a, 2 writes digest a's
+	 * result at b, closes it and returns its length, 3 closes it, 4 copies digest a for a fork child and
+	 * returns the copy's ticket, 5 hands the ticket a to the task that claims it, which must be a child
+	 * of the task that took it (the ticket's id is then the child's digest). A negative result is an
+	 * error: no `digest` option, an id the task did not open, or an address outside the memory
+	 */
+	private hostDigest(me: Runner, op: number, a: number, b: number, c: number): number {
+		try {
+			if (op === 0) {
+				const algorithm = (['md5', 'sha1', 'sha256', 'sha512'] as const)[a - 1];
+				if (!algorithm || !this.options.digest) return -1;
+				this.digests.set(this.nextDigest, {
+					owner: me.id,
+					hash: this.options.digest(algorithm)
+				});
+				return this.nextDigest++;
+			}
+			const open = this.digests.get(a);
+			if (op === 5) {
+				if (!open?.ticket || me.parent !== open.owner) return -1;
+				open.owner = me.id;
+				open.ticket = false;
+				return a;
+			}
+			if (!open || open.ticket || open.owner !== me.id) return -1;
+			if (op === 4) {
+				let pending = 0;
+				for (const d of this.digests.values()) if (d.ticket && d.owner === me.id) pending++;
+				if (pending >= MAX_DIGEST_TICKETS) return -1;
+				this.digests.set(this.nextDigest, {
+					owner: me.id,
+					hash: open.hash.copy(),
+					ticket: true
+				});
+				return this.nextDigest++;
+			}
+			const memory = new Uint8Array(this.userMemory(me).buffer);
+			if (op === 1) {
+				// subarray clamps to the memory's end, so an address past it must not get that far
+				if ((b >>> 0) + (c >>> 0) > memory.length) return -1;
+				open.hash.update(memory.subarray(b >>> 0, (b >>> 0) + (c >>> 0)));
+				this.stats.digestBytes += c >>> 0;
+				return 0;
+			}
+			this.digests.delete(a);
+			if (op === 3) return 0;
+			if (op !== 2) return -1;
+			const result = open.hash.digest();
+			memory.set(result, b >>> 0);
+			this.stats.digests++;
+			return result.length;
+		} catch {
+			return -1;
+		}
+	}
+
+	private dropDigests(owner: number) {
+		for (const [id, open] of this.digests) if (open.owner === owner) this.digests.delete(id);
+	}
+
 	/** the memory a task's program runs on: its own after a fork, else the machine's */
 	private userMemory(runner: Runner): WebAssembly.Memory {
 		if (!this.privateMemories.size) return this.memory;
@@ -3197,6 +3295,9 @@ export class Machine {
 		// ponytail: a stream is a socket in the kernel and queues here; closing them at a checkpoint is part 2
 		if (this.net.open)
 			throw new Error('checkpoint: streams are open to the machine and are not saved');
+		// a host digest cannot hand its state back, so a checkpoint waits for the stream to end
+		if (this.digests.size)
+			throw new Error('checkpoint: a host digest is open and is not saved');
 		// ponytail: shared instances hold one process's values at a time; saving each runner's
 		// set and rebuilding the template on restore would lift this
 		if (this.sharedPrograms.size)

@@ -46,7 +46,8 @@ int main(int argc, char** argv) {
             return 127;
         }
         int status = kb_run(cpu);
-        if (getenv("KATYBUG_STATS")) kb_prim_report(), kb_image_report(cpu);
+        if (getenv("KATYBUG_STATS"))
+            kb_prim_report(), kb_image_report(cpu), kb_decode_report(cpu);
         return status;
     }
     if (argc >= 4 && !strcmp(argv[1], "--wasm"))
@@ -79,7 +80,7 @@ int main(int argc, char** argv) {
     kb_persist_save(cpu);
     if (cpu->trace) fclose(cpu->trace);
     if (cpu->fault && !cpu->exited) {
-        uint8_t* p = kb_host(cpu, cpu->pc, 4);
+        const uint8_t* p = kb_host_r(cpu, cpu->pc, 4);
         fprintf(
             kb_log, "katybug: %s at %#llx", cpu->fault,
             (unsigned long long) cpu->pc
@@ -119,7 +120,8 @@ int main(int argc, char** argv) {
             (unsigned long long) held_ops, (unsigned long long) cpu->decoded,
             (unsigned long long) cpu->loaded, (unsigned long long) cpu->lookups
         );
-    if (getenv("KATYBUG_STATS")) kb_prim_report(), kb_image_report(cpu);
+    if (getenv("KATYBUG_STATS"))
+        kb_prim_report(), kb_image_report(cpu), kb_decode_report(cpu);
 #ifdef KB_HOT
     kb_hot_dump(cpu);
 #endif

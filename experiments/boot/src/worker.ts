@@ -48,6 +48,7 @@ export class MachineDO extends DurableObject<Env> {
 			sharedKernel: shared,
 			asyncify: asyncify && shared,
 			sha256: (bytes) => createHash('sha256').update(bytes).digest('hex'),
+			digest: (algorithm) => createHash(algorithm),
 			log: (line) => {
 				this.log.push(line);
 				console.log(line);

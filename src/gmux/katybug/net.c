@@ -24,7 +24,7 @@ static int64_t addr_in(
     struct kb_cpu* cpu, uint64_t va, uint64_t len, struct sockaddr_storage* ss,
     socklen_t* hl
 ) {
-    uint8_t* p = kb_buf(cpu, va, len);
+    const uint8_t* p = kb_buf_r(cpu, va, len);
     if (!p || len < 2 || len > sizeof *ss) return -14;
     memset(ss, 0, sizeof *ss);
     uint16_t fam;
@@ -267,10 +267,12 @@ static int64_t msg(
     for (uint64_t i = 0; i < iovlen; i++) {
         uint64_t base = kb_load(cpu, iov + 16 * i, 8),
                  len = kb_load(cpu, iov + 16 * i + 8, 8);
-        int room = (int) (len >> KB_PIECE_BITS) + 2;
+        int room = (int) (len >> KB_MIN_PIECE_BITS) + 2;
         struct iovec* g =
             len ? realloc(h, (size_t) (nh + room) * sizeof *h) : h;
-        int n = g && len ? kb_iov(cpu, base, len, g + nh, room) : 0;
+        int n = !g || !len ? 0
+                : send     ? kb_iov_r(cpu, base, len, g + nh, room)
+                           : kb_iov(cpu, base, len, g + nh, room);
         if (!g && len) n = -1;
         if (g) h = g;
         if (n < 0) {
@@ -382,7 +384,7 @@ int64_t kb_net(struct kb_cpu* cpu, int64_t nr, const uint64_t* a) {
             int64_t total = 0;
             for (;;) {
                 struct iovec iov[256];
-                int n = len ? kb_iov(cpu, va, len, iov, 256) : 0;
+                int n = len ? kb_iov_r(cpu, va, len, iov, 256) : 0;
                 if (n < 0) return -14;
                 uint64_t chunk = 0;
                 for (int i = 0; i < n; i++) chunk += iov[i].iov_len;
@@ -445,7 +447,7 @@ int64_t kb_net(struct kb_cpu* cpu, int64_t nr, const uint64_t* a) {
             /* option values pass as they are: ints, and timeval/linger lay out
              * alike on 64-bit hosts */
             if (nr == 208) {
-                uint8_t* p = kb_buf(cpu, a[3], a[4]);
+                const uint8_t* p = kb_buf_r(cpu, a[3], a[4]);
                 if (!p && a[4]) return -14;
                 return ret(setsockopt(fd, level, name, p, (socklen_t) a[4]));
             }

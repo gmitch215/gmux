@@ -13,6 +13,19 @@
 #ifndef KB_PIECE_BITS
     #define KB_PIECE_BITS 16
 #endif
+/* an ELF image's mappings use smaller pieces, so a guest that touches a few
+ * pages of a large binary holds fewer of them */
+#ifndef KB_IMAGE_PIECE_BITS
+    #define KB_IMAGE_PIECE_BITS (KB_PIECE_BITS < 14 ? KB_PIECE_BITS : 14)
+#endif
+#define KB_MIN_PIECE_BITS                                                      \
+    (KB_IMAGE_PIECE_BITS < KB_PIECE_BITS ? KB_IMAGE_PIECE_BITS : KB_PIECE_BITS)
+/* read-only pieces of images and file mappings as the file's own pages,
+ * shared between processes; off by default (a fork child maps each again).
+ * off, they are private pieces read from the file on first touch */
+#ifndef KB_SHARE
+    #define KB_SHARE 0
+#endif
 /* the most bytes kb_buf copies for a range across pieces */
 #define KB_BUF_MAX (64u << 10)
 
@@ -261,25 +274,40 @@ struct kb_block {
  * so a fork's exec carries it at the same number */
 #define KB_IMAGES 2
 #define KB_IMAGE_SEGS 8
+struct kb_seg {
+    uint64_t va, off, len; /* the file's [off, off + len) is at va */
+    int ro;                /* the segment is not writable */
+};
 struct kb_image {
     int fd, hdr_ok;
     uint64_t dev, ino;
     uint64_t start; /* where the first segment's page, and the header, sit */
     uint8_t hdr[64];
     int nseg;
-    struct {
-        uint64_t va, off, len; /* the file's [off, off + len) is at va */
-    } seg[KB_IMAGE_SEGS];
+    struct kb_seg seg[KB_IMAGE_SEGS];
+};
+
+/* a guest's private file mapping read the same way: one entry per mapping,
+ * the descriptor shared by the entries of one file */
+#define KB_FILES 32
+struct kb_file {
+    int fd;
+    uint64_t dev, ino;
+    struct kb_seg seg;
 };
 
 struct kb_mapping {
     uint64_t start, end;
     uint8_t** pieces; /* mappings never overlap; each owns its pieces (mem.c),
-                         which are NULL until touched */
+                         which are NULL until touched; the low bit of a
+                         pointer marks a read-only piece of an image's file
+                         (kb_shared), that the first write replaces by a copy */
     int prot;
     uint8_t image; /* 1 + the kb_cpu.images entry that fills a piece when it is
-                      made, 0 for none; a split keeps it, a mapping that
+                      made, KB_IMAGES + 1 + the kb_cpu.files entry for a file
+                      mapping, 0 for none; a split keeps it, a mapping that
                       replaces part of one starts at 0 */
+    uint8_t bits;  /* a piece is 1 << bits bytes; a split keeps it */
 };
 
 struct kb_sigaction {
@@ -311,6 +339,8 @@ struct kb_cpu {
     int nmaps;
     struct kb_image images[KB_IMAGES];
     int nimages;
+    struct kb_file files[KB_FILES];
+    int nfiles;
     uint64_t image_total, /* pieces the image mappings had when loaded */
         image_filled;     /* pieces made from an image's file */
     uint32_t mapgen;  /* bumped by every change to maps, which makes older kb_ic
@@ -360,21 +390,43 @@ struct kb_cpu {
     uint64_t fault_addr;
 };
 
-/* mem.c */
+/* mem.c: a host pointer for guest memory comes in two kinds. The plain one
+ * (kb_host, kb_span, kb_buf, kb_iov, kb_piece) is for bytes the caller may
+ * write: a read-only piece of an image is copied first. The _r one is for
+ * bytes only read, and may point into the image's file */
 uint8_t* kb_host(struct kb_cpu* cpu, uint64_t va, uint64_t len);
+const uint8_t* kb_host_r(struct kb_cpu* cpu, uint64_t va, uint64_t len);
 uint8_t* kb_span(struct kb_cpu* cpu, uint64_t va, uint64_t* len);
+const uint8_t* kb_span_r(struct kb_cpu* cpu, uint64_t va, uint64_t* len);
 uint8_t* kb_buf(struct kb_cpu* cpu, uint64_t va, uint64_t len);
+const uint8_t* kb_buf_r(struct kb_cpu* cpu, uint64_t va, uint64_t len);
 void kb_flush(struct kb_cpu* cpu);
 int kb_read(struct kb_cpu* cpu, uint64_t va, void* dst, uint64_t len);
 int kb_write(struct kb_cpu* cpu, uint64_t va, const void* src, uint64_t len);
 int kb_iov(
     struct kb_cpu* cpu, uint64_t va, uint64_t len, struct iovec* iov, int max
 );
-uint64_t kb_pieces(uint64_t start, uint64_t end);
+int kb_iov_r(
+    struct kb_cpu* cpu, uint64_t va, uint64_t len, struct iovec* iov, int max
+);
+uint64_t kb_pieces(uint64_t start, uint64_t end, int bits);
+uint64_t kb_piece_va(const struct kb_mapping* m, uint64_t k);
 uint8_t* kb_piece(
     struct kb_cpu* cpu, struct kb_mapping* m, uint64_t va, uint64_t* lo,
     uint64_t* hi
 );
+const uint8_t* kb_piece_r(
+    struct kb_cpu* cpu, struct kb_mapping* m, uint64_t va, uint64_t* lo,
+    uint64_t* hi
+);
+int kb_adopt(struct kb_cpu* cpu, struct kb_mapping* m, uint64_t k);
+int kb_file_map(
+    struct kb_cpu* cpu, struct kb_mapping* m, int fd, uint64_t off, int prot
+);
+
+static inline int kb_shared(const uint8_t* p) {
+    return (int) ((uintptr_t) p & 1);
+}
 int kb_bus(uint64_t va);
 uint8_t* kb_piece_blank(
     struct kb_mapping* m, uint64_t va, uint64_t* lo, uint64_t* hi
@@ -397,6 +449,36 @@ void kb_sha512_blocks(uint64_t st[8], const uint8_t* p, size_t n);
 uint32_t kb_cksum_blocks(
     uint32_t crc, const uint8_t* tab, const uint8_t* p, size_t n
 );
+/* digest.c: a coreutils stream's whole digest on the host's crypto; prim.c's
+ * block kernel stays the path for anything not proven private */
+enum
+{
+    KB_HD_MD5,
+    KB_HD_SHA1,
+    KB_HD_SHA256,
+    KB_HD_SHA512,
+    KB_HD_N
+};
+int kb_digest_ready(void);
+int kb_digest_at(struct kb_cpu* cpu, uint64_t pc);
+int kb_digest_block(
+    struct kb_cpu* cpu, int alg, uint64_t buf, uint64_t len, uint64_t ctx
+);
+int kb_digest_finish(struct kb_cpu* cpu, int alg, uint64_t ctx, uint64_t res);
+/* an open digest as a fork by exec hands it to the child: the child claims the
+ * copy under the ticket (the native test double sends its state in blob) */
+enum
+{
+    KB_HD_ROWS = 8
+};
+struct kb_digest_row {
+    uint64_t ctx, mark;
+    int32_t alg, ticket, lost, len;
+    uint8_t blob[256];
+};
+int kb_digest_fork(struct kb_digest_row rows[KB_HD_ROWS]);
+void kb_digest_adopt(const struct kb_digest_row* row);
+int kb_reach(struct kb_cpu* cpu, uint64_t a, uint64_t n);
 /* thunk.c: library calls found by the name a loaded object imports them under;
  * the ids are prim.c's */
 enum
@@ -439,11 +521,15 @@ int kb_thunk_object(
 int kb_prim_at(struct kb_cpu* cpu, uint64_t pc);
 int kb_prim(struct kb_cpu* cpu, int id, uint64_t* next);
 void kb_prim_report(void);
+void kb_decode_report(const struct kb_cpu* cpu);
 uint8_t* kb_host_ic(
     struct kb_cpu* cpu, struct kb_ic* ic, uint64_t va, uint64_t len
 );
 struct kb_mapping* kb_map(
     struct kb_cpu* cpu, uint64_t start, uint64_t len, int prot
+);
+struct kb_mapping* kb_map_bits(
+    struct kb_cpu* cpu, uint64_t start, uint64_t len, int prot, int bits
 );
 int kb_unmap(struct kb_cpu* cpu, uint64_t start, uint64_t len);
 int kb_protect(struct kb_cpu* cpu, uint64_t start, uint64_t len, int prot);

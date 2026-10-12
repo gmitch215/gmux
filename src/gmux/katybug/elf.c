@@ -86,6 +86,7 @@ static int lazy_image(
             return 0;
         im.seg[im.nseg].va = base + ph.vaddr;
         im.seg[im.nseg].off = ph.offset;
+        im.seg[im.nseg].ro = !(ph.flags & 2);
         im.seg[im.nseg++].len = ph.filesz;
     }
     im.fd = kb_keep_fd(fileno(f));
@@ -98,7 +99,7 @@ static int lazy_image(
     }
     cpu->images[cpu->nimages] = im;
     m->image = (uint8_t) ++cpu->nimages;
-    cpu->image_total += kb_pieces(m->start, m->end);
+    cpu->image_total += kb_pieces(m->start, m->end, m->bits);
     return 1;
 }
 
@@ -139,7 +140,8 @@ static int map_image(
     if (lo > hi) return -5;
     lo &= ~0xfffull;
     /* one mapping for the whole image: segments may share pages */
-    struct kb_mapping* m = kb_map(cpu, base + lo, hi - lo, 7);
+    struct kb_mapping* m =
+        kb_map_bits(cpu, base + lo, hi - lo, 7, KB_IMAGE_PIECE_BITS);
     if (!m) return -6;
     if (!lazy_image(cpu, f, &eh, base, m)) {
         for (int i = 0; i < eh.phnum; i++) {

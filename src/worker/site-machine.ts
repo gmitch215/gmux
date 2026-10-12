@@ -32,7 +32,7 @@ export interface SiteBuild {
  */
 export function siteOptions(
 	build: SiteBuild,
-	host: Pick<MachineOptions, 'sha256' | 'write' | 'memory'>
+	host: Pick<MachineOptions, 'sha256' | 'digest' | 'write' | 'memory'>
 ): MachineOptions {
 	return {
 		vmlinux: build.vmlinux,

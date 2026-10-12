@@ -29,7 +29,7 @@ struct dec {
 };
 
 static uint8_t byte(struct dec* d) {
-    uint8_t* p = kb_host(d->cpu, d->at, 1);
+    const uint8_t* p = kb_host_r(d->cpu, d->at, 1);
     if (!p) {
         d->bad = 1;
         return 0;

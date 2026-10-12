@@ -16,7 +16,8 @@ extern char** environ;
    must regain FD_CLOEXEC, the guest's descriptor limit, then every mapping's
    bytes in order; a piece that was never made (an image's, not yet read from
    its file) is not sent, and the child reads it from the descriptor on the
-   file, which the exec keeps at its number */
+   file, which the exec keeps at its number; a piece the parent shares with
+   the file is only named, and the child maps it from the same descriptor */
 
 static int put(int fd, const void* p, size_t n) {
     const uint8_t* b = p;
@@ -92,18 +93,22 @@ int64_t kb_fork(struct kb_cpu* cpu) {
               put(p[1], nofile, sizeof nofile);
     for (int i = 0; !bad && i < cpu->nmaps; i++) {
         struct kb_mapping* m = &cpu->maps[i];
-        uint64_t np = kb_pieces(m->start, m->end);
+        uint64_t np = kb_pieces(m->start, m->end, m->bits);
         for (uint64_t k = 0; !bad && k < np; k++) {
-            uint8_t here = m->pieces[k] != NULL;
+            uint8_t here = !m->pieces[k] ? 0 : kb_shared(m->pieces[k]) ? 2 : 1;
             bad = put(p[1], &here, 1);
-            if (!bad && here) {
+            if (!bad && here == 1) {
                 uint64_t lo, hi;
-                uint64_t va =
-                    (((m->start >> KB_PIECE_BITS) + k) << KB_PIECE_BITS);
-                kb_piece_blank(m, va > m->start ? va : m->start, &lo, &hi);
+                kb_piece_blank(m, kb_piece_va(m, k), &lo, &hi);
                 bad = put(p[1], m->pieces[k], hi - lo);
             }
         }
+    }
+    if (!bad) {
+        struct kb_digest_row rows[KB_HD_ROWS];
+        int32_t nrow = kb_digest_fork(rows);
+        bad = put(p[1], &nrow, sizeof nrow) ||
+              put(p[1], rows, sizeof *rows * (size_t) nrow);
     }
     close(p[1]);
     /* a child that got no state exits 127 on its own; the parent still sees a
@@ -128,6 +133,13 @@ int kb_resume(struct kb_cpu* cpu, int fd) {
             (uint64_t) st.st_ino != cpu->images[i].ino)
             return -1; /* the file the parent read pieces from did not arrive */
     }
+    for (int i = 0; i < cpu->nfiles; i++) {
+        struct stat st;
+        if (fstat(cpu->files[i].fd, &st) ||
+            (uint64_t) st.st_dev != cpu->files[i].dev ||
+            (uint64_t) st.st_ino != cpu->files[i].ino)
+            return -1;
+    }
     kb_nofile_set(nofile);
     memset(cpu->cache, 0, sizeof cpu->cache);
     cpu->trace = NULL;
@@ -135,19 +147,28 @@ int kb_resume(struct kb_cpu* cpu, int fd) {
     cpu->restore_mask = 0;
     for (int i = 0; i < cpu->nmaps; i++) {
         struct kb_mapping* m = &cpu->maps[i];
-        uint64_t np = kb_pieces(m->start, m->end);
+        uint64_t np = kb_pieces(m->start, m->end, m->bits);
         m->pieces = calloc((size_t) np, sizeof *m->pieces);
         if (!m->pieces) return -1;
         for (uint64_t k = 0; k < np; k++) {
             uint8_t here;
             if (get(fd, &here, 1)) return -1;
             if (!here) continue;
+            if (here == 2) {
+                if (kb_adopt(cpu, m, k)) return -1;
+                continue;
+            }
             uint64_t lo, hi;
-            uint64_t va = (((m->start >> KB_PIECE_BITS) + k) << KB_PIECE_BITS);
-            uint8_t* piece =
-                kb_piece_blank(m, va > m->start ? va : m->start, &lo, &hi);
+            uint8_t* piece = kb_piece_blank(m, kb_piece_va(m, k), &lo, &hi);
             if (!piece || get(fd, piece, hi - lo)) return -1;
         }
+    }
+    int32_t nrow;
+    struct kb_digest_row row;
+    if (get(fd, &nrow, sizeof nrow) || nrow < 0 || nrow > KB_HD_ROWS) return -1;
+    for (int i = 0; i < nrow; i++) {
+        if (get(fd, &row, sizeof row)) return -1;
+        kb_digest_adopt(&row);
     }
     close(fd);
     for (int i = 0; i < n; i++) fcntl(cloexec[i], F_SETFD, FD_CLOEXEC);

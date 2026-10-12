@@ -90,7 +90,7 @@ static int ignored_by_default(int s) {
 static void terminate(struct kb_cpu* cpu, int s) {
     if (cpu->trace) fflush(cpu->trace);
     if (getenv("KATYBUG_DEBUG")) {
-        uint8_t* p = kb_host(cpu, cpu->ipc, 8);
+        const uint8_t* p = kb_host_r(cpu, cpu->ipc, 8);
         fprintf(
             kb_log, "katybug: signal %d (%s) at %#llx", s,
             cpu->last_fault ? cpu->last_fault : "sent",

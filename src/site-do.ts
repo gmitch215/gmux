@@ -91,6 +91,7 @@ export class MachineDO extends DurableObject<Env> {
 							memory: MEMORIES.get(id)?.deref(),
 							// the rootfs's own executables carry their hash (exec stubs); anything else is hashed
 							sha256: (bytes) => createHash('sha256').update(bytes).digest('hex'),
+							digest: (algorithm) => createHash(algorithm),
 							write: (text) => {
 								this.keeper.activity();
 								this.pending += text;

@@ -144,7 +144,7 @@ static int structure_bytes(uint32_t i) {
 }
 
 static int one(struct dec* d, struct kb_block* blk) {
-    uint32_t* p = (uint32_t*) kb_host(d->cpu, d->pc, 4);
+    const uint32_t* p = (const uint32_t*) kb_host_r(d->cpu, d->pc, 4);
     if (!p) return -1;
     uint32_t i = *p;
     uint64_t pc = d->pc;

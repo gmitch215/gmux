@@ -84,7 +84,7 @@ printf 'int __gmux_main(int c, char **v, char **e) { %s }\n' "$call" > "$tmp/mai
 "$REAL" $TARGET -c "$tmp/main.c" -o "$tmp/main.o" || exit 1
 "$REAL" $SJLJ "${sys[@]}" -nostartfiles "$crt" "$sjlj" "$tag" "$vfork" "$dl" "${fk[@]}" "$@" "$tmp/main.o" -lc || exit $?
 [ -f "$out" ] || exit 0
-allowed='^(__wasm_syscall_[0-6]|__wasm_abort|__gmux_vfork|__gmux_vfork_exec|__gmux_vfork_exit|__gmux_fork|__gmux_dl(prep|open|sym|close|error)|__stack_pointer|__memory_base|__table_base|__indirect_function_table|memory)$'
+allowed='^(__wasm_syscall_[0-6]|__wasm_abort|__gmux_vfork|__gmux_vfork_exec|__gmux_vfork_exit|__gmux_fork|__gmux_digest|__gmux_dl(prep|open|sym|close|error)|__stack_pointer|__memory_base|__table_base|__indirect_function_table|memory)$'
 bad=$("$imports" "$out" | grep -v -E "$allowed")
 if [ -n "$bad" ]; then
 	echo "cc-strict: unresolved: $(echo $bad | cut -c1-300)" >&2
