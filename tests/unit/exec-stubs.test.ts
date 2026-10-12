@@ -193,6 +193,26 @@ describe('staging another katybug', () => {
 		expect(() => lstatSync(join(cyclic, 'batch'))).toThrow();
 	});
 
+	it('refuses a program that imports what the machine does not provide', () => {
+		const nope = [2, 14, 1, ...name('env'), ...name('__nope'), 0, 0];
+		const importing = new Uint8Array([
+			...MAGIC,
+			...DYLINK,
+			...CODE.slice(0, 6),
+			...nope,
+			...CODE.slice(6)
+		]);
+		writeFileSync(join(dir, 'importing.wasm'), importing);
+		expect(() =>
+			stageKatybug(
+				build,
+				join(dir, 'importing.wasm'),
+				join(dir, 'refused'),
+				join(dir, 'grown.fueled.wasm')
+			)
+		).toThrow(/does not provide: env.__nope/);
+	});
+
 	it('refuses a file binfmt_wasm would not run', () => {
 		writeFileSync(join(dir, 'plain.wasm'), PLAIN);
 		expect(() => stageKatybug(build, join(dir, 'plain.wasm'), join(dir, 'bad'))).toThrow(

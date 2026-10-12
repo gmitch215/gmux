@@ -12,6 +12,7 @@ import {
 } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve, sep } from 'node:path';
+import { PLAIN_IMPORTS } from '../../src/worker/machine/machine.ts';
 import { appendCpio } from './cpio-append.ts';
 import { stub } from './exec-stubs.ts';
 
@@ -26,6 +27,12 @@ export function stageKatybug(build: string, raw: string, out: string, instrument
 	const bytes = new Uint8Array(readFileSync(raw));
 	const small = stub(bytes);
 	if (!small) throw new Error(`${raw}: not a wasm program with a dylink.0 section`);
+	// a katybug built against a newer machine fails at instantiation, so refuse it here
+	const missing = WebAssembly.Module.imports(new WebAssembly.Module(bytes))
+		.filter((i) => i.module !== 'env' || !PLAIN_IMPORTS.has(i.name))
+		.map((i) => `${i.module}.${i.name}`);
+	if (missing.length)
+		throw new Error(`${raw}: imports the machine does not provide: ${missing.join(', ')}`);
 	mkdirSync(out, { recursive: true });
 	const dest = resolve(out);
 	for (const entry of readdirSync(build)) {
