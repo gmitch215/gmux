@@ -20,6 +20,8 @@ case ${KATYBUG_ARCH:-x86_64} in
 		;;
 esac
 dock="docker run --rm --platform $platform"
+# a prebuilt image (GMUX_GATE_ALPINE) skips the package installs; userland-build.sh and the busybox fetch check for their tools
+alpine=${GMUX_GATE_ALPINE:-alpine:3.20}
 rig=gmux-rig/k3$sfx
 on_host() {
 	if [ "$host" = local ]; then (cd && sh -c "$1"); else ssh "$host" "$1"; fi
@@ -38,17 +40,17 @@ cc -std=c11 -D_DEFAULT_SOURCE -D_DARWIN_C_SOURCE -O2 ${KATYBUG_CFLAGS:-} -o "$ou
 # the work tree both sides see: inputs, the binaries, bin/ and ubin/ of links, and the runner
 mkdir -p "$out/t/bin" "$out/t/ubin" "$out/tmp"
 cp "$here"/busybox/input.txt "$here"/busybox/numbers.txt "$out/t/"
-on_host "$dock"' --memory 1g --cpus 2 alpine:3.20 sh -c "apk add --no-cache busybox-static > /dev/null && cat /bin/busybox.static"' > "$out/t/busybox"
+on_host "$dock"' --memory 1g --cpus 2 '"$alpine"' sh -c "[ -x /bin/busybox.static ] || apk add --no-cache busybox-static > /dev/null; cat /bin/busybox.static"' > "$out/t/busybox"
 case " $suites " in *" userland "*)
 	to_host "$here/userland-build.sh" "$rig/build.sh"
 	# docker refuses --cpus above the host's count (a CI runner has 4)
 	on_host 'c=$(getconf _NPROCESSORS_ONLN); [ "$c" -le 6 ] || c=6
 		mkdir -p ~/'"$rig"'/src ~/'"$rig"'/out && cd ~/'"$rig"' &&
 		{ [ -f out/curl ] || '"$dock"' --memory 4g --cpus "$c" -v "$PWD/src:/src" -v "$PWD/out:/out" \
-			-v "$PWD/build.sh:/build.sh:ro" alpine:3.20 sh /build.sh > build.log 2>&1 ||
+			-v "$PWD/build.sh:/build.sh:ro" '"$alpine"' sh /build.sh > build.log 2>&1 ||
 			{ tail -40 build.log >&2; false; }; } &&
 		tar -C out -cf - bash coreutils curl sqlite3' | tar -C "$out/t/ubin" -xf -
-	for p in $(on_host "$dock"' --memory 1g --cpus 2 -v "$HOME/'"$rig"'/out:/o:ro" alpine:3.20 /o/coreutils --help' | sed -n 's/^ \[ //p'); do
+	for p in $(on_host "$dock"' --memory 1g --cpus 2 -v "$HOME/'"$rig"'/out:/o:ro" '"$alpine"' /o/coreutils --help' | sed -n 's/^ \[ //p'); do
 		ln -s coreutils "$out/t/ubin/$p"
 	done
 	ln -s coreutils "$out/t/ubin/["
@@ -93,7 +95,7 @@ if [ -f "$out/t/ubin/bash" ]; then
 fi
 fail=0
 for s in $suites; do
-	on_host "$dock --memory 1g --cpus 2 -v \"\$HOME/gmux-rig/t1/bbt$sfx/t:/t\" alpine:3.20 /t/run.sh $s" > "$out/$s.native.txt"
+	on_host "$dock --memory 1g --cpus 2 -v \"\$HOME/gmux-rig/t1/bbt$sfx/t:/t\" $alpine /t/run.sh $s" > "$out/$s.native.txt"
 	cp "$out/$s.native.txt" "$keep/"
 	# the native side starts in a fresh container; a CI runner starts steps with SIGPIPE ignored
 	TMPDIR=$out/tmp perl -e '$SIG{PIPE} = "DEFAULT"; exec @ARGV or die' \

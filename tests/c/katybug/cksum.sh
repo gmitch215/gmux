@@ -11,7 +11,9 @@ set -euo pipefail
 here=$(cd "$(dirname "$0")" && pwd)
 root=$(cd "$here/../../.." && pwd)
 llvm=${LLVM:-/opt/homebrew/opt/llvm/bin}
-host=${NATIVE_HOST:?set NATIVE_HOST to an ssh host that runs x86-64 natively}
+host=${NATIVE_HOST:?set NATIVE_HOST to an ssh host that runs x86-64 natively, or local}
+# local runs the native side on this machine, which must be x86-64 Linux
+ssh() { if [ "$1" = local ]; then (cd && sh -c "$2"); else command ssh "$@"; fi; }
 cu=${1:-$root/build/katybug/transcript/ubin/coreutils}
 cu=$(cd "$(dirname "$cu")" && pwd)/$(basename "$cu")
 out=$(mktemp -d)

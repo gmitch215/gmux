@@ -20,6 +20,8 @@ case ${KATYBUG_ARCH:-x86_64} in
 		;;
 esac
 dock="docker run --rm --platform $platform --memory 1g --cpus 2"
+# prebuilt images (GMUX_GATE_ALPINE, GMUX_GATE_DEBIAN) skip the package installs below
+alpine=${GMUX_GATE_ALPINE:-alpine:3.20} debian=${GMUX_GATE_DEBIAN:-debian:bookworm-slim}
 rig=gmux-rig/k4$sfx
 on_host() {
 	if [ "$host" = local ]; then (cd && sh -c "$1"); else ssh "$host" "$1"; fi
@@ -48,14 +50,14 @@ fi
 tar -C "$root/src/gmux/katybug" -cf "$out/t/src.tar" .
 tar -C "$out" -cf - t | on_host "mkdir -p ~/$rig && tar -C ~/$rig -xf -"
 # a static katybug, so it runs in either image, and the pthread suite against each image's libc
-on_host "$dock -v \"\$HOME/$rig/t:/t\" alpine:3.20 sh -c 'apk add --no-cache build-base zlib-dev zlib-static > /dev/null &&
+on_host "$dock -v \"\$HOME/$rig/t:/t\" $alpine sh -c '{ command -v cc > /dev/null && [ -f /usr/lib/libz.a ] || apk add --no-cache build-base zlib-dev zlib-static > /dev/null; } &&
 	mkdir -p /src && tar -C /src -xf /t/src.tar && cc -std=c11 -D_DEFAULT_SOURCE -DKB_ZLIB -O2 -static -o /t/katybug /src/*.c -lm -lz &&
 	cc -O2 -pthread -o /t/threads-musl /t/threads.c'"
-on_host "$dock -v \"\$HOME/$rig/t:/t\" debian:bookworm-slim sh -c 'apt-get -qq update > /dev/null &&
-	apt-get -qq install -y gcc libc6-dev > /dev/null 2>&1 && gcc -O2 -pthread -o /t/threads-glibc /t/threads.c'"
+on_host "$dock -v \"\$HOME/$rig/t:/t\" $debian sh -c '{ command -v gcc > /dev/null || { apt-get -qq update > /dev/null &&
+	apt-get -qq install -y gcc libc6-dev > /dev/null 2>&1; }; } && gcc -O2 -pthread -o /t/threads-glibc /t/threads.c'"
 fail=0
-for img in debian:bookworm-slim alpine:3.20; do
-	tag=${img%%:*}
+for pair in debian=$debian alpine=$alpine; do
+	tag=${pair%%=*} img=${pair#*=}
 	on_host "$dock -v \"\$HOME/$rig/t:/t\" $img sh /t/each.sh" > "$out/$tag.native.txt"
 	on_host "$dock -v \"\$HOME/$rig/t:/t\" $img sh /t/each.sh /t/katybug" \
 		> "$out/$tag.katybug.txt"

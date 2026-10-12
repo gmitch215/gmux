@@ -21,6 +21,8 @@ case ${KATYBUG_ARCH:-x86_64} in
 		;;
 esac
 dock="docker run --rm --platform $platform --memory 1g --cpus 2"
+# prebuilt images (GMUX_GATE_ALPINE, GMUX_GATE_DEBIAN) skip the package installs below
+alpine=${GMUX_GATE_ALPINE:-alpine:3.20} debian=${GMUX_GATE_DEBIAN:-debian:bookworm-slim}
 rig=gmux-rig/k7$sfx
 on_host() {
 	if [ "$host" = local ]; then (cd && sh -c "$1"); else ssh "$host" "$1"; fi
@@ -54,12 +56,12 @@ echo "rc $?"
 EOF
 tar -C "$root/src/gmux/katybug" -cf "$out/t/src.tar" .
 tar -C "$out" -cf - t | on_host "mkdir -p ~/$rig && tar -C ~/$rig -xf -"
-on_host "$dock -v \"\$HOME/$rig/t:/t\" alpine:3.20 sh -c 'apk add --no-cache build-base zlib-dev zlib-static > /dev/null &&
+on_host "$dock -v \"\$HOME/$rig/t:/t\" $alpine sh -c '{ command -v cc > /dev/null && [ -f /usr/lib/libz.a ] || apk add --no-cache build-base zlib-dev zlib-static > /dev/null; } &&
 	mkdir -p /src && tar -C /src -xf /t/src.tar && cc -std=c11 -D_DEFAULT_SOURCE -DKB_ZLIB -O2 -static -o /t/katybug /src/*.c -lm -lz &&
 	cc -O1 -fno-builtin -o /t/thunk-musl /t/thunk.c && cc -O1 -fno-builtin -Wl,-z,now -o /t/thunk-musl-now /t/thunk.c &&
 	cc -O1 -fno-builtin -ffp-contract=off -o /t/libm-musl /t/libm.c -lm'"
-on_host "$dock -v \"\$HOME/$rig/t:/t\" debian:bookworm-slim sh -c 'apt-get -qq update > /dev/null &&
-	apt-get -qq install -y gcc libc6-dev > /dev/null 2>&1 && gcc -O1 -fno-builtin -o /t/thunk-glibc /t/thunk.c &&
+on_host "$dock -v \"\$HOME/$rig/t:/t\" $debian sh -c '{ command -v gcc > /dev/null || { apt-get -qq update > /dev/null &&
+	apt-get -qq install -y gcc libc6-dev > /dev/null 2>&1; }; } && gcc -O1 -fno-builtin -o /t/thunk-glibc /t/thunk.c &&
 	gcc -O1 -fno-builtin -Wl,-z,now -o /t/thunk-glibc-now /t/thunk.c &&
 	gcc -O1 -fno-builtin -ffp-contract=off -o /t/libm-glibc /t/libm.c -lm &&
 	if [ \$(uname -m) = aarch64 ]; then
@@ -67,8 +69,8 @@ on_host "$dock -v \"\$HOME/$rig/t:/t\" debian:bookworm-slim sh -c 'apt-get -qq u
 		/t/libm-edit /lib/aarch64-linux-gnu/libm.so.6 /t/edit/libm.so.6
 	fi'"
 fail=0
-for img in debian:bookworm-slim alpine:3.20; do
-	tag=${img%%:*}
+for pair in debian=$debian alpine=$alpine; do
+	tag=${pair%%=*} img=${pair#*=}
 	libc=glibc
 	[ "$tag" = alpine ] && libc=musl
 	for bind in "" -now; do
@@ -142,8 +144,8 @@ done
 # the refusals must have reached them; glibc on AArch64 runs them for Debian 12's build, whose code
 # libm-sigs.h lists
 n=${LIBM_SAMPLES:-300000}
-for img in debian:bookworm-slim alpine:3.20; do
-	tag=${img%%:*}
+for pair in debian=$debian alpine=$alpine; do
+	tag=${pair%%=*} img=${pair#*=}
 	libc=glibc
 	[ "$tag" = alpine ] && libc=musl
 	col=4
@@ -202,7 +204,7 @@ done
 if [ "$platform" = linux/arm64 ]; then
 	for mode in "sample $n" refuse; do
 		name=libm-debian-edited-${mode%% *}
-		elrun() { on_host "rm -f \$HOME/$rig/t/prim.log; $dock -v \"\$HOME/$rig/t:/t\" -e LD_LIBRARY_PATH=/t/edit ${2:-} debian:bookworm-slim sh /t/libm-each.sh '$1' /t/libm-glibc $mode; cat \$HOME/$rig/t/prim.log 2> /dev/null || true"; }
+		elrun() { on_host "rm -f \$HOME/$rig/t/prim.log; $dock -v \"\$HOME/$rig/t:/t\" -e LD_LIBRARY_PATH=/t/edit ${2:-} $debian sh /t/libm-each.sh '$1' /t/libm-glibc $mode; cat \$HOME/$rig/t/prim.log 2> /dev/null || true"; }
 		elrun "" > "$out/$name.native.txt"
 		elrun /t/katybug > "$out/$name.on.txt"
 		elrun /t/katybug "-e KATYBUG_PRIM=0" > "$out/$name.off.txt"

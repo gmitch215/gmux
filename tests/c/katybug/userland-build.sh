@@ -2,7 +2,8 @@
 # builds static amd64 coreutils, bash, sqlite3 and curl from pinned upstream sources into /out; runs
 # inside alpine:3.20 (busybox.sh starts it on the native host)
 set -eu
-apk add --no-cache build-base perl linux-headers xz > /dev/null
+{ command -v cc > /dev/null && command -v perl > /dev/null && command -v xz > /dev/null && [ -d /usr/include/linux ]; } \
+	|| apk add --no-cache build-base perl linux-headers xz > /dev/null
 mkdir -p /src /out
 cd /src
 fetch() {
