@@ -1,12 +1,13 @@
 # Technical Report: Linux on Cloudflare Workers
 
-gmux runs a real Linux kernel, compiled to WebAssembly, inside one Cloudflare Worker deployment. Each
-machine is a Durable Object; its kernel, BusyBox and user programs share one linear memory and one
+gmux runs a real Linux kernel [1], compiled to WebAssembly [2], inside one Cloudflare Worker
+deployment [3]. Each machine is a Durable Object; its kernel, BusyBox [4] and user programs share one
+linear memory and one
 host thread. This document is the engineering reference for that system: how it is put together,
 which platform limits shape it, what each operation costs, and which classes of defect it has
 produced.
 
-`src/` holds the machine host, the site Worker, Katybug, gmux's C runtime and the kernel, musl and
+`src/` holds the machine host, the site Worker, Katybug, gmux's C runtime and the kernel, musl [5] and
 BusyBox patches; `experiments/` holds one probe per measurement, deployed to a Free account and torn
 down after each run. Every figure is measured, and the instrument is named beside it, because a local
 wall clock and a deployed `cpuTime` reading are not interchangeable.
@@ -15,10 +16,10 @@ wall clock and a deployed `cpuTime` reading are not interchangeable.
 
 ## 🧭 Executive Summary
 
-Linux 7.0 (the `joelseverin/linux` wasm fork) boots to a BusyBox shell inside a Free-plan Durable
+Linux 7.0 (the `joelseverin/linux` wasm fork [1]) boots to a BusyBox shell inside a Free-plan Durable
 Object, runs pipelines and background jobs, and finishes a job that needs more CPU than one event
-allows. Blocking is JSPI; checkpointing is Asyncify for the kernel, and either Asyncify or resumable
-frames for user programs, paid only when a machine leaves memory.
+allows. Blocking is JSPI [6]; checkpointing is Asyncify [7] for the kernel, and either Asyncify or
+resumable frames for user programs, paid only when a machine leaves memory.
 
 | | measured | instrument |
 | --- | --- | --- |
@@ -35,7 +36,7 @@ frames for user programs, paid only when a machine leaves memory.
 | Whole booted machine checkpointed mid-job, evicted, restored | **exact**, 1 GiB foreground 3 of 3, background job 2 of 2, idle 4 of 4 | `ctx.abort()`, Free |
 | Pipes, job control, `^C`, background jobs | **5 of 5** cases | `experiments/shell`, Free |
 | `vfork`, `$(...)`, pthreads, a signal handler that blocks, the POSIX surface | **all pass** (execve, `_exit`, failed execve; 4 threads x 10,000 locked increments; sockets, flock, epoll, eventfd, timerfd, inotify) | `experiments/vfork`, `posix`, Free |
-| Lua 5.4.7's own suite, file by file | **30 of 32** on Free, against **29 of 32** native musl; the two agree on 31 files | `tests/suites/lua.sh`, Alpine reference on paisley-park |
+| Lua 5.4.7's [8] own suite, file by file | **30 of 32** on Free, against **29 of 32** native musl; the two agree on 31 files | `tests/suites/lua.sh`, Alpine reference on paisley-park |
 | libc-test's pthread suite | **20 of 24** on Free | `tests/suites/`, Free |
 | A non-root process reaching memory it does not own | `SIGSEGV` from the load or store, `EFAULT` from a syscall; the checked build costs **1.26-2.86x** on the census in Node and **1.94-3.78x** on Free (stores alone 1.09-1.46x); a fork child in its own memory computes at **0.93-1.00x** | `tests/c/isolation.c` (Node and Free), `experiments/mmu` |
 | Checkpoint tax on user programs | resumable frames **0.977-1.023x** of the plain build on six census programs, against Asyncify's +63% | local wall clock, Node, interleaved |
@@ -44,18 +45,28 @@ frames for user programs, paid only when a machine leaves memory.
 | Asyncify tax on a CPU pipeline | **+63%**, almost all in the user program; kernel +3-9% | local wall clock, Node, interleaved |
 | Native wasm compiled at startup from compressed bytes | **54.5 MB** in 715 ms; 15 copies rejected | wrangler `Worker Startup Time` |
 | Package census | **24 programs and 7 libraries** of 48 recipes build and link cleanly | `scripts/census.sh`, paisley-park |
-| Unchanged amd64 BusyBox, coreutils, bash, sqlite3 and curl under Katybug | **117 of 117** transcript lines equal native x86-64 Linux, inside a machine; 31,725-case instruction corpus equal | `tests/c/katybug/`, paisley-park reference |
+| Unchanged amd64 BusyBox, coreutils [9], bash [10], sqlite3 [11] and curl [12] under Katybug | **117 of 117** transcript lines equal native x86-64 Linux, inside a machine; 31,725-case instruction corpus equal | `tests/c/katybug/`, paisley-park reference |
 | `fork` from an unmodified C program | **5 of 5** cases, including a forking server whose handlers fork again; deployed | `tests/c/fork.c`, Free |
-| Coreutils hash tools under Katybug against native coreutils, 512 MiB | **1.02-1.08x** natively and **1.28-1.51x** in a machine under V8 (md5, sha1, sha256, sha512); `cksum` 4.67x and 5.43x | wall time over native, 5 samples a cell, paisley-park |
-| zlib's calls through Katybug in a machine, 4 MiB corpus and 32 MiB streams | one-shot calls **1.02-2.15x** native against 71-322x with the kernels off; streams **1.50-1.78x**, 46.6-68.8 times faster than with the kernels off | wall time, node V8, paisley-park |
-| Whole-program lifted regions, Katybug under V8 | gzip **7.60x** native, bzip2 13.86x, sqlite 20.12x, bash 77.40x (74% lifted) | wall time over native, paisley-park |
+| Coreutils hash tools under Katybug against native coreutils (the pinned static 9.5), 512 MiB | **1.02-1.08x** natively and **1.28-1.51x** in a machine under V8 [13] (md5, sha1, sha256, sha512); `cksum` 4.67x and 5.43x | wall time over native, 5 samples a cell, paisley-park |
+| zlib's [14] calls through Katybug in a machine, 4 MiB corpus and 32 MiB streams | one-shot calls **1.02-2.15x** native against 71-322x with the kernels off; streams **1.50-1.78x**, 46.6-68.8 times faster than with the kernels off | wall time, node V8, paisley-park |
+| Whole-program lifted regions, Katybug under V8 | gzip [15] **7.60x** native, bzip2 13.86x, sqlite 20.12x, bash 77.40x (74% lifted) | wall time over native, paisley-park |
 | statx hit, forced miss | **36 ns** and **4,387 ns** (58 and 8,106 before) | `experiments/syscall-cost`, paisley-park |
 | Process start in the host | busy samples **-57.4%** (configure-shaped run) and **-64.8%** (fork and exec) with a finished process's instance reused | profile samples, `experiments/instances`, paisley-park |
+| Whole digests on the host's crypto, eight distinct 64 MiB files | sha1sum **0.75**, sha224sum **0.40**, sha256sum **0.40**, sha384sum **0.84**, sha512sum **0.85** under 1.0 on 5 of 5 paired rounds; md5sum **1.09**, b2sum **1.25** above; the native control is the pinned static coreutils 9.5 (portable C) | wall time over native, V8 under node, paisley-park, 5 rounds, `experiments/string-kernels` |
+| `gzip -dc` with the deflate stream decoded on the host's zlib, eight 64 MiB files | **0.37-0.41** to a file and **0.40-0.43** to a pipe against GNU gzip 1.13, 10 of 10 samples; **31.3-33.4** when the input is a pipe | wall time over native, 5 samples a cell, V8 under node, paisley-park |
+| Bash with every function lifted (99.1%) | **33.49** and **33.97** under V8 and **19.05** on x86-64, against 80.33, 80.56 and 60.55 for 24 functions | wall time over native, `experiments/aot-oracle`, paisley-park |
+| Emitted wasm against the clang route [16] for the same regions | exact, and **1.10-1.85x** slower under V8 on every timed pair | wall time, 8 kept samples a cell in two processes, paisley-park |
+| Burrow's interpreter on the guest's own memory, zlib endpoint | **1.000** of the untouched guest (rebased form 1.110); **1.15** of native `-O2` | wall time, V8 under node, paisley-park |
+| A 6.9 MB served request, buffers lent to the host | mean CPU **-13.0%** (BusyBox httpd) and **-10.6%** (lighttpd) | CPU per request, 3 runs of 25 rounds, paisley-park |
+| Process start, share build against today's registry | busy samples **-59.1%** (configure), **-64.5%** (fork), fork+exec wall **-61.6%** | profile samples, `experiments/syscall-cost`, paisley-park |
+| Tasks on a Free machine | **160** run at 1,400 pages; 176 and up are taken by the platform in 3 of 3 attempts | deployed boot rig, Free |
+| A kept-alive lighttpd request against a new stream | **-49.3%** CPU on the one clean sample | CPU per request, paisley-park |
+| A mid-job checkpoint, restored | **0 of 20** panic with the host fix, 6 of 20 without; `drive.ts survive` 3 of 3 on Free at 24,000,000 iterations | `experiments/staged-init/scripts/restore-chain.ts`, Free |
 
 ### What Decides the Design
 
-**Task count, not CPU, was the ceiling on a running machine.** linux-wasm gives every task its own
-vmlinux instance. Boot alone creates 48, each instance holds ~2.7 MiB of the object's budget, and a
+**Task count, not CPU, was the ceiling on a running machine.** linux-wasm [17] gives every task its
+own vmlinux instance. Boot alone creates 48, each instance holds ~2.7 MiB of the object's budget, and a
 machine died silently after about ten more processes in its lifetime: event outcome `ok`, no
 exception, a new instance on the next request. vmlinux has five mutable globals, so gmux runs every
 task on one instance and swaps those five words at each switch. After that change the 1 GiB job ran
@@ -93,13 +104,16 @@ Root processes share one trust domain; non-root processes are isolated for reads
 (Isolation, below), at the cost measured there. A non-root process cannot fork (`ENOSYS`), and a
 forked child copies its parent's memory eagerly, so a shared mapping across `fork` is a copy.
 Checkpoints do not save shared instances or a fork child's own memory. The deployed machine has
-run the whole kernel patch set (38 patches) on Free: the smoke start, the 19 probes of the boot rig
-and a first start of the shipped bootstrap image pass there (3 of 3, with `lo` up), but a machine
-redeployed mid-job has never survived on Free (4 of 4 tries on the real build failed: the object
-was not replaced, and after late replacements the console shows a `Kernel panic: Syscall called
-when in kernel mode`), and coreutils at 800 pages passes 331 of 516
-(339 at 1,200 pages, native 353). Serving has a measurement (Serving a Guest's HTTP) with an
-open-stream cap and a request bound but no keepalive figure. The idle-day figures for the new keeper
+run the whole kernel patch set (41 patches) on Free: the smoke start and a first start of the shipped
+bootstrap image pass there (3 of 3, with `lo` up) and 19 of the 20 probes of the boot rig pass (the
+`taskcap` probe stops after its third line on Free and passes locally). A machine redeployed
+mid-job survived on Free 3 of 3 once the host stopped checkpointing inside a user-mode interrupt
+(Checkpoints), but 1 of 3 on the final build: one try died on a network error from the client and
+one was a guest out-of-memory kill after a restore that has no explanation yet. Coreutils passes 340
+of 516 at 1,200 pages and 334 at 800 (native 353). The final build's deployed sha256sum cell has no
+number: the machine was replaced at its first exec in 2 of 2 tries. Serving has a measurement
+(Serving a Guest's HTTP) with an open-stream cap, a request bound, a 30 s limit on a stalled
+stream, and a keepalive figure for lighttpd. The idle-day figures for the new keeper
 defaults are read for 24 hours (Idle Machine, 24 Hours), and a short-sleep job still makes 900 s
 events. Also unmeasured: execution memoization, publication of proven responses, and energy per
 job on the wasm arms (the native and Katybug arms have a table). None of it has a number, and no
@@ -305,7 +319,7 @@ checked) was restored into 10 fresh isolates and 30 warm ones: cold 965 ms (940-
 isolate start removes the node penalty. On Free it would add 626 ms to every isolate start and save
 nothing measurable, and the variant that warms only on a restore needs 58 subrequests against the
 cap of 50, so the site has no warm-up. The deployed wall includes the asset fetches and `cpuTime`
-was 0 in 34 of 50 rows, so compute and fetch are not separated. workerd keeps a compiled-module
+was 0 in 34 of 50 rows, so compute and fetch are not separated. workerd [18] keeps a compiled-module
 cache across isolates (its documentation describes one); whether it holds optimized code is not
 known, and it may be why the deployed penalty is small.
 
@@ -912,13 +926,60 @@ private local of that frame (the caller's bytes and return offset, the stack dis
 signal handler, the context still at its initial state); the machine's `__gmux_digest` import then
 feeds `node:crypto`'s `createHash` from a view of guest memory, and anything not proven private stays
 on the block kernels. A fork inside a stream copies the open digest under a ticket the parent owns; a
-checkpoint waits until no stream is open. On eight distinct 64 MiB files in a machine under V8
-(paisley-park, 5 samples a cell, every digest equal to native) `r` against native coreutils is sha1
-0.73, sha256 0.40 and sha512 0.83, under 1.0 on every sample, and md5 1.06 (node's md5 alone runs
+checkpoint waits until no stream is open. A task holds at most 64 open digests and 16 unclaimed fork
+copies, since each is host memory outside the machine's maximum. On eight distinct 64 MiB files in a machine under V8
+(paisley-park, 5 samples a cell, every digest equal to native) `r` against the native control, the
+same static x86-64 coreutils 9.5 the guest runs (Alpine 3.20, musl, gcc -O2, so Gnulib's portable C
+for every hash), is sha1 0.73, sha256 0.40 and sha512 0.83, under 1.0 on every sample, and md5 1.06 (node's md5 alone runs
 1,197-1,230 MB/s against coreutils' 1,044; the rest is the machine's reads and calls). Deployed on
 Free, one file of 64 or 112 MiB, sha256 is 0.84-0.86 and the others 1.59-3.23, bounded by Free's
 `createHash` rates (md5 461-488, sha512 328-373 MB/s). Through a pipe from `busybox head` every tool
 is 2.37-4.42: the producer alone takes 0.733 s in the machine.
+
+The family grew to sha224sum, sha384sum and b2sum. On the same eight files under V8 (5 paired rounds,
+31 of 31 cells, 155 samples, none failed or noisy), `r` is sha1sum 0.75, sha224sum 0.40, sha256sum
+0.40, sha384sum 0.84 and sha512sum 0.85, under 1.0 in 5 of 5 rounds each, and md5sum 1.09 (1.08-1.11)
+and b2sum 1.25 (1.23-1.40), above it in 0 of 5. Node's own md5 (0.439 s over the eight files) and
+blake2b512 (0.273 s) are faster than the native tools; what holds md5sum above 1.0 is the machine's
+own time outside the hash, 0.108 s of its 0.553 s wall (eight starts, the guest's reads and exit)
+against 0.027 s for a native run, and a start costs 5.5-9.9 ms on an empty input. The sha256 figure
+compares the host's `node:crypto` hash with a portable-C coreutils: the control is the statically
+linked x86-64 coreutils 9.5 [9] the guest runs, run natively (its `--version`, checked 2026-10-16).
+The machine's `sha256sum` was not timed against an optimized native build (the box's system
+coreutils, Ubuntu 24.04's 9.4 [19], links `libcrypto.so.3` from OpenSSL [20] on a CPU with
+`sha_ni`), so 0.40 shows the host path beats this native build,
+not that gmux beats an equally optimized native program. A digest of a 128 MiB file on Free had been
+wrong because `hostDigest` took a `subarray` of the machine's memory, which Workers throw on from
+128 MiB; it builds a view from the buffer and offset instead and is exact on Free. Free's `node:crypto`
+has no `blake2b512`, so b2sum runs the guest's own code there at 2.0-2.2 MB/s (`r_product` about 764
+on 16 MiB). A 144 MiB file at 2,600 pages answers HTTP 500 on Free and the cause is not found.
+
+The pipe cells above were split by a sampling profile of 14 cells (5 native and 5 guest rounds, quiet
+at most 0.49, the sampler covers 0.19-0.65 of wall time so shares are of samples; paisley-park, V8 under
+node). The largest share is `busybox head`'s own byte loop, 687 of 776 ms (88.5% of samples) in `head`
+and 703 of 993 ms in `head | cat`; it makes 2,047 syscalls per MiB in 1 KiB reads, where `dd` at 32 KiB
+makes 64 and moves 512 MiB in 6.5 ms. The host digest follows (35% of `head | md5sum`, 76% of `cat |
+md5sum`, native md5 speed). The kernel's user-memory copy is 0.0% of samples in every profiled cell, no
+copy crosses to the host, and the clear is 3-5 ms in the `dd` cells, so a copy in the pipe is not the
+cost. `head`, `head | cat` and `head | md5sum` already run at `r` 0.68, 0.58 and 0.75 against the
+native build; six cells stay above 1.0 (up to 2.37) and their kernel share is unnamed because the
+kernel has no name section.
+
+Decompression has one correct output too, and `gzip -dc` runs it on the host's zlib [14]. GNU gzip
+keeps its decoder state in globals and writes through `flush_window`; on an end of file inside a block
+it writes the window as of the last block boundary, which `node:zlib` cannot report. The host path
+therefore verifies the whole stream before releasing a byte: at `inflate`'s entry (found by its bytes)
+Katybug reads the rest of a regular input file, the host decodes the raw deflate stream into windows,
+and the stream is taken only if zlib reaches its end with at least 8 bytes after it. gzip's own
+`fill_inbuf` and `flush_window` then run the reads and writes in gzip's order; every other case,
+including a pipe on input, stays with the guest's code. A machine holds at most 4 streams a task, 4 MiB
+fed per call and 256 MiB of decoded bytes a task (a limit per task, not per machine), and a checkpoint is
+refused while one is open. Native, kernel arm, host arm and the real machine agree on 692 cases in
+Debian 12 and Alpine (686 also through the machine). On eight distinct 64 MiB `.gz` files (5 samples
+a cell, V8 under node, paisley-park) GNU gzip 1.13's `gzip -dc` runs at `r` 0.37-0.41 to a file and
+0.40-0.43 to a pipe, at or under 1.0 on 10 of 10 samples, against 40-43 for the guest's own inflate;
+with the compressed input on a pipe the host path is not taken and `r` is 31.3-33.4. The deployed
+Worker cannot use the path until `InflateRaw._handle.writeSync` is probed on Free.
 
 A guest's executable image is read in 64 KiB pieces when first touched instead of whole at load. A
 file changed in place reads its new bytes into the pieces not yet made; truncation makes an access to a
@@ -1131,6 +1192,107 @@ decoding (`persist.c`). A file is used only when Katybug's own executable, the I
 plan settings match the ones that wrote it, and a block only while the guest bytes it was decoded
 from hash the same. sqlite decodes 4,754 blocks on its first run and 104 on its second.
 
+Hashing a block's guest bytes when it is decoded, and saving every block with that hash (persisted
+records are version 3), is correct and tested and wins nothing on gzip, bzip2, sqlite or bash: warm
+decodes are 20 with either code, and a warm gzip start is 4.26 ms against 4.27 ms (cold 2.46 against
+2.44; 112 of 112 samples on paisley-park, none noisy). One module table attaches gzip, bzip2, sqlite
+and bash with the same lifted share and entries as their single builds, natively and under V8; it adds
+2,121,549 bytes for the four (1,670 under the sum of the singles), shares no pc between ELFs, and a
+test of the pc check at attach fails before the fix and passes after. A start with the cache on costs
+more than one with it off: warm is 1.41-2.41 times cold for every workload (+1.8 ms gzip, +3.5 ms with
+the one-table module, +3.15 ms bzip2, +2.03 ms sqlite, +2.49 ms bash, one-line inputs). The load hashes
+the ELF and Katybug's own executable a byte at a time, about 2 ms a process; the one-table module's
+extra 1.66 ms over a 1.76 MB larger executable is 0.94 ns a byte (inferred to be that hash, not
+isolated). The warm lifted share of a promoted ELF also drifts down on the default plan (gzip
+whole-program 99.8%, 98.4%, 96.6% on runs 1 to 3); the mechanism is not found.
+
+Lifting every function of bash [10] (335 regions, 3,425 blocks, 71,756 IR operations, 99.1% of the
+dynamic work) takes 59.89 s of clang at 766 MiB and adds 5.75 MB to the module. Every sample's md5
+equals the binary's. Under V8 (two processes, 7 rounds, paisley-park) `r` is 33.49 and 33.97 (2,445
+and 2,480 ms) against 80.33 and 80.56 for the 24-function arm, and 19.05 on x86-64 (1,391 ms) against
+60.55; the binary runs in 73 ms (75-76 under V8) and the spread of the paired ratios is 1.2-3.2%.
+Region entries did not fall (16.49 million to 15.69 million) and the lifted part's cost per unit of
+work stayed at about 32 times the binary's under V8 (17.6 on x86-64). An entry costs 12.5 ns under V8
+and 5.4 ns on x86-64 in a small guest, so removing every entry would take 196 ms of the 2,445 (8.0%,
+`r` from 33.5 to 30.8) and 85 ms of 1,391 on x86-64: a bound from another guest, not a measurement
+of bash. The lifted code's own cost holds the rest.
+
+The lifter has a second route that writes WebAssembly assembly instead of C. `emit.ts` takes the
+same region description as the C route (which now comes out of one shared module, 18 of 18 region sets
+byte-identical), and LLVM's assembler [16] makes an object from it, so a region set links in about 1.3 s
+(0.03 s to assemble, 0.31 s to link, 0.75 s to instrument) with no run-time compile. It emits gzip's
+82 blocks whole and the result is exact in a machine: the md5 equals the binary's and the transcript
+the interpreter's, and the 13 whole-function guests, 41 single-function sets and the region guards
+pass (73 of 73 cases after the last change to the emitter); each mutant of the emitter fails the guest
+that carries it. A curl-scale region (508 blocks) emits in 0.34 s and links in about 3 s, against 245 s
+for `clang -O2` of a different dump. The module is 10-11% smaller on gzip (523,381 bytes against
+589,689) and 2.3% larger on sha256. Timed under V8 (two processes, 8 kept samples a cell, none noisy)
+the emitted route is slower than the clang route on every pair that has both: 1.13-1.20x on gzip's
+function set, 1.33-1.38x on its whole-program set (`r` 9.62-9.88 against 7.10-7.26), 1.10-1.11x on a
+direct-call set and 1.74-1.85x on sha256, while it executes 0.57 times as many instructions. The gzip
+arms were emitted before a fix to the loop-entry selector and not timed again. Computing a flag only
+where something reads it (recipes rebuilt at a fault or an exit) cuts the emitted arm's time 21.1-24.4%
+on sha256 (536 ms against 709 and 679) and 4.4-8.3% on gzip (1,379 and 1,406 ms against 1,504 and
+1,471; one process's ranges overlap), exact against native on every case and five mutants; the emitted
+gzip arm still runs at `r` 23.7 and 24.5 against 18.4-18.6 for the clang route, because 54% of gzip's
+flag operations stay eager where the next block reads flags only through an access that can fault. A
+rights check that looked exact had never run the emitted regions; fixing it exposed a loop that never
+cleared its entry selector and hung its guest.
+
+Every mapping carries its rights, and a store to a page that holds decoded code makes its blocks
+stale. A fetch from a non-executable page, a write to a read-only page and an access the mapping does
+not allow report `SIGSEGV` with the right `si_code`; each has a guest and a mutant (555 checks, 11 of 11
+mutants caught). The interpreter with the edits is inside the larger spread in 7 of 9 cells and
+outside it in two (gzip natively +3.4%, where the unedited tree also moves +3.7% with link order; sqlite
+under V8 +2.3% in one process and +0.6% in the other, unexplained). A data store to a page that is
+writable and executable takes a slow path and costs +18.5% (1,674 to 1,983 ms for 20,000,000 stores).
+Lifted windows resolve with the rights their accesses need, and a region is never attached to a block
+on a writable and executable page (12 of 12 rows of the region guards agree; two of three mutants are
+caught, the third, a write window not refused on such a page, by no guest).
+
+Checks that cannot be removed can be made cheaper. A one-block mapping up to 1 MiB is a flat table the
+lifted code compares against, and a region revalidates its bounds from an epoch instead of per access.
+On gzip's whole-program arm under V8 (two processes of 7 rounds, quiet 0.00-0.13, none noisy) the flat
+table with epochs runs in 350 and 353 ms, against 392 and 390 for the flat backing without the table,
+389 and 390 for the epoch form on the ordinary backing, and 412 and 413 for the baseline form. `r`
+falls from 7.09 and 7.10 to 6.03 and 6.07, 29.7% and 29.6% of the gap between the baseline form and
+the plain-access floor; the flat backing alone is a tie (3 and 0 ms), and 99.06% of gzip's 85.26
+million checked accesses take the table. `x86-flat.c` passes natively, in the interpreter and in the
+lifted route, and each of three mutants fails one named case. Memory of whole one-block mappings
+outside gzip, and the function-region, sqlite and sha256 arms, are not measured; 70% of the gap to the
+floor remains.
+
+### Related Systems
+
+Four public projects translate or run foreign code in a browser or a Worker. gmux borrowed no code from
+them. The facts below were read on 10-16 as a model's extraction of each named file or page (not the
+full text) and are given with that label; a number that came only from a source nobody could read is
+left out.
+
+- v86 [21] emulates 32-bit x86 and translates machine code to wasm at run time. A generated module loads
+  the eight x86 registers into wasm locals and stores them back at its end, and locals do not live
+  across modules. It keeps the previous result in a local for 32-bit operations only and otherwise in
+  memory beside a `flags_changed` word, replaces a compare and its consumer by one wasm compare,
+  bounds a module at 3 pages and starts translating a page after 200,000 runs because very large wasm
+  functions and wide `br_table`s made V8 use too much memory, and tracks writes to pages that hold
+  translated code. It compiles wasm at run time, which a Free Worker refuses at request time, and has no
+  x86-64, so only the patterns used at emission time carry over to Katybug's emitter.
+- elfconv [22] lifts static AArch64 executables through Remill to LLVM IR and then to wasm. Its README
+  compares the output with wasm built from the same source: 82%, 78% and 96% of source-wasm speed for
+  Sieve, LINPACK and MNIST under Emscripten, and 60%, 56% and 96% under WASI. The baseline is
+  source-built wasm, not native, so none of it compares with `r` here. Its other figures (a 6.4x to
+  9.07x gain from a flat arena and about 1.7x from register promotion) come from posts that returned
+  HTTP 403 and are not used.
+- NanoVM [23] runs a RISC-V Linux ELF interpreter beside the host's Node.js. A router sends a command to
+  the host or the VM by pins and registered delegates, and its automatic mode falls back only on an
+  error named `ERR_NODE_HOST_UNSUPPORTED`; its zlib service uses the host's zlib as the fast default
+  and a wasm backend where byte-exact framing matters, a split gmux's decompression makes for the same
+  reason. It is
+  dual-licensed (AGPL-3.0 or a commercial licence), so only its contract shapes are usable.
+- WebVM [24] serves an ext2 root through a stack of an HTTP byte device (blocks fetched on demand), an
+  IndexedDB cache and an overlay that takes the writes; its engine is loaded from a CDN and its JIT is
+  not public, so no figure of it is cited here.
+
 ---
 
 ## Platform Constraints
@@ -1321,7 +1483,7 @@ BusyBox instance ~2.5 ms including its data segments (48-55 ms for 20).
 | a wasm3 guest calling a `Suspending` import | 1,000 and 100,000 cycles exact; two interleaved interpreters exact |
 | 5,000 and 20,000 tasks parked at once, 1,025 frames | all resumed exact |
 
-burrow's wasm3 suspends through a `Suspending`-wrapped `burrow.host_call` with no change to burrow.
+burrow's wasm3 [25] suspends through a `Suspending`-wrapped `burrow.host_call` with no change to burrow.
 
 ### Checkpoints
 
@@ -1533,7 +1695,19 @@ first start on Free with `lo` up passes 3 of 3. A redeploy of a running machine 
 part: `drive.ts survive` never passed on the real build on Free (9 of 9 tries before the final pipeline
 run and 4 of 4 in it: the object was not replaced, or was replaced late, and twice the console shows
 `Kernel panic - not syncing: Syscall called when in kernel mode`; a kernel without `lo` panics the
-same way, and 52 local mid-job restores did not reproduce it).
+same way, and 52 local mid-job restores did not reproduce it). The panic is a checkpoint taken while a
+user task is inside `Machine.userInterrupt`, the host-started kernel entry a busy task takes at each
+fuel yield: the task's kernel half is parked with the cpu flags in kernel mode, a restore resumes the
+user frames and never re-enters that half, and the task's next syscall finds `user_mode` false. A
+scratch kernel that printed the flags at the panic showed none of the 29 per-cpu words with the user
+bit set. `Machine.checkpoint` now runs the pump on (at most 10,000 steps) until no runner is
+interrupting, and refuses with a message the keeper retries otherwise. Without the guard 6 of 20 local
+runs panic and with it 0 of 20; 20 of 20 old builds fail the restore gate and 0 of 40 good builds
+(60 chained checkpoints, 2.4-6.7 s). `drive.ts survive` at 24,000,000 iterations then passes on Free 3
+of 3 (exact counts, one restore each); at 9,000,000 it fails by timing, because a redeploy replaces a
+warm-socket object only 262-330 s later (22-50 s with no socket). The final build passed 1 of 3 (one
+Mac-side network error, one guest out-of-memory kill after a restore); a post-restore kill that
+appears in 7 of 20 local runs on the fixed host and on the control kernel has no cause yet.
 
 On Free, each run against a fresh deployment:
 
@@ -1625,6 +1799,42 @@ read the owner token in `localStorage`), the guest's `set-cookie` and `clear-sit
 and the browser's `cookie` and `authorization` are not forwarded. The host parses a response the
 guest controls: its head is bounded at 64 KiB and bad framing is a 502.
 
+The kernel now lends the relay's buffers to the host (patch 0041) and the host hands them to the
+response body without a copy. On a 6.9 MB request (3 runs of 25 rounds, quiet at most 0.13 on all 54
+samples, paisley-park, under node) mean CPU is 13.0% lower for BusyBox httpd and 10.6% lower for
+lighttpd, a sign that held in all 3 paired runs on both servers, against a view ceiling of 34.0% and
+34.5% (a dropped body, 58.0% and 58.3%); the round medians show no gain for httpd (7.32 against 7.32 ms),
+so the saving sits in the tail rounds, and a 1 KiB request is unchanged inside a spread of 10% to 30%.
+All 6 replies are exact, and workerd reads a body stream's parts when they are pulled: a stream that
+reads nothing ahead is safe (128 of 128 chunks intact), an overwrite at enqueue is not (4 of 128). Before
+the lend, `wasm_net_send` crossings took 16.2-16.6% of the big request's CPU (16.1-17.2% in the first
+reading), their call share 4.4-6.7% (7.3-9.9% counting the timed clock imports) and the copy 63-76% of
+the send time, since only 422 of 605 sends copy; after it, send and copy are 3.4% of busy samples.
+
+lighttpd 1.4.76 [26] runs behind the relay: 6 of 6 replies equal its native build, and 12 of 12 through an
+idle-stream pool that keeps a stream for GET and HEAD requests without a body for 3 s (under lighttpd's
+5 s) and counts it in the 20-stream cap. A kept-alive lighttpd request takes 0.073 ms against 0.144 ms
+on a new stream, 49.3% less on the one clean sample (the two noisy ones read 42.4% and 46.5% and are not
+counted; 19 of 45 timed samples were noisy because the box was shared); BusyBox httpd cannot keep a
+connection, so its saving is 0. Per request httpd costs 0.654 ms, and a stalled stream holds 340 kB
+(httpd, one task each) against 24 kB (lighttpd, no task). A 6.9 MB read at 64 KiB/s finishes in
+104.7 s on local workerd (native BusyBox 105.0 s). The deployed Free edge keeps the
+`content-length` of a 206 reply that local `wrangler dev` drops for `text/html`, but one deployed read
+at 64 KiB/s ended at 27.15 s (curl exit 92, 1,703,717 bytes) and the later run on the final build
+finished (105.0 s); one run each. A stream with no read for 30 s is now closed and its slot freed (102
+of 102 serve and http tests); a client that reads one part every 29 s still holds a slot. A machine
+running lighttpd refuses to checkpoint, since the program has no Asyncify build (6 of 6 refusals).
+
+A census of the site's own machine (800 pages, borrowing on, 3 runs a cell, paisley-park, a V8 CPU
+profile at 100 us) puts process start at 34.8% of a configure-shaped run's busy samples (the
+instantiation leaves 30.9%), the kernel at 21.0%, guest code at 16.1%, unattributed `(program)` frames at
+14.8% and the garbage collector at 8.8%. On a big served request the guest kernel outside syscalls is
+the largest row (38.9% httpd, 44.5% lighttpd; the kernel has no name section, so it is not split),
+the scheduler's clock reads take 7.1% and 7.9%, and a machine costs 7.6x (httpd, 1 KiB), 9.4x (httpd,
+6.9 MB), 14.1x (lighttpd, 1 KiB) and 10.9x (lighttpd, 6.9 MB) native CPU per request (native 0.1433,
+0.7548, 0.0172 and 0.5793 ms). A checkpoint of that machine takes 37.1-51.6 ms of CPU every 26-27.6 s
+(0.14-0.20% amortised).
+
 ### Scheduler Core
 
 The scan-free tables in `machine.ts` (idle cpus and sleepers as indexes rather than scans) cut
@@ -1648,6 +1858,20 @@ the TypeScript scheduler on this host; the 4.7-7.5% above was measured in an ear
 columns the other way round from how the first copy of this table read them. A snapshot taken without
 a core region restores on the TypeScript scheduler and one taken with it restores without the core,
 keeping the region recorded.
+
+A Free machine does not hold 256 tasks. On the deployed boot rig 160 tasks pass at 1,400 pages with a
+4,096 kB reserve in the kernel's cap, 176 to 256 are taken by the platform in 3 of 3 attempts each, and
+on the shipped kernel (an 8,192 kB reserve) 150 pass at 1,200 pages while 160 at 1,200 was replaced 3 of
+3 (the account ended at 0 workers, 0 Durable Object namespaces, 2 KV). A task costs 353.6 kB of guest
+memory (a MemFree drop on paisley-park; 347-358 kB resident per cell) and about 150 kB of host: 111.3 kB
+of JavaScript heap after a collection (78.6 kB of arrays, 18.5 kB of dispatch table, 18.1 kB of tuples,
+from one 772-entry `WebAssembly.Table` per instance) and about 39 kB derived as native memory. Of a task's
+85 private pages 54 hold a nonzero byte and 31 are all zero (124 kB, 35% of the guest cost, 31 MB at 256
+tasks), touched because `mm/nommu.c` zero-fills every anonymous mapping it makes. `rcS` caps
+`kernel.threads-max` at (free memory minus the reserve) divided by 355 kB so `vfork` returns `EAGAIN`
+before the kernel's out-of-memory killer runs; the `taskcap` probe passes at 800 and 4,096 pages in all
+three C-suite modes, but on the deployed boot rig it stops after "the 61 running tasks stay alive" (3 of 6
+expected lines) and is not explained. The `SHORT` cell is 0 in 100 on both arms on all three hosts.
 
 ### Idle Machine, 24 Hours
 
@@ -1934,6 +2158,22 @@ endpoint pays is the address add; the base in each access's offset immediate giv
 is exact only for addresses proved not to wrap. Every figure is against the original wasm and not
 native Linux, and a nested `memory.grow` moves wasm3's guest base under native code (open).
 
+Giving the guest's bytes their own memory removes that add. The promoted module's memory 0 is the
+bytes wasm3 owns, and its metadata sits in memory 1 (C cannot name a memory index, so a text pass
+rewrites the guest's accesses to calls that become loads and stores on the other memory). Against the
+untouched guest in V8 (paisley-park, 9 samples of 5 rounds, 80 of 80 samples passed, 3 noisy and kept),
+the zlib endpoint reads 1.000 [1.000-1.010] over wasm3's shared Memory (the rebased form 1.110
+[1.110-1.120]) and zstd 1.000 [0.970-1.020] over a plain memory but 1.090 [0.990-1.150] over the shared
+one (4 of 9 samples at 0.99-1.00, 5 at 1.09-1.15; the best round is 0.984-0.997 in all 9 and the
+medians lose to spikes of 1-2.3 ms on a 6 ms unit, cause not isolated). Open zlib rungs read 2.38 at
+87.302% of instructions native, 1.79 at 92.312%, 1.43 at 95.333%, 1.02 at 99.873% and 1.01 at 99.943%
+and above (the base form: 2.43, 1.88, 1.52, 1.13, 1.11); the all-interpreted rung is 5% slower than the
+re-entry build (zlib 1.050 [1.030-1.080], zstd 1.010). Against native `-O2` the same endpoint is 1.15
+(zlib) and 1.58 (zstd), because native x86-64 runs the guests faster than V8 does (0.87 and 0.63 of the
+untouched module's time), so the layout moves `r` against the untouched module and cannot move it
+below native's. Combined peak memory is 6.8 MiB (zlib) and 28.7 MiB (zstd) under the base form's, and an
+over-limit `memory.grow` fails with -1 in both tiers.
+
 ---
 
 ## The Toolchain
@@ -2003,6 +2243,9 @@ compressed bytes once, and its cpio is the same.
 | the path-query counters live in one block exported by address, and `wasm_fs_chain` writes the mount, inode and mode of each prefix of a path in one call, with no sleeping lock and at most 9 links (0036) | the statx hit reads the generation in place and a miss fills in one call instead of one probe per component: hit 58 to 36 ns, forced miss 8,106 to 4,387 ns on paisley-park |
 | a program carries its stack ABI in a `gmux.abi` section and `exec` refuses one without the current version with `EPROTO` and a console line (0037, musl 0011) | a program built before the stack change failed with `cannot create state: not enough memory` or a segfault; the exec stub keeps the section, and the `abi` probe passes on the new kernel and fails on the old |
 | console output queues in a ring the host drains in one call (0038) | each write was a host call: on paisley-park `seq`'s CPU falls from 503.2 to 338.8 ms (0.673) and `cat`'s from 45.8 to 15.2 ms (0.332), output sha256 equal |
+| a copied region's pages are freed in aligned blocks instead of one by one (0039) | process teardown spent its time in `exit_group`; on paisley-park its samples fall from 340 to 154 (9.86% to 4.79% of busy samples, configure run at pool size 8), `mmput` inclusive from 251 to 82, pool8 configure wall from 660.3 to 626.3 ms and busy samples from 3,451 to 3,213, pool8 fork wall from 303.7 to 285.0 ms; `vmlinux.wasm` of the series is byte-equal to the earlier pipeline's |
+| a program stub's `gmux.abi` section is read from the bytes `exec` already has (0040) | the check that refuses a program built for another stack layout (0037) reads its section from the buffer `exec` already holds; a failing `execve` costs 0.3-0.5 us, so PATH-search failures were not the spawn path's cost |
+| the relay lends its buffers to the host and the host hands them to the response body without a copy (0041) | a 6.9 MB served request's mean CPU falls 13.0% (BusyBox httpd) and 10.6% (lighttpd) on paisley-park, 3 runs of 25 rounds, with a view ceiling of 34.0% and 34.5%; the kernel keeps a lent buffer until the host releases its address, and a release of an address that is not a live buffer frees nothing |
 
 The host boots the kernel without `nohz_full`. With it, the timekeeping cpu never stops its tick,
 so an idle machine woke the host about 220 times a second, and context tracking reads the clock
@@ -2058,7 +2301,7 @@ booted kernel.
 musl's wasm port shipped `setjmp` returning 0 and `longjmp` calling `abort()`. `cc-strict` now
 compiles every program with LLVM's wasm exception-handling lowering (`-mexception-handling -mllvm
 -wasm-enable-sjlj`) and links its runtime, `src/gmux/sjlj.c` and `src/gmux/sjlj-tag.S`. LLVM 18 emits
-the Emscripten ABI: `saveSetjmp`, `testSetjmp`, `getTempRet0`, `__wasm_longjmp`, and the tag
+the Emscripten [27] ABI: `saveSetjmp`, `testSetjmp`, `getTempRet0`, `__wasm_longjmp`, and the tag
 `__c_longjmp`, which nothing else in the link defines and which clang 18 crashes on as file-scope asm
 in C. Only functions that call `setjmp` are instrumented. The lowering matches calls named `setjmp`
 and `_setjmp` but not `sigsetjmp`, so `src/gmux/include/setjmp.h` routes `sigsetjmp` through
@@ -2220,6 +2463,17 @@ configure-shaped run down 57.4% (8,483 to 3,616 samples) and of a fork and exec 
 1,491); 300 fork and exec pairs take 43.3 ms against 124.6 (36 samples, 3 rounds, all kept). It
 engages on shared-instance builds only: the production site registers the plain BusyBox, and Katybug
 and asyncified or evacuable builds cannot be reset. A failing `execve` costs 0.3-0.5 us, so the PATH-search failures of a shell are not what spawn costs.
+
+Registering the share build of BusyBox (`busyboxShare`) takes a finished process's instance back
+into use on rigs and on fresh machines that never checkpoint. Against today's registry on paisley-park
+(36 of 36 samples, quiet 0.03-0.27) it cuts busy samples 59.1% on the configure-shaped run and 64.5%
+on fork and exec, wall 65.3% and 69.2%, and 300 fork and exec pairs by 61.6%; the six instantiation
+leaves fall from 42.0% and 45.3% of busy samples to 25.0% and 29.9%, and `new Instance` runs 6 times
+where it ran 10,830. Preparing instances ahead while the pump idles (`prefillInstances`, off by default)
+is inside the spread on every cell but one (1.2% lower, unexplained). The production build's ceiling is
+41.2% and 44.6% of busy samples, and no site path takes the share build, because the site checkpoints on
+a schedule. An asyncified instance costs 61.5-65.3 us to create against 59.0-67.2 us for the share
+build on the micro-rig, not the 100-200% more that had been assumed.
 
 ### Threads
 
@@ -2490,3 +2744,105 @@ Katybug's native checks need a Linux x86-64 host for the reference side (`tests/
 (`experiments/boot/scripts/stage.sh`, then `experiments/evacuation/scripts/control-flow.ts`).
 
 Every command prints its own total. Run it rather than quoting a count from this document.
+
+---
+
+## References
+
+Numbers appear in order of first use. "Pinned" names the commit or tag `src/sources.json` or a build
+script fixes, which is what the build read. "Read as an extraction" means a model's summary of the
+page or file was read, not its full text. A date of "n.d." means the year was not checked.
+
+[1] joelseverin, "linux, branch wasm-7.0: the Linux kernel with a WebAssembly architecture port," GitHub,
+commit 039e5f3e583f56f329657d1fe9945510dba10f41 on upstream Linux v7.0 (commit
+028ef9c96e96197026887c0f092424679298aae8), pinned in `src/sources.json`, n.d. [Online]. Available:
+https://github.com/joelseverin/linux
+
+[2] WebAssembly Community Group, "WebAssembly Specification," W3C, n.d. [Online]. Available:
+https://webassembly.github.io/spec/
+
+[3] Cloudflare, Inc., "Workers and Durable Objects: platform limits and pricing," Cloudflare Docs, n.d.
+[Online]. Available: https://developers.cloudflare.com/ (the limit and price figures in this report are
+labelled where they were measured instead of read; the pages are not individually identified)
+
+[4] BusyBox project, "BusyBox," tag 1_36_1, commit 1a64f6a20aaf6ea4dbba68bbfa8cc1ab7e5c57c4, pinned in
+`src/sources.json`, n.d. [Online]. Available: https://git.busybox.net/busybox
+
+[5] R. Felker et al., "musl libc," v1.2.5, commit 0784374d561435f7c787a555aeab8ede699ed298, pinned in
+`src/sources.json`, n.d. [Online]. Available: https://git.musl-libc.org/git/musl
+
+[6] WebAssembly Community Group, "JavaScript-Promise Integration (JSPI) proposal," n.d. [Online].
+Available: https://github.com/WebAssembly/js-promise-integration
+
+[7] WebAssembly Community Group, "Binaryen: Asyncify pass," n.d. [Online]. Available:
+https://github.com/WebAssembly/binaryen
+
+[8] R. Ierusalimschy et al., "Lua," version 5.4.7, n.d. [Online]. Available: https://www.lua.org/
+
+[9] Free Software Foundation, "GNU Coreutils," version 9.5, built on Alpine 3.20 with gcc -O2 as a static
+x86-64 binary by `userland-build.sh`, n.d. [Online]. Available: https://www.gnu.org/software/coreutils/
+
+[10] Free Software Foundation, "GNU Bash," version 5.2.37, n.d. [Online]. Available:
+https://www.gnu.org/software/bash/
+
+[11] D. R. Hipp et al., "SQLite," amalgamation `sqlite-autoconf-3460100`, n.d. [Online]. Available:
+https://sqlite.org/
+
+[12] D. Stenberg et al., "curl," version 8.10.1, n.d. [Online]. Available: https://curl.se/
+
+[13] Google, "V8 JavaScript engine," as shipped in Node.js v26.10.0 (V8 14.6.202.34-node.34) for the
+timed arms; the version in Workers is not exposed, n.d. [Online]. Available: https://v8.dev/
+
+[14] J. Gailly and M. Adler, "zlib," version 1.3.1, sha256
+9a93b2b7dfdac77ceba5a558a580e74667dd6fede4585b91eefb60f03b72df23, pinned in `src/sources.json`, n.d.
+[Online]. Available: https://zlib.net/
+
+[15] Free Software Foundation, "GNU gzip," version 1.13, n.d. [Online]. Available:
+https://www.gnu.org/software/gzip/
+
+[16] LLVM Project, "LLVM and clang," 18.1.2 (fork branch wasm-18.1.2, commit
+30dfc8fca8c206fa4f483e300937637291f61716, pinned in `src/sources.json`) and 18.1.3 in the CI image,
+n.d. [Online]. Available: https://llvm.org/
+
+[17] joelseverin, "linux-wasm: scripts to download, build and run a Linux system on the web using native
+WebAssembly," GitHub, commit 3103d5c877a8f6251b4b451c866a46941fd1fab3, pinned in `src/sources.json`,
+n.d. [Online]. Available: https://github.com/joelseverin/linux-wasm (repository page read as an
+extraction, accessed Oct. 16, 2026)
+
+[18] Cloudflare, Inc., "workerd: the Workers runtime," behaviour observed under `wrangler dev` and in
+`experiments/`, n.d. [Online]. Available: https://github.com/cloudflare/workerd
+
+[19] Canonical, "coreutils (noble) package details," Ubuntu Packages, version 9.4-3ubuntu6.3, read
+through a fetch tool's extraction of the live index. [Online]. Available:
+https://packages.ubuntu.com/noble/coreutils (accessed Oct. 16, 2026).
+
+[20] OpenSSL Project, "OpenSSL," version 3.0.13 in the Ubuntu 24.04 CI image and `libcrypto.so.3` in the
+box's system coreutils, n.d. [Online]. Available: https://www.openssl.org/
+
+[21] copy and contributors, "v86: x86 PC emulator and x86-to-WebAssembly compiler," GitHub, files
+`src/rust/jit.rs`, `src/rust/codegen.rs`, `src/rust/control_flow.rs`, `src/rust/cpu/memory.rs` and
+`docs/how-it-works.md` at master (commit not recorded), BSD-2-Clause, n.d. [Online]. Available:
+https://github.com/copy/v86 (files read as extractions, accessed Oct. 16, 2026)
+
+[22] yomaytk and contributors, "elfconv: AArch64 ELF to WebAssembly through Remill and LLVM," GitHub,
+`README.md`, `runtime/Memory.cpp`, `lifter/MainLifter.cpp` and the releases page at main (commit not
+recorded), n.d. [Online]. Available: https://github.com/yomaytk/elfconv (read as extractions, accessed
+Oct. 16, 2026; the project's Medium posts returned HTTP 403 and were not read)
+
+[23] userland-run, "NanoVM (userland.run): a RISC-V Linux userland emulator beside Node.js," GitHub, files
+`kernel/proc/router.mjs`, `kernel/proc/pipes.mjs`, `kernel/services/zlib.mjs`,
+`runners/node/src/host/engine.mjs`, `runners/node/DIVERGENCES.md` and `LICENSE.md` at main (commit not
+recorded), AGPL-3.0 or a commercial licence, n.d. [Online]. Available:
+https://github.com/userland-run/nano (read as extractions, accessed Oct. 16, 2026)
+
+[24] Leaning Technologies, "WebVM," GitHub, `src/lib/WebVM.svelte` at main, and "cheerpx-meta," n.d.
+[Online]. Available: https://github.com/leaningtech/webvm (read as an extraction, accessed Oct. 16,
+2026)
+
+[25] V. Shymanskyy and S. Volodin, "wasm3: a WebAssembly interpreter," GitHub, at the pin set in
+`tools/build-interp.sh` of the burrow package, n.d. [Online]. Available: https://github.com/wasm3/wasm3
+
+[26] lighttpd project, "lighttpd," version 1.4.76, n.d. [Online]. Available: https://www.lighttpd.net/
+
+[27] A. Zakai et al., "Emscripten," whose setjmp and longjmp ABI the toolchain follows, n.d. [Online].
+Available: https://emscripten.org/
