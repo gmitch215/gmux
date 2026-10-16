@@ -22,6 +22,7 @@ Durable Object with a BusyBox userland and a browser terminal.
 - [🚀 Quick Start](#-quick-start)
 - [📥 Install the Library](#-install-the-library)
 - [🐧 What Runs](#-what-runs)
+- [🐞 Katybug](#-katybug)
 - [🧱 How It Works](#-how-it-works)
 - [🔒 Security](#-security)
 - [🛠️ Building from Source](#️-building-from-source)
@@ -109,6 +110,74 @@ Programs are compiled for `wasm32-linux` with `scripts/cc-strict`, which refuses
 the syscall surface. Code that arrives at run time cannot be compiled on Workers, so every native
 executable is built with the deployment.
 
+## 🐞 Katybug
+
+Katybug runs unmodified x86-64 and AArch64 Linux executables inside a machine. It ships in the
+package as `kernel/katybug.wasm`, an ordinary gmux program: it decodes the guest's machine code into
+gmux's IR, runs it, and turns each guest syscall into the machine's own. The init script registers
+it with `binfmt_misc`, so a shell, `execve` and `fork` treat a foreign ELF like any other program.
+
+- **Executables:** static and dynamically linked, against glibc or musl with their own `ld.so`
+- **Processes:** `fork`, `execve`, threads, signals and their handlers
+- **Instruction sets:** x86-64 with x87 and SSE, AArch64 with its floating point and SIMD
+- **Host implementations:** recognized library code (the string functions, zlib, the md5, sha1,
+  sha256 and sha512 blocks) runs on host kernels, and a whole md5, sha1, sha256 or sha512 stream
+  can finish on the host's own crypto
+- **Images:** an executable's pages are read from its file when first touched
+
+### Running a Foreign Binary
+
+Register Katybug next to BusyBox, then add the executable to the root filesystem by appending a
+`newc` cpio archive to the initramfs. The kernel unpacks the archives in order.
+
+```sh
+printf 'hello\n' | cpio -o -H newc > hello.cpio
+```
+
+```ts
+import { createHash } from 'node:crypto';
+import { readFileSync } from 'node:fs';
+import { Machine } from '@gmitch215/gmux';
+import manifest from '@gmitch215/gmux/kernel/manifest.json';
+import vmlinux from '@gmitch215/gmux/kernel/vmlinux.wasm';
+import busybox from '@gmitch215/gmux/kernel/busybox.wasm';
+import katybug from '@gmitch215/gmux/kernel/katybug.wasm';
+import initrd from '@gmitch215/gmux/kernel/initramfs.bin';
+
+const base = new Uint8Array(initrd);
+const extra = readFileSync('hello.cpio');
+const pad = (4 - (base.length % 4)) % 4;
+const image = new Uint8Array(base.length + pad + extra.length);
+image.set(base);
+image.set(extra, base.length + pad);
+
+const machine = new Machine({
+  vmlinux,
+  initrd: image,
+  cmdline: 'maxcpus=3 root=/dev/ram0 rootfstype=ramfs init=/init console=hvc',
+  registry: new Map([
+    [manifest.busybox, busybox],
+    [manifest.katybug, katybug]
+  ]),
+  sharedKernel: true,
+  sha256: (bytes) => createHash('sha256').update(bytes).digest('hex'),
+  digest: (algorithm) => createHash(algorithm),
+  write: (text) => console.log(text)
+});
+machine.type('/hello\n');
+const started = Date.now();
+await machine.run(
+  () => Date.now() - started > 10_000,
+  (ms) => new Promise((resolve) => setTimeout(resolve, ms))
+);
+```
+
+`digest` is optional. With it, a digest stream Katybug recognizes runs on the host's crypto; without
+it, Katybug hashes with its own kernels. A machine cannot checkpoint while a host digest is open.
+
+The technical report's [Foreign Executables](TECHNICAL_REPORT.md#foreign-executables) section covers
+how Katybug decodes, caches and lifts code, its host kernels, and what each costs.
+
 ## 🧱 How It Works
 
 The kernel and every process share one WebAssembly memory. A syscall is a direct call from the
@@ -116,9 +185,7 @@ program's instance into the kernel's. Blocking is JSPI: every task that waits is
 stack, and one pump on the Durable Object's single thread resumes exactly the task the kernel
 schedules next. When a machine has to leave memory, its parked stacks become bytes (Asyncify for the
 kernel, resumable frames or Asyncify for programs), and a restore rewinds them into fresh instances.
-
-Katybug decodes x86-64 and AArch64 into gmux's IR and interprets it, turning guest syscalls into the
-machine's own. `binfmt_misc` hands it any foreign ELF, so `execve` of an amd64 binary just works.
+Foreign executables run through [Katybug](#-katybug).
 
 [TECHNICAL_REPORT.md](TECHNICAL_REPORT.md) has the design, the platform limits that shape it, and
 what each operation costs.
@@ -127,8 +194,8 @@ what each operation costs.
 
 A machine is a Durable Object: code inside it has no Worker bindings, secrets or network authority
 beyond what the host passes to it, and a deployed Worker cannot compile code at run time. Inside one
-machine, root processes share one trust domain; non-root processes cannot write memory they do not
-own, but they can read it. [SECURITY.md](SECURITY.md) has the trust model, the import surface and the
+machine, root processes share one trust domain; a non-root process reaches only its own memory and
+the shared mappings it maps, and a forked process runs in a memory of its own. [SECURITY.md](SECURITY.md) has the trust model, the import surface and the
 threat matrix.
 
 ## 🛠️ Building from Source
