@@ -108,6 +108,12 @@ function timersCheck(section: string): string[] {
 	return problems;
 }
 
+function taskcapCheck(section: string): string[] {
+	const oom = section.match(/invoked oom-killer|Out of memory|Killed process/);
+	console.log(`taskcap: ${section.match(/^CAP .*$/m)?.[0] ?? 'no CAP line'}`);
+	return oom ? [`the kernel ran the OOM killer: ${oom[0]}`] : [];
+}
+
 const probes: Record<string, Probe> = {
 	// SECURITY.md: root is trusted with the machine; a non-root task runs its guarded build, which
 	// checks loads and stores, and reaches a shared mapping (System V, POSIX, a file, anonymous)
@@ -450,6 +456,29 @@ const probes: Record<string, Probe> = {
 		lines: [],
 		passes: 3
 	},
+	// rcS sets kernel.threads-max from free memory: past it vfork fails with EAGAIN, the tasks
+	// already running stay alive and the OOM killer does not run
+	taskcap: {
+		program: null,
+		pages: 800,
+		cmd:
+			'mkdir -p /cap; mkfifo /cap/go; max=$(cat /proc/sys/kernel/threads-max); ' +
+			'read -r _ _ _ t _ < /proc/loadavg; base=${t#*/}; want=$((max+40)); [ $want -gt 200 ] && want=200; ' +
+			'count() { n=0; for d in /proc/[0-9]*; do { read c < $d/comm; } 2> /dev/null; [ "$c" = cat ] && n=$((n+1)); done; }; ' +
+			'memfree() { while read -r k v _; do [ "$k" = MemFree: ] && mf=$v && break; done < /proc/meminfo; }; ' +
+			'[ $max -lt 200 ] && echo "PASS threads-max $max is set from free memory" || echo "FAIL threads-max $max"; ' +
+			'i=0; { while [ $i -lt $want ]; do cat /cap/go > /dev/null & i=$((i+1)); done; } 2> /cap/err; ' +
+			'count; first=$n; memfree; k=0; while [ $k -lt 20000 ]; do k=$((k+1)); done; count; ' +
+			'echo "CAP max $max base $base started $first then $n free $mf kB"; ' +
+			'[ $first -ge $((max-base-3)) ] && [ $first -le $((max-base)) ] && echo "PASS $first tasks fill the cap" || echo "FAIL $first tasks at a cap of $((max-base))"; ' +
+			'[ $n -eq $first ] && echo "PASS the $n running tasks stay alive" || echo "FAIL $n tasks left of $first"; ' +
+			'echo x > /cap/go; wait; [ $? -eq 0 ] && echo "PASS wait returned" || echo "FAIL wait"; ' +
+			'grep -q "Resource temporarily unavailable" /cap/err && echo "PASS vfork failed with EAGAIN" || echo "FAIL vfork: $(head -n 1 /cap/err)"; ' +
+			'dmesg | grep -q "invoked oom-killer" && echo "FAIL the OOM killer ran" || echo "PASS no OOM killer"',
+		lines: [],
+		passes: 6,
+		check: taskcapCheck
+	},
 	// a thread cannot change its affinity; a program may set a mask of several cpus and exit (the
 	// kernel once panicked in release_thread)
 	affinity: { cmd: 'affinity; echo "affinity rc $?"', lines: ['affinity rc 0'], passes: 5 },
@@ -501,7 +530,9 @@ const fileEntries = (name: string) =>
 // SHARE=1: every program that can be shared runs each of its processes on one instance
 const share = !!process.env.SHARE;
 // RECYCLE=1: the same share builds, each process on an instance of its own that a finished one hands on
-const recycle = !!process.env.RECYCLE;
+// PREFILL=1: RECYCLE=1 with idle instances made ahead while the pump has nothing to run
+const prefill = !!process.env.PREFILL;
+const recycle = !!process.env.RECYCLE || prefill;
 const busybox = read(share || recycle ? 'kernel/busybox.share.wasm' : 'kernel/busybox.wasm');
 const manifest = JSON.parse(readFileSync(join(build, 'kernel/manifest.json'), 'utf8'));
 // a kernel staged from other patches than this tree's fails probes for reasons the tree does not have
@@ -648,6 +679,7 @@ async function boot(group: string[], maximumPages: number, maxcpus = 3) {
 		sha256,
 		sharedKernel: true,
 		shareInstances: share,
+		...(prefill ? { prefillInstances: 4 } : {}),
 		guarded,
 		// FROZEN=1: a host clock that never moves, as a deployed Worker's while code runs
 		...(process.env.FROZEN ? { now: () => 0n } : {}),

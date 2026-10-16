@@ -1,6 +1,7 @@
 // tests/c probes and libc-test's thread suite on a deployed Free machine, one machine each
 const B = process.env.WORKER_URL;
 if (!B) throw new Error('set WORKER_URL to the deployed worker, e.g. https://<name>.<subdomain>.workers.dev');
+const taskCount = Number(process.env.TASKS ?? 96);
 const passes = (n) => (o) => (o.match(/^PASS /gm) ?? []).length === n && !/^FAIL /m.test(o);
 const probes = [
 	['isolation', 'isolation', (o) => o.includes('TRUST kernel-address write accepted') && passes(90)(o)],
@@ -63,14 +64,31 @@ const probes = [
 	[
 		'tasks',
 		'mkdir -p /tasks; mkfifo /tasks/go; i=0; ' +
-			'{ while [ $i -lt 96 ]; do cat /tasks/go > /dev/null & i=$((i+1)); done; } 2> /tasks/err; ' +
+			`{ while [ $i -lt ${taskCount} ]; do cat /tasks/go > /dev/null & i=$((i+1)); done; } 2> /tasks/err; ` +
 			'count() { n=0; for d in /proc/[0-9]*; do read c < $d/comm; [ "$c" = cat ] && n=$((n+1)); done; }; ' +
-			'k=0; count; while [ $n -lt 96 ] && [ $k -lt 50 ]; do sleep 0.1; count; k=$((k+1)); done; ' +
-			'[ $n -eq 96 ] && echo "PASS 96 tasks alive" || echo "FAIL $n tasks alive"; ' +
+			`k=0; count; while [ $n -lt ${taskCount} ] && [ $k -lt 50 ]; do sleep 0.1; count; k=$((k+1)); done; ` +
+			`[ $n -eq ${taskCount} ] && echo "PASS ${taskCount} tasks alive" || echo "FAIL $n tasks alive"; ` +
 			'[ -s /tasks/err ] && echo "FAIL vfork: $(head -n 1 /tasks/err)" || echo "PASS no vfork failure"; ' +
 			'grep MemFree /proc/meminfo; echo x > /tasks/go; wait; ' +
 			'[ $? -eq 0 ] && echo "PASS wait returned" || echo "FAIL wait"',
 		passes(3)
+	],
+	[
+		'taskcap',
+		'mkdir -p /cap; mkfifo /cap/go; max=$(cat /proc/sys/kernel/threads-max); ' +
+			'read -r _ _ _ t _ < /proc/loadavg; base=${t#*/}; want=$((max+40)); [ $want -gt 200 ] && want=200; ' +
+			'count() { n=0; for d in /proc/[0-9]*; do { read c < $d/comm; } 2> /dev/null; [ "$c" = cat ] && n=$((n+1)); done; }; ' +
+			'memfree() { while read -r k v _; do [ "$k" = MemFree: ] && mf=$v && break; done < /proc/meminfo; }; ' +
+			'[ $max -lt 200 ] && echo "PASS threads-max $max is set from free memory" || echo "FAIL threads-max $max"; ' +
+			'i=0; { while [ $i -lt $want ]; do cat /cap/go > /dev/null & i=$((i+1)); done; } 2> /cap/err; ' +
+			'count; first=$n; memfree; k=0; while [ $k -lt 20000 ]; do k=$((k+1)); done; count; ' +
+			'echo "CAP max $max base $base started $first then $n free $mf kB"; ' +
+			'[ $first -ge $((max-base-3)) ] && [ $first -le $((max-base)) ] && echo "PASS $first tasks fill the cap" || echo "FAIL $first tasks at a cap of $((max-base))"; ' +
+			'[ $n -eq $first ] && echo "PASS the $n running tasks stay alive" || echo "FAIL $n tasks left of $first"; ' +
+			'echo x > /cap/go; wait; [ $? -eq 0 ] && echo "PASS wait returned" || echo "FAIL wait"; ' +
+			'grep -q "Resource temporarily unavailable" /cap/err && echo "PASS vfork failed with EAGAIN" || echo "FAIL vfork: $(head -n 1 /cap/err)"; ' +
+			'dmesg | grep -q "invoked oom-killer" && echo "FAIL the OOM killer ran" || echo "PASS no OOM killer"',
+		passes(6)
 	],
 	[
 		'serve',
@@ -101,7 +119,7 @@ const probes = [
 // fork needs resumable frames; PROT_NONE mappings take real memory without an MMU
 const blocked = new Set(['ipc_sem', 'pthread_atfork-errno-clobber', 'pthread_exit-dtor', 'pthread_create-oom']);
 // the amd64 userland needs more guest pages than the default
-const pages = { userland: 2400 };
+const pages = { userland: 2400, taskcap: 800, ...(process.env.PAGES ? { tasks: Number(process.env.PAGES) } : {}) };
 const libcTests = (process.env.LIBC_TESTS ?? '').split(' ').filter(Boolean);
 // ONLY="posix dl" runs just those
 const only = (process.env.ONLY ?? '').split(' ').filter(Boolean);
@@ -145,7 +163,8 @@ for (const [label, cmd, check] of cases) {
 	const ok = check(out);
 	const note = blocked.has(label) ? ' (known: needs fork or an MMU)' : '';
 	if (!ok && !note) failed++;
-	console.log(ok ? 'PASS' : 'FAIL', label.padEnd(34), ok ? '' : note || JSON.stringify(out.slice(-240)));
+	const held = label === 'tasks' ? (out.match(/MemFree:\s+\d+ kB/)?.[0] ?? '') : '';
+	console.log(ok ? 'PASS' : 'FAIL', label.padEnd(34), ok ? held : note || JSON.stringify(out.slice(-240)));
 }
 console.log(`machines lost to the platform: ${resets} boots reset, ${replaced} replaced after boot`);
 process.exit(failed ? 1 : 0);

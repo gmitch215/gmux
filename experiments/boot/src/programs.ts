@@ -63,7 +63,7 @@ export const PROGRAMS: [string, WebAssembly.Module][] = [
 	['c4cd091d72ad4c1da645dd145012fbddbdda3a90a9fcad6f6ee335030493f84e', program18],
 	['4dda0b934734a3b0c2106687adb00a7a438e07bb422e65ec4538005c38c83b15', program19],
 	['2e32baa636fb6b3125d8bacb8ea887d97222d3cfe85aeb8ede499efe93d3f0e6', program20],
-	['230b1e0288d3ce6c5a1a9ab9b3f761d565ee746ff41caa640428cef77e2b8d4f', katybug],
+	['ccc1452ef031226249be93d74d037cae24c80d98ab8bf185942f4a5010ce61ae', katybug],
 ];
 export const GUARDED: [string, WebAssembly.Module][] = [
 	['ee6f4c2817b36625e19934ee8bacd21a8c653952d850907c5e9ef81659a012da', guarded0],
