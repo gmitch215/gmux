@@ -237,6 +237,11 @@ export class MachineDO extends DurableObject<Env> {
 					claimed: this.owner.get() !== null,
 					running: this.keeper.machine !== null,
 					stats: this.keeper.machine?.stats ?? null,
+					streams: {
+						machine: this.keeper.machine?.openStreams ?? null,
+						serving: this.server.open,
+						idle: this.server.idle
+					},
 					durable: { ...this.keeper.counts, quietMs: this.keeper.quietMs },
 					policy: this.keeper.policy,
 					thermal: {

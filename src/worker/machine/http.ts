@@ -33,12 +33,14 @@ const encoder = new TextEncoder();
 /**
  * A request as HTTP/1.1 for a program in the machine: the head, then the body as it arrives, framed
  * by its Content-Length or chunked. Hop-by-hop headers are dropped and the connection is closed
- * after the response, which is how the response is framed when it carries no length. A body that
- * runs past `maxBytes` throws BodyTooLarge before the byte that crosses the bound is sent
+ * after the response, which is how the response is framed when it carries no length; with
+ * `keepAlive` it is left open for the next request. A body that runs past `maxBytes` throws
+ * BodyTooLarge before the byte that crosses the bound is sent
  */
 export async function* requestBytes(
 	request: Request,
-	maxBytes = Infinity
+	maxBytes = Infinity,
+	keepAlive = false
 ): AsyncGenerator<Uint8Array> {
 	const url = new URL(request.url);
 	const connection = (request.headers.get('connection') ?? '')
@@ -62,7 +64,7 @@ export async function* requestBytes(
 	else if (chunked) head += 'transfer-encoding: chunked\r\n';
 	else if (request.method === 'POST' || request.method === 'PUT' || request.method === 'PATCH')
 		head += 'content-length: 0\r\n';
-	head += 'connection: close\r\n\r\n';
+	head += `connection: ${keepAlive ? 'keep-alive' : 'close'}\r\n\r\n`;
 	yield encoder.encode(head);
 	if (request.body === null) return;
 	const reader = request.body.getReader();
@@ -101,6 +103,8 @@ export interface ResponseHead {
 	statusText: string;
 	headers: Headers;
 	framing: Framing;
+	/** the connection stays open after the body: HTTP/1.1 (or a keep-alive 1.0) with a body that has its own end */
+	keepAlive: boolean;
 }
 
 /** the index just past the first blank line of `bytes` (a script's headers may end in a bare LF), or -1 */
@@ -125,9 +129,9 @@ function latin1(bytes: Uint8Array): string {
 export function parseHead(bytes: Uint8Array, method: string): ResponseHead {
 	const lines = latin1(bytes).split(/\r?\n/);
 	while (lines.at(-1) === '') lines.pop();
-	const status = /^HTTP\/1\.[01] (\d{3})(?: (.*))?$/.exec(lines[0] ?? '');
+	const status = /^HTTP\/1\.([01]) (\d{3})(?: (.*))?$/.exec(lines[0] ?? '');
 	if (!status) throw new BadGateway('bad status line');
-	const code = Number(status[1]);
+	const code = Number(status[2]);
 	const headers = new Headers();
 	for (const line of lines.slice(1)) {
 		const colon = line.indexOf(':');
@@ -166,7 +170,11 @@ export function parseHead(bytes: Uint8Array, method: string): ResponseHead {
 	headers.append('content-security-policy', GUEST_CSP);
 	// a body the host decoded no longer has a chunked length
 	if (framing.kind === 'chunked' || framing.kind === 'close') headers.delete('content-length');
-	return { status: code, statusText: status[2] ?? '', headers, framing };
+	const keepAlive =
+		framing.kind !== 'close' &&
+		!named.includes('close') &&
+		(status[1] === '1' || named.includes('keep-alive'));
+	return { status: code, statusText: status[3] ?? '', headers, framing, keepAlive };
 }
 
 /** decodes a chunked body incrementally; `push` returns the bytes it held and whether the body ended */
@@ -179,6 +187,9 @@ class ChunkedDecoder {
 	get ended(): boolean {
 		return this.state === 'end';
 	}
+
+	/** bytes came after the body's end */
+	extra = false;
 
 	push(bytes: Uint8Array): Uint8Array[] {
 		const out: Uint8Array[] = [];
@@ -220,6 +231,7 @@ class ChunkedDecoder {
 					throw new BadGateway('trailer too long');
 			}
 		}
+		if (this.state === 'end' && at < bytes.length) this.extra = true;
 		return out;
 	}
 }
@@ -229,64 +241,87 @@ function framedBody(
 	reader: ReadableStreamDefaultReader<Uint8Array>,
 	rest: Uint8Array,
 	framing: Framing,
-	done: (clean: boolean) => void,
-	fail: (error: Error) => Error
+	keepAlive: boolean,
+	done: (clean: boolean, reusable?: boolean) => void,
+	fail: (error: Error) => Error,
+	recycle?: () => void
 ): ReadableStream<Uint8Array> {
 	const decoder = framing.kind === 'chunked' ? new ChunkedDecoder() : null;
 	let left = framing.kind === 'length' ? framing.left : 0;
 	let pending: Uint8Array | undefined = rest.length ? rest : undefined;
+	let extra = false;
 	/** the body bytes in `bytes`, and whether the body is over */
 	const feed = (bytes: Uint8Array): { out: Uint8Array[]; ended: boolean } => {
-		if (decoder) return { out: decoder.push(bytes), ended: decoder.ended };
+		if (decoder) {
+			const out = decoder.push(bytes);
+			extra = decoder.extra;
+			return { out, ended: decoder.ended };
+		}
 		if (framing.kind === 'length') {
 			const take = bytes.subarray(0, left);
 			left -= take.length;
+			extra = take.length < bytes.length;
 			return { out: [take], ended: left === 0 };
 		}
 		return { out: [bytes], ended: false };
 	};
-	return new ReadableStream<Uint8Array>({
-		async pull(controller) {
-			try {
-				for (;;) {
-					let result: { out: Uint8Array[]; ended: boolean };
-					if (pending) {
-						result = feed(pending);
-						pending = undefined;
-					} else {
-						const { done: eof, value } = await reader.read();
-						if (!eof) result = feed(value);
-						else if (framing.kind === 'close') result = { out: [], ended: true };
-						else throw new Error('the machine closed mid-body');
+	return new ReadableStream<Uint8Array>(
+		{
+			async pull(controller) {
+				// a read is waiting, so the consumer is done with every part this stream gave before
+				recycle?.();
+				try {
+					for (;;) {
+						let result: { out: Uint8Array[]; ended: boolean };
+						if (pending) {
+							result = feed(pending);
+							pending = undefined;
+						} else {
+							const { done: eof, value } = await reader.read();
+							if (!eof) result = feed(value);
+							else if (framing.kind === 'close') result = { out: [], ended: true };
+							else throw new Error('the machine closed mid-body');
+						}
+						for (const part of result.out) if (part.length) controller.enqueue(part);
+						if (result.ended) {
+							// bytes past the body's end leave the connection out of step with the next request
+							const reusable = keepAlive && !extra;
+							if (reusable) reader.releaseLock();
+							done(true, reusable);
+							controller.close();
+							return;
+						}
+						if (result.out.some((part) => part.length)) return;
 					}
-					for (const part of result.out) if (part.length) controller.enqueue(part);
-					if (result.ended) {
-						done(true);
-						controller.close();
-						return;
-					}
-					if (result.out.some((part) => part.length)) return;
+				} catch (error) {
+					controller.error(fail(error as Error));
 				}
-			} catch (error) {
-				controller.error(fail(error as Error));
+			},
+			cancel() {
+				fail(new Error('the reader went away'));
 			}
 		},
-		cancel() {
-			fail(new Error('the reader went away'));
-		}
-	});
+		// no read ahead: a pull means the consumer asked, which is what lets `recycle` free buffers
+		{ highWaterMark: 0 }
+	);
 }
 
 /**
  * The machine's reply as a `Response`: reads until the head is complete, then streams the body as
  * the framing says. A head the host cannot frame throws BadGateway; a body cut short errors the
  * stream, since its head has gone out already. `done` is told once the body has ended cleanly (true)
- * or the stream is over for another reason (false: the reader left, or the reply was bad)
+ * or the stream is over for another reason (false: the reader left, or the reply was bad). A clean
+ * end that leaves the connection open and in step for another request says `reusable`, and the
+ * source's reader is released so the next `responseFrom` can take it. `recycle` is told, each time
+ * the body is asked for more, that every chunk read from `source` before is used up (the head is
+ * copied before the body starts); the body needs its consumer to finish one part before it asks for
+ * the next
  */
 export async function responseFrom(
 	source: ReadableStream<Uint8Array>,
 	method: string,
-	done: (clean: boolean) => void = () => {}
+	done: (clean: boolean, reusable?: boolean) => void = () => {},
+	recycle?: () => void
 ): Promise<Response> {
 	const reader = source.getReader();
 	const fail = (error: Error) => {
@@ -322,14 +357,19 @@ export async function responseFrom(
 	}
 	const { framing } = head;
 	const empty = framing.kind === 'none' || (framing.kind === 'length' && framing.left === 0);
-	if (empty) done(true);
+	let response: Response;
 	try {
-		return new Response(empty ? null : framedBody(reader, rest, framing, done, fail), {
-			status: head.status,
-			statusText: head.statusText,
-			headers: head.headers
-		});
+		response = new Response(
+			empty ? null : framedBody(reader, rest, framing, head.keepAlive, done, fail, recycle),
+			{ status: head.status, statusText: head.statusText, headers: head.headers }
+		);
 	} catch {
 		throw fail(new BadGateway('the response is refused'));
 	}
+	if (empty) {
+		const reusable = head.keepAlive && !rest.length;
+		if (reusable) reader.releaseLock();
+		done(true, reusable);
+	}
+	return response;
 }

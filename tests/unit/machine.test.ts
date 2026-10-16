@@ -4,10 +4,12 @@ import { createHash } from 'node:crypto';
 import { mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { deflateRawSync } from 'node:zlib';
 import { describe, expect, it } from 'vitest';
 import { uleb } from '../../scripts/wasm/binary.ts';
 import { stub } from '../../scripts/wasm/exec-stubs.ts';
 import { hostRuntime } from '../../scripts/wasm/router-modules.ts';
+import { nodeInflater } from '../../src/worker/machine/inflate.ts';
 import { Ingress, READ_BUFFER, type NetStats } from '../../src/worker/machine/ingress.ts';
 import {
 	Machine,
@@ -532,9 +534,10 @@ describe('Machine', () => {
 			await spawn('w', 2);
 			await release(3);
 			await release(5);
+			// the program's start function reads its data's flag word, so the memory reaches the data
 			(machine as any).privateMemories.set(
 				1,
-				new WebAssembly.Memory({ initial: 2, maximum: 64, shared: true })
+				new WebAssembly.Memory({ initial: 8, maximum: 64, shared: true })
 			);
 			await spawn('w', 4);
 			expect(machine.stats.recycledStarts).toBe(0);
@@ -560,6 +563,102 @@ describe('Machine', () => {
 			await spawn('w', 6, restored);
 			expect(restored.stats.recycledStarts).toBe(2);
 			expect(r.output()).not.toContain('shared bad');
+		});
+
+		describe('instances made ahead', () => {
+			const ahead = async (options: Partial<MachineOptions> = {}) => {
+				const made = setup({ recycleInstances: 4, prefillInstances: 4, ...options });
+				await made.r.run(made.machine, () => made.r.output().includes('parent ok'));
+				await made.spawn('w', 2);
+				return made;
+			};
+			const idle = (machine: Machine) =>
+				(machine as any).pool.get((machine as any).options.registry.get('S'));
+			const sentinel = (machine: Machine) => {
+				const at = (machine as any).sentinel;
+				return new Uint32Array(machine.memory.buffer, at, 0x4000);
+			};
+
+			it('fills the pool while the pump idles, writes nothing, and hands the instances to the next execs', async () => {
+				const { r, machine, release, spawn } = await ahead();
+				expect(machine.stats.userExecs).toBe(2);
+				await r.run(machine, () => machine.stats.prefilled === 2);
+				expect(machine.stats.prefilled).toBe(2);
+				expect(idle(machine)).toHaveLength(2);
+				expect(sentinel(machine).every((word) => word === 2)).toBe(true);
+				await release(3);
+				await release(5);
+				// the two running processes' places were left free for their instances
+				expect(machine.stats.recycleReturns).toBe(2);
+				expect(idle(machine)).toHaveLength(4);
+				await spawn('w', 4);
+				expect(machine.stats.recycledStarts).toBe(2);
+				expect(machine.stats.userExecs).toBe(4);
+				expect(r.output().match(/shared ok\n/g)).toHaveLength(4);
+				expect(r.output()).not.toContain('shared bad');
+			});
+
+			it('leaves the places of running processes free, so no instance it makes is dropped on return', async () => {
+				const { r, machine, release } = await ahead({
+					recycleInstances: 2,
+					prefillInstances: 2
+				});
+				await r.run(machine, () => false);
+				// two processes run and the limit is two
+				expect(machine.stats.prefilled).toBe(0);
+				await release(3);
+				await r.run(machine, () => false);
+				// one is back in the pool and one still runs
+				expect(machine.stats.prefilled).toBe(0);
+				expect(idle(machine)).toHaveLength(1);
+			});
+
+			it('gives the same transcript as no pool at all', async () => {
+				const transcript = async (options: Partial<MachineOptions>) => {
+					const { r, machine, release, spawn } = await ahead(options);
+					await r.run(machine, () =>
+						options.prefillInstances ? machine.stats.prefilled === 2 : true
+					);
+					await release(3);
+					await release(5);
+					await spawn('w', 4);
+					return r.output();
+				};
+				const plain = await transcript({ recycleInstances: 0, prefillInstances: 0 });
+				expect(await transcript({})).toBe(plain);
+			});
+
+			it('makes none by default', async () => {
+				const { r, machine } = await ahead({ prefillInstances: undefined });
+				await r.run(machine, () => false);
+				expect(machine.stats.prefilled).toBe(0);
+				expect((machine as any).sentinel).toBe(0);
+			});
+
+			it('makes none while a fork child has memory of its own', async () => {
+				const { r, machine } = await ahead();
+				(machine as any).privateMemories.set(
+					1,
+					new WebAssembly.Memory({ initial: 8, maximum: 64, shared: true })
+				);
+				await r.run(machine, () => false);
+				expect(machine.stats.prefilled).toBe(0);
+			});
+
+			it('saves none in a checkpoint, and a restored machine makes none', async () => {
+				const { r, machine, release } = await ahead({ asyncify: true });
+				await r.run(machine, () => machine.stats.prefilled === 2);
+				await release(3);
+				await release(5);
+				const snapshot = await machine.checkpoint();
+				const restored = await Machine.restore(r.machineOptions, snapshot);
+				expect(idle(restored) ?? []).toHaveLength(0);
+				// the counters travel in the snapshot; a restored machine adds none
+				const before = restored.stats.prefilled;
+				await r.run(restored, () => false);
+				expect(restored.stats.prefilled).toBe(before);
+				expect(idle(restored) ?? []).toHaveLength(0);
+			});
 		});
 
 		it('leaves a program that is not a share build to its own instance each time', async () => {
@@ -1083,6 +1182,41 @@ describe('Machine', () => {
 			expect(restored.crashed).toBeFalsy();
 		});
 
+		it('finishes a task inside a user-mode interrupt before it checkpoints, so a restore never skips its kernel half', async () => {
+			const r = rig({
+				asyncify: true,
+				sharedKernel: true,
+				registry: new Map([['I', evacuated('toy-evac.wat')]])
+			});
+			const machine = new Machine(r.machineOptions);
+			await r.run(machine, () => r.output().includes('parent ok'));
+			machine.type('i');
+			await r.run(machine, () => machine.stats.fuelYields >= 5);
+			const view = new DataView(machine.memory.buffer);
+			view.setUint32(0x814, 1, true);
+			view.setUint32(0x80c, 1, true);
+			const inside = () =>
+				[
+					...(
+						machine as unknown as { runners: Map<number, { interrupting?: boolean }> }
+					).runners.values()
+				].some((runner) => runner.interrupting);
+			await r.run(machine, inside);
+			expect(inside()).toBe(true);
+			const snapshot = await machine.checkpoint();
+			expect(r.output().match(/user interrupt/g)).toHaveLength(1);
+			const restored = await Machine.restore(r.machineOptions, {
+				...snapshot,
+				memory: snapshot.memory.slice()
+			});
+			await r.run(restored, () => false);
+			const before = r.output().length;
+			restored.type('r');
+			await r.run(restored, () => r.output().includes('user back'));
+			expect(r.output().slice(before)).toContain('handled\nvfork child\nuser back\n');
+			expect(restored.crashed).toBeFalsy();
+		});
+
 		it("restores lazily: a parked process's pages come in only when one of its tasks runs", async () => {
 			const r = rig({
 				asyncify: true,
@@ -1245,6 +1379,52 @@ describe('Machine', () => {
 			expect(word(machine, 0x1420c)).toBe(-1);
 		});
 
+		it('opens every algorithm of the family and refuses an id past it', async () => {
+			const { machine } = await started();
+			new Uint8Array(machine.memory.buffer).set(Buffer.from('abc'), 0x14400);
+			const me = { id: 3 } as never;
+			const family = [
+				['md5', 16],
+				['sha1', 20],
+				['sha256', 32],
+				['sha512', 64],
+				['sha224', 28],
+				['sha384', 48],
+				['blake2b512', 64]
+			] as const;
+			for (const [i, [name, length]] of family.entries()) {
+				const id = machine['hostDigest'](me, 0, i + 1, 0, 0);
+				expect(id).toBeGreaterThan(0);
+				expect(machine['hostDigest'](me, 1, id, 0x14400, 3)).toBe(0);
+				expect(machine['hostDigest'](me, 2, id, 0x14500, 0)).toBe(length);
+				const got = Buffer.from(machine.memory.buffer.slice(0x14500, 0x14500 + length));
+				expect(got.toString('hex')).toBe(createHash(name).update('abc').digest('hex'));
+			}
+			expect(machine['hostDigest'](me, 0, 8, 0, 0)).toBe(-1);
+		});
+
+		it('takes the bytes and writes the result with no subarray of the memory (Workers throw on one past 128 MiB)', async () => {
+			const { machine } = await started();
+			new Uint8Array(machine.memory.buffer).set(Buffer.from('abc'), 0x14400);
+			const me = { id: 3 } as never;
+			const subarray = Uint8Array.prototype.subarray;
+			Uint8Array.prototype.subarray = function (this: Uint8Array, ...args: [number, number]) {
+				if (this.buffer === machine.memory.buffer)
+					throw new RangeError('Invalid array buffer length');
+				return subarray.apply(this, args);
+			} as never;
+			try {
+				const id = machine['hostDigest'](me, 0, 3, 0, 0);
+				expect(machine['hostDigest'](me, 1, id, 0x14400, 3)).toBe(0);
+				expect(machine['hostDigest'](me, 2, id, 0x14500, 0)).toBe(32);
+			} finally {
+				Uint8Array.prototype.subarray = subarray;
+			}
+			expect(Buffer.from(machine.memory.buffer.slice(0x14500, 0x14520)).toString('hex')).toBe(
+				sha256abc
+			);
+		});
+
 		it('declines to open one without a digest option', async () => {
 			const { r, machine } = await started({ digest: undefined });
 			expect(word(machine, 0x14200)).toBe(-1);
@@ -1298,6 +1478,18 @@ describe('Machine', () => {
 			expect(machine['digests'].size).toBe(0);
 		});
 
+		it('refuses a task a 65th open digest, which is host memory the machine does not bound', async () => {
+			const { machine } = await started();
+			const open = () => machine['hostDigest']({ id: 3 } as never, 0, 3, 0, 0);
+			const held = machine['digests'].size;
+			const ids = Array.from({ length: 64 - held }, open);
+			expect(ids.every((id) => id > 0)).toBe(true);
+			expect(open()).toBe(-1);
+			expect(machine['hostDigest']({ id: 4 } as never, 0, 3, 0, 0)).toBeGreaterThan(0);
+			machine['release'](3);
+			expect([...machine['digests'].values()].every((d) => d.owner !== 3)).toBe(true);
+		});
+
 		it('provides every host import the program build allows (cc-strict)', () => {
 			const strict = readFileSync(
 				new URL('../../scripts/cc-strict', import.meta.url),
@@ -1318,6 +1510,122 @@ describe('Machine', () => {
 			expect(machine['digests'].size).toBe(1);
 			machine['release'](3);
 			expect(machine['digests'].size).toBe(0);
+		});
+	});
+
+	describe('host inflate', () => {
+		const started = async (options: Partial<MachineOptions> = {}) => {
+			const r = rig({
+				asyncify: true,
+				registry: new Map([['Y', toyUser('toy-digest.wat', true)]]),
+				digest: (algorithm) => createHash(algorithm),
+				inflate: nodeInflater,
+				...options
+			});
+			const machine = new Machine(r.machineOptions);
+			await r.run(machine, () => r.output().includes('parent ok'));
+			return machine;
+		};
+		const me = { id: 3 } as never;
+		const call = (m: Machine, op: number, a = 0, b = 0, c = 0, who = me) =>
+			m['hostDigest'](who, op, a, b, c);
+		let seed = 7;
+		const data = Buffer.from(
+			Array.from(
+				{ length: 100000 },
+				() => 97 + (((seed = Math.imul(seed, 1103515245) + 12345) >>> 24) % 13)
+			)
+		);
+		const raw = deflateRawSync(data);
+		const FEED = 0x14400;
+		const OUT = 0x16000;
+		const feed = (m: Machine, id: number, bytes: Uint8Array, who = me) => {
+			new Uint8Array(m.memory.buffer).set(bytes, FEED);
+			return call(m, 9, id, FEED, bytes.length, who);
+		};
+
+		it('decodes a stream fed in pieces, with each window and the input it took', async () => {
+			const m = await started();
+			const id = call(m, 8);
+			expect(id).toBeGreaterThan(0);
+			const input = Buffer.concat([raw, Buffer.from('trailer!')]);
+			let result = 0;
+			for (let at = 0; !result && at < input.length; at += 4000)
+				result = feed(m, id, input.subarray(at, Math.min(at + 4000, input.length)));
+			expect(result).toBe(1);
+			const words = () => {
+				call(m, 10, id, FEED);
+				return [...new Uint32Array(m.memory.buffer.slice(FEED, FEED + 16))];
+			};
+			expect(words()).toEqual([data.length, raw.length, Math.floor(data.length / 32768), 1]);
+			const parts: Buffer[] = [];
+			for (let k = 0; k * 32768 < data.length; k++) {
+				const n = call(m, 12, id, OUT, k);
+				expect(n).toBe(Math.min(32768, data.length - k * 32768));
+				parts.push(Buffer.from(m.memory.buffer.slice(OUT, OUT + n)));
+			}
+			expect(Buffer.concat(parts).equals(data)).toBe(true);
+			const marks = [0, 1, 2].map((k) => call(m, 11, id, k));
+			expect(marks[0]).toBeGreaterThan(0);
+			expect(marks[0]).toBeLessThan(marks[1]);
+			expect(marks[1]).toBeLessThan(marks[2]);
+			expect(marks[2]).toBeLessThanOrEqual(raw.length);
+			expect(call(m, 11, id, 3)).toBe(-1);
+			expect(call(m, 12, id, OUT, 4)).toBe(-1);
+			expect(m.stats.inflates).toBe(1);
+			expect(m.stats.inflateBytes).toBe(data.length);
+			expect(call(m, 13, id)).toBe(0);
+			expect(call(m, 10, id, FEED)).toBe(-1);
+		});
+
+		it('says an input that stops early wants more, and hands nothing back before the end', async () => {
+			const m = await started();
+			const id = call(m, 8);
+			expect(feed(m, id, raw.subarray(0, 500))).toBe(0);
+			expect(call(m, 12, id, OUT, 0)).toBe(-1);
+			expect(feed(m, id, Buffer.concat([raw.subarray(500), Buffer.alloc(9)]))).toBe(1);
+			expect(call(m, 12, id, OUT, 0)).toBe(32768);
+		});
+
+		it('fails a data error for good and answers a stranger, a closed id and a bad address with -1', async () => {
+			const m = await started();
+			const id = call(m, 8);
+			expect(feed(m, id, Buffer.from([7, 7, 7, 7, 7]))).toBe(-1);
+			expect(feed(m, id, raw)).toBe(-1);
+			const other = call(m, 8);
+			expect(feed(m, other, raw, { id: 4 } as never)).toBe(-1);
+			expect(call(m, 9, other, 0x7ffffff0, 64)).toBe(-1);
+			expect(call(m, 9, other, FEED, 5 << 20)).toBe(-1);
+			expect(call(m, 13, 99)).toBe(-1);
+			expect(call(m, 14, other)).toBe(-1);
+		});
+
+		it('refuses a fifth open stream per task, and holds no more decoded bytes than its limit', async () => {
+			const m = await started();
+			const ids = Array.from({ length: 4 }, () => call(m, 8));
+			expect(ids.every((id) => id > 0)).toBe(true);
+			expect(call(m, 8)).toBe(-1);
+			expect(call(m, 8, 0, 0, 0, { id: 4 } as never)).toBeGreaterThan(0);
+			new Uint8Array(m.memory.buffer).set(raw.subarray(0, 4000), FEED);
+			const stream = m['inflates'].get(ids[0])!;
+			const view = new Uint8Array(m.memory.buffer, FEED, 4000);
+			expect(stream.feed(view, 40000)).toBe(0);
+			expect(stream.feed(raw.subarray(4000), 40000)).toBe(-2);
+			expect(stream.feed(raw.subarray(4000), 1 << 30)).toBe(-1);
+		});
+
+		it('declines to open one without an inflate option', async () => {
+			const m = await started({ inflate: undefined });
+			expect(call(m, 8)).toBe(-1);
+		});
+
+		it('refuses a checkpoint while a stream is open, and drops it when the kernel releases the task', async () => {
+			const m = await started();
+			call(m, 8);
+			await expect(m.checkpoint()).rejects.toThrow('a host inflate stream is open');
+			m['dropDigests'](3);
+			expect(m['inflates'].size).toBe(0);
+			await m.checkpoint();
 		});
 	});
 
@@ -2140,6 +2448,223 @@ describe('Machine', () => {
 				expect(net.open).toBe(0);
 			});
 		});
+
+		describe('lent buffers', () => {
+			const EVENT = 0x100;
+			const DATA = 0x200;
+			const SIZE = 8192;
+			const COPIED = 0x4000_0000;
+			const RECLAIM = 5;
+			const at = (i: number) => 0x4000 + i * 0x2000;
+
+			function rigLend(borrows = true) {
+				const memory = new WebAssembly.Memory({ initial: 2, maximum: 8, shared: true });
+				const stats = netStats();
+				const raised = { n: 0 };
+				const net = new Ingress(stats, () => raised.n++);
+				net.listen(80, true);
+				const stream = net.connect(80, borrows);
+				// the kernel's first call takes the open
+				net.next(memory, EVENT, DATA, 64);
+				const fill = (i: number, value: number) =>
+					new Uint8Array(memory.buffer).fill(value, at(i), at(i) + SIZE);
+				const lend = (i: number, n = SIZE) => net.lend(memory, stream.id, at(i), n);
+				/** the addresses of the next reclaim event, empty when the kernel is owed none */
+				const reclaimed = (cap = 4096) => {
+					if (!net.next(memory, EVENT, DATA, cap)) return [];
+					const view = new DataView(memory.buffer);
+					expect(view.getUint32(EVENT, true)).toBe(RECLAIM);
+					expect(view.getUint32(EVENT + 4, true)).toBe(0);
+					return Array.from({ length: view.getUint32(EVENT + 8, true) }, (_, i) =>
+						view.getUint32(DATA + i * 4, true)
+					);
+				};
+				const reader = stream.readable.getReader();
+				return { memory, stats, raised, net, stream, reader, fill, lend, reclaimed };
+			}
+
+			it('hands the reader the machine memory itself for a large buffer, and nothing is released by a read', async () => {
+				const { memory, stats, reader, fill, lend, reclaimed } = rigLend();
+				fill(0, 7);
+				expect(lend(0)).toBe(SIZE);
+				const { value } = await reader.read();
+				expect(value).toHaveLength(SIZE);
+				expect(value!.buffer).toBe(memory.buffer);
+				fill(0, 9);
+				expect(value![0]).toBe(9);
+				expect(stats.netBorrowed).toBe(SIZE);
+				expect(reclaimed()).toEqual([]);
+			});
+
+			it('copies a buffer under 4 KiB and tells the kernel the buffer is its own again', async () => {
+				const { stats, reader, fill, lend, reclaimed } = rigLend();
+				fill(0, 7);
+				expect(lend(0, 100)).toBe(100 | COPIED);
+				fill(0, 9);
+				const { value } = await reader.read();
+				expect([...value!.subarray(0, 3)]).toEqual([7, 7, 7]);
+				expect(stats.netBorrowed).toBe(0);
+				expect(reclaimed()).toEqual([]);
+			});
+
+			it('copies for a stream that does not borrow, however large the buffer', async () => {
+				const { memory, stats, reader, fill, lend } = rigLend(false);
+				fill(0, 7);
+				expect(lend(0)).toBe(SIZE | COPIED);
+				fill(0, 9);
+				const { value } = await reader.read();
+				expect(value![0]).toBe(7);
+				expect(value!.buffer).not.toBe(memory.buffer);
+				expect(stats.netBorrowed).toBe(0);
+			});
+
+			it('takes a buffer whole or not at all, and a refused buffer can be filled again and offered again', async () => {
+				const { net, stream, stats, raised, reader, fill, lend, reclaimed } = rigLend();
+				for (let i = 0; i < 8; i++) {
+					fill(i, 10 + i);
+					expect(lend(i)).toBe(SIZE);
+				}
+				fill(8, 1);
+				expect(lend(8)).toBe(0);
+				expect(stats.netBackpressure).toBe(1);
+				const before = raised.n;
+				expect((await reader.read()).value![0]).toBe(10);
+				expect(raised.n).toBe(before + 1);
+				// the kernel reuses the refused buffer for newer bytes
+				fill(8, 2);
+				// eight buffers are kept (seven queued, one taken): the ninth is copied
+				expect(lend(8)).toBe(SIZE | COPIED);
+				fill(8, 3);
+				for (let i = 1; i < 8; i++) expect((await reader.read()).value![0]).toBe(10 + i);
+				expect((await reader.read()).value![0]).toBe(2);
+				expect(net.send(stream.id, new Uint8Array(1))).toBe(1);
+				expect(reclaimed()).toEqual([]);
+			});
+
+			it('keeps no more than eight buffers per stream and borrows again once some are released', async () => {
+				const { stats, stream, reader, fill, lend } = rigLend();
+				for (let i = 0; i < 8; i++) {
+					fill(i, 1);
+					expect(lend(i)).toBe(SIZE);
+					await reader.read();
+				}
+				expect(lend(8)).toBe(SIZE | COPIED);
+				stream.recycle();
+				expect(lend(9)).toBe(SIZE);
+				expect(stats.netBorrowed).toBe(9 * SIZE);
+			});
+
+			it('gives back only the chunks the reader has read, and only when it recycles', async () => {
+				const { net, stream, raised, reader, fill, lend, reclaimed } = rigLend();
+				for (let i = 0; i < 3; i++) {
+					fill(i, i);
+					lend(i);
+				}
+				await reader.read();
+				await reader.read();
+				expect(reclaimed()).toEqual([]);
+				stream.recycle();
+				expect(net.open).toBe(2);
+				expect(reclaimed()).toEqual([at(0), at(1)]);
+				expect(net.open).toBe(1);
+				const before = raised.n;
+				stream.releaseAll();
+				expect(raised.n).toBe(before + 1);
+				expect(reclaimed()).toEqual([at(2)]);
+			});
+
+			it('names an address once: a second recycle or release repeats nothing', async () => {
+				const { stream, reader, fill, lend, reclaimed } = rigLend();
+				for (let i = 0; i < 3; i++) {
+					fill(i, i);
+					lend(i);
+				}
+				await reader.read();
+				stream.recycle();
+				stream.recycle();
+				stream.releaseAll();
+				stream.releaseAll();
+				const all = [...reclaimed(), ...reclaimed()];
+				expect(all.sort()).toEqual([at(0), at(1), at(2)]);
+				expect(reclaimed()).toEqual([]);
+			});
+
+			it('splits a long list of addresses over events of the size the kernel asked for', async () => {
+				const { stream, reader, fill, lend, reclaimed } = rigLend();
+				for (let i = 0; i < 3; i++) {
+					fill(i, i);
+					lend(i);
+					await reader.read();
+				}
+				stream.recycle();
+				expect(reclaimed(8)).toEqual([at(0), at(1)]);
+				expect(reclaimed(8)).toEqual([at(2)]);
+			});
+
+			it('gives the queued buffers back at a reset and the held ones at the release', async () => {
+				const { net, stream, reader, fill, lend, reclaimed } = rigLend();
+				for (let i = 0; i < 3; i++) {
+					fill(i, i);
+					lend(i);
+				}
+				await reader.read();
+				net.end(stream.id, 1);
+				await expect(reader.read()).rejects.toThrow('reset');
+				expect(reclaimed()).toEqual([at(1), at(2)]);
+				stream.releaseAll();
+				expect(reclaimed()).toEqual([at(0)]);
+			});
+
+			it('gives the queued buffers back when the reader aborts the stream', async () => {
+				const { stream, fill, lend, reclaimed } = rigLend();
+				fill(0, 1);
+				fill(1, 2);
+				lend(0);
+				lend(1);
+				stream.abort();
+				// the abort event comes first, then the release of what nobody read
+				expect(reclaimed()).toEqual([at(0), at(1)]);
+			});
+
+			it('ends the reader after the chunks that are queued when the guest closes', async () => {
+				const { net, stream, reader, fill, lend } = rigLend();
+				fill(0, 1);
+				fill(1, 2);
+				lend(0);
+				lend(1);
+				net.end(stream.id, 0);
+				expect((await reader.read()).value![0]).toBe(1);
+				expect((await reader.read()).value![0]).toBe(2);
+				expect((await reader.read()).done).toBe(true);
+			});
+
+			it('keeps a view valid when the memory grows during the transfer', async () => {
+				const { memory, reader, fill, lend } = rigLend();
+				fill(0, 5);
+				lend(0);
+				const { value } = await reader.read();
+				memory.grow(2);
+				new Uint8Array(memory.buffer)[at(0)] = 6;
+				expect(value![0]).toBe(6);
+				expect(value![1]).toBe(5);
+				expect(value).toHaveLength(SIZE);
+			});
+
+			it('answers a lend for a stream that is gone with -1', async () => {
+				const { net, memory, stream, lend } = rigLend();
+				net.end(stream.id, 1);
+				expect(lend(0)).toBe(-1);
+				expect(net.lend(memory, 999, at(0), SIZE)).toBe(-1);
+			});
+
+			it('still takes bytes through the older send import on a borrowing stream', async () => {
+				const { net, stream, reader } = rigLend();
+				expect(net.send(stream.id, new Uint8Array(READ_BUFFER + 10).fill(3))).toBe(
+					READ_BUFFER
+				);
+				expect((await reader.read()).value).toHaveLength(READ_BUFFER);
+			});
+		});
 	});
 });
 
@@ -2150,6 +2675,7 @@ function netStats(): NetStats {
 		netSends: 0,
 		netBytesIn: 0,
 		netBytesOut: 0,
-		netBackpressure: 0
+		netBackpressure: 0,
+		netBorrowed: 0
 	};
 }

@@ -20,6 +20,10 @@ class FakeStream implements IngressStream {
 	readonly written: Uint8Array[] = [];
 	ended = false;
 	aborted = false;
+	closed = false;
+	/** called with the request's number each time a head arrives, so a guest can answer a kept stream */
+	onRequest: (n: number) => void = () => {};
+	heads = 0;
 	private controller!: ReadableStreamDefaultController<Uint8Array>;
 
 	constructor() {
@@ -30,11 +34,28 @@ class FakeStream implements IngressStream {
 
 	async write(data: Uint8Array | string) {
 		if (this.aborted) throw new Error('the stream was aborted');
-		this.written.push(typeof data === 'string' ? encode(data) : data);
+		const bytes = typeof data === 'string' ? encode(data) : data;
+		this.written.push(bytes);
+		// the guest answers after it has taken the head
+		if (new TextDecoder().decode(bytes).includes('\r\n\r\n')) {
+			const n = ++this.heads;
+			setTimeout(() => this.onRequest(n), 0);
+		}
 	}
 
 	end() {
 		this.ended = true;
+	}
+
+	recycles = 0;
+	releases = 0;
+
+	recycle() {
+		this.recycles++;
+	}
+
+	releaseAll() {
+		this.releases++;
 	}
 
 	abort() {
@@ -49,10 +70,12 @@ class FakeStream implements IngressStream {
 	}
 
 	finish() {
+		this.closed = true;
 		this.controller.close();
 	}
 
 	fail(error: Error) {
+		this.closed = true;
 		this.controller.error(error);
 	}
 
@@ -74,7 +97,8 @@ function rig(
 		opens: 0,
 		rests: 0,
 		pumps: 0,
-		waits: 0
+		waits: 0,
+		stall: false
 	};
 	const fixed: number[] = [];
 	const machine: ServeMachine = {
@@ -99,13 +123,14 @@ function rig(
 			while (Date.now() < until && !wake()) await sleep(1);
 		},
 		rest: async () => void state.rests++,
-		wait: (ms) => (state.waits++, sleep(ms)),
+		wait: (ms) => (state.waits++, state.stall ? new Promise<void>(() => {}) : sleep(ms)),
 		fixedLength: (length) => (fixed.push(length), new TransformStream())
 	};
 	const server = new Server(host, {
 		timeoutMs: 60,
 		maxStreams: 2,
 		maxRequestBytes: 16,
+		idleMs: 0,
 		...limits
 	});
 	return { server, streams, state, fixed };
@@ -316,6 +341,20 @@ describe('Server.serve', () => {
 		expect(closed.fixed).toEqual([]);
 	});
 
+	it('hands a 206 over with its Content-Range and a fixed length of its own', async () => {
+		const { server, fixed } = rig((s) =>
+			s.send(
+				'HTTP/1.1 206 Partial Content\r\ncontent-length: 5\r\ncontent-range: bytes 100-104/1024\r\n\r\nhello'
+			)
+		);
+		const res = await get(server);
+		expect(res.status).toBe(206);
+		expect(res.headers.get('content-range')).toBe('bytes 100-104/1024');
+		expect(res.headers.get('content-length')).toBe('5');
+		expect(fixed).toEqual([5]);
+		expect(await res.text()).toBe('hello');
+	});
+
 	it('waits out a pump another request runs, and rests only when the last stream is done', async () => {
 		const { server, state } = rig((s) => s.send(reply('hello', 10)));
 		state.pumping = true;
@@ -331,5 +370,330 @@ describe('Server.serve', () => {
 		await second.body!.cancel();
 		await vi.waitFor(() => expect(server.open).toBe(0));
 		await vi.waitFor(() => expect(state.rests).toBeGreaterThan(0));
+	});
+});
+
+describe('Server.serve with borrowed buffers', () => {
+	it('asks for a borrowing stream and gives its buffers back once the body has been read', async () => {
+		const asked: (boolean | undefined)[] = [];
+		const { server, streams } = rig((s) => s.send(reply('hello')));
+		const open = (server as unknown as { host: ServeHost }).host.open;
+		(server as unknown as { host: ServeHost }).host.open = async () => {
+			const machine = await open();
+			const ingress = machine.ingress.bind(machine);
+			machine.ingress = (port, borrows) => (asked.push(borrows), ingress(port, borrows));
+			return machine;
+		};
+		const res = await get(server);
+		expect(streams[0]!.releases).toBe(0);
+		expect(await res.text()).toBe('hello');
+		expect(asked).toEqual([true]);
+		expect(streams[0]!.releases).toBe(1);
+		expect(streams[0]!.recycles).toBeGreaterThan(0);
+	});
+
+	it('keeps the slot until the last part has gone out, not until the guest has sent it', async () => {
+		const { server } = rig((s) => s.send(reply('hello')));
+		const res = await get(server);
+		expect(server.open).toBe(1);
+		await res.text();
+		expect(server.open).toBe(0);
+	});
+
+	it('frees the slot at the end of the body when the buffers are not borrowed', async () => {
+		const { server, streams } = rig((s) => s.send(reply('hello')), { borrow: false });
+		const res = await get(server);
+		await res.text();
+		expect(server.open).toBe(0);
+		expect(streams[0]!.releases).toBe(1);
+	});
+
+	it('gives the buffers back when the client cancels the body', async () => {
+		const { server, streams } = rig((s) => s.send(reply('hello', 10)));
+		const res = await get(server);
+		await res.body!.cancel();
+		await vi.waitFor(() => expect(streams[0]!.releases).toBeGreaterThan(0));
+		expect(streams[0]!.aborted).toBe(true);
+	});
+
+	it('gives the buffers back when the machine resets in the middle of the body', async () => {
+		const { server, streams } = rig((s) => {
+			s.send(reply('hel', 10));
+			setTimeout(() => s.fail(new Error('the connection was reset')), 5);
+		});
+		const res = await get(server);
+		await expect(res.text()).rejects.toThrow();
+		await vi.waitFor(() => expect(streams[0]!.releases).toBe(1));
+		expect(server.open).toBe(0);
+	});
+
+	it('gives the buffers back when the head cannot be framed', async () => {
+		const { server, streams } = rig((s) => s.send('garbage\r\n\r\n'));
+		expect((await get(server)).status).toBe(502);
+		expect(streams[0]!.releases).toBeGreaterThan(0);
+	});
+
+	it('parks a kept stream only once its body has been read', async () => {
+		const { server } = rig((s) => void (s.onRequest = () => s.send(reply('hello'))), {
+			idleMs: 1000
+		});
+		const res = await get(server);
+		expect(server.idle).toBe(0);
+		await res.text();
+		expect(server.idle).toBe(1);
+	});
+});
+
+describe('Server.serve with idle streams', () => {
+	/** the guest answers every request on a stream with 's<stream>r<request>' */
+	const answers = (s: FakeStream, n: number) =>
+		void (s.onRequest = (k) => s.send(reply(`s${n}r${k}`)));
+	const text = async (res: Response | Promise<Response>) => (await res).text();
+
+	it('sends the next request down the stream the last one finished on', async () => {
+		const { server, streams } = rig(answers, { idleMs: 1000 });
+		expect(await text(get(server))).toBe('s1r1');
+		expect(server.open).toBe(0);
+		expect(server.idle).toBe(1);
+		expect(await text(get(server, '/b'))).toBe('s1r2');
+		expect(streams).toHaveLength(1);
+		expect(streams[0]!.received).toContain('GET /b HTTP/1.1');
+		expect(streams[0]!.received).toContain('connection: keep-alive');
+		expect(streams[0]!.ended).toBe(false);
+	});
+
+	it('serves HEAD on a kept stream and sends no body down it', async () => {
+		const { server, streams } = rig(
+			(s) =>
+				void (s.onRequest = (k) =>
+					s.send(
+						k === 1 ? reply('hello') : 'HTTP/1.1 200 OK\r\ncontent-length: 5\r\n\r\n'
+					)),
+			{ idleMs: 1000 }
+		);
+		expect(await text(get(server))).toBe('hello');
+		const head = await server.serve(new Request('http://site.test/', { method: 'HEAD' }));
+		expect(head.body).toBeNull();
+		expect(head.headers.get('content-length')).toBe('5');
+		expect(streams).toHaveLength(1);
+		expect(server.idle).toBe(1);
+	});
+
+	it('ends an idle stream after its timeout, with the machine resting as after any request', async () => {
+		const { server, streams, state } = rig(answers, { idleMs: 40 });
+		await text(get(server));
+		await vi.waitFor(() => expect(state.rests).toBeGreaterThan(0));
+		expect(server.idle).toBe(1);
+		expect(streams[0]!.ended).toBe(false);
+		await vi.waitFor(() => expect(streams[0]!.ended).toBe(true));
+		expect(server.idle).toBe(0);
+		expect(await text(get(server))).toBe('s2r1');
+		expect(streams).toHaveLength(2);
+	});
+
+	it('does not hand out a stream that outwaited its timeout, whatever the clock did to the sweep', async () => {
+		const { server, streams, state } = rig(answers, { idleMs: 30 });
+		state.stall = true;
+		await text(get(server));
+		await sleep(50);
+		expect(streams[0]!.ended).toBe(false);
+		expect(await text(get(server))).toBe('s2r1');
+		expect(streams[0]!.ended).toBe(true);
+		expect(streams).toHaveLength(2);
+	});
+
+	const ending: Record<string, (s: FakeStream) => void> = {
+		'a reply that says Connection: close': (s) =>
+			s.send('HTTP/1.1 200 OK\r\ncontent-length: 2\r\nconnection: close\r\n\r\nok'),
+		'a body that runs to the close': (s) => {
+			s.send('HTTP/1.1 200 OK\r\n\r\nok');
+			s.finish();
+		},
+		'a reply with bytes after its body': (s) =>
+			s.send('HTTP/1.1 200 OK\r\ncontent-length: 2\r\n\r\nokNEXT'),
+		'an HTTP/1.0 reply': (s) => s.send('HTTP/1.0 200 OK\r\ncontent-length: 2\r\n\r\nok')
+	};
+	for (const [name, answer] of Object.entries(ending))
+		it(`ends the stream after ${name}`, async () => {
+			const { server, streams } = rig((s) => void (s.onRequest = () => answer(s)), {
+				idleMs: 1000
+			});
+			expect(await text(get(server))).toBe('ok');
+			expect(streams[0]!.ended).toBe(true);
+			expect(server.idle).toBe(0);
+			expect(server.open).toBe(0);
+		});
+
+	it('does not reuse a stream the guest closed while it was idle', async () => {
+		const { server, streams } = rig(answers, { idleMs: 1000 });
+		await text(get(server));
+		streams[0]!.finish();
+		expect(await text(get(server))).toBe('s2r1');
+		expect(streams).toHaveLength(2);
+		expect(streams[0]!.ended).toBe(true);
+	});
+
+	it('retries on a new stream when a kept stream fails before it answers', async () => {
+		const { server, streams } = rig(
+			(s, n) =>
+				void (s.onRequest = (k) =>
+					n === 1 && k === 2 ? s.fail(new Error('reset')) : s.send(reply(`s${n}r${k}`))),
+			{ idleMs: 1000 }
+		);
+		expect(await text(get(server))).toBe('s1r1');
+		const res = await get(server);
+		expect(res.status).toBe(200);
+		expect(await res.text()).toBe('s2r1');
+		expect(streams).toHaveLength(2);
+		expect(server.open).toBe(0);
+		expect(server.idle).toBe(1);
+	});
+
+	it('answers 504 and does not retry when a kept stream goes quiet', async () => {
+		const { server, streams } = rig(
+			(s, n) =>
+				void (s.onRequest = (k) => (n === 1 && k === 2 ? undefined : s.send(reply('ok')))),
+			{ idleMs: 1000 }
+		);
+		await text(get(server));
+		expect((await get(server)).status).toBe(504);
+		expect(streams).toHaveLength(1);
+		expect(streams[0]!.aborted).toBe(true);
+	});
+
+	it('does not retry a failure on a new stream', async () => {
+		const { server, streams } = rig(
+			(s) => void (s.onRequest = () => s.send('nonsense\r\n\r\n')),
+			{ idleMs: 1000 }
+		);
+		expect((await get(server)).status).toBe(502);
+		expect(streams).toHaveLength(1);
+		expect(server.idle).toBe(0);
+	});
+
+	it('gives a request with a body a stream of its own that closes after the reply', async () => {
+		const { server, streams } = rig(answers, { idleMs: 1000 });
+		await text(get(server));
+		const post = await server.serve(
+			new Request('http://site.test/', { method: 'POST', body: 'abc' })
+		);
+		expect(await post.text()).toBe('s2r1');
+		expect(streams).toHaveLength(2);
+		expect(streams[1]!.received).toContain('connection: close');
+		expect(streams[1]!.ended).toBe(true);
+		expect(server.idle).toBe(1);
+	});
+
+	it('counts idle streams against the cap and ends the oldest to open another', async () => {
+		const { server, streams } = rig(
+			(s, n) => void (s.onRequest = () => s.send(n <= 2 ? reply('hello', 10) : reply('ok'))),
+			{ idleMs: 1000, maxStreams: 2 }
+		);
+		const [a, b] = [await get(server), await get(server)];
+		expect(streams).toHaveLength(2);
+		for (const s of streams) s.send('world');
+		await a.text();
+		await b.text();
+		expect(server.idle).toBe(2);
+		const post = await server.serve(new Request('http://site.test/', { method: 'POST' }));
+		await post.text();
+		expect(streams).toHaveLength(3);
+		expect(streams[0]!.ended).toBe(true);
+		expect(streams[1]!.ended).toBe(false);
+		expect(server.idle).toBe(1);
+		expect(server.open).toBe(0);
+	});
+
+	it('still answers 503 at the cap when every stream is busy', async () => {
+		const { server } = rig((s) => s.send(reply('hello', 10)), { idleMs: 1000 });
+		await get(server);
+		await get(server);
+		expect((await get(server)).status).toBe(503);
+		expect(server.idle).toBe(0);
+	});
+});
+
+describe('Server.serve with stalled readers', () => {
+	const head = 'HTTP/1.1 200 OK\r\ntransfer-encoding: chunked\r\n\r\n';
+	const chunk = (text: string) => `${text.length.toString(16)}\r\n${text}\r\n`;
+
+	/** advances fake time in small steps until `work` settles, as the machine's own timers would */
+	async function run<T>(work: Promise<T>): Promise<T> {
+		let settled = false;
+		work.then(
+			() => (settled = true),
+			() => (settled = true)
+		);
+		while (!settled) await vi.advanceTimersByTimeAsync(10);
+		return work;
+	}
+
+	async function started(limits: Partial<ServeLimits> = {}) {
+		vi.useFakeTimers();
+		const made = rig((s) => s.send(head + chunk('one')), { maxStreams: 1, ...limits });
+		const res = await run(get(made.server));
+		const reader = res.body!.getReader();
+		expect(new TextDecoder().decode((await run(reader.read())).value)).toBe('one');
+		return { ...made, reader };
+	}
+
+	it('closes a stream whose client has not read for 30 s and gives its slot to a new request', async () => {
+		try {
+			const { server, streams, reader } = await started({ stalledMs: 30_000 });
+			expect(server.open).toBe(1);
+			expect((await run(get(server))).status).toBe(503);
+			await vi.advanceTimersByTimeAsync(29_000);
+			expect(server.open).toBe(1);
+			await vi.advanceTimersByTimeAsync(1_000);
+			expect(server.open).toBe(0);
+			expect(streams[0]!.aborted).toBe(true);
+			await expect(reader.read()).rejects.toThrow('stopped reading');
+			expect((await run(get(server))).status).not.toBe(503);
+			expect(streams).toHaveLength(2);
+		} finally {
+			vi.useRealTimers();
+		}
+	});
+
+	it('keeps a stream whose client pauses 29 s and reads again', async () => {
+		try {
+			const { server, streams, reader } = await started({ stalledMs: 30_000 });
+			await vi.advanceTimersByTimeAsync(29_000);
+			streams[0]!.send(chunk('two'));
+			expect(new TextDecoder().decode((await run(reader.read())).value)).toBe('two');
+			await vi.advanceTimersByTimeAsync(29_000);
+			expect(server.open).toBe(1);
+			expect(streams[0]!.aborted).toBe(false);
+		} finally {
+			vi.useRealTimers();
+		}
+	});
+
+	it('does not cut a slow reader that keeps reading past 30 s in total', async () => {
+		try {
+			const { server, streams, reader } = await started({ stalledMs: 30_000 });
+			for (let i = 0; i < 5; i++) {
+				await vi.advanceTimersByTimeAsync(10_000);
+				streams[0]!.send(chunk('x'));
+				await run(reader.read());
+			}
+			expect(server.open).toBe(1);
+			expect(streams[0]!.aborted).toBe(false);
+		} finally {
+			vi.useRealTimers();
+		}
+	});
+
+	it('stops the timer once the body is read to its end', async () => {
+		try {
+			const { server, streams, reader } = await started({ stalledMs: 30_000 });
+			streams[0]!.send('0\r\n\r\n');
+			expect((await run(reader.read())).done).toBe(true);
+			expect(server.open).toBe(0);
+			await vi.advanceTimersByTimeAsync(60_000);
+			expect(streams[0]!.aborted).toBe(false);
+		} finally {
+			vi.useRealTimers();
+		}
 	});
 });

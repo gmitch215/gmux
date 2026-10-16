@@ -5,6 +5,14 @@ const OPEN = 1;
 const DATA = 2;
 const SHUT = 3;
 const ABORT = 4;
+/** kept buffers the kernel may free again: the count as the argument, their addresses as u32s in the data (kernel patch 0041) */
+const RECLAIM = 5;
+/** wasm_net_lend answers the count with this bit set when it copied the bytes, so the buffer is the kernel's again */
+const COPIED = 0x4000_0000;
+/** a smaller chunk is copied: a kept buffer pins 16 KiB of the machine whatever it holds */
+const KEEP_MIN = 4096;
+/** buffers one stream keeps at once */
+const KEEP_MAX = 8;
 /** what wasm_net_end tells the host: the guest finished sending, or the stream is gone; hold and release pause the host's events for a stream */
 const FIN = 0;
 const RESET = 1;
@@ -16,7 +24,13 @@ export const READ_BUFFER = 65_536;
 
 export type NetStats = Pick<
 	MachineStats,
-	'netOpens' | 'netEvents' | 'netSends' | 'netBytesIn' | 'netBytesOut' | 'netBackpressure'
+	| 'netOpens'
+	| 'netEvents'
+	| 'netSends'
+	| 'netBytesIn'
+	| 'netBytesOut'
+	| 'netBackpressure'
+	| 'netBorrowed'
 >;
 
 /** one connection to a program that listens in the machine */
@@ -24,12 +38,22 @@ export interface IngressStream {
 	readonly id: number;
 	/** what the guest sends; ends at the guest's close, errors at its reset */
 	readonly readable: ReadableStream<Uint8Array>;
+	/** the guest ended or reset its side, whether or not anyone has read to it */
+	readonly closed: boolean;
 	/** resolves once the guest took the bytes, rejects when the stream is gone */
 	write(data: Uint8Array | string): Promise<void>;
 	/** no more bytes from the host: the guest reads the end of its input */
 	end(): void;
 	/** drops the connection from the host's side */
 	abort(): void;
+	/**
+	 * a borrowing stream's chunks are the machine's own memory: the reader promises, with each call,
+	 * that nothing it read before this call is used again except what it copied. A stream that does not
+	 * borrow ignores both calls
+	 */
+	recycle(): void;
+	/** the reader is done with the stream's chunks, including any it never read */
+	releaseAll(): void;
 }
 
 interface Chunk {
@@ -53,27 +77,115 @@ class Stream implements IngressStream {
 	/** a send found no room: the host raises the interrupt once a read makes some */
 	starved = false;
 	dead = false;
+	/** buffers the kernel lent that are queued or taken and not given back */
+	kept = 0;
 
 	readonly id: number;
 	readonly port: number;
+	readonly borrows: boolean;
 	private readonly table: Ingress;
+	// a borrowing stream's chunks wait here and leave one per read, so the host knows what a reader has taken
+	private readonly queue: { view: Uint8Array; token?: number }[] = [];
+	private queued = 0;
+	private wanting = false;
+	private closeAfter = false;
+	private taken: number[] = [];
 
-	constructor(id: number, port: number, table: Ingress) {
+	constructor(id: number, port: number, table: Ingress, borrows: boolean) {
 		this.id = id;
 		this.port = port;
 		this.table = table;
+		this.borrows = borrows;
 		this.readable = new ReadableStream<Uint8Array>(
 			{
 				start: (controller) => void (this.controller = controller),
-				pull: () => {
-					if (!this.starved) return;
-					this.starved = false;
-					this.table.wake();
-				},
+				pull: () => (this.borrows ? this.hand() : this.unstarve()),
 				cancel: () => this.abort()
 			},
-			new ByteLengthQueuingStrategy({ highWaterMark: READ_BUFFER })
+			borrows
+				? { highWaterMark: 0 }
+				: new ByteLengthQueuingStrategy({ highWaterMark: READ_BUFFER })
 		);
+	}
+
+	get closed(): boolean {
+		return this.readClosed;
+	}
+
+	/** bytes the reader may still be sent before it is told to wait */
+	room(): number {
+		return this.borrows
+			? READ_BUFFER - this.queued
+			: Math.max(this.controller.desiredSize ?? 0, 0);
+	}
+
+	unstarve() {
+		if (!this.starved || this.room() <= 0) return;
+		this.starved = false;
+		this.table.wake();
+	}
+
+	/** a chunk for the reader; `token` names the kernel's buffer it is a view of */
+	give(view: Uint8Array, token?: number) {
+		if (!this.borrows) return this.controller.enqueue(view);
+		if (token !== undefined) this.kept++;
+		if (this.wanting) {
+			this.wanting = false;
+			this.hand(view, token);
+		} else {
+			this.queue.push({ view, token });
+			this.queued += view.length;
+		}
+	}
+
+	private hand(view?: Uint8Array, token?: number) {
+		if (!view) {
+			const next = this.queue.shift();
+			if (!next) {
+				this.wanting = true;
+				return;
+			}
+			({ view, token } = next);
+			this.queued -= view.length;
+		}
+		if (token !== undefined) this.taken.push(token);
+		this.controller.enqueue(view);
+		this.unstarve();
+		if (this.closeAfter && !this.queue.length) this.endReadable();
+	}
+
+	/** the chunks queued and never read, given up */
+	private dropQueued(): number[] {
+		const tokens = this.queue
+			.splice(0)
+			.flatMap((c) => (c.token === undefined ? [] : [c.token]));
+		this.queued = 0;
+		this.kept -= tokens.length;
+		return tokens;
+	}
+
+	recycle() {
+		if (!this.taken.length) return;
+		this.kept -= this.taken.length;
+		this.table.reclaim(this.taken.splice(0), false);
+	}
+
+	releaseAll() {
+		const taken = this.taken.splice(0);
+		this.kept -= taken.length;
+		const tokens = [...taken, ...this.dropQueued()];
+		if (tokens.length) this.table.reclaim(tokens, true);
+		if (this.closeAfter) this.endReadable();
+	}
+
+	private endReadable(error?: Error) {
+		this.closeAfter = false;
+		try {
+			if (error) this.controller.error(error);
+			else this.controller.close();
+		} catch {
+			// a reader that cancelled has closed it already
+		}
 	}
 
 	/** the next thing the kernel is owed, if the stream may deliver it now */
@@ -118,12 +230,15 @@ class Stream implements IngressStream {
 	close(error?: Error) {
 		if (this.readClosed) return;
 		this.readClosed = true;
-		try {
-			if (error) this.controller.error(error);
-			else this.controller.close();
-		} catch {
-			// a reader that cancelled has closed it already
+		if (error) {
+			// nothing will read the queue now, so its buffers go back
+			const tokens = this.dropQueued();
+			if (tokens.length) this.table.reclaim(tokens, true);
+		} else if (this.borrows && this.queue.length) {
+			this.closeAfter = true;
+			return;
 		}
+		this.endReadable(error);
 	}
 }
 
@@ -149,9 +264,12 @@ export class Ingress {
 		this.raise = raise;
 	}
 
-	/** streams the kernel or the host has not finished with */
+	/** buffers the reader is done with that the kernel has not been told to free yet */
+	private readonly freed: number[] = [];
+
+	/** streams the kernel or the host has not finished with, and buffers the kernel has yet to free */
 	get open(): number {
-		return this.streams.size;
+		return this.streams.size + (this.freed.length ? 1 : 0);
 	}
 
 	/** every listening port, once per listener, which a snapshot keeps */
@@ -174,9 +292,10 @@ export class Ingress {
 		else this.ports.delete(port);
 	}
 
-	connect(port: number): IngressStream {
+	/** `borrows`: the reader follows the contract of `IngressStream.recycle`, so chunks may be the machine's own memory */
+	connect(port: number, borrows = false): IngressStream {
 		if (!this.listening(port)) throw new Error(`nothing listens on port ${port}`);
-		const stream = new Stream(this.nextId++, port, this);
+		const stream = new Stream(this.nextId++, port, this, borrows);
 		this.streams.set(stream.id, stream);
 		this.stats.netOpens++;
 		this.raise();
@@ -190,10 +309,16 @@ export class Ingress {
 	/** wakes the kernel for a stream whose reader has room though no pull said so (workerd left one starved) */
 	poll() {
 		for (const stream of this.streams.values()) {
-			if (!stream.starved || (stream.controller.desiredSize ?? 0) <= 0) continue;
+			if (!stream.starved || stream.room() <= 0) continue;
 			stream.starved = false;
 			this.raise();
 		}
+	}
+
+	/** buffers a reader is done with: the kernel hears of them on its next call, at once when `now` */
+	reclaim(tokens: number[], now: boolean) {
+		this.freed.push(...tokens);
+		if (now) this.raise();
 	}
 
 	drop(stream: Stream) {
@@ -206,6 +331,17 @@ export class Ingress {
 	 * with a data event's bytes at `buf` (at most `cap`); 0 when there is none. Streams take turns
 	 */
 	next(memory: WebAssembly.Memory, event: number, buf: number, cap: number): number {
+		if (this.freed.length) {
+			const view = new DataView(memory.buffer);
+			const n = Math.min(this.freed.length, cap >>> 2);
+			for (const [i, token] of this.freed.splice(0, n).entries())
+				view.setUint32(buf + i * 4, token, true);
+			view.setUint32(event, RECLAIM, true);
+			view.setUint32(event + 4, 0, true);
+			view.setUint32(event + 8, n, true);
+			this.stats.netEvents++;
+			return 1;
+		}
 		for (const stream of this.streams.values()) {
 			if (!stream.ready()) continue;
 			const view = new DataView(memory.buffer);
@@ -257,17 +393,44 @@ export class Ingress {
 		const stream = this.streams.get(id);
 		if (!stream || stream.readClosed) return -1;
 		this.stats.netSends++;
-		const room = Math.max(stream.controller.desiredSize ?? 0, 0);
-		const n = Math.min(room, bytes.length);
+		const n = Math.min(stream.room(), bytes.length);
 		if (n < bytes.length) {
 			stream.starved = true;
 			this.stats.netBackpressure++;
 		}
 		if (!n) return 0;
-		stream.controller.enqueue(bytes.slice(0, n));
+		stream.give(bytes.slice(0, n));
 		this.stats.netBytesOut += n;
 		this.activity++;
 		return n;
+	}
+
+	/**
+	 * wasm_net_lend (kernel patch 0041): a buffer of bytes the guest read for a stream. A borrowing
+	 * stream keeps a large one as it is until `recycle` or `releaseAll`, so the reader sees the
+	 * machine's memory itself; any other bytes are copied. Answers the count taken (with `COPIED` set
+	 * when the buffer is the kernel's again), 0 when the reader is behind (the kernel offers the buffer
+	 * again after the interrupt) and -1 when the stream is gone. A buffer is taken whole
+	 */
+	lend(memory: WebAssembly.Memory, id: number, buf: number, n: number): number {
+		const stream = this.streams.get(id);
+		if (!stream || stream.readClosed) return -1;
+		this.stats.netSends++;
+		if (stream.room() <= 0) {
+			stream.starved = true;
+			this.stats.netBackpressure++;
+			return 0;
+		}
+		const view = new Uint8Array(memory.buffer, buf, n);
+		this.stats.netBytesOut += n;
+		this.activity++;
+		if (stream.borrows && n >= KEEP_MIN && stream.kept < KEEP_MAX) {
+			this.stats.netBorrowed += n;
+			stream.give(view, buf);
+			return n;
+		}
+		stream.give(view.slice());
+		return n | COPIED;
 	}
 
 	/** wasm_net_end */

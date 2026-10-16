@@ -54,6 +54,28 @@ export interface HostDigest {
 	copy(): HostDigest;
 }
 
+/** the algorithms `__gmux_digest` opens, by id (1 is md5), as node:crypto names them */
+const DIGEST_ALGORITHMS = [
+	'md5',
+	'sha1',
+	'sha256',
+	'sha512',
+	'sha224',
+	'sha384',
+	'blake2b512'
+] as const;
+export type DigestAlgorithm = (typeof DIGEST_ALGORITHMS)[number];
+
+/** a raw deflate decoder a machine uses for `MachineOptions.inflate` (see `nodeInflater` in inflate.ts) */
+export interface HostInflater {
+	/**
+	 * decodes input into output and returns the bytes it took and wrote. `ended` is only set when
+	 * the final block is done and input is left over: a decoder that took all of its input cannot
+	 * say whether the stream ended. Throws on a data error
+	 */
+	step(input: Uint8Array, output: Uint8Array): { read: number; written: number; ended: boolean };
+}
+
 export interface MachineOptions {
 	/** the kernel, compiled (`kernel/vmlinux.wasm`) */
 	vmlinux: WebAssembly.Module;
@@ -75,6 +97,14 @@ export interface MachineOptions {
 	 * `sharedKernel`; nothing pooled is saved by a checkpoint
 	 */
 	recycleInstances?: number;
+	/**
+	 * instances of each recyclable share build made ahead while the pump has nothing to run, up to
+	 * this many idle per build (and no more than `recycleInstances`), so an exec after a pause finds
+	 * one ready. Default 0 (off). Costs about 120 KiB of JS heap per idle instance and, before
+	 * `_start`, a region of the machine's memory the size of the largest share build's data. A
+	 * restored machine makes none, and a checkpoint saves none
+	 */
+	prefillInstances?: number;
 	/**
 	 * builds of the registry's programs that check every load and store against the kernel's page
 	 * owner table (scripts/wasm/guard-pass.ts), by the same hash. A task whose effective uid is not 0 runs
@@ -98,11 +128,19 @@ export interface MachineOptions {
 	/** the hex SHA-256 of an executable without an exec stub, to find it in `registry` */
 	sha256: (bytes: Uint8Array) => string;
 	/**
-	 * a host digest for a program's whole md5, sha1, sha256 or sha512 stream (katybug's digest
-	 * recognizer, `__gmux_digest`): node:crypto's `createHash` fits. Without it a program hashes with
-	 * its own code. A machine with a digest open cannot checkpoint: a host digest has no state to save
+	 * a host digest for a program's whole md5, sha1, sha224, sha256, sha384, sha512 or blake2b512
+	 * stream (katybug's digest recognizer, `__gmux_digest`): node:crypto's `createHash` fits. Without
+	 * it a program hashes with its own code. A machine with a digest open cannot checkpoint: a host
+	 * digest has no state to save
 	 */
-	digest?: (algorithm: 'md5' | 'sha1' | 'sha256' | 'sha512') => HostDigest;
+	digest?: (algorithm: DigestAlgorithm) => HostDigest;
+	/**
+	 * a host decoder for the whole raw deflate stream of a program's gzip member (katybug's
+	 * inflate recognizer, `__gmux_digest` ops 8 to 13). Without it a program decodes with its own
+	 * code. The machine keeps the decoded bytes (at most `MAX_INFLATE_BYTES` a task) until the
+	 * program has taken them, and a machine with a stream open cannot checkpoint
+	 */
+	inflate?: () => HostInflater;
 	/** log every task switch and release through `log` */
 	trace?: boolean;
 	/**
@@ -363,6 +401,70 @@ const SIGCHLD = 17;
 const FORK_SPILL = 1 << 20;
 // copies of open digests a task has made for fork children that have not claimed them yet
 const MAX_DIGEST_TICKETS = 16;
+// host digests one task may hold open; each is host memory outside the machine's maximum
+const MAX_DIGESTS = 64;
+// host decoders one task may hold open, the decoded bytes they hold in all (host memory outside the
+// machine's maximum), and the most one feed call takes
+const MAX_INFLATES = 4;
+const MAX_INFLATE_BYTES = 256 << 20;
+const MAX_INFLATE_FEED = 4 << 20;
+// the unit a stream is kept and handed back in, and the size of the pieces it is stored in
+const INFLATE_WINDOW = 32768;
+const INFLATE_PIECE = 1 << 20;
+
+/** a deflate stream the host decodes ahead of the program, kept in windows with the input each took */
+class InflateStream {
+	length = 0;
+	taken = 0;
+	ended = false;
+	failed = false;
+	/** the bytes of input taken when each whole window was done */
+	readonly marks: number[] = [];
+	private readonly pieces: Uint8Array[] = [];
+	readonly owner: number;
+	private readonly decoder: HostInflater;
+
+	constructor(owner: number, decoder: HostInflater) {
+		this.owner = owner;
+		this.decoder = decoder;
+	}
+
+	/** 0 wants more input, 1 the stream ended, -1 failed, -2 would hold more than limit bytes */
+	feed(input: Uint8Array, limit: number): number {
+		if (this.failed) return -1;
+		if (this.ended) return 1;
+		let pos = 0;
+		try {
+			for (;;) {
+				const room = INFLATE_WINDOW - (this.length % INFLATE_WINDOW);
+				if (this.length + room > limit) return ((this.failed = true), -2);
+				const index = Math.floor(this.length / INFLATE_PIECE);
+				const piece = (this.pieces[index] ??= new Uint8Array(INFLATE_PIECE));
+				const at = this.length % INFLATE_PIECE;
+				const r = this.decoder.step(input.subarray(pos), piece.subarray(at, at + room));
+				pos += r.read;
+				this.taken += r.read;
+				this.length += r.written;
+				if (this.taken > 0x7fffffff) return ((this.failed = true), -1);
+				if (r.written && this.length % INFLATE_WINDOW === 0) this.marks.push(this.taken);
+				if (r.ended) return ((this.ended = true), 1);
+				// a decoder that stops with room and input left is stuck, not waiting
+				if (r.written < room) return pos < input.length ? ((this.failed = true), -1) : 0;
+			}
+		} catch {
+			return ((this.failed = true), -1);
+		}
+	}
+
+	/** window k as decoded (32 KiB; the last may be short and an empty stream has none), or undefined */
+	window(k: number): Uint8Array | undefined {
+		const start = k * INFLATE_WINDOW;
+		if (!(k >= 0) || start > this.length || !this.ended || this.failed) return undefined;
+		const piece = this.pieces[Math.floor(start / INFLATE_PIECE)];
+		const at = start % INFLATE_PIECE;
+		return piece?.subarray(at, at + Math.min(INFLATE_WINDOW, this.length - start));
+	}
+}
 const SIG_UNBLOCK = 1;
 
 /**
@@ -599,6 +701,13 @@ interface Pooled {
 	reused: boolean;
 }
 
+interface Template {
+	hash: string;
+	tableStart: number;
+	initial: number[];
+	tlsOffset: number;
+}
+
 /** the registry key an exec stub carries (scripts/wasm/exec-stubs.ts), or null for a full file */
 export function stubHash(bytes: Uint8Array): string | null {
 	let p = 8;
@@ -712,6 +821,8 @@ export interface MachineStats {
 	recycledStarts: number;
 	/** finished processes' instances kept for the next exec of their program */
 	recycleReturns: number;
+	/** instances made ahead while the pump idled (`prefillInstances`) */
+	prefilled: number;
 	/** the console driver's reads from the host */
 	consoleReads: number;
 	/** input interrupts raised to the console */
@@ -772,6 +883,8 @@ export interface MachineStats {
 	netBytesIn: number;
 	netBytesOut: number;
 	netBackpressure: number;
+	/** bytes handed to a reader as the machine's own memory, not copied */
+	netBorrowed: number;
 	/** `restoreFiles` written back */
 	filesRestored: number;
 	/** `restoreFiles` the kernel refused, with its error */
@@ -779,6 +892,9 @@ export interface MachineStats {
 	/** whole digests a program had the host finish (`MachineOptions.digest`), and the bytes they took */
 	digests: number;
 	digestBytes: number;
+	/** whole deflate streams the host decoded for a program (`MachineOptions.inflate`), and the bytes it handed back */
+	inflates: number;
+	inflateBytes: number;
 }
 
 /**
@@ -822,6 +938,7 @@ export class Machine {
 		sharedEntries: 0,
 		recycledStarts: 0,
 		recycleReturns: 0,
+		prefilled: 0,
 		consoleReads: 0,
 		consoleRaises: 0,
 		consolePuts: 0,
@@ -858,10 +975,13 @@ export class Machine {
 		netBytesIn: 0,
 		netBytesOut: 0,
 		netBackpressure: 0,
+		netBorrowed: 0,
 		filesRestored: 0,
 		fileRestoreErrors: [],
 		digests: 0,
-		digestBytes: 0
+		digestBytes: 0,
+		inflates: 0,
+		inflateBytes: 0
 	};
 	/** the streams hosts open to the machine's listeners (kernel patch 0031) */
 	private readonly net = new Ingress(this.stats, () => this.raiseNet());
@@ -1327,6 +1447,8 @@ export class Machine {
 				self.net.next(self.memory, event, buf, cap),
 			wasm_net_send: (id: number, buf: number, n: number) =>
 				self.net.send(id, new Uint8Array(self.memory.buffer, buf, n)),
+			wasm_net_lend: (id: number, buf: number, n: number) =>
+				self.net.lend(self.memory, id, buf, n),
 			wasm_net_end: (id: number, how: number) => self.net.end(id, how)
 		};
 	}
@@ -1465,6 +1587,8 @@ export class Machine {
 		);
 		// before _start: the kernel grows its RAM to the memory maximum and leaves no room after it
 		if (this.options.asyncify) this.ensureScratch();
+		if ((this.options.prefillInstances ?? 0) > 0 && this.options.sharedKernel)
+			this.reserveSentinel();
 		const core = this.options.runtime?.core;
 		if (core) this.startCore(this.memory.grow(coreRegionPages(core)) * 0x10000);
 		await this.enter(runner, () => WebAssembly.promising(exports._start)(), '_start');
@@ -1688,9 +1812,91 @@ export class Machine {
 				clone,
 				reused: false
 			};
+			if (!clone && !this.templates.has(user.module))
+				this.templates.set(user.module, {
+					hash: user.hash,
+					tableStart: p.tableStart,
+					initial: p.initial,
+					tlsOffset: p.tlsOffset
+				});
 		}
 		runner.recycled = p;
+		if (!clone) this.held.set(user.module, (this.held.get(user.module) ?? 0) + 1);
 		return { ux: p.exports, global: p.stackPointer };
+	}
+
+	/**
+	 * grows the region prefilled instances start over, before `_start`. A share build's start
+	 * function copies its data to `__memory_base` unless the word at its flag reads nonzero; every
+	 * word here is 2, so an instance started at the region's base reads one wherever the flag is,
+	 * writes nothing, and only its globals are set (the next exec resets all of them)
+	 */
+	private reserveSentinel() {
+		let bytes = 0;
+		for (const module of this.options.registry.values()) {
+			const facts = moduleFacts(module);
+			if (facts.recyclable) bytes = Math.max(bytes, facts.share!);
+		}
+		if (!bytes) return;
+		const pages = Math.ceil(bytes / 0x10000);
+		this.sentinel = this.memory.grow(pages) * 0x10000;
+		new Uint32Array(this.memory.buffer, this.sentinel, pages * 0x4000).fill(2);
+	}
+
+	/** makes idle instances ahead, up to `prefillInstances` for each build a process has started */
+	private prefill() {
+		const limit = Math.min(
+			this.options.prefillInstances ?? 0,
+			this.options.recycleInstances ?? RECYCLE_DEFAULT
+		);
+		// a fork child's memory can be the current one: the env would bind to it
+		if (!this.sentinel || !this.shared || limit <= 0 || this.privateMemories.size) return;
+		if (!this.templates.size) return;
+		const ghost = (this.ghost ??= this.runner('prefill', { kind: 'secondary', idle: 0 }));
+		ghost.instance = this.shared;
+		for (const [module, t] of this.templates) {
+			// an exec resets from the pristine image, which the first exec's start function wrote
+			if (!this.pristine.has(module)) continue;
+			let idle = this.pool.get(module);
+			if (!idle) this.pool.set(module, (idle = []));
+			// a running process's instance comes back to the pool: filling its place now would drop it
+			while (idle.length + (this.held.get(module) ?? 0) < limit) {
+				ghost.user = {
+					module,
+					hash: t.hash,
+					dataStart: this.sentinel,
+					tableStart: t.tableStart
+				};
+				const g = (value: number) =>
+					new WebAssembly.Global({ value: 'i32', mutable: true }, value);
+				const [memoryBase, stack] = [g(this.sentinel), g(0)];
+				const tableBase = new WebAssembly.Global(
+					{ value: 'i32', mutable: false },
+					t.tableStart
+				);
+				const exports = this.instantiateUser(
+					ghost,
+					this.userEnv(ghost, stack, memoryBase, tableBase)
+				).exports as Record<string, any>;
+				idle.push({
+					module,
+					memory: this.memory,
+					exports,
+					memoryBase,
+					stackPointer: stack,
+					globals: Object.keys(exports)
+						.filter((k) => /^gmux_g\d+$/.test(k))
+						.map((k) => exports[k] as WebAssembly.Global),
+					initial: t.initial,
+					tlsOffset: t.tlsOffset,
+					tableStart: t.tableStart,
+					clone: false,
+					reused: false
+				});
+				this.stats.prefilled++;
+			}
+		}
+		ghost.user = null;
 	}
 
 	/** the program ended (an exec replaced it, or its task unwound): its instance goes back */
@@ -1698,6 +1904,7 @@ export class Machine {
 		const p = runner.recycled;
 		if (!p) return;
 		runner.recycled = null;
+		if (!p.clone) this.held.set(p.module, (this.held.get(p.module) ?? 1) - 1);
 		if (p.clone && !this.cloneChecked.get(p.module)) return;
 		const pools = p.clone ? this.clonePool : this.pool;
 		let idle = pools.get(p.module);
@@ -3082,6 +3289,13 @@ export class Machine {
 	private pool = new Map<WebAssembly.Module, Pooled[]>();
 	private clonePool = new Map<WebAssembly.Module, Pooled[]>();
 	private pristine = new Map<WebAssembly.Module, Uint8Array>();
+	/** what a prefilled instance of a build is reset to, from the first exec's instance of it */
+	private templates = new Map<WebAssembly.Module, Template>();
+	/** exec instances of a build that processes hold, until `retire` gets them back */
+	private held = new Map<WebAssembly.Module, number>();
+	/** where `prefillInstances` instances start: a region whose every word is 2, past which no start function writes */
+	private sentinel = 0;
+	private ghost: Runner | null = null;
 	/** whether a clone's start function left the parent's data as it found it, by module */
 	private cloneChecked = new Map<WebAssembly.Module, boolean>();
 	/** pages a lazy restore has not written yet, by owner tag, and where they come from */
@@ -3167,18 +3381,22 @@ export class Machine {
 	private nextDigest = 1;
 
 	/**
-	 * katybug's `__gmux_digest(op, a, b, c)`: 0 opens a digest of algorithm a (1 md5, 2 sha1, 3 sha256, 4
-	 * sha512) and returns its id, 1 hashes the c bytes at address b into digest a, 2 writes digest a's
+	 * katybug's `__gmux_digest(op, a, b, c)`: 0 opens a digest of algorithm a (`DIGEST_ALGORITHMS`, 1 md5)
+	 * and returns its id, 1 hashes the c bytes at address b into digest a, 2 writes digest a's
 	 * result at b, closes it and returns its length, 3 closes it, 4 copies digest a for a fork child and
 	 * returns the copy's ticket, 5 hands the ticket a to the task that claims it, which must be a child
 	 * of the task that took it (the ticket's id is then the child's digest). A negative result is an
 	 * error: no `digest` option, an id the task did not open, or an address outside the memory
 	 */
 	private hostDigest(me: Runner, op: number, a: number, b: number, c: number): number {
+		if (op >= 8) return this.hostInflate(me, op, a, b, c);
 		try {
 			if (op === 0) {
-				const algorithm = (['md5', 'sha1', 'sha256', 'sha512'] as const)[a - 1];
+				const algorithm = DIGEST_ALGORITHMS[a - 1];
 				if (!algorithm || !this.options.digest) return -1;
+				let held = 0;
+				for (const d of this.digests.values()) if (!d.ticket && d.owner === me.id) held++;
+				if (held >= MAX_DIGESTS) return -1;
 				this.digests.set(this.nextDigest, {
 					owner: me.id,
 					hash: this.options.digest(algorithm)
@@ -3204,11 +3422,10 @@ export class Machine {
 				});
 				return this.nextDigest++;
 			}
-			const memory = new Uint8Array(this.userMemory(me).buffer);
+			const buffer = this.userMemory(me).buffer;
 			if (op === 1) {
-				// subarray clamps to the memory's end, so an address past it must not get that far
-				if ((b >>> 0) + (c >>> 0) > memory.length) return -1;
-				open.hash.update(memory.subarray(b >>> 0, (b >>> 0) + (c >>> 0)));
+				// a constructor view, which throws past the memory's end (subarray throws on Workers from 128 MiB up)
+				open.hash.update(new Uint8Array(buffer, b >>> 0, c >>> 0));
 				this.stats.digestBytes += c >>> 0;
 				return 0;
 			}
@@ -3216,7 +3433,7 @@ export class Machine {
 			if (op === 3) return 0;
 			if (op !== 2) return -1;
 			const result = open.hash.digest();
-			memory.set(result, b >>> 0);
+			new Uint8Array(buffer, b >>> 0, result.length).set(result);
 			this.stats.digests++;
 			return result.length;
 		} catch {
@@ -3226,6 +3443,71 @@ export class Machine {
 
 	private dropDigests(owner: number) {
 		for (const [id, open] of this.digests) if (open.owner === owner) this.digests.delete(id);
+		for (const [id, open] of this.inflates) if (open.owner === owner) this.inflates.delete(id);
+	}
+
+	/** the host decoders programs have open, by the id `__gmux_digest` gave out, and the task that opened each */
+	private readonly inflates = new Map<number, InflateStream>();
+	private nextInflate = 1;
+
+	/**
+	 * katybug's `__gmux_digest` ops 8 to 13, a program's gzip member decoded whole before its code
+	 * hands any of it on: 8 opens a decoder and returns its id, 9 decodes the c bytes at address b
+	 * (0 more input wanted, 1 the stream ended, -1 a data error or a bad request, -2 over the
+	 * bytes a task may hold), 10 writes four words at b (bytes decoded, bytes of input taken, whole
+	 * windows decoded, whether it ended), 11 returns the bytes of input taken when window b was
+	 * done, 12 copies window c (32 KiB, the last may be short) to address b, 13 closes it. A
+	 * negative result is an error: no `inflate` option, an id the task did not open, or an address
+	 * outside the memory
+	 */
+	private hostInflate(me: Runner, op: number, a: number, b: number, c: number): number {
+		try {
+			if (op === 8) {
+				if (!this.options.inflate) return -1;
+				let held = 0;
+				for (const s of this.inflates.values()) if (s.owner === me.id) held++;
+				if (held >= MAX_INFLATES) return -1;
+				this.inflates.set(
+					this.nextInflate,
+					new InflateStream(me.id, this.options.inflate())
+				);
+				return this.nextInflate++;
+			}
+			const stream = this.inflates.get(a);
+			if (!stream || stream.owner !== me.id) return -1;
+			if (op === 13) return (this.inflates.delete(a), 0);
+			const buffer = this.userMemory(me).buffer;
+			if (op === 9) {
+				if (c >>> 0 > MAX_INFLATE_FEED) return -1;
+				let others = 0;
+				for (const s of this.inflates.values())
+					if (s.owner === me.id && s !== stream) others += s.length;
+				const done = stream.ended;
+				const result = stream.feed(
+					new Uint8Array(buffer, b >>> 0, c >>> 0),
+					MAX_INFLATE_BYTES - others
+				);
+				if (result === 1 && !done) this.stats.inflates++;
+				return result;
+			}
+			if (op === 10) {
+				const words = new DataView(buffer, b >>> 0, 16);
+				words.setUint32(0, stream.length, true);
+				words.setUint32(4, stream.taken, true);
+				words.setUint32(8, stream.marks.length, true);
+				words.setUint32(12, stream.ended ? 1 : 0, true);
+				return 0;
+			}
+			if (op === 11) return stream.marks[b] ?? -1;
+			if (op !== 12) return -1;
+			const window = stream.window(c);
+			if (!window) return -1;
+			new Uint8Array(buffer, b >>> 0, window.length).set(window);
+			this.stats.inflateBytes += window.length;
+			return window.length;
+		} catch {
+			return -1;
+		}
 	}
 
 	/** the memory a task's program runs on: its own after a fork, else the machine's */
@@ -3281,6 +3563,17 @@ export class Machine {
 	 * machine's memory, not a copy, so a caller persists it before dropping the machine
 	 */
 	async checkpoint(): Promise<Snapshot> {
+		// a task inside userInterrupt has a kernel half that no restore re-enters (its user frames
+		// resume past the call), which leaves the cpu in kernel mode: run on until it is out
+		const interrupted = () => [...this.runners.values()].some((r) => r.interrupting);
+		if (!this.running && interrupted()) {
+			await this.run(
+				() => !interrupted(),
+				async () => {},
+				10_000
+			);
+			if (interrupted()) throw new Error('checkpoint during a user-mode interrupt');
+		}
 		// the snapshot holds an empty console ring, so a restore neither loses nor repeats a byte
 		this.drainConsole();
 		// a task the kernel released can still hold a turn in the ready queue, which a live machine
@@ -3298,6 +3591,8 @@ export class Machine {
 		// a host digest cannot hand its state back, so a checkpoint waits for the stream to end
 		if (this.digests.size)
 			throw new Error('checkpoint: a host digest is open and is not saved');
+		if (this.inflates.size)
+			throw new Error('checkpoint: a host inflate stream is open and is not saved');
 		// ponytail: shared instances hold one process's values at a time; saving each runner's
 		// set and rebuilding the template on restore would lift this
 		if (this.sharedPrograms.size)
@@ -3719,10 +4014,11 @@ export class Machine {
 
 	/**
 	 * opens a stream to the program listening on `port`: the kernel connects a socket to it and the
-	 * program accepts an ordinary connection. Throws when nothing listens there
+	 * program accepts an ordinary connection. Throws when nothing listens there. `borrows` lets the
+	 * kernel lend its buffers to the reader (kernel patch 0041) on the terms of `IngressStream.recycle`
 	 */
-	ingress(port: number): IngressStream {
-		return this.net.connect(port);
+	ingress(port: number, borrows = false): IngressStream {
+		return this.net.connect(port, borrows);
 	}
 
 	/** kernel patch 0031: the relay thread is woken by an interrupt, as the console is */
@@ -3980,6 +4276,7 @@ export class Machine {
 			if (next) next.idle = null;
 			else next = this.ready.shift() ?? null;
 			if (!next) {
+				this.prefill();
 				const deadline = this.nextDeadline();
 				if (deadline === null) return 'deadlock: nothing runnable and no timer armed';
 				// rounded up: a timer under a millisecond away is still time the machine skips, and a

@@ -140,6 +140,15 @@ describe('requestBytes', () => {
 		const text = await collect(new Request('http://site.test/', { method: 'POST' }));
 		expect(text).toContain('content-length: 0\r\n');
 	});
+
+	it('leaves the connection open for the next request when asked to keep it', async () => {
+		let text = '';
+		const request = new Request('http://site.test/', { headers: { connection: 'close' } });
+		for await (const chunk of requestBytes(request, Infinity, true))
+			text += new TextDecoder().decode(chunk);
+		expect(text.endsWith('connection: keep-alive\r\n\r\n')).toBe(true);
+		expect(text).not.toContain('connection: close');
+	});
 });
 
 describe('parseHead', () => {
@@ -219,6 +228,31 @@ describe('parseHead', () => {
 
 	it('refuses a header value Response would not accept', () => {
 		expect(() => head('HTTP/1.1 200 OK\r\nX-Bad: a\u0000b\r\n\r\n')).toThrow(BadGateway);
+	});
+
+	it.each([
+		['HTTP/1.1 with a length', 'HTTP/1.1 200 OK\r\nContent-Length: 3\r\n\r\n', true],
+		['HTTP/1.1 chunked', 'HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n', true],
+		['a 204', 'HTTP/1.1 204 No Content\r\n\r\n', true],
+		['a body that runs to the close', 'HTTP/1.1 200 OK\r\n\r\n', false],
+		[
+			'Connection: close',
+			'HTTP/1.1 200 OK\r\nContent-Length: 3\r\nConnection: Close\r\n\r\n',
+			false
+		],
+		['HTTP/1.0 with a length', 'HTTP/1.0 200 OK\r\nContent-Length: 3\r\n\r\n', false],
+		[
+			'HTTP/1.0 with keep-alive',
+			'HTTP/1.0 200 OK\r\nContent-Length: 3\r\nConnection: keep-alive\r\n\r\n',
+			true
+		],
+		[
+			'HTTP/1.0 with keep-alive and no length',
+			'HTTP/1.0 200 OK\r\nConnection: keep-alive\r\n\r\n',
+			false
+		]
+	])('says whether the connection stays open for %s', (_, text, keepAlive) => {
+		expect(head(text).keepAlive).toBe(keepAlive);
 	});
 });
 
@@ -353,5 +387,119 @@ describe('responseFrom', () => {
 		);
 		await response.body!.cancel();
 		expect(done).toEqual([false]);
+	});
+
+	describe('a connection that stays open', () => {
+		const ends = async (wire: string, method = 'GET') => {
+			const done: [boolean, boolean | undefined][] = [];
+			const response = await responseFrom(source(wire), method, (clean, reusable) =>
+				done.push([clean, reusable])
+			);
+			if (response.body) await response.text();
+			return done;
+		};
+
+		it.each([
+			['a length', 'HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok'],
+			['chunks', 'HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n2\r\nok\r\n0\r\n\r\n'],
+			['a 204', 'HTTP/1.1 204 No Content\r\n\r\n'],
+			['a zero length', 'HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n']
+		])('is reusable after %s', async (_, wire) => {
+			expect(await ends(wire)).toEqual([[true, true]]);
+		});
+
+		it('is reusable after a HEAD reply', async () => {
+			expect(await ends('HTTP/1.1 200 OK\r\nContent-Length: 9\r\n\r\n', 'HEAD')).toEqual([
+				[true, true]
+			]);
+		});
+
+		it.each([
+			[
+				'Connection: close',
+				'HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok'
+			],
+			['a body that runs to the close', 'HTTP/1.1 200 OK\r\n\r\nok'],
+			['bytes after a length body', 'HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nokNEXT'],
+			[
+				'bytes after the last chunk',
+				'HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n2\r\nok\r\n0\r\n\r\nNEXT'
+			],
+			['bytes after a 204', 'HTTP/1.1 204 No Content\r\n\r\nNEXT']
+		])('is not reusable after %s', async (_, wire) => {
+			expect(await ends(wire)).toEqual([[true, false]]);
+		});
+
+		it('hands the source to the next reply once a body has ended', async () => {
+			const stream = source('HTTP/1.1 200 OK\r\nContent-Length: 3\r\n\r\none');
+			const done: (boolean | undefined)[] = [];
+			const first = await responseFrom(stream, 'GET', (_, reusable) => done.push(reusable));
+			expect(await read(first)).toBe('one');
+			expect(done).toEqual([true]);
+			expect(stream.locked).toBe(false);
+		});
+
+		describe('recycle', () => {
+			function logged(...parts: string[]) {
+				const log: string[] = [];
+				let next = 0;
+				const stream = new ReadableStream<Uint8Array>(
+					{
+						pull(c) {
+							log.push('read');
+							if (next < parts.length) c.enqueue(encode(parts[next++]!));
+							else c.close();
+						}
+					},
+					{ highWaterMark: 0 }
+				);
+				return { stream, log };
+			}
+			const wire = 'HTTP/1.1 200 OK\r\nContent-Length: 11\r\n\r\nhel';
+
+			it('asks for nothing from the machine until the body is read', async () => {
+				const { stream, log } = logged(wire, 'lo ', 'world');
+				await responseFrom(stream, 'GET', undefined, () => log.push('recycle'));
+				expect(log).toEqual(['read']);
+			});
+
+			it('is told before each read of the machine that what was read before is used up', async () => {
+				const { stream, log } = logged(wire, 'lo ', 'world');
+				const response = await responseFrom(stream, 'GET', undefined, () =>
+					log.push('recycle')
+				);
+				expect(await read(response)).toBe('hello world');
+				expect(log).toEqual(['read', 'recycle', 'recycle', 'read', 'recycle', 'read']);
+				for (const [i, entry] of log.entries())
+					if (entry === 'read' && i > 0) expect(log[i - 1]).toBe('recycle');
+			});
+
+			it('hands the consumer parts of the chunks it read and copies the head', async () => {
+				const { stream } = logged(wire, 'lo ', 'world');
+				const seen: Uint8Array[] = [];
+				const response = await responseFrom(stream, 'GET');
+				const reader = response.body!.getReader();
+				for (let r = await reader.read(); !r.done; r = await reader.read())
+					seen.push(r.value);
+				expect(seen.map((part) => new TextDecoder().decode(part))).toEqual([
+					'hel',
+					'lo ',
+					'world'
+				]);
+			});
+		});
+
+		it('keeps a connection whose second reply comes in a later read', async () => {
+			let controller!: ReadableStreamDefaultController<Uint8Array>;
+			const stream = new ReadableStream<Uint8Array>({
+				start: (c) => void (controller = c)
+			});
+			controller.enqueue(encode('HTTP/1.1 200 OK\r\nContent-Length: 3\r\n\r\none'));
+			const first = await responseFrom(stream, 'GET');
+			expect(await read(first)).toBe('one');
+			controller.enqueue(encode('HTTP/1.1 200 OK\r\nContent-Length: 3\r\n\r\ntwo'));
+			const second = await responseFrom(stream, 'GET');
+			expect(await read(second)).toBe('two');
+		});
 	});
 });
