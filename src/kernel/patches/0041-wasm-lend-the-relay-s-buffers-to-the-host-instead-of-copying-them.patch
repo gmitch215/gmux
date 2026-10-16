@@ -1,0 +1,237 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Gregory Mitchell <me@gmitch215.xyz>
+Date: Thu, 15 Oct 2026 14:30:00 +0000
+Subject: [PATCH] wasm: lend the relay's buffers to the host instead of copying
+ them
+
+khostnetd read the socket into one buffer and the host copied what it
+took, then the thread kept a copy of whatever the host refused. The
+thread now reads into a buffer of its own for each chunk and offers it
+through wasm_net_lend. The host answers with the bytes it took and keeps
+the buffer, or sets HN_COPIED when it copied them, or takes nothing and
+the thread offers the same buffer again later. A kept buffer comes back
+in a release event (the addresses of the buffers, in the event's data)
+and a header on each buffer makes a repeated or invented address free
+nothing.
+---
+ arch/wasm/kernel/hostnet.c | 120 +++++++++++++++++++++++++++++++-----------
+ 1 file changed, 82 insertions(+), 38 deletions(-)
+
+diff --git a/arch/wasm/kernel/hostnet.c b/arch/wasm/kernel/hostnet.c
+--- a/arch/wasm/kernel/hostnet.c
++++ b/arch/wasm/kernel/hostnet.c
+@@ -24,7 +24,7 @@
+ #include <asm/irq.h>
+ 
+ /* what the host hands wasm_net_next */
+-enum { HN_OPEN = 1, HN_DATA, HN_SHUT, HN_ABORT };
++enum { HN_OPEN = 1, HN_DATA, HN_SHUT, HN_ABORT, HN_RELEASE };
+ /* what wasm_net_end tells the host: the guest's end is done, or the stream is gone; hold and release
+    pause and resume the host's events for one stream */
+ enum { HN_END_FIN, HN_END_RESET, HN_END_HOLD, HN_END_RELEASE };
+@@ -32,16 +32,19 @@
+ struct hn_event {
+ 	u32 op;
+ 	u32 id;
+-	/* a port for an open, the byte count for data */
++	/* a port for an open, the byte count for data, the token count for a release */
+ 	u32 arg;
+ };
+ 
+ extern int wasm_net_listen(unsigned int port, int on);
+ extern int wasm_net_next(struct hn_event *event, void *buf, unsigned int cap);
+-extern int wasm_net_send(unsigned int id, const void *buf, unsigned int len);
++extern int wasm_net_lend(unsigned int id, const void *buf, unsigned int len);
+ extern void wasm_net_end(unsigned int id, int how);
+ 
+ #define HN_BUF		16384
++/* wasm_net_lend answers the count with this bit set when it copied the bytes: the buffer is ours again */
++#define HN_COPIED	0x40000000
++#define HN_LEND_MAGIC	0x6c656e64686f7374ULL
+ /* SO_RCVBUF of the client socket, which bounds what a slow host reader leaves queued here */
+ #define HN_RCVBUF	32768
+ /* chunks one stream moves before the others take a turn */
+@@ -49,6 +52,15 @@
+ 
+ enum { C_WORK, C_UP, C_FIN_OUT, C_WDONE, C_RDONE };
+ 
++/*
++ * A buffer the host may keep: it holds the bytes it was given until it sends a release for the
++ * address. The magic names a live buffer, so a release the host repeats or invents frees nothing
++ */
++struct hn_lend {
++	u64 magic;
++	u8 data[HN_BUF - sizeof(u64)];
++};
++
+ struct hn_conn {
+ 	struct list_head node;
+ 	struct socket *sock;
+@@ -58,10 +70,9 @@
+ 	u8 *wtail;
+ 	u32 wlen;
+ 	u32 woff;
+-	/* bytes the socket gave that the host has not taken yet */
+-	u8 *rtail;
++	/* a buffer of bytes the socket gave that the host refused: offered again as it is */
++	struct hn_lend *rbuf;
+ 	u32 rlen;
+-	u32 roff;
+ 	void (*data_ready)(struct sock *sk);
+ 	void (*write_space)(struct sock *sk);
+ 	void (*state_change)(struct sock *sk);
+@@ -79,7 +90,43 @@
+ /* only khostnetd touches the list */
+ static LIST_HEAD(hn_conns);
+ static DEFINE_MUTEX(hn_start);
++/* a buffer the last read left unused, for the next one */
++static struct hn_lend *hn_spare;
++
++static struct hn_lend *hn_lend_get(void)
++{
++	struct hn_lend *lend = hn_spare;
++
++	if (lend) {
++		hn_spare = NULL;
++		return lend;
++	}
++	return kmalloc(sizeof(*lend), GFP_KERNEL);
++}
+ 
++static void hn_lend_put(struct hn_lend *lend)
++{
++	if (hn_spare)
++		kfree(lend);
++	else
++		hn_spare = lend;
++}
++
++/* the host is done with these buffers (a token is the address of its bytes) */
++static void hn_release(const u32 *tokens, u32 count)
++{
++	u32 i;
++
++	for (i = 0; i < count; i++) {
++		struct hn_lend *lend = (void *)((unsigned long)tokens[i] - offsetof(struct hn_lend, data));
++
++		if (tokens[i] < PAGE_SIZE || lend->magic != (HN_LEND_MAGIC ^ (u64)(unsigned long)lend))
++			continue;
++		lend->magic = 0;
++		hn_lend_put(lend);
++	}
++}
++
+ __visible int wasm_net_irq(void)
+ {
+ 	return WASM_IRQ_NET;
+@@ -123,7 +170,7 @@
+ 	sock_release(c->sock);
+ 	list_del(&c->node);
+ 	kfree(c->wtail);
+-	kfree(c->rtail);
++	kfree(c->rbuf);
+ 	kfree(c);
+ }
+ 
+@@ -231,6 +278,10 @@
+ 			hostnet_open(event->id, event->arg);
+ 			continue;
+ 		}
++		if (event->op == HN_RELEASE) {
++			hn_release((const u32 *)hn_io->data, min_t(u32, event->arg, HN_BUF / sizeof(u32)));
++			continue;
++		}
+ 		c = hn_find(event->id);
+ 		if (!c)
+ 			continue;
+@@ -247,48 +298,48 @@
+ /* the socket's bytes to the host, until the host is full or the socket has nothing more */
+ static bool hostnet_to_host(struct hn_conn *c)
+ {
+-	struct kvec vec = { .iov_base = hn_io->data, .iov_len = HN_BUF };
+ 	int burst = 0;
+ 
+ 	while (burst++ < HN_BURST) {
+ 		struct msghdr msg = { .msg_flags = MSG_DONTWAIT };
+-		int n, sent;
++		struct hn_lend *lend = c->rbuf;
++		struct kvec vec;
++		int n = c->rlen, sent;
+ 
+-		if (c->rlen) {
+-			sent = wasm_net_send(c->id, c->rtail + c->roff, c->rlen - c->roff);
+-			if (sent < 0)
++		if (!lend) {
++			lend = hn_lend_get();
++			if (!lend)
+ 				return false;
+-			if (!sent)
++			lend->magic = HN_LEND_MAGIC ^ (u64)(unsigned long)lend;
++			vec.iov_base = lend->data;
++			vec.iov_len = sizeof(lend->data);
++			n = kernel_recvmsg(c->sock, &msg, &vec, 1, sizeof(lend->data), MSG_DONTWAIT);
++			if (n <= 0) {
++				hn_lend_put(lend);
++				if (n == -EAGAIN)
++					return true;
++				if (n < 0)
++					return false;
++				if (!test_and_set_bit(C_RDONE, &c->flags))
++					wasm_net_end(c->id, HN_END_FIN);
+ 				return true;
+-			c->roff += sent;
+-			if (c->roff < c->rlen)
+-				return true;
+-			kfree(c->rtail);
+-			c->rtail = NULL;
+-			c->rlen = c->roff = 0;
+-			continue;
++			}
+ 		}
+-		n = kernel_recvmsg(c->sock, &msg, &vec, 1, HN_BUF, MSG_DONTWAIT);
+-		if (n == -EAGAIN)
+-			return true;
+-		if (n < 0)
++		c->rbuf = NULL;
++		c->rlen = 0;
++		/* the host keeps the buffer unless it copied the bytes or refused them */
++		sent = wasm_net_lend(c->id, lend->data, n);
++		if (sent < 0) {
++			hn_lend_put(lend);
+ 			return false;
+-		if (!n) {
+-			if (!test_and_set_bit(C_RDONE, &c->flags))
+-				wasm_net_end(c->id, HN_END_FIN);
+-			return true;
+ 		}
+-		sent = wasm_net_send(c->id, hn_io->data, n);
+-		if (sent < 0)
+-			return false;
+-		if (sent < n) {
+-			c->rtail = kmemdup(hn_io->data + sent, n - sent, GFP_KERNEL);
+-			if (!c->rtail)
+-				return false;
+-			c->rlen = n - sent;
+-			c->roff = 0;
++		if (!sent) {
++			c->rbuf = lend;
++			c->rlen = n;
+ 			return true;
+ 		}
++		if (sent & HN_COPIED)
++			hn_lend_put(lend);
+ 	}
+ 	/* more may be waiting: come back after the other streams */
+ 	set_bit(C_WORK, &c->flags);
+@@ -349,7 +400,7 @@
+ 		/* ponytail: a walk of every stream per wake; a ready list when streams number in the thousands */
+ 		list_for_each_entry_safe(c, next, &hn_conns, node)
+ 			/* the host's interrupt means room in its buffers: a stream holding bytes retries */
+-			if (test_and_clear_bit(C_WORK, &c->flags) || c->rlen)
++			if (test_and_clear_bit(C_WORK, &c->flags) || c->rbuf)
+ 				hn_service(c);
+ 		cond_resched();
+ 	}
+--
+2.43.0
+
