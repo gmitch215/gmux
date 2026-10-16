@@ -23,7 +23,7 @@
  <tr id="projectrow">
   <td id="projectlogo"><img alt="Logo" src="gmux_64.png"/></td>
   <td id="projectalign">
-   <div id="projectname">gmux<span id="projectnumber">&#160;1.0.0</span>
+   <div id="projectname">gmux<span id="projectnumber">&#160;0.1.0</span>
    </div>
    <div id="projectbrief">Linux on Cloudflare Workers</div>
   </td>
@@ -85,6 +85,7 @@ $(function() {
 <li><a class="el" href="index.html#autotoc_md-quick-start">🚀 Quick Start</a></li>
 <li><a class="el" href="index.html#autotoc_md-install-the-library">📥 Install the Library</a></li>
 <li><a class="el" href="index.html#autotoc_md-what-runs">🐧 What Runs</a></li>
+<li><a class="el" href="index.html#autotoc_md-katybug">🐞 Katybug</a></li>
 <li><a class="el" href="index.html#autotoc_md-how-it-works">🧱 How It Works</a></li>
 <li><a class="el" href="index.html#autotoc_md-security">🔒 Security</a></li>
 <li><a class="el" href="index.html#️-building-from-source">🛠️ Building from Source</a></li>
@@ -150,14 +151,64 @@ $(function() {
 <td class="markdownTableBodyNone">Foreign binaries   </td><td class="markdownTableBodyNone">unchanged x86-64 and AArch64 Linux ELFs, through Katybug   </td></tr>
 </table>
 <p>Programs are compiled for <code>wasm32-linux</code> with <code>scripts/cc-strict</code>, which refuses any import outside the syscall surface. Code that arrives at run time cannot be compiled on Workers, so every native executable is built with the deployment.</p>
+<h2><a class="anchor" id="autotoc_md-katybug"></a>
+🐞 Katybug</h2>
+<p>Katybug runs unmodified x86-64 and AArch64 Linux executables inside a machine. It ships in the package as <code>kernel/katybug.wasm</code>, an ordinary gmux program: it decodes the guest's machine code into gmux's IR, runs it, and turns each guest syscall into the machine's own. The init script registers it with <code>binfmt_misc</code>, so a shell, <code>execve</code> and <code>fork</code> treat a foreign ELF like any other program.</p>
+<ul>
+<li><b>Executables:</b> static and dynamically linked, against glibc or musl with their own <code>ld.so</code></li>
+<li><b>Processes:</b> <code>fork</code>, <code>execve</code>, threads, signals and their handlers</li>
+<li><b>Instruction sets:</b> x86-64 with x87 and SSE, AArch64 with its floating point and SIMD</li>
+<li><b>Host implementations:</b> recognized library code (the string functions, zlib, the md5, sha1, sha256 and sha512 blocks) runs on host kernels, and a whole md5, sha1, sha256 or sha512 stream can finish on the host's own crypto</li>
+<li><b>Images:</b> an executable's pages are read from its file when first touched</li>
+</ul>
+<h3><a class="anchor" id="running-a-foreign-binary"></a>
+Running a Foreign Binary</h3>
+<p>Register Katybug next to BusyBox, then add the executable to the root filesystem by appending a <code>newc</code> cpio archive to the initramfs. The kernel unpacks the archives in order.</p>
+<div class="fragment"><div class="line">printf &#39;hello\n&#39; | cpio -o -H newc &gt; hello.cpio</div>
+</div><!-- fragment --><div class="fragment"><div class="line">import { createHash } from &#39;node:crypto&#39;;</div>
+<div class="line">import { readFileSync } from &#39;node:fs&#39;;</div>
+<div class="line">import { Machine } from &#39;@gmitch215/gmux&#39;;</div>
+<div class="line">import manifest from &#39;@gmitch215/gmux/kernel/manifest.json&#39;;</div>
+<div class="line">import vmlinux from &#39;@gmitch215/gmux/kernel/vmlinux.wasm&#39;;</div>
+<div class="line">import busybox from &#39;@gmitch215/gmux/kernel/busybox.wasm&#39;;</div>
+<div class="line">import katybug from &#39;@gmitch215/gmux/kernel/katybug.wasm&#39;;</div>
+<div class="line">import initrd from &#39;@gmitch215/gmux/kernel/initramfs.bin&#39;;</div>
+<div class="line"> </div>
+<div class="line">const base = new Uint8Array(initrd);</div>
+<div class="line">const extra = readFileSync(&#39;hello.cpio&#39;);</div>
+<div class="line">const pad = (4 - (base.length % 4)) % 4;</div>
+<div class="line">const image = new Uint8Array(base.length + pad + extra.length);</div>
+<div class="line">image.set(base);</div>
+<div class="line">image.set(extra, base.length + pad);</div>
+<div class="line"> </div>
+<div class="line">const machine = new Machine({</div>
+<div class="line">  vmlinux,</div>
+<div class="line">  initrd: image,</div>
+<div class="line">  cmdline: &#39;maxcpus=3 root=/dev/ram0 rootfstype=ramfs init=/init console=hvc&#39;,</div>
+<div class="line">  registry: new Map([</div>
+<div class="line">    [manifest.busybox, busybox],</div>
+<div class="line">    [manifest.katybug, katybug]</div>
+<div class="line">  ]),</div>
+<div class="line">  sharedKernel: true,</div>
+<div class="line">  sha256: (bytes) =&gt; createHash(&#39;sha256&#39;).update(bytes).digest(&#39;hex&#39;),</div>
+<div class="line">  digest: (algorithm) =&gt; createHash(algorithm),</div>
+<div class="line">  write: (text) =&gt; console.log(text)</div>
+<div class="line">});</div>
+<div class="line">machine.type(&#39;/hello\n&#39;);</div>
+<div class="line">const started = Date.now();</div>
+<div class="line">await machine.run(</div>
+<div class="line">  () =&gt; Date.now() - started &gt; 10_000,</div>
+<div class="line">  (ms) =&gt; new Promise((resolve) =&gt; setTimeout(resolve, ms))</div>
+<div class="line">);</div>
+</div><!-- fragment --><p><code>digest</code> is optional. With it, a digest stream Katybug recognizes runs on the host's crypto; without it, Katybug hashes with its own kernels. A machine cannot checkpoint while a host digest is open.</p>
+<p>The technical report's <a href="TECHNICAL_REPORT.md#foreign-executables">Foreign Executables</a> section covers how Katybug decodes, caches and lifts code, its host kernels, and what each costs.</p>
 <h2><a class="anchor" id="autotoc_md-how-it-works"></a>
 🧱 How It Works</h2>
-<p>The kernel and every process share one WebAssembly memory. A syscall is a direct call from the program's instance into the kernel's. Blocking is JSPI: every task that waits is a suspended wasm stack, and one pump on the Durable Object's single thread resumes exactly the task the kernel schedules next. When a machine has to leave memory, its parked stacks become bytes (Asyncify for the kernel, resumable frames or Asyncify for programs), and a restore rewinds them into fresh instances.</p>
-<p>Katybug decodes x86-64 and AArch64 into gmux's IR and interprets it, turning guest syscalls into the machine's own. <code>binfmt_misc</code> hands it any foreign ELF, so <code>execve</code> of an amd64 binary just works.</p>
+<p>The kernel and every process share one WebAssembly memory. A syscall is a direct call from the program's instance into the kernel's. Blocking is JSPI: every task that waits is a suspended wasm stack, and one pump on the Durable Object's single thread resumes exactly the task the kernel schedules next. When a machine has to leave memory, its parked stacks become bytes (Asyncify for the kernel, resumable frames or Asyncify for programs), and a restore rewinds them into fresh instances. Foreign executables run through <a class="el" href="index.html#autotoc_md-katybug">Katybug</a>.</p>
 <p>TECHNICAL_REPORT.md has the design, the platform limits that shape it, and what each operation costs.</p>
 <h2><a class="anchor" id="autotoc_md-security"></a>
 🔒 Security</h2>
-<p>A machine is a Durable Object: code inside it has no Worker bindings, secrets or network authority beyond what the host passes to it, and a deployed Worker cannot compile code at run time. Inside one machine, root processes share one trust domain; non-root processes cannot write memory they do not own, but they can read it. SECURITY.md has the trust model, the import surface and the threat matrix.</p>
+<p>A machine is a Durable Object: code inside it has no Worker bindings, secrets or network authority beyond what the host passes to it, and a deployed Worker cannot compile code at run time. Inside one machine, root processes share one trust domain; a non-root process reaches only its own memory and the shared mappings it maps, and a forked process runs in a memory of its own. SECURITY.md has the trust model, the import surface and the threat matrix.</p>
 <h2><a class="anchor" id="️-building-from-source"></a>
 🛠️ Building from Source</h2>
 <p>The kernel, musl, BusyBox and Katybug build reproducibly on a Linux host with Docker from the pins in <code>src/sources.json</code> and the patches under <code>src/</code>:</p>

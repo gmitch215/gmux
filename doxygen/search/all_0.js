@@ -1,4 +1,4 @@
 var searchData=
 [
-  ['building_20from_20source_0',['🛠️ Building from Source',['../index.html#️-building-from-source',1,'']]]
+  ['a_20foreign_20binary_0',['Running a Foreign Binary',['../index.html#running-a-foreign-binary',1,'']]]
 ];

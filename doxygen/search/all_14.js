@@ -1,4 +1,4 @@
 var searchData=
 [
-  ['🐧_20what_20runs_0',['🐧 What Runs',['../index.html#autotoc_md-what-runs',1,'']]]
+  ['🎯_20why_20gmux_0',['🎯 Why gmux',['../index.html#autotoc_md-why-gmux',1,'']]]
 ];

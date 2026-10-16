@@ -1,19 +1,7 @@
 var searchData=
 [
-  ['kb_5fblock_0',['kb_block',['../db/dee/structkb__block.html',1,'']]],
-  ['kb_5fcpu_1',['kb_cpu',['../de/d32/structkb__cpu.html',1,'']]],
-  ['kb_5fdigest_5frow_2',['kb_digest_row',['../db/dce/structkb__digest__row.html',1,'']]],
-  ['kb_5femit_3',['kb_emit',['../d9/d98/structkb__emit.html',1,'']]],
-  ['kb_5fexp_5fdata_4',['kb_exp_data',['../df/d0c/structkb__exp__data.html',1,'']]],
-  ['kb_5ffile_5',['kb_file',['../d4/dea/structkb__file.html',1,'']]],
-  ['kb_5ffuse_6',['kb_fuse',['../d7/d0d/structkb__fuse.html',1,'']]],
-  ['kb_5fic_7',['kb_ic',['../d7/de5/structkb__ic.html',1,'']]],
-  ['kb_5fimage_8',['kb_image',['../d1/dd8/structkb__image.html',1,'']]],
-  ['kb_5fins_9',['kb_ins',['../de/de4/structkb__ins.html',1,'']]],
-  ['kb_5flog_5fdata_10',['kb_log_data',['../d8/dcf/structkb__log__data.html',1,'']]],
-  ['kb_5fmapping_11',['kb_mapping',['../dd/dce/structkb__mapping.html',1,'']]],
-  ['kb_5fpow_5flog_5fdata_12',['kb_pow_log_data',['../d4/d6e/structkb__pow__log__data.html',1,'']]],
-  ['kb_5fseg_13',['kb_seg',['../de/dde/structkb__seg.html',1,'']]],
-  ['kb_5fsigaction_14',['kb_sigaction',['../d6/d41/structkb__sigaction.html',1,'']]],
-  ['kb_5fthread_15',['kb_thread',['../da/db9/structkb__thread.html',1,'']]]
+  ['idle_0',['idle',['../df/df7/structidle.html',1,'']]],
+  ['image_1',['image',['../de/d68/structimage.html',1,'']]],
+  ['install_20the_20library_2',['📥 Install the Library',['../index.html#autotoc_md-install-the-library',1,'']]],
+  ['it_20works_3',['🧱 How It Works',['../index.html#autotoc_md-how-it-works',1,'']]]
 ];

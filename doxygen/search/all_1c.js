@@ -1,4 +1,4 @@
 var searchData=
 [
-  ['🧱_20how_20it_20works_0',['🧱 How It Works',['../index.html#autotoc_md-how-it-works',1,'']]]
+  ['🚀_20quick_20start_0',['🚀 Quick Start',['../index.html#autotoc_md-quick-start',1,'']]]
 ];

@@ -1,4 +1,4 @@
 var searchData=
 [
-  ['📥_20install_20the_20library_0',['📥 Install the Library',['../index.html#autotoc_md-install-the-library',1,'']]]
+  ['📋_20table_20of_20contents_0',['📋 Table of Contents',['../index.html#autotoc_md-table-of-contents',1,'']]]
 ];

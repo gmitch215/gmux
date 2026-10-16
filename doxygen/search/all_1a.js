@@ -1,4 +1,4 @@
 var searchData=
 [
-  ['🚀_20quick_20start_0',['🚀 Quick Start',['../index.html#autotoc_md-quick-start',1,'']]]
+  ['📥_20install_20the_20library_0',['📥 Install the Library',['../index.html#autotoc_md-install-the-library',1,'']]]
 ];

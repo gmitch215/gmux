@@ -1,6 +1,6 @@
 var searchData=
 [
-  ['security_0',['🔒 Security',['../index.html#autotoc_md-security',1,'']]],
-  ['source_1',['🛠️ Building from Source',['../index.html#️-building-from-source',1,'']]],
-  ['start_2',['🚀 Quick Start',['../index.html#autotoc_md-quick-start',1,'']]]
+  ['record_0',['record',['../d1/d49/structrecord.html',1,'']]],
+  ['running_20a_20foreign_20binary_1',['Running a Foreign Binary',['../index.html#running-a-foreign-binary',1,'']]],
+  ['runs_2',['🐧 What Runs',['../index.html#autotoc_md-what-runs',1,'']]]
 ];

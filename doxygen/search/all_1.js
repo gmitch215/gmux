@@ -1,5 +1,5 @@
 var searchData=
 [
-  ['contents_0',['📋 Table of Contents',['../index.html#autotoc_md-table-of-contents',1,'']]],
-  ['ctl_1',['ctl',['../db/d8b/structctl.html',1,'']]]
+  ['binary_0',['Running a Foreign Binary',['../index.html#running-a-foreign-binary',1,'']]],
+  ['building_20from_20source_1',['🛠️ Building from Source',['../index.html#️-building-from-source',1,'']]]
 ];
