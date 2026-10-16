@@ -5,7 +5,13 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { appendCpio } from '../../../scripts/wasm/cpio-append.ts';
 import { hostRuntime } from '../../../scripts/wasm/router-modules.ts';
-import { Machine, type SyscallCall } from '../../../src/worker/machine/machine.ts';
+import { DurableStore, encodeSnapshot } from '../../../src/worker/durable.ts';
+import { checkpointCost } from '../../../src/worker/keeper.ts';
+import { Machine, type MachineOptions, type SyscallCall } from '../../../src/worker/machine/machine.ts';
+import { Cadence } from '../../../src/worker/schedule.ts';
+import { siteOptions } from '../../../src/worker/site-machine.ts';
+import { imports, watchKernel } from './imports.ts';
+import { sqlite } from '../../write-back/scripts/sqlite.ts';
 
 /**
  * Syscalls of four workloads run inside a machine under Node, and the share of their CPU the kernel
@@ -17,21 +23,26 @@ import { Machine, type SyscallCall } from '../../../src/worker/machine/machine.t
  *   MODE=wall: the workload's wall time, no counting and no profiler
  *   MODE=stat: the system paths the workload opened (a counted run), their size, mtime and ctime
  *     before and after a second run in a fresh machine
+ * SITE=1 runs the machine the site runs (siteOptions) with a file sync handler; IMPORTS=1 times each plain
+ * kernel import, KERNELURL=1 records the kernel module's profile url, CPUPROF=<file> and BOOTPROF=<file> keep
+ * the raw V8 profiles of the workload and the boot (composed.ts reads them), PERSIST=1 writes one checkpoint.
  * GMUX_BUILD picks the build (default build/), VMLINUX a kernel with a name section, N the loop
  * count, NR_TABLE a file of `#define __NR_<name> <n>` lines for call names.
  * `node --no-warnings --experimental-strip-types experiments/syscall-cost/scripts/census.ts <workload>`
  */
 const root = new URL('../../../', import.meta.url).pathname;
 const [workload] = process.argv.slice(2);
-if (!['configure', 'fork', 'lsl', 'userland'].includes(workload ?? ''))
-	throw new Error('usage: census.ts <configure|fork|lsl|userland>');
+if (!['configure', 'fork', 'lsl', 'userland', 'gap'].includes(workload ?? ''))
+	throw new Error('usage: census.ts <configure|fork|lsl|userland|gap>');
 const mode = process.env.MODE ?? 'count';
 const build = process.env.GMUX_BUILD ?? join(root, 'build');
 const kernel = join(build, 'kernel');
 const work = mkdtempSync(join(tmpdir(), 'gmux-census-'));
 const sha256 = (bytes: Uint8Array) => createHash('sha256').update(bytes).digest('hex');
 const manifest = JSON.parse(readFileSync(join(kernel, 'manifest.json'), 'utf8'));
-const n = Number(process.env.N ?? { configure: 300, fork: 300, lsl: 1000, userland: 40 }[workload!]);
+const n = Number(
+	process.env.N ?? { configure: 300, fork: 300, lsl: 1000, userland: 40, gap: 200 }[workload!]
+);
 
 const names = new Map<number, string>();
 if (process.env.NR_TABLE)
@@ -65,6 +76,14 @@ done
 i=0
 while [ $i -lt ${n} ]; do
 	i=$((i+1))
+	/bin/true
+done
+`,
+	gap: `
+i=0
+while [ $i -lt ${n} ]; do
+	i=$((i+1))
+	sleep 0.01
 	/bin/true
 done
 `,
@@ -107,42 +126,156 @@ if (workload === 'userland') {
 }
 appendCpio(join(kernel, 'initramfs.bin'), join(work, 'initramfs.cpio'), files);
 
-// ARM names what the timed arms differ in: BUSYBOX=share runs the share build of BusyBox, RECYCLE=<n>
-// sets MachineOptions.recycleInstances, SHARE_INSTANCES=1 sets shareInstances
-const shareBuild = process.env.BUSYBOX === 'share';
+// ARM names what the timed arms differ in: BUSYBOX=share runs the share build of BusyBox, BUSYBOX=async
+// the site's production kind (asyncified kernel and BusyBox, the guarded build for non-root tasks),
+// RECYCLE=<n> sets MachineOptions.recycleInstances, PREFILL=<n> prefillInstances, SHARE_INSTANCES=1
+// shareInstances
+const busyboxArm = process.env.BUSYBOX ?? 'plain';
+if (!['plain', 'share', 'async'].includes(busyboxArm)) throw new Error(`BUSYBOX=${busyboxArm}`);
+const shareBuild = busyboxArm === 'share';
+const asyncBuild = busyboxArm === 'async';
 const registry = new Map<string, WebAssembly.Module>([
 	[
 		manifest.busybox,
 		new WebAssembly.Module(
-			readFileSync(join(kernel, shareBuild ? 'busybox.share.wasm' : 'busybox.wasm'))
+			readFileSync(
+				join(
+					kernel,
+					shareBuild ? 'busybox.share.wasm' : asyncBuild ? 'busybox.async.wasm' : 'busybox.wasm'
+				)
+			)
 		)
 	]
 ]);
+const guarded = asyncBuild
+	? new Map([[manifest.busybox, new WebAssembly.Module(readFileSync(join(kernel, 'busybox.guard.wasm')))]])
+	: undefined;
 if (manifest.katybug)
 	registry.set(manifest.katybug, new WebAssembly.Module(readFileSync(join(kernel, 'katybug.wasm'))));
 const vmlinux = new WebAssembly.Module(
-	readFileSync(process.env.VMLINUX ?? join(kernel, 'vmlinux.wasm'))
+	readFileSync(process.env.VMLINUX ?? join(kernel, asyncBuild ? 'vmlinux.async.wasm' : 'vmlinux.wasm'))
 );
+// instances made ahead are instantiations that start no program
+const started = (s: Machine['stats']) => s.userExecs - s.prefilled + s.recycledStarts + s.sharedEntries;
 const runtime = hostRuntime();
 const initrd = new Uint8Array(readFileSync(join(work, 'initramfs.cpio')));
 
+// SITE=1 boots the machine the site runs (siteOptions: asyncified kernel and BusyBox, the guarded map, the
+// router, 800 pages) with a file sync handler over a SQLite stand-in, as the keeper's is; IMPORTS=1 times
+// every plain import of the kernel by name
+const site = process.env.SITE === '1';
+if (process.env.IMPORTS === '1' || process.env.KERNELURL === '1') watchKernel(process.env.IMPORTS === '1');
+const syncs = { calls: 0, ms: 0 };
+const store = site ? new DurableStore(sqlite()) : undefined;
+const siteModules = site
+	? {
+			vmlinux: new WebAssembly.Module(readFileSync(join(kernel, 'vmlinux.async.wasm'))),
+			busybox: new WebAssembly.Module(readFileSync(join(kernel, 'busybox.async.wasm'))),
+			busyboxGuard: new WebAssembly.Module(readFileSync(join(kernel, 'busybox.guard.wasm'))),
+			katybug: new WebAssembly.Module(readFileSync(join(kernel, 'katybug.wasm')))
+		}
+	: undefined;
+
+let bootInfo = { wallMs: 0, cpuMs: 0 };
+const numbers = (s: Machine['stats']) =>
+	Object.fromEntries(Object.entries(s).filter(([, v]) => typeof v === 'number'));
+const importMark = (machine: Machine) => ({
+	us: { ...imports.us },
+	calls: { ...imports.calls },
+	stats: numbers(machine.stats) as Record<string, number>
+});
+// the boot, the machine's counters and the plain imports' host time since `before`, per workload
+const siteReport = (machine: Machine, before: ReturnType<typeof importMark>) => ({
+	site,
+	kernelUrl: imports.kernelUrl,
+	boot: bootInfo,
+	stats: Object.fromEntries(
+		Object.entries(numbers(machine.stats)).map(([k, v]) => [k, (v as number) - (before.stats[k] ?? 0)])
+	),
+	imports: Object.fromEntries(
+		Object.keys(imports.us)
+			.map((name) => [
+				name,
+				{
+					us: +(imports.us[name]! - before.us[name]!).toFixed(1),
+					calls: imports.calls[name]! - before.calls[name]!
+				}
+			])
+			.filter(([, v]) => (v as { calls: number }).calls > 0)
+	)
+});
+
+// PERSIST=1: one checkpoint of the finished machine written as the keeper writes it, and the interval the
+// cadence picks once it has seen that cost
+async function persist(machine: Machine) {
+	if (process.env.PERSIST !== '1' || !store) return undefined;
+	const cpu = process.cpuUsage();
+	const t0 = performance.now();
+	const snapshot = await machine.checkpoint();
+	const written = store.writeCheckpoint(snapshot.memory, encodeSnapshot(snapshot));
+	const wallMs = performance.now() - t0;
+	const used = process.cpuUsage(cpu);
+	const cadence = new Cadence();
+	cadence.checkpointed(checkpointCost(snapshot.memory.byteLength, written.changed), written.rows);
+	return {
+		checkpointWallMs: +wallMs.toFixed(1),
+		checkpointCpuMs: +((used.user + used.system) / 1000).toFixed(1),
+		memoryBytes: snapshot.memory.byteLength,
+		changed: written.changed,
+		rows: written.rows,
+		intervalMs: Math.round(cadence.interval),
+		fileSyncs: syncs.calls,
+		fileSyncMs: +syncs.ms.toFixed(3)
+	};
+}
+
 async function boot(count: boolean | ((call: SyscallCall) => void)) {
 	let output = '';
-	const machine = new Machine({
-		vmlinux,
-		initrd,
-		cmdline: 'maxcpus=3 root=/dev/ram0 rootfstype=ramfs init=/init console=hvc console=ttyS0',
-		registry,
-		maximumPages: 4096,
-		sha256,
-		sharedKernel: true,
-		shareInstances: process.env.SHARE_INSTANCES === '1',
-		...(process.env.RECYCLE === undefined
-			? {}
-			: { recycleInstances: Number(process.env.RECYCLE) }),
-		...(count ? { runtime, countSyscalls: count } : {}),
-		write: (text) => (output += text)
-	});
+	// BOOTPROF=<file> writes a V8 CPU profile of the boot alone, machine creation to the console prompt
+	const bootProf = process.env.BOOTPROF ? new Session() : undefined;
+	if (bootProf) {
+		bootProf.connect();
+		await bootProf.post('Profiler.enable');
+		await bootProf.post('Profiler.setSamplingInterval', { interval: 100 });
+		await bootProf.post('Profiler.start');
+	}
+	const bootStart = performance.now();
+	const cpuStart = process.cpuUsage();
+	const options: MachineOptions = site
+		? {
+				...siteOptions(
+					{ ...siteModules!, runtime, initrd, manifest },
+					{ sha256, write: (text) => void (output += text) }
+				),
+				fileSync: async (file) => {
+					const t0 = performance.now();
+					store!.writeFile(file);
+					syncs.calls++;
+					syncs.ms += performance.now() - t0;
+				},
+				...(count ? { countSyscalls: count } : {})
+			}
+		: {
+				vmlinux,
+				initrd,
+				cmdline: 'maxcpus=3 root=/dev/ram0 rootfstype=ramfs init=/init console=hvc console=ttyS0',
+				registry,
+				maximumPages: 4096,
+				sha256,
+				sharedKernel: true,
+				asyncify: asyncBuild,
+				guarded,
+				shareInstances: process.env.SHARE_INSTANCES === '1',
+				...(process.env.RECYCLE === undefined
+					? {}
+					: { recycleInstances: Number(process.env.RECYCLE) }),
+				...(process.env.PREFILL === undefined
+					? {}
+					: { prefillInstances: Number(process.env.PREFILL) }),
+				...(count ? { runtime, countSyscalls: count } : {}),
+				write: (text) => (output += text)
+			};
+	const machine = new Machine(options);
 	const run = async (until: () => boolean, limit = 1_800_000) => {
 		const t = Date.now();
 		await machine.run(
@@ -152,6 +285,16 @@ async function boot(count: boolean | ((call: SyscallCall) => void)) {
 		if (!until()) throw new Error(`stuck: ${output.slice(-400)}`);
 	};
 	await run(() => output.includes('# '), 120_000);
+	const cpu = process.cpuUsage(cpuStart);
+	bootInfo = {
+		wallMs: +(performance.now() - bootStart).toFixed(1),
+		cpuMs: +((cpu.user + cpu.system) / 1000).toFixed(1)
+	};
+	if (bootProf) {
+		const { profile } = await bootProf.post('Profiler.stop');
+		writeFileSync(process.env.BOOTPROF!, JSON.stringify(profile));
+		bootProf.disconnect();
+	}
 	// a command typed on the machine's console, until its marker returns
 	const exec = async (line: string) => {
 		const start = output.length;
@@ -351,18 +494,24 @@ if (mode === 'stat') {
 
 if (mode === 'wall') {
 	const m = await boot(false);
+	const before = importMark(m.machine);
+	const cpu0 = process.cpuUsage();
 	const t0 = performance.now();
 	const printed = await m.exec(`{ ${runner}; } < /dev/null`);
 	const ms = performance.now() - t0;
+	const cpu = process.cpuUsage(cpu0);
 	const s = m.machine.stats;
 	console.log(
 		JSON.stringify({
 			workload,
 			n,
 			wallMs: +ms.toFixed(1),
-			programs: s.userExecs + s.recycledStarts + s.sharedEntries,
-			execs: { userExecs: s.userExecs, recycledStarts: s.recycledStarts, recycleReturns: s.recycleReturns },
-			arm: { busybox: shareBuild ? 'share' : 'plain', recycle: process.env.RECYCLE ?? 'default', shareInstances: process.env.SHARE_INSTANCES === '1' },
+			cpuMs: +((cpu.user + cpu.system) / 1000).toFixed(1),
+			...siteReport(m.machine, before),
+			persist: await persist(m.machine),
+			programs: started(s),
+			execs: { userExecs: s.userExecs, recycledStarts: s.recycledStarts, recycleReturns: s.recycleReturns, prefilled: s.prefilled },
+			arm: { busybox: busyboxArm, recycle: process.env.RECYCLE ?? 'default', prefill: process.env.PREFILL ?? '0', shareInstances: process.env.SHARE_INSTANCES === '1' },
 			outputEnd: printed.replace(/\r/g, '').slice(-40),
 			crashed: String(m.machine.crashed)
 		})
@@ -377,11 +526,14 @@ const session = new Session();
 session.connect();
 await session.post('Profiler.enable');
 await session.post('Profiler.setSamplingInterval', { interval: 100 });
+const before = importMark(m.machine);
 await session.post('Profiler.start');
 const t0 = performance.now();
 const printed = await m.exec(`{ ${runner}; } < /dev/null`);
 const ms = performance.now() - t0;
 const { profile } = await session.post('Profiler.stop');
+// CPUPROF=<file> keeps the raw profile, which composed.ts reads
+if (process.env.CPUPROF) writeFileSync(process.env.CPUPROF, JSON.stringify(profile));
 type Node = { id: number; callFrame: { functionName: string; url: string }; children?: number[] };
 const nodes = new Map<number, Node>(profile.nodes.map((x: Node) => [x.id, x]));
 const parent = new Map<number, number>();
@@ -460,18 +612,21 @@ console.log(
 		topHostLeaves: top(hostLeaf, 60),
 		topUserLeaves: top(userLeaf, 5),
 		arm: {
-			busybox: shareBuild ? 'share' : 'plain',
+			busybox: busyboxArm,
 			recycle: process.env.RECYCLE ?? 'default',
+			prefill: process.env.PREFILL ?? '0',
 			shareInstances: process.env.SHARE_INSTANCES === '1'
 		},
-		programs:
-			m.machine.stats.userExecs + m.machine.stats.recycledStarts + m.machine.stats.sharedEntries,
+		programs: started(m.machine.stats),
 		execs: {
 			userExecs: m.machine.stats.userExecs,
 			recycledStarts: m.machine.stats.recycledStarts,
 			recycleReturns: m.machine.stats.recycleReturns,
+			prefilled: m.machine.stats.prefilled,
 			sharedEntries: m.machine.stats.sharedEntries
 		},
+		...siteReport(m.machine, before),
+		persist: await persist(m.machine),
 		outputSha: sha256(new TextEncoder().encode(printed.replace(/\r/g, ''))),
 		outputEnd: printed.replace(/\r/g, '').slice(-40),
 		crashed: String(m.machine.crashed)

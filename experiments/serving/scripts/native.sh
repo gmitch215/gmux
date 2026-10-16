@@ -3,17 +3,19 @@
 # 127.0.0.1 in a capped container, and the six raw requests scripts/serve.ts sends: one JSON line
 # each (bytes, sha256 of the reply with its Date line masked). The masked replies stay in
 # /tmp/gmux-serve-native/raw on the host.
+# SERVER=lighttpd LIGHTTPD=<its binary on the host> serves the same /www with lighttpd instead (a static build,
+# its own native control); RAW=<dir> names the work directory (default /tmp/gmux-serve-native)
 # NATIVE_HOST=<ssh alias> SRC=<busybox source on the host> CONFIG=<its .config on the host> scripts/native.sh
 set -euo pipefail
 host=${NATIVE_HOST:?usage: NATIVE_HOST=<ssh alias> SRC=<busybox source on the host> CONFIG=<busybox .config on the host> scripts/native.sh}
 src=${SRC:?SRC is required}
 config=${CONFIG:?CONFIG is required}
 # the container's caps; PORT is on 127.0.0.1 of the host
-ssh "$host" "SRC='$src' CONFIG='$config' PORT='${PORT:-18080}' MEMORY='${MEMORY:-512m}' CPUS='${CPUS:-1}' bash -s" << 'REMOTE'
+ssh "$host" "SRC='$src' CONFIG='$config' SERVER='${SERVER:-busybox}' LIGHTTPD='${LIGHTTPD:-}' WORK='${WORK:-/tmp/gmux-serve-native}' PORT='${PORT:-18080}' MEMORY='${MEMORY:-512m}' CPUS='${CPUS:-1}' bash -s" << 'REMOTE'
 set -euo pipefail
-work=/tmp/gmux-serve-native
+work=$WORK
 mkdir -p "$work/nbuild" "$work/www/cgi-bin" "$work/raw"
-if [ ! -x "$work/nbuild/busybox" ]; then
+if [ "$SERVER" = busybox ] && [ ! -x "$work/nbuild/busybox" ]; then
 	# the pinned release is the commit under linux-wasm's one upstream patch; its Makefile is not
 	# patched for the wasm toolchain
 	if [ ! -d "$work/src" ]; then
@@ -29,9 +31,15 @@ seq 1 1000000 > "$work/www/big.txt"
 printf '#!/bin/sh\necho "Content-Type: text/plain"\necho\necho hello\n' > "$work/www/cgi-bin/hello.cgi"
 printf '#!/bin/sh\necho "Content-Type: text/plain"\necho\nseq 1 3000000\n' > "$work/www/cgi-bin/stream.cgi"
 chmod +x "$work"/www/cgi-bin/*.cgi
-name=gmux-serve-native
-docker run -d --rm --name "$name" --network host --user "$(id -u):$(id -g)" --memory "$MEMORY" --cpus "$CPUS" \
-	-v "$work:/w:ro" alpine:3.21 /w/nbuild/busybox httpd -f -p "127.0.0.1:$PORT" -h /w/www > /dev/null
+name=gmux-serve-native-$SERVER
+if [ "$SERVER" = lighttpd ]; then
+	printf 'server.document-root = "/w/www"\nserver.port = %s\nserver.bind = "127.0.0.1"\n' "$PORT" > "$work/lighttpd.conf"
+	docker run -d --rm --name "$name" --network host --user "$(id -u):$(id -g)" --memory "$MEMORY" --cpus "$CPUS" \
+		-v "$work:/w:ro" -v "$(dirname "$LIGHTTPD"):/l:ro" alpine:3.21 /l/"$(basename "$LIGHTTPD")" -D -f /w/lighttpd.conf > /dev/null
+else
+	docker run -d --rm --name "$name" --network host --user "$(id -u):$(id -g)" --memory "$MEMORY" --cpus "$CPUS" \
+		-v "$work:/w:ro" alpine:3.21 /w/nbuild/busybox httpd -f -p "127.0.0.1:$PORT" -h /w/www > /dev/null
+fi
 trap 'docker stop "$name" > /dev/null 2>&1 || true' EXIT
 for _ in $(seq 1 50); do (exec 3<> "/dev/tcp/127.0.0.1/$PORT") 2> /dev/null && break; sleep 0.1; done
 request() {

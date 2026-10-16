@@ -27,6 +27,8 @@ const memory = new WebAssembly.Memory({ initial: 256, maximum: 4096, shared: tru
 const dataStart = 0x400000;
 const programs = {
 	busybox: new WebAssembly.Module(readFileSync(join(kernel, 'busybox.share.wasm'))),
+	// the asyncified build the site registers: no gmux.share section, so no reset row
+	busyboxAsync: new WebAssembly.Module(readFileSync(join(kernel, 'busybox.async.wasm'))),
 	katybug: new WebAssembly.Module(readFileSync(join(kernel, 'katybug.wasm')))
 };
 
@@ -63,7 +65,8 @@ function env(module: WebAssembly.Module) {
 		__gmux_vfork: new WebAssembly.Suspending((env: number) => env),
 		__gmux_fork: () => -38,
 		__gmux_vfork_exec: new WebAssembly.Suspending((a: number, b: number, c: number) => a + b + c),
-		__gmux_vfork_exit: new WebAssembly.Suspending((s: number) => s)
+		__gmux_vfork_exit: new WebAssembly.Suspending((s: number) => s),
+		__gmux_digest: () => -1
 	};
 	for (let n = 0; n <= 6; n++) e[`__wasm_syscall_${n}`] = call;
 	return { env: e, global, memoryBase };
@@ -183,6 +186,22 @@ async function measure(name: keyof typeof programs) {
 		out.resetRelocs = us(now() - t, execs);
 		out.pristineBytes = share;
 		out.globals = own.length;
+		// what an idle instance holds: env, router and instance kept alive, per instance, KiB
+		const held: unknown[] = [];
+		gc();
+		await new Promise((r) => setImmediate(r));
+		const before = process.memoryUsage();
+		const count = 200;
+		for (let i = 0; i < count; i++) {
+			const made = env(module);
+			held.push([made, router(), new WebAssembly.Instance(module, { env: made.env as WebAssembly.ModuleImports })]);
+		}
+		gc();
+		await new Promise((r) => setImmediate(r));
+		const after = process.memoryUsage();
+		out.idleHeapKiB = (after.heapUsed - before.heapUsed) / count / 1024;
+		out.idleExternalKiB = (after.external - before.external) / count / 1024;
+		held.length = 0;
 	}
 	return out;
 }

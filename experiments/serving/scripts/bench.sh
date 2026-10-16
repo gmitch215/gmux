@@ -6,7 +6,14 @@
 # written whatever the exit status.
 #   serve: serve.ts MODE=bench for each workload, ROUNDS requests per sample, RUNS samples per workload
 #   ingest: serve.ts WORKLOAD=ingest for each size in BODY_MIBS ("1 8 32"), ROUNDS so that about INGEST_BYTES_PER_SAMPLE (256) MiB go in a sample
+#   ceiling: per SERVER (httpd lighttpd) the big file under SEND_ARM copy, view, drop and slab; EXPECT_httpd_big, EXPECT_lighttpd_big,
+#     LIGHTTPD_PLAIN, LIGHTTPD and WORK as for shapes
+#   lend: per SERVER the small and big files (and httpd's catcgi) on the kernel without patch 0041 against GMUX_BUILD_NEW's, which
+#     borrows; EXPECT_<server>_<small|big|catcgi>, LIGHTTPD_PLAIN, LIGHTTPD and WORK as for shapes
 #   sendfile: the tests/c/sendfile probe's CPU per transfer, natively and in the machine, for each kind and size
+#   shapes: per SERVER (httpd lighttpd) the small file in rounds of PER_ROUND (100) requests: seq (a new stream each, one after
+#     another), keepalive (all down one stream; httpd closes after a reply, so it has no timed cell) and conc<k> (k at a
+#     time); EXPECT_httpd and EXPECT_lighttpd are the reply hashes, LIGHTTPD_PLAIN and LIGHTTPD the program and its instrumented build
 # usage: GMUX_BUILD=<build dir> CPUS=<list or none> OUT=<dir> DONE=<marker> EXPECT_small=<sha> ... bench.sh [serve] [sendfile]
 # KERNEL (default $GMUX_BUILD/kernel), WORKLOADS, RUNS (3), ROUNDS (25), BYTES_MACHINE (512 MiB) and BYTES_NATIVE
 # (2 GiB) per cell, PROBE (the wasm probe), NATIVE (the native probe), WORK (the prep output) set the rest.
@@ -46,6 +53,8 @@ sample() {
 		else
 			[[ "$text" == *'"ok":true'* ]] && ok=1
 		fi
+		# a shaped round that served fewer requests than it sent is a failed cell
+		[[ "$text" != *'"shapeOk":false'* ]] || ok=0
 	fi
 	json=${text:-null}
 	echo "{$head,\"loadavg\":\"$avg\",\"quiet\":\"$q\",\"rc\":$rc,\"ok\":$ok,\"out\":$json}" >> "$OUT/$part.jsonl"
@@ -76,6 +85,70 @@ for part in "${parts[@]}"; do
 				sample serve "$w" "\"workload\":\"$w\",\"run\":$run" "${!expect_var:?$expect_var}" \
 					env MODE=bench WORKLOAD="$workload" HASH="$hashed" IMPORTS="$imports" ROUNDS="$rounds" GMUX_BUILD="$GMUX_BUILD" "${pin[@]}" \
 					node --no-warnings --experimental-strip-types "$here/serve.ts" "$kernel"
+			done
+		done
+		;;
+	shapes)
+		for run in $(seq "$runs"); do
+			for server in ${SERVERS:-httpd lighttpd}; do
+				expect_var=EXPECT_$server
+				for cell in ${SHAPE_CELLS:-seq keepalive conc1 conc2 conc4 conc8 conc16 conc20}; do
+					[ "$server $cell" != "httpd keepalive" ] || continue
+					shape=${cell%%[0-9]*}
+					k=${cell#"$shape"}
+					sample shapes "$server-$cell" "\"server\":\"$server\",\"cell\":\"$cell\",\"run\":$run" "${!expect_var:?$expect_var}" \
+						env SERVER="$server" MODE=bench WORKLOAD=small SHAPE="$shape" K="${k:-1}" PER_ROUND="${PER_ROUND:-100}" ROUNDS="$rounds" \
+						GMUX_BUILD="$GMUX_BUILD" "${pin[@]}" node --no-warnings --experimental-strip-types "$here/serve.ts" "$kernel"
+				done
+			done
+		done
+		;;
+	ceiling)
+		# the send path's arms (SEND_ARM) on the big file per server: copy (today, exact), view (the guest's bytes enqueued
+		# uncopied), drop (counted and discarded) and slab (copied into a shared slab, exact); the arm order rotates by run.
+		# EXPECT_<server>_big is the reply hash of the exact arms
+		for run in $(seq "$runs"); do
+			for server in ${SERVERS:-httpd lighttpd}; do
+				expect_var=EXPECT_${server}_big
+				arms=(copy view drop slab)
+				for i in 0 1 2 3; do
+					arm=${arms[$(((i + run - 1) % 4))]}
+					expect=""
+					# copy and slab keep the reply exact, view and drop do not
+					{ [ "$arm" != copy ] && [ "$arm" != slab ]; } || expect=${!expect_var:?$expect_var}
+					sample ceiling "$server-$arm" "\"server\":\"$server\",\"arm\":\"$arm\",\"run\":$run" "$expect" \
+						env SERVER="$server" MODE=bench WORKLOAD=big SEND_ARM="$arm" ROUNDS="$rounds" GMUX_BUILD="$GMUX_BUILD" "${pin[@]}" \
+						node --no-warnings --experimental-strip-types "$here/serve.ts" "$kernel"
+				done
+			done
+		done
+		;;
+	lend)
+		# per server the small and big files (and httpd's catcgi) on the kernel without the lend patch (ctl: today's copy,
+		# streams that do not borrow) against the kernel with it (new: GMUX_BUILD_NEW, streams that borrow); which goes first
+		# alternates by run. EXPECT_<server>_<workload> is the reply hash both must give
+		for run in $(seq "$runs"); do
+			for server in ${SERVERS:-httpd lighttpd}; do
+				for w in ${LEND_WORKLOADS:-small big catcgi}; do
+					[ "$server $w" != "lighttpd catcgi" ] || continue
+					expect_var=EXPECT_${server}_${w}
+					for i in 0 1; do
+						if [ $(((i + run) % 2)) -eq 0 ]; then
+							kind=ctl
+							dir=$kernel
+							gb=$GMUX_BUILD
+							borrow=0
+						else
+							kind=new
+							dir=${GMUX_BUILD_NEW:?}/kernel
+							gb=$GMUX_BUILD_NEW
+							borrow=1
+						fi
+						sample lend "$server-$w-$kind" "\"server\":\"$server\",\"workload\":\"$w\",\"kind\":\"$kind\",\"run\":$run" "${!expect_var:?$expect_var}" \
+							env SERVER="$server" MODE=bench WORKLOAD="$w" BORROW="$borrow" ROUNDS="$rounds" GMUX_BUILD="$gb" "${pin[@]}" \
+							node --no-warnings --experimental-strip-types "$here/serve.ts" "$dir"
+					done
+				done
 			done
 		done
 		;;
