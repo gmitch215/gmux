@@ -12,7 +12,8 @@ import { join } from 'node:path';
  * 99.5, 99.9 and 100% of it, closes each set under direct calls (native code never calls back into
  * wasm3, which is not re-entrant), and writes two modules per rung: `interp` for wasm3, where each
  * promoted function is a thunk to a host import, and `native`, which imports wasm3's memory and adds
- * the guest's base to every load and store. The stack pointer crosses as the thunk's first argument.
+ * the guest's base to every load and store (with LADDER_MEM0=1 it imports the guest's own memory at base 0
+ * and adds nothing). The stack pointer crosses as the thunk's first argument.
  *
  * `run <out dir> <burrow dist> [rounds]` times `run(n)` and `run(2n)` per rung and keeps the difference.
  */
@@ -139,6 +140,9 @@ if (mode === 'prepare') {
 	// LADDER_OPEN=1: a promoted function may call an interpreted one; the native module then holds a wrapper for it that
 	// enters wasm3 through the host's call_at import, and wasm3 exports an entry stub (ie_<name>) per such function
 	const open = process.env.LADDER_OPEN === '1';
+	// LADDER_MEM0=1: the native module's memory 0 is the guest's own (wasm3's shared Memory, guest bytes at 0), so its accesses,
+	// memory.size/grow/copy/fill included, are the guest's own; data segments are left to wasm3's initialisation
+	const mem0 = process.env.LADDER_MEM0 === '1';
 	const elemRefs = new Set([...head, ...tail].filter((l) => /^\s*\(elem\b/.test(l)).flatMap((l) => [...l.matchAll(/\$([A-Za-z0-9_.]+)/g)].map((m) => m[1]!)));
 	// imports go right after the types, ahead of the table, memory and globals wasm-tools prints next
 	const importAt = head.findLastIndex((l) => /^ {2}\(type/.test(l)) + 1;
@@ -200,7 +204,7 @@ if (mode === 'prepare') {
 		const coldImports = cold.length
 			? ['  (import "interp" "call_at" (func $call_at (param i32 i32 i32 i32 i32 i32 i32 i32 i32) (result i32)))', ...cold.map((n) => `  (import "interp" "h_${n}" (global $h_${n} i32))`)]
 			: [];
-		const nativeHead = [...head.slice(0, importAt), '  (import "env" "memory" (memory 1))', '  (import "env" "base" (global $gbase i32))', ...coldImports, ...head.slice(importAt).filter(own)];
+		const nativeHead = [...head.slice(0, importAt), '  (import "env" "memory" (memory 1))', ...(mem0 ? [] : ['  (import "env" "base" (global $gbase i32))']), ...coldImports, ...head.slice(importAt).filter(own)];
 		// an interpreted function the native side calls is a wrapper that enters wasm3 at the live frame's top
 		const wrapper = (fn: Fn): Fn => ({
 			...fn,
@@ -216,6 +220,7 @@ if (mode === 'prepare') {
 		});
 		const rebased = fns.filter((fn) => !open || rung.set.has(fn.name) || cold.includes(fn.name)).map((fn) => {
 			if (open && !rung.set.has(fn.name)) return wrapper(fn);
+			if (mem0) return fn;
 			const body: string[] = [];
 			for (const l of fn.body) {
 				if (/^\s*memory\.(size|grow|copy|fill)/.test(l)) throw new Error(`${fn.name}: ${l.trim()} cannot be rebased`);

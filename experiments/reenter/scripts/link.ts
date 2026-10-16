@@ -1,6 +1,6 @@
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
-import { createVm, type Loaded, type Vm } from './vm.ts';
+import { createVm, memoryLimits, type Loaded, type Vm, type VmOptions } from './vm.ts';
 
 export interface Rung {
 	rung: number;
@@ -69,7 +69,8 @@ export function linkRung(vm: Vm, dir: string, rung: Rung, options: { direct?: { 
 					)
 				}
 			});
-	const memory = vm.shim.memory;
+	// the guest memory build: the guest's bytes are the shared Memory at base 0, which is the native module's memory
+	const memory = vm.guest ?? vm.shim.memory;
 	const base = new WebAssembly.Global({ value: 'i32', mutable: false }, guest.memory().base);
 	const callAt = options.jsUp
 		? (...a: number[]) => {
@@ -80,7 +81,10 @@ export function linkRung(vm: Vm, dir: string, rung: Rung, options: { direct?: { 
 		: (vm.shim.burrow_call_at as unknown as WebAssembly.ImportValue);
 	const interp: Record<string, WebAssembly.ImportValue> = { call_at: callAt };
 	for (const c of rung.cold ?? []) interp[`h_${c}`] = new WebAssembly.Global({ value: 'i32', mutable: false }, guest.handle(`ie_${c}`));
-	const instance = new WebAssembly.Instance(new WebAssembly.Module(readFileSync(join(dir, `rung${rung.rung}.native.wasm`))), { env: { memory, base }, interp });
+	const nativeModule = new WebAssembly.Module(readFileSync(join(dir, `rung${rung.rung}.native.wasm`)));
+	// a module made with LADDER_MEM0 has no base to import
+	const needsBase = WebAssembly.Module.imports(nativeModule).some((i) => i.name === 'base');
+	const instance = new WebAssembly.Instance(nativeModule, { env: needsBase ? { memory, base } : { memory }, interp });
 	Object.assign(native, instance.exports);
 	if (options.direct) entries.forEach((e, i) => options.direct!.table.set(i, native[`f_${e.name}`] as unknown as Function));
 	return { guest, native, counts };
@@ -91,14 +95,16 @@ export function linkRung(vm: Vm, dir: string, rung: Rung, options: { direct?: { 
  * thunks with `dispatcher` (dispatchWat over a table, assembled) and gives the native side the interpreter's burrow_call_at
  * export itself, so no JavaScript frame sits between the two.
  */
-export async function openRung(wasm3: string, dir: string, rung: Rung, mode: 'glued' | 'direct', dispatcher?: Uint8Array): Promise<{ vm: Vm; linked: Linked }> {
+export async function openRung(wasm3: string, dir: string, rung: Rung, mode: 'glued' | 'direct', dispatcher?: Uint8Array, vmOptions: VmOptions = {}): Promise<{ vm: Vm; linked: Linked }> {
+	// the guest memory build takes the guest's limits to make its shared Memory; the other builds ignore them
+	const options = { guest: memoryLimits(new Uint8Array(readFileSync(join(dir, 'guest.wasm')))), ...vmOptions };
 	if (mode === 'glued') {
-		const vm = await createVm(wasm3);
+		const vm = await createVm(wasm3, options);
 		return { vm, linked: linkRung(vm, dir, rung, { jsUp: true }) };
 	}
 	if (!dispatcher) throw new Error('direct needs the assembled dispatcher');
 	const table = new WebAssembly.Table({ element: 'anyfunc', initial: 64 });
 	const instance = new WebAssembly.Instance(new WebAssembly.Module(dispatcher as Uint8Array<ArrayBuffer>), { env: { table } });
-	const vm = await createVm(wasm3, { hostDirect: instance.exports.host_direct as (...a: number[]) => number });
+	const vm = await createVm(wasm3, { ...options, hostDirect: instance.exports.host_direct as (...a: number[]) => number });
 	return { vm, linked: linkRung(vm, dir, rung, { direct: { table } }) };
 }

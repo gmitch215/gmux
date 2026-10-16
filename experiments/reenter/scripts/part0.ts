@@ -1,8 +1,9 @@
 import { execFileSync } from 'node:child_process';
-import { copyFileSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { copyFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { loadavg } from 'node:os';
 import { join } from 'node:path';
 import { countInsns } from './insn.ts';
+import { createVm, memoryLimits } from './vm.ts';
 
 /**
  * What the promotion ladder's all-native module costs against the guest it was made from, with no interpreter in the
@@ -27,8 +28,17 @@ const wasmTools = (a: string[], input?: string) => execFileSync('wasm-tools', a,
 const BASE = 16_869_112;
 
 if (mode === 'assemble') {
-	const [out = '', guest = '', rungs = ''] = args;
+	const [out = '', guest = '', rungs = '', mem0Rungs = ''] = args;
 	mkdirSync(out, { recursive: true });
+	if (mem0Rungs) {
+		// the same ladder made with LADDER_MEM0=1: its all-native module owns no base and no temporaries
+		const m0 = JSON.parse(readFileSync(join(mem0Rungs, 'rungs.json'), 'utf8')) as { rungs: { rung: number; label: string }[] };
+		const m0Last = m0.rungs.at(-1)!;
+		if (m0Last.label !== 'native') throw new Error(`the last mem0 rung is ${m0Last.label}, not native`);
+		const m0Text = wasmTools(['print', join(mem0Rungs, `rung${m0Last.rung}.native.wasm`)]).toString();
+		if (/\$gbase|\$tv_/.test(m0Text)) throw new Error('the mem0 module still has a base or store temporaries');
+		copyFileSync(join(mem0Rungs, `rung${m0Last.rung}.native.wasm`), join(out, 'mem0.wasm'));
+	}
 	const manifest = JSON.parse(readFileSync(join(rungs, 'rungs.json'), 'utf8')) as { rungs: { rung: number; label: string }[] };
 	const last = manifest.rungs.at(-1)!;
 	if (last.label !== 'native') throw new Error(`the last rung is ${last.label}, not native`);
@@ -59,7 +69,7 @@ const median = (xs: number[]) => [...xs].sort((a, b) => a - b)[Math.floor(xs.len
 type Run = (n: number) => number;
 
 /** every variant over its own copy of the guest's pristine memory */
-function variants(dir: string, only?: string) {
+function variants(dir: string, only?: string, shared?: WebAssembly.Memory) {
 	const guest = () => new WebAssembly.Module(readFileSync(join(dir, 'guest.wasm')));
 	// a variant other than orig reads the image from a file, so the guest is not compiled beside it (the code count would print both)
 	const image = only && only !== 'orig' ? new Uint8Array(readFileSync(join(dir, 'image.bin'))) : new Uint8Array((new WebAssembly.Instance(guest()).exports.memory as WebAssembly.Memory).buffer).slice();
@@ -74,6 +84,7 @@ function variants(dir: string, only?: string) {
 	const zero = () => new WebAssembly.Module(readFileSync(join(dir, 'zero.wasm')));
 	const const0 = () => new WebAssembly.Module(readFileSync(join(dir, 'const0.wasm')));
 	const offset = () => new WebAssembly.Module(readFileSync(join(dir, 'offset.wasm')));
+	const mem0 = () => new WebAssembly.Module(readFileSync(join(dir, 'mem0.wasm')));
 	const base = (v: number) => new WebAssembly.Global({ value: 'i32', mutable: false }, v);
 	type Exports = Record<string, (...a: number[]) => number>;
 	const make = {
@@ -106,16 +117,42 @@ function variants(dir: string, only?: string) {
 			return (n: number) => f.f_run!(sp, n);
 		}
 	};
-	return Object.entries(make)
+	// the all-native module of a LADDER_MEM0 ladder, over a plain memory at 0 (the code V8 makes of it) and over the
+	// guest memory build's shared Memory, which wasm3 filled from the guest's data segments
+	const m0 = existsSync(join(dir, 'mem0.wasm'))
+		? {
+				mem0: () => {
+					const g = new WebAssembly.Instance(mem0(), { env: { memory: memoryAt(0) } }).exports as Exports;
+					return (n: number) => g.f_run!(sp, n);
+				},
+				...(shared
+					? {
+							'mem0-shared': () => {
+								const h = new WebAssembly.Instance(mem0(), { env: { memory: shared } }).exports as Exports;
+								return (n: number) => h.f_run!(sp, n);
+							}
+						}
+					: {})
+			}
+		: {};
+	return Object.entries({ ...make, ...m0 })
 		.filter(([name]) => !only || name === only)
 		.map(([name, f]) => ({ name, run: f() as Run }));
+}
+
+/** the guest loaded into the guest memory build, and its shared Memory */
+async function sharedMemory(dir: string, wasm3: string) {
+	const bytes = new Uint8Array(readFileSync(join(dir, 'guest.wasm')));
+	const vm = await createVm(wasm3, { guest: memoryLimits(bytes) });
+	vm.load(bytes);
+	return vm.guest!;
 }
 
 if (mode === 'sample') {
 	const [dir = '', roundsArg = '5', out = ''] = args;
 	const rounds = Number(roundsArg);
 	const n = Number(process.env.N ?? 2);
-	const list = variants(dir);
+	const list = variants(dir, undefined, process.env.PART0_WASM3 ? await sharedMemory(dir, process.env.PART0_WASM3) : undefined);
 	const want = list[0]!.run(2) >>> 0;
 	for (const v of list) if ((v.run(2) >>> 0) !== want) throw new Error(`${v.name}: run(2) answered ${(v.run(2) >>> 0).toString(16)}, the guest ${want.toString(16)}`);
 	const time = (f: () => number) => {

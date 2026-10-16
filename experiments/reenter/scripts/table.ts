@@ -32,11 +32,15 @@ const tally = (names: string[]) => {
 const good = (names: string[]) => names.filter((n) => quiet.get(n)?.rc === '0' || !quiet.size);
 
 // #region part 0
-for (const g of ['zlib', 'zstd']) {
-	const names = good(files.filter((f) => f.startsWith(`p0-${g}-`) && f.endsWith('.json')).map((f) => f.slice(0, -5)));
+for (const [prefix, title] of [
+	['p0', 'Part 0'],
+	['e', 'Endpoint (guest memory build)']
+] as const)
+	for (const g of ['zlib', 'zstd']) {
+	const names = good(files.filter((f) => f.startsWith(`${prefix}-${g}-`) && f.endsWith('.json')).map((f) => f.slice(0, -5)));
 	if (!names.length) continue;
 	const samples = names.map((n) => read(`${n}.json`) as { node: string; rows: { variant: string; ms: number; ratioToOrig: number }[] });
-	console.log(`\n### Part 0: ${g}, whole workload, ratio to the original guest in V8 (node ${samples[0]!.node})\n`);
+	console.log(`\n### ${title}: ${g}, whole workload, ratio to the original guest in V8 (node ${samples[0]!.node})\n`);
 	console.log(`${tally(names)}\n`);
 	console.log('| variant | ms a sample (median [min-max]) | ratio to orig (median [min-max]) | spread of the ratio |');
 	console.log('| --- | --- | --- | --- |');
@@ -70,7 +74,7 @@ for (const g of ['zlib', 'zstd']) {
 // #region c
 {
 	const groups = new Map<string, string[]>();
-	for (const f of files.filter((x) => /^c-.*-\d+\.json$/.test(x))) {
+	for (const f of files.filter((x) => /^(c|o|i)-.*-\d+\.json$/.test(x))) {
 		const name = f.slice(0, -5);
 		const cell = name.replace(/-\d+$/, '');
 		if (good([name]).length) groups.set(cell, [...(groups.get(cell) ?? []), name]);
@@ -88,6 +92,81 @@ for (const g of ['zlib', 'zstd']) {
 			const am = samples.map((s, i) => (1 - row.share) * rI[i]! + row.share * rN[i]!);
 			const crossings = samples.map((s) => s.rows.find((r) => r.rung === row.rung)!);
 			console.log(`| ${row.rung} | ${row.label} | ${(100 * row.share).toFixed(3)}% | ${span(rs)} | ${spread(rs)} | ${median(am).toFixed(2)} | ${(median(crossings.map((c) => c.down)) / samples[0]!.n).toFixed(0)} | ${(median(crossings.map((c) => c.up)) / samples[0]!.n).toFixed(0)} |`);
+		}
+	}
+}
+// #endregion
+
+// #region native controls
+for (const g of ['zlib', 'zstd']) {
+	const names = good(files.filter((f) => f.startsWith(`en-${g}-`) && f.endsWith('.json')).map((f) => f.slice(0, -5)));
+	if (!names.length) continue;
+	const ratios = new Map<string, number[]>();
+	const mss = new Map<string, number[]>();
+	for (const n of names) {
+		const i = n.slice(`en-${g}-`.length);
+		const orig = existsSync(join(dir, `e-${g}-${i}.json`)) ? (read(`e-${g}-${i}.json`) as { rows: { variant: string; ms: number }[] }).rows.find((r) => r.variant === 'orig')?.ms : undefined;
+		for (const line of readFileSync(join(dir, `${n}.json`), 'utf8').split('\n').filter(Boolean)) {
+			const row = JSON.parse(line) as { variant: string; ms: number; checksum: number };
+			mss.set(row.variant, [...(mss.get(row.variant) ?? []), row.ms]);
+			if (orig) ratios.set(row.variant, [...(ratios.get(row.variant) ?? []), row.ms / orig]);
+		}
+	}
+	console.log(`\n### Native controls: ${g} (x86-64 binaries, libc mem*), ratio to the untouched wasm in V8 of the same sample index\n`);
+	console.log(`${tally(names)}\n`);
+	console.log('| arm | ms a sample (median [min-max]) | ratio to the untouched wasm in V8 (median [min-max]) | spread |');
+	console.log('| --- | --- | --- | --- |');
+	for (const [arm, xs] of mss) console.log(`| ${arm} | ${span(xs)} | ${ratios.get(arm) ? span(ratios.get(arm)!).replace(/(\d+\.\d+)/g, (x) => Number(x).toFixed(3)) : '-'} | ${ratios.get(arm) ? spread(ratios.get(arm)!) : '-'} |`);
+}
+// #endregion
+
+// #region all interpreted, re-entry build against guest memory build
+for (const g of ['zlib', 'zstd']) {
+	const re = good(files.filter((f) => f.startsWith(`i-${g}-re-`) && f.endsWith('.json')).map((f) => f.slice(0, -5)));
+	const gm = good(files.filter((f) => f.startsWith(`i-${g}-gm-`) && f.endsWith('.json')).map((f) => f.slice(0, -5)));
+	if (!re.length || !gm.length) continue;
+	type Run = { v8ms: number; rows: { rung: number; ms: number }[] };
+	const ratios: number[] = [];
+	for (const n of re) {
+		const m = n.replace('-re-', '-gm-');
+		if (!gm.includes(m)) continue;
+		ratios.push((read(`${m}.json`) as Run).rows[0]!.ms / (read(`${n}.json`) as Run).rows[0]!.ms);
+	}
+	console.log(`\n### All interpreted (rung 0), ${g}: guest memory build time over re-entry build time, the same sample index (one session each)\n`);
+	console.log(`${ratios.length} pairs; ${span(ratios).replace(/(\d+\.\d+)/g, (x) => Number(x).toFixed(3))}, spread ${ratios.length ? spread(ratios) : '-'}\n`);
+}
+// #endregion
+
+// #region memory
+{
+	const names = good(files.filter((f) => /^m-.*-\d+\.json$/.test(f)).map((f) => f.slice(0, -5)));
+	if (names.length) {
+		type Row = { arm: string; rssBefore: number; rssAfterInstantiate: number; rssAfterRun: number; maxRssRaw: number; wasm3MemoryBytes: number; sharedMemoryBytes: number; nativeModuleBytes: number };
+		const cells = [...new Set(names.map((n) => n.replace(/-\d+$/, '')))].sort();
+		console.log('\n### Memory, one fresh process per arm (MiB; RSS is the process, so the combined peak is one number)\n');
+		console.log('| cell | samples | RSS before | RSS after instantiate | RSS after run(1) | max RSS | wasm3 Memory | shared Memory | native module (KiB) |');
+		console.log('| --- | --- | --- | --- | --- | --- | --- | --- | --- |');
+		const mib = (b: number) => (b / 1048576).toFixed(1);
+		for (const c of cells) {
+			const rows = names.filter((n) => n.replace(/-\d+$/, '') === c).map((n) => read(`${n}.json`) as Row);
+			const med = (f: (r: Row) => number) => median(rows.map(f));
+			const raw = med((r) => r.maxRssRaw);
+			console.log(`| ${c} | ${rows.length} | ${mib(med((r) => r.rssBefore))} | ${mib(med((r) => r.rssAfterInstantiate))} | ${mib(med((r) => r.rssAfterRun))} | ${(raw / 1024).toFixed(1)} (raw ${raw}) | ${mib(med((r) => r.wasm3MemoryBytes))} | ${mib(med((r) => r.sharedMemoryBytes))} | ${(med((r) => r.nativeModuleBytes) / 1024).toFixed(1)} |`);
+		}
+	}
+}
+// #endregion
+
+// #region x86-64 code counts
+{
+	const names = files.filter((f) => /^x-.*\.json$/.test(f)).sort();
+	if (names.length) {
+		console.log('\n### Machine code, V8 optimising tier, one hot function per guest\n');
+		console.log('| guest | variant | function | arch | instructions | bytes | loads | stores | frame | adds | leas |');
+		console.log('| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |');
+		for (const n of names) {
+			const r = JSON.parse(readFileSync(join(dir, n), 'utf8').trim().split('\n').at(-1)!) as Record<string, string | number>;
+			console.log(`| ${n.split('-')[1]} | ${r.variant} | ${r.function} | ${r.arch} | ${r.instructions} | ${r.bytes} | ${r.loads} | ${r.stores} | ${r.frame} | ${r.adds} | ${r.leas} |`);
 		}
 	}
 }

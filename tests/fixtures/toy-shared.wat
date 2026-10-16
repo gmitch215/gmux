@@ -10,7 +10,10 @@
 	(global $got (mut i32) (i32.const 0))
 	(export "gmux_g4" (global $got))
 	(start $init)
-	(func $init (call $relocs))
+	;; a share build's start function sets the flag in its data's last word and copies the image only when it was 0
+	(func $init
+		(drop (i32.atomic.rmw.cmpxchg (i32.add (global.get $mb) (i32.const 12)) (i32.const 0) (i32.const 2)))
+		(call $relocs))
 	(func $relocs (export "__wasm_apply_global_relocs") (global.set $got (i32.add (global.get $mb) (i32.const 8))))
 	(func (export "__wasm_apply_data_relocs") (i32.store (i32.add (global.get $mb) (i32.const 4)) (global.get $mb)))
 	(func $sys (param $nr i32) (drop (call $syscall (i32.const 0) (i32.const 0) (local.get $nr))))

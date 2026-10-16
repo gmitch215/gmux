@@ -19,7 +19,11 @@ quiet=${QUIET:-$root/build/batch/quiet.sh}
 waits=${WAITS:-2}
 lock_wait=${LOCK_WAIT:-3600}
 cells=${CELLS:-"p0 rt c"}
-b=build/batch/run4/B22
+b=${B22:-build/batch/run4/B22}
+r5=${R5:-build/batch/run5/B22-2-a}
+re=${WASM3_RE:-$b/out-reenter/wasm3.wasm}
+gm=${WASM3_GM:-$r5/out-gm-reenter/wasm3.wasm}
+native=${NATIVE_DIR:-$r5/native}
 node="node --no-warnings --experimental-strip-types"
 if [ "$host" != mac ]; then
 	export NVM_DIR=$HOME/.nvm
@@ -86,14 +90,78 @@ cell() {
 p0n=${P0_SAMPLES:-9}
 rtn=${RT_SAMPLES:-12}
 cn=${C_SAMPLES:-3}
+en=${E_SAMPLES:-9}
+on=${O_SAMPLES:-3}
+isn=${I_SAMPLES:-3}
+mn=${M_SAMPLES:-3}
 rounds=5
-[ "$smoke" = 1 ] && { p0n=1; rtn=1; cn=1; rounds=1; }
+[ "$smoke" = 1 ] && { p0n=1; rtn=1; cn=1; en=1; on=1; isn=1; mn=1; rounds=1; }
 echo "# sweep start $(date -u +%FT%TZ) host $host cpus $cpus node $(node --version) cells $cells" >> "$out/log"
+# the guest memory item's cells: e (endpoint arms over the guest memory build, with mem0 and mem0-shared), en (native controls),
+# o (open zlib rungs, old base form on the re-entry build against mem0 on the guest memory build), i (the all-interpreted rung,
+# re-entry build against guest memory build), m (memory per arm, one fresh process each), x (x86-64 code counts, untimed work)
+wantx() { [[ " $cells " == *" $1 "* ]]; }
+cells_r5() {
+	local i=$1 g how a v idx
+	if wantx e && [ "$i" -le "$en" ]; then
+		for g in zlib zstd; do
+			cell "e-$g-$i" "e-$g" 9 '"variant"' $pin env PART0_WASM3="$gm" $node $scripts/part0.ts sample $r5/p0/$g/asm $rounds "$out/e-$g-$i.json"
+		done
+	fi
+	if wantx en && [ "$i" -le "$en" ]; then
+		for g in zlib zstd; do
+			[ -x "$native/$g-O2" ] || { echo "no $native/$g-O2" >> "$out/log"; continue; }
+			cell "en-$g-$i" "en-$g" 2 '"variant"' bash -c "$pin $native/$g-O2 O2 $rounds 2 > $out/en-$g-$i.json && $pin $native/$g-O3native O3native $rounds 2 >> $out/en-$g-$i.json"
+		done
+	fi
+	if wantx o && [ "$i" -le "$on" ]; then
+		for how in base mem0; do
+			[ $((i % 2)) = 0 ] && how=$([ "$how" = base ] && echo mem0 || echo base)
+			if [ "$how" = base ]; then
+				cell "o-base-$i" o-base 7 '"rung"' $pin $node $scripts/mixed.ts run $r5/c/zlib-open $re $rounds direct "$out/o-base-$i.json"
+			else
+				cell "o-mem0-$i" o-mem0 7 '"rung"' $pin $node $scripts/mixed.ts run $r5/m0/zlib-open $gm $rounds direct "$out/o-mem0-$i.json"
+			fi
+		done
+	fi
+	if wantx i && [ "$i" -le "$isn" ]; then
+		for g in zlib zstd; do
+			for how in re gm; do
+				[ $((i % 2)) = 0 ] && how=$([ "$how" = re ] && echo gm || echo re)
+				if [ "$how" = re ]; then
+					cell "i-$g-re-$i" "i-$g-re" 2 '"rung"' $pin $node $scripts/mixed.ts run $r5/p0/$g $re $rounds glued "$out/i-$g-re-$i.json"
+				else
+					cell "i-$g-gm-$i" "i-$g-gm" 2 '"rung"' $pin $node $scripts/mixed.ts run $r5/p0m/$g $gm $rounds glued "$out/i-$g-gm-$i.json"
+				fi
+			done
+		done
+	fi
+	if wantx m && [ "$i" -le "$mn" ]; then
+		for g in zlib zstd; do
+			cell "m-$g-orig-$i" "m-$g-orig" 1 '"arm"' $pin $node $scripts/mem.ts $r5/p0/$g orig - "$out/m-$g-orig-$i.json"
+			cell "m-$g-base-form-$i" "m-$g-base-form" 1 '"arm"' $pin $node $scripts/mem.ts $r5/p0/$g base-form $re "$out/m-$g-base-form-$i.json"
+			cell "m-$g-shared-$i" "m-$g-shared" 1 '"arm"' $pin $node $scripts/mem.ts $r5/p0m/$g shared $gm "$out/m-$g-shared-$i.json"
+		done
+	fi
+	if wantx x && [ "$i" = 1 ]; then
+		for a in "zlib:12:longest_match" "zstd:114:ZSTD_RowFindBestMatch_noDict_5_4"; do
+			g=${a%%:*}
+			idx=${a#*:}
+			idx=${idx%%:*}
+			for v in orig rebased const0 mem0; do
+				cell "x-$g-$v" "x-$g" 1 '"variant"' bash -c "$pin $node $scripts/part0.ts code $r5/p0/$g/asm $v $idx ${a##*:} > $out/x-$g-$v.json"
+			done
+		done
+	fi
+}
 (
 	max=$p0n
 	[ "$rtn" -gt "$max" ] && max=$rtn
 	[ "$cn" -gt "$max" ] && max=$cn
+	[ "$en" -gt "$max" ] && max=$en
+	[ "$on" -gt "$max" ] && max=$on
 	for i in $(seq "$max"); do
+		cells_r5 "$i"
 		if [[ " $cells " == *" p0 "* ]] && [ "$i" -le "$p0n" ]; then
 			for g in zlib zstd; do
 				cell "p0-$g-$i" "p0-$g" 7 '"variant"' $pin $node $scripts/part0.ts sample $b/p0/$g/asm $rounds "$out/p0-$g-$i.json"

@@ -6,7 +6,15 @@ import { describe, expect, it } from 'vitest';
 import { countInsns } from '../../experiments/reenter/scripts/insn.ts';
 import { dispatchWat, entriesOf } from '../../experiments/reenter/scripts/link.ts';
 import { ieWat, upWat } from '../../experiments/reenter/scripts/rt.ts';
-import { prepareToy, runGrow, runToy } from '../../experiments/reenter/scripts/toy.ts';
+import {
+	memScenarios,
+	memSets,
+	prepareToy,
+	runGrow,
+	runMemory,
+	runToy
+} from '../../experiments/reenter/scripts/toy.ts';
+import { createVm, memoryLimits } from '../../experiments/reenter/scripts/vm.ts';
 
 const hasTools = (() => {
 	try {
@@ -18,6 +26,8 @@ const hasTools = (() => {
 })();
 const wasm3 = process.env.REENTER_WASM3;
 const mutant = process.env.REENTER_MUTANT_WASM3;
+const guestMemory = process.env.GUEST_MEMORY_WASM3;
+const guestMemoryMutant = process.env.GUEST_MEMORY_MUTANT_WASM3;
 const assemble = (wat: string) =>
 	new Uint8Array(execFileSync('wasm-tools', ['parse', '-o', '/dev/stdout'], { input: wat }));
 const toy = new URL('../../experiments/reenter/toy.wat', import.meta.url).pathname;
@@ -180,6 +190,116 @@ describe.skipIf(!hasTools || !wasm3)(
 			expect(
 				failed(await runToy(mutant!, join(dir, 'mutant'), 'direct')).length
 			).toBeGreaterThan(0);
+		});
+	}
+);
+
+describe('a module memory limits', () => {
+	it('reads a defined memory and an imported one', () => {
+		const defined = assemble('(module (memory 2 5))');
+		const noMax = assemble('(module (memory 3))');
+		const imported = assemble('(module (import "env" "memory" (memory 7 9)))');
+		const afterOther = assemble(
+			'(module (import "env" "f" (func)) (import "env" "t" (table 1 funcref)) (import "env" "g" (global i32)) (import "env" "memory" (memory 4)))'
+		);
+		expect(memoryLimits(defined)).toEqual({ initial: 2, maximum: 5 });
+		expect(memoryLimits(noMax)).toEqual({ initial: 3 });
+		expect(memoryLimits(imported)).toEqual({ initial: 7, maximum: 9 });
+		expect(memoryLimits(afterOther)).toEqual({ initial: 4 });
+		expect(() => memoryLimits(assemble('(module)'))).toThrow(/no memory/);
+	});
+});
+
+describe.skipIf(!hasTools || !guestMemory)(
+	'the guest memory build: the interpreter and native code over one Memory',
+	() => {
+		const dir = mkdtempSync(join(tmpdir(), 'guest-memory-'));
+		const toyMem = new URL('../../experiments/reenter/toy-mem.wat', import.meta.url).pathname;
+		const failed = (checks: { ok: boolean; name: string; detail: string }[]) =>
+			checks.filter((c) => !c.ok).map((c) => `${c.name}: ${c.detail}`);
+		const mem0 = { LADDER_MEM0: '1' };
+
+		it('lists the cases the spec names', () => {
+			const names = memScenarios.map((s) => s.name);
+			expect(names).toEqual(
+				expect.arrayContaining([
+					'zero growth',
+					'interpreter growth, then native reads and writes the new pages',
+					'native growth, then the interpreter reads',
+					'native to interpreter to grow to native return',
+					'a grow past the declared maximum fails in both tiers',
+					'accesses at the end of memory, in both tiers',
+					'an address plus an offset past 2^32 traps in both tiers',
+					'overlapping copies and fills, both directions',
+					'an active data segment'
+				])
+			);
+		});
+
+		it('answers what V8 answers with no JavaScript in the loop', async () => {
+			prepareToy(toyMem, join(dir, 'direct'), memSets, false, mem0);
+			expect(failed(await runMemory(guestMemory!, join(dir, 'direct'), 'direct'))).toEqual(
+				[]
+			);
+		});
+
+		it('answers what V8 answers over JavaScript', async () => {
+			prepareToy(toyMem, join(dir, 'glued'), memSets, false, mem0);
+			expect(failed(await runMemory(guestMemory!, join(dir, 'glued'), 'glued'))).toEqual([]);
+		});
+
+		it('refuses a grow past maxMemoryBytes in both tiers and leaves the state unchanged', async () => {
+			prepareToy(toyMem, join(dir, 'limit'), memSets, false, mem0);
+			const checks = await runMemory(guestMemory!, join(dir, 'limit'), 'direct', {
+				memoryLimitPages: 3,
+				refMax: 3,
+				only: ['a grow past the declared maximum fails in both tiers']
+			});
+			expect(checks).toHaveLength(1);
+			expect(failed(checks)).toEqual([]);
+		});
+
+		it('refuses a second memory, custom pages and a second memory-owning module with a message', async () => {
+			const load = async (wat: string, first?: string) => {
+				const vm = await createVm(guestMemory!, { guest: { initial: 1, maximum: 2 } });
+				if (first) vm.load(assemble(first));
+				return () => vm.load(assemble(wat));
+			};
+			expect(await load('(module (memory 1) (memory 1))')).toThrow(/only one memory/);
+			expect(await load('(module (memory 1 (pagesize 1)))')).toThrow(/64 KiB pages/);
+			expect(await load('(module (memory 1 2))', '(module (memory 1 2))')).toThrow(
+				/second module with a memory/
+			);
+		});
+
+		it('keeps the module with native memory ops free of a base', () => {
+			const text = execFileSync(
+				'wasm-tools',
+				['print', join(dir, 'direct', 'rungs', 'rung1.native.wasm')],
+				{ encoding: 'utf8' }
+			);
+			expect(text).toContain('(import "env" "memory" (memory');
+			expect(text).toContain('memory.grow');
+			expect(text).not.toMatch(/\$gbase|\$tv_|\(data /);
+		});
+
+		it.skipIf(!guestMemoryMutant)(
+			'fails the native growth cases when the size is never re-read',
+			async () => {
+				prepareToy(toyMem, join(dir, 'mutant'), memSets, false, mem0);
+				const bad = failed(
+					await runMemory(guestMemoryMutant!, join(dir, 'mutant'), 'direct')
+				);
+				expect(
+					bad.filter((b) => /^native (growth|called from JavaScript)/.test(b)).length
+				).toBeGreaterThanOrEqual(2);
+			}
+		);
+
+		it('passes the nested-entry toy over the shared Memory', async () => {
+			const sets = { mixed: ['hotA', 'leafH', 'viaTab', 'callTrap'] };
+			prepareToy(toy, join(dir, 'toy'), sets, true, mem0);
+			expect(failed(await runToy(guestMemory!, join(dir, 'toy'), 'direct'))).toEqual([]);
 		});
 	}
 );

@@ -19,6 +19,8 @@ export interface Loaded {
 }
 
 export interface Vm {
+	/** the guest memory build's shared Memory (the guest's bytes at base 0, and the native module's memory 0); absent in the other builds */
+	guest?: WebAssembly.Memory;
 	shim: Record<string, (...args: number[]) => number | bigint | void> & { memory: WebAssembly.Memory };
 	/** parses and instantiates a guest; `glued` imports go through JavaScript (host_call), `direct` ones to host_direct (needs the re-entry build) */
 	load: (bytes: Uint8Array, imports?: { glued?: Record<string, Record<string, HostImport>>; direct?: { module: string; field: string; signature: string }[] }) => Loaded;
@@ -36,6 +38,56 @@ export interface VmOptions {
 	/** answers the interpreter's host_direct import; defaults to one that returns 0 */
 	hostDirect?: (...args: number[]) => number;
 	stackBytes?: number;
+	/** burrow's maxMemoryBytes (0 or absent: none) */
+	memoryLimit?: number;
+	/** the guest memory build's shared Memory: the guest's limits in pages (see `memoryLimits`); it is created here, capped to 65,535 pages and to memoryLimit */
+	guest?: { initial: number; maximum?: number };
+}
+
+const leb = (b: Uint8Array, at: { i: number }) => {
+	let v = 0;
+	for (let shift = 0; ; shift += 7) {
+		const x = b[at.i++]!;
+		v += (x & 0x7f) * 2 ** shift;
+		if (!(x & 0x80)) return v;
+	}
+};
+
+/** the limits, in pages, of a module's memory 0 (a defined memory or an imported one), read from the binary */
+export function memoryLimits(bytes: Uint8Array): { initial: number; maximum?: number } {
+	const at = { i: 8 };
+	const limits = () => {
+		const flags = leb(bytes, at);
+		const initial = leb(bytes, at);
+		return flags & 1 ? { initial, maximum: leb(bytes, at) } : { initial };
+	};
+	while (at.i < bytes.length) {
+		const id = bytes[at.i++]!;
+		const size = leb(bytes, at);
+		const end = at.i + size;
+		if (id === 5) {
+			leb(bytes, at);
+			return limits();
+		}
+		if (id === 2) {
+			for (let n = leb(bytes, at); n > 0; n--) {
+				for (let k = 0; k < 2; k++) {
+					const length = leb(bytes, at);
+					at.i += length;
+				}
+				const kind = bytes[at.i++]!;
+				if (kind === 2) return limits();
+				if (kind === 0) leb(bytes, at);
+				else if (kind === 1) {
+					at.i++;
+					limits();
+				} else if (kind === 3) at.i += 2;
+				else throw new Error(`import kind ${kind}`);
+			}
+		}
+		at.i = end;
+	}
+	throw new Error('the module has no memory');
 }
 
 /**
@@ -62,10 +114,22 @@ export async function createVm(wasm3: WebAssembly.Module | string, options: VmOp
 		}
 	};
 	if (WebAssembly.Module.imports(module).some((i) => i.module === 'burrow' && i.name === 'host_direct')) burrow.host_direct = options.hostDirect ?? (() => 0);
-	const instance = await WebAssembly.instantiate(module, { env: { emscripten_notify_memory_growth: () => {} }, burrow });
-	shim = instance.exports as unknown as Vm['shim'];
+	const wanted = WebAssembly.Module.imports(module);
+	const env: Record<string, WebAssembly.ImportValue> = { emscripten_notify_memory_growth: () => {} };
+	// the guest memory build imports both its own memory and the guest's (see tools/interp/guest-memory.mjs)
+	const own = wanted.some((i) => i.module === 'env' && i.name === 'memory') ? new WebAssembly.Memory({ initial: 256, maximum: 32768 }) : undefined;
+	let guest: WebAssembly.Memory | undefined;
+	if (wanted.some((i) => i.module === 'env' && i.name === 'guest_memory')) {
+		if (!options.guest) throw new Error('the guest memory build needs options.guest (the guest\'s limits in pages)');
+		const cap = Math.min(options.guest.maximum ?? 65535, 65535, options.memoryLimit ? Math.floor(options.memoryLimit / 65536) : 65535);
+		guest = new WebAssembly.Memory({ initial: options.guest.initial, maximum: Math.max(cap, options.guest.initial) });
+		env.guest_memory = guest;
+	}
+	if (own) env.memory = own;
+	const instance = await WebAssembly.instantiate(module, { env, burrow });
+	shim = (own ? Object.assign({}, instance.exports, { memory: own }) : instance.exports) as unknown as Vm['shim'];
 	(shim as unknown as { _initialize: () => void })._initialize();
-	if (shim.burrow_init!(options.stackBytes ?? 8 << 20, 0) !== 0) throw new Error('burrow_init failed');
+	if (shim.burrow_init!(options.stackBytes ?? 8 << 20, options.memoryLimit ?? 0) !== 0) throw new Error('burrow_init failed');
 
 	const names = new Map<string, number>();
 	const cstr = (s: string) => {
@@ -138,5 +202,5 @@ export async function createVm(wasm3: WebAssembly.Module | string, options: VmOp
 		};
 	};
 
-	return { shim, load, callAt, error, recover, stackState: (index, which) => (shim.burrow_stack_state as (...x: number[]) => number)(index, which) };
+	return { shim, guest, load, callAt, error, recover, stackState: (index, which) => (shim.burrow_stack_state as (...x: number[]) => number)(index, which) };
 }
