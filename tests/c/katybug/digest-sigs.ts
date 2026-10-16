@@ -30,6 +30,8 @@ interface Algorithm {
 	finish: number;
 	conclude?: number;
 	read?: number;
+	/** the update function a stream with no block function calls (its code is hashed too) */
+	update?: number;
 }
 
 // found from the callers of each process_block (the K34 rows' functions) in this one build
@@ -53,7 +55,28 @@ const algorithms: Algorithm[] = [
 		finish: 0x4a50d0,
 		conclude: 0x4a4f70,
 		read: 0x4a0f60
-	}
+	},
+	// sha224 and sha384 enter the sha256 and sha512 stream functions with their own init and finish
+	{
+		name: 'sha224',
+		ctx: 0x10,
+		body: 0x49d850,
+		block: 0x49db20,
+		finish: 0x4a0870,
+		conclude: 0x4a06c0,
+		read: 0x49daa0
+	},
+	{
+		name: 'sha384',
+		ctx: 0x10,
+		body: 0x4a0d70,
+		block: 0x4a1060,
+		finish: 0x4a5100,
+		conclude: 0x4a4f70,
+		read: 0x4a0fe0
+	},
+	// b2sum's stream function calls blake2b's update wrapper for each read and its final directly
+	{ name: 'b2', ctx: 0x10, body: 0x411470, block: 0x4133c0, finish: 0x4133e0, update: 0x4133c0 }
 ];
 
 const listing = execFileSync(join(llvm, 'llvm-objdump'), ['-d', '--no-show-raw-insn', path], {
@@ -138,8 +161,12 @@ for (const a of algorithms) {
 		.map(([s, e]) => `{${s - a.finish}, ${e - s}}`)
 		.concat(Array(3 - regions.length).fill('{0, 0}'))
 		.join(', ');
+	const upd = a.update ? bytes(a.update, extent(a.update)) : Buffer.alloc(8);
+	const u = a.update
+		? `${upd.length}, ${hex(upd.readBigUInt64LE(0))}, ${hex(fnv(upd))}`
+		: '0, 0, 0';
 	rows.push(
-		`{${body.length}, ${hex(body.readBigUInt64LE(0))}, ${hex(fnv(body))}, ${ret - a.body}, ${a.ctx}, ${fin}, ${hex(first.readBigUInt64LE(0))}, ${hex(fnv(whole))}, ${regions.length}, {${r}}}, /* ${a.name} */`
+		`{${body.length}, ${hex(body.readBigUInt64LE(0))}, ${hex(fnv(body))}, ${ret - a.body}, ${a.ctx}, ${fin}, ${hex(first.readBigUInt64LE(0))}, ${hex(fnv(whole))}, ${regions.length}, {${r}}, ${u}}, /* ${a.name} */`
 	);
 }
 const here = dirname(fileURLToPath(import.meta.url));

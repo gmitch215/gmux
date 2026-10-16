@@ -6,7 +6,7 @@
 # machine's node:crypto). Every scenario's output and exit status must be the same in all four; the host digest
 # arm must also finish as many digests as the scenario's row says. "context" reads the context between block calls,
 # which a host digest cannot answer: the arm differs there by exactly the words it shows (the initial state).
-# usage: tests/c/katybug/digest.sh [coreutils [tool...]]; tools default to md5 sha1 sha256 sha512
+# usage: tests/c/katybug/digest.sh [coreutils [tool...]]; tools default to md5 sha1 sha224 sha256 sha384 sha512 b2
 # NATIVE_HOST required: an ssh host that runs x86-64 natively
 set -euo pipefail
 here=$(cd "$(dirname "$0")" && pwd)
@@ -16,7 +16,7 @@ host=${NATIVE_HOST:?set NATIVE_HOST to an ssh host that runs x86-64 natively, or
 cu=${1:-$root/build/katybug/transcript/ubin/coreutils}
 cu=$(cd "$(dirname "$cu")" && pwd)/$(basename "$cu")
 shift || true
-tools=${*:-md5 sha1 sha256 sha512}
+tools=${*:-md5 sha1 sha224 sha256 sha384 sha512 b2}
 out=$(mktemp -d)
 rig=gmux-rig/k45-digest
 ${CC:-cc} -std=c11 -D_DEFAULT_SOURCE -D_DARWIN_C_SOURCE -O2 -Wall -Wextra -Werror -o "$out/katybug" "$root"/src/gmux/katybug/*.c -lm
@@ -35,6 +35,9 @@ native() { if [ "$host" = local ]; then (cd ~/$rig && sh -c "$1"); else ssh "$ho
 
 # scenario, host digests the host arm finishes at least (summed over every process that reports)
 scenarios="plain:1 exact:1 short:1 small:0 error:1 nested:2 handler:0 thread:0 fork-before:2 fork-after:2 fork-mid:1 unmap:0 exit:0 context:1"
+# blake2b's program counts every update it takes as well as each finish: the reads of a stream (its blocks and
+# its tail) plus one finish where the stream ends cleanly; fork-after counts the parent's stream again in the child
+scenarios_b2="plain:7 exact:4 short:6 small:0 error:10 nested:10 handler:0 thread:0 fork-before:12 fork-after:22 fork-mid:10 unmap:0 exit:0 context:6"
 
 run() {
 	# run <arm> <tool> <scenario>: stdout and the status, the host digests the process reports
@@ -58,7 +61,7 @@ run() {
 
 for tool in $tools; do
 	echo "# $tool"
-	for pair in $scenarios; do
+	for pair in $(if [ "$tool" = b2 ]; then echo "$scenarios_b2"; else echo "$scenarios"; fi); do
 		scn=${pair%%:*}
 		want=${pair##*:}
 		native "./stream-faults ./coreutils $tool $scn; echo rc \$?" > "$out/native.$tool.$scn" 2> /dev/null || true
@@ -98,7 +101,10 @@ for tool in $tools; do
 			}
 			case $tool in
 				md5 | sha1) iv="context 67452301 efcdab89" ;;
+				sha224) iv="context c1059ed8 367cd507" ;;
 				sha256) iv="context 6a09e667 bb67ae85" ;;
+				sha384) iv="context c1059ed8 cbbb9d5d" ;;
+				b2) iv="context f2bdc948 6a09e667" ;;
 				sha512) iv="context f3bcc908 6a09e667" ;;
 			esac
 			[ "$(grep '^context' "$out/on.$tool.$scn")" = "$iv" ] && [ "$(grep '^context' "$out/native.$tool.$scn")" != "$iv" ] || {

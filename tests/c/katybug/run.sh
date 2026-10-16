@@ -17,6 +17,11 @@ cc -std=c11 -D_DEFAULT_SOURCE -D_DARWIN_C_SOURCE -DKB_ZLIB -O2 -Wall -Wextra -We
 	-o "$out/katybug-i64" "$root"/src/gmux/katybug/*.c -lm -lz
 cc -std=c11 -D_DEFAULT_SOURCE -D_DARWIN_C_SOURCE -DKB_ZLIB -O2 -Wall -Wextra -Werror -DKB_EPOCH=1 \
 	-o "$out/katybug-epoch" "$root"/src/gmux/katybug/*.c -lm -lz
+# mappings of up to 1 MiB as one block each, without and with the epoch guard
+cc -std=c11 -D_DEFAULT_SOURCE -D_DARWIN_C_SOURCE -DKB_ZLIB -O2 -Wall -Wextra -Werror -DKB_FLAT=1048576 \
+	-o "$out/katybug-flat" "$root"/src/gmux/katybug/*.c -lm -lz
+cc -std=c11 -D_DEFAULT_SOURCE -D_DARWIN_C_SOURCE -DKB_ZLIB -O2 -Wall -Wextra -Werror -DKB_FLAT=1048576 -DKB_EPOCH=1 \
+	-o "$out/katybug-flat-epoch" "$root"/src/gmux/katybug/*.c -lm -lz
 # sharing read-only pieces between processes is off in the build that ships (a fork maps them again)
 for v in ":" "-4k:-DKB_PIECE_BITS=12" "-i64:-DKB_IMAGE_PIECE_BITS=16"; do
 	cc -std=c11 -D_DEFAULT_SOURCE -D_DARWIN_C_SOURCE -DKB_ZLIB -O2 -Wall -Wextra -Werror -DKB_SHARE=1 ${v#*:} \
@@ -34,6 +39,8 @@ flags=(-nostdlib -static -fuse-ld=lld -O2 -ffreestanding -fno-stack-protector -f
 "$llvm/clang" --target=x86_64-linux-gnu "${flags[@]}" -mno-sse -mno-mmx -mno-red-zone -o "$out/calls-x86" "$here/x86-calls.c"
 "$llvm/clang" --target=x86_64-linux-gnu "${flags[@]}" -mno-sse -mno-mmx -mno-red-zone -o "$out/index-x86" "$here/x86-index.c"
 "$llvm/clang" --target=x86_64-linux-gnu "${flags[@]}" -mno-sse -mno-mmx -mno-red-zone -o "$out/loops-x86" "$here/x86-loops.c"
+"$llvm/clang" --target=x86_64-linux-gnu "${flags[@]}" -mno-sse -mno-mmx -mno-red-zone -o "$out/flat-x86" "$here/x86-flat.c"
+"$llvm/clang" --target=x86_64-linux-gnu "${flags[@]}" -mno-sse -mno-mmx -mno-red-zone -o "$out/commit-x86" "$here/x86-commit.c"
 "$llvm/clang" --target=x86_64-linux-gnu "${flags[@]}" -mno-sse -mno-mmx -o "$out/flags-x86" "$here/x86-flags.c"
 "$llvm/clang" --target=x86_64-linux-gnu "${flags[@]}" -I"$here" -mno-sse -mno-mmx -mno-red-zone -o "$out/prim-x86" "$here/prim-faults.c"
 "$llvm/clang" --target=aarch64-linux-gnu "${flags[@]}" -I"$here" -mgeneral-regs-only -o "$out/prim-a64" "$here/prim-faults.c"
@@ -54,9 +61,12 @@ cc -std=c11 -O2 -Wall -Wextra -Werror -o "$out/libm-kernel" "$here/libm-kernel.c
 	"$root/src/gmux/katybug/libm-data.c" -lm
 cc -std=c11 -O2 -Wall -Wextra -Werror -DFROM_KERNEL -o "$out/libm-tables" "$here/libm-tables.c" "$root/src/gmux/katybug/libm-data.c"
 # -N: one writable and executable segment, for the loop that patches its own code
-"$llvm/clang" --target=x86_64-linux-gnu "${flags[@]}" -Wl,-N -mno-sse -mno-mmx -o "$out/epochs-x86" "$here/epochs.c"
-"$llvm/clang" --target=aarch64-linux-gnu "${flags[@]}" -Wl,-N -mgeneral-regs-only -o "$out/epochs-a64" "$here/epochs.c"
+"$llvm/clang" --target=x86_64-linux-gnu "${flags[@]}" -mno-sse -mno-mmx -o "$out/epochs-x86" "$here/epochs.c"
+"$llvm/clang" --target=aarch64-linux-gnu "${flags[@]}" -mgeneral-regs-only -o "$out/epochs-a64" "$here/epochs.c"
+"$llvm/clang" --target=x86_64-linux-gnu "${flags[@]}" -Wl,-N -mno-sse -mno-mmx -o "$out/rights-x86" "$here/rights.c"
+"$llvm/clang" --target=aarch64-linux-gnu "${flags[@]}" -Wl,-N -mgeneral-regs-only -o "$out/rights-a64" "$here/rights.c"
 "$llvm/clang" --target=x86_64-linux-gnu "${flags[@]}" -Wl,-N -mno-sse -mno-mmx -o "$out/region-smc-x86" "$here/x86-region-smc.c"
+"$llvm/clang" --target=x86_64-linux-gnu "${flags[@]}" -mno-sse -mno-mmx -o "$out/persist-x86" "$here/x86-persist.c"
 "$llvm/clang" --target=x86_64-linux-gnu -nostdlib -static -fuse-ld=lld -o "$out/hello-x86" "$here/hello-x86.S"
 "$llvm/clang" --target=aarch64-linux-gnu -nostdlib -static -fuse-ld=lld -o "$out/hello-a64" "$here/hello-a64.S"
 
@@ -112,6 +122,22 @@ cached() {
 }
 cached cache-guest-x86 "$ref" "$ref_rc" "$out/guest-x86"
 cached cache-guest-a64 "$ref" "$ref_rc" "$out/guest-a64"
+# x86-persist.c: a block is saved with the hash of the bytes it was decoded from. Mode a runs code and rewrites it, b
+# starts on the rewritten bytes and must not take a's block; w moves the code generation mid-run, and a second w run
+# takes most blocks from the cache, the ones decoded before the move included
+mkdir -p "$out/cache-persist" "$out/cache-persist-w"
+check persist-x86-a "a 07" 0 env KATYBUG_CACHE="$out/cache-persist" "$out/katybug" "$out/persist-x86" a
+check persist-x86-b-other-bytes "b 09" 0 env KATYBUG_CACHE="$out/cache-persist" "$out/katybug" "$out/persist-x86" b
+check persist-x86-w-cold "w 79" 0 env KATYBUG_CACHE="$out/cache-persist-w" "$out/katybug" "$out/persist-x86" w
+persist_got=$(KATYBUG_STATS=1 KATYBUG_CACHE="$out/cache-persist-w" "$out/katybug" "$out/persist-x86" w 2> "$out/err")
+persist_dec=$( (grep -o '[0-9]* decoded, [0-9]* from the cache' "$out/err" || true) | tr -d ',')
+read -r p_dec _ p_hit _ <<< "$persist_dec"
+if [ "$persist_got" = "w 79" ] && [ "${p_dec:-99}" -lt "${p_hit:-0}" ]; then
+	echo "PASS persist-x86-w-warm ($p_dec decoded, $p_hit from the cache)"
+else
+	echo "FAIL persist-x86-w-warm (output '$persist_got'; $persist_dec)"
+	failed=1
+fi
 # x86-faults.expected is native Linux's: faults mid-rep, divide errors
 check faults-x86 "$(cat "$here/x86-faults.expected")" 0 "$out/katybug" "$out/faults-x86"
 # x86-regs.expected is native Linux's: every register and flag after SSE, x87 and string instructions,
@@ -127,10 +153,27 @@ check calls-x86 "$(cat "$here/x86-calls.expected")" 0 "$out/katybug" "$out/calls
 check index-x86 "$(cat "$here/x86-index.expected")" 0 "$out/katybug" "$out/index-x86"
 check index-x86-small-pieces "$(cat "$here/x86-index.expected")" 0 "$out/katybug-4k" "$out/index-x86"
 # x86-loops.expected is native Linux's: loops over one base register while a window straddles a piece boundary, a page
-# goes PROT_NONE, an index runs off the mapping, a far mapping comes and goes, another thread remaps the buffer at a
+# goes PROT_NONE or read-only, an index runs off the mapping, a far mapping comes and goes, another thread remaps the buffer at a
 # futex wait and a signal handler remaps it
 check loops-x86 "$(cat "$here/x86-loops.expected")" 0 "$out/katybug" "$out/loops-x86"
 check loops-x86-small-pieces "$(cat "$here/x86-loops.expected")" 0 "$out/katybug-4k" "$out/loops-x86"
+check loops-x86-guard "$(cat "$here/x86-loops.expected")" 0 "$out/katybug-epoch" "$out/loops-x86"
+check loops-x86-flat "$(cat "$here/x86-loops.expected")" 0 "$out/katybug-flat" "$out/loops-x86"
+check loops-x86-flat-guard "$(cat "$here/x86-loops.expected")" 0 "$out/katybug-flat-epoch" "$out/loops-x86"
+check index-x86-flat "$(cat "$here/x86-index.expected")" 0 "$out/katybug-flat" "$out/index-x86"
+# x86-flat.expected is native Linux's: loads and stores at an index read from memory on a buffer with a hole, a page without
+# protection or write, one remapped by a signal handler or another thread, grown by brk, forked, and read at addresses that
+# share its low 32 bits
+for build in katybug katybug-4k katybug-epoch katybug-flat katybug-flat-epoch; do
+	check flat-x86-$build "$(cat "$here/x86-flat.expected")" 0 "$out/$build" "$out/flat-x86"
+done
+# x86-commit.expected is native Linux's: what a fault leaves committed (a load into its own base, a push, call, ret, leave,
+# xchg and cmpxchg on a bad page, rep stos and movs across a page, an access straddling one) and what the handler sees of
+# the registers and flags, a signal in a loop, multiword add and subtract, and every condition after each flag-setting
+# instruction. The syscall case needs a named run: katybug leaves r11 at 0x246
+for build in katybug katybug-4k katybug-epoch; do
+	check commit-x86-$build "$(cat "$here/x86-commit.expected")" 0 "$out/$build" "$out/commit-x86"
+done
 # x86-flags.expected is native Linux's: the flags of a cmp, add or sub, read by a cmov after a jump through a register
 # into a block with cpuid
 check flags-x86 "$(cat "$here/x86-flags.expected")" 0 "$out/katybug" "$out/flags-x86"
@@ -190,7 +233,7 @@ done
 for a in x86 a64; do
 	for mode in read rewrite truncate fork replace protect share sharewrite sharefork shareprot shareexit sharerewrite sharetruncate \
 		fshare fsharewrite fsharefork fshareprot fshareexit fsharerewrite fsharetruncate; do
-		for build in katybug katybug-4k katybug-i64 katybug-epoch katybug-share katybug-share-4k katybug-share-i64; do
+		for build in katybug katybug-4k katybug-i64 katybug-epoch katybug-flat katybug-share katybug-share-4k katybug-share-i64; do
 			cp "$out/image-$a" "$out/image-$a.w"
 			check image-$a-$mode-$build "$mode ok" 0 "$out/$build" "$out/image-$a.w" $mode
 		done
@@ -290,11 +333,47 @@ for a in x86 a64; do
 	check epochs-$a-segments-1 "$epochs" 0 env KATYBUG_SEGMENTS=1 "$out/katybug" "$out/epochs-$a"
 	check epochs-$a-guard "$epochs" 0 "$out/katybug-epoch" "$out/epochs-$a"
 	check epochs-$a-guard-segments-1 "$epochs" 0 env KATYBUG_SEGMENTS=1 "$out/katybug-epoch" "$out/epochs-$a"
+	check epochs-$a-flat "$epochs" 0 "$out/katybug-flat" "$out/epochs-$a"
+	check epochs-$a-flat-guard "$epochs" 0 "$out/katybug-flat-epoch" "$out/epochs-$a"
 	# grep reads to the end: a -q that exits on its match leaves the later report lines a SIGPIPE, which pipefail fails
 	if KATYBUG_STATS=1 "$out/katybug" "$out/epochs-$a" 2>&1 > /dev/null | grep '[1-9][0-9]* traces' > /dev/null; then
 		echo "PASS epochs-$a-traced"
 	else
 		echo "FAIL epochs-$a-traced"
+		failed=1
+	fi
+done
+# rights.c: stores to read-only pages, fetches from pages that are not executable, system calls on buffers
+# that lack the right, a loop that loses a right mid-run, and code rewritten with no mprotect (a store, a
+# store through another address, a read(), a second thread, a store into the same block); the .expected
+# files are native Linux's (x86-64 on a Zen 5 host with protection keys, AArch64 on an Apple core in
+# Docker, where an execute-only page still reads)
+for a in x86 a64; do
+	for build in katybug katybug-4k katybug-epoch katybug-flat katybug-flat-epoch; do
+		check rights-$a-$build "$(cat "$here/rights-$a.expected")" 0 "$out/$build" "$out/rights-$a"
+	done
+done
+# a store to data on a page of decoded code decodes nothing again (at most a trace of the loop), and
+# code written in each iteration decodes once per iteration
+decoded() {
+	KATYBUG_STATS=1 "$@" 2>&1 > /dev/null | sed -n 's/^katybug: decoded \([0-9]*\) blocks$/\1/p'
+}
+for a in x86 a64; do
+	short=$(decoded "$out/katybug" "$out/rights-$a" smc-data 200)
+	long=$(decoded "$out/katybug" "$out/rights-$a" smc-data 2000)
+	# a hot loop becomes a trace once (a block more) at one length and not at the other
+	if [ -n "$short" ] && [ -n "$long" ] && [ $((long - short)) -le 2 ]; then
+		echo "PASS rights-$a-data-decodes-once ($short blocks at 200 iterations, $long at 2000)"
+	else
+		echo "FAIL rights-$a-data-decodes-once: $short blocks at 200 iterations, $long at 2000"
+		failed=1
+	fi
+	short=$(decoded "$out/katybug" "$out/rights-$a" smc-jit 200)
+	long=$(decoded "$out/katybug" "$out/rights-$a" smc-jit 2000)
+	if [ -n "$short" ] && [ -n "$long" ] && [ $((long - short)) -ge 1800 ]; then
+		echo "PASS rights-$a-jit-decodes-each ($short blocks at 200 iterations, $long at 2000)"
+	else
+		echo "FAIL rights-$a-jit-decodes-each: $short blocks at 200 iterations, $long at 2000"
 		failed=1
 	fi
 done

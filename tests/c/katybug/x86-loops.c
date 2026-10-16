@@ -250,9 +250,7 @@ void loops_main(long* sp) {
         line("none", r, faults, faddr);
         line("none sum", sum(BUF, 64), 0, 0);
     }
-    /* katybug maps a read-only page as writable (mem.c checks only for a zero
-       protection), so this case runs when it is named and not by default */
-    if (only && pick(only, "ro")) {
+    if (pick(only, "ro")) {
         sys(NR_MPROTECT, BUF, PAGE, 3);
         fill(BUF, 64);
         faults = faddr = 0;

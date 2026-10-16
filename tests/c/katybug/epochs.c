@@ -49,14 +49,16 @@ static void put_code(unsigned char* p, int v) {
  * Most passes leave the code generation alone, so the block that ends in the
  * syscall and its link to X stay current; the passes that change it must run
  * the new X */
-__asm__(".text\n.globl smc_loop\nsmc_loop:\n"
-        " push %r12\n mov %rdi, %r12\n xor %r9d, %r9d\n mov $300, %r8d\n"
-        "1: mov %r8d, %eax\n xor %edx, %edx\n mov $25, %ecx\n div %ecx\n"
-        " mov %al, 3f+2(%rip)\n cmp $1, %edx\n sbb %edx, %edx\n and $4, %edx\n"
-        " mov $7, %ecx\n sub %edx, %ecx\n mov %ecx, %edx\n"
-        " mov $10, %eax\n mov %r12, %rdi\n mov $4096, %esi\n syscall\n"
-        "3: mov $0, %r10d\n add %r10d, %r9d\n dec %r8d\n jnz 1b\n"
-        " mov %r9d, %eax\n pop %r12\n ret\n");
+__asm__(
+    ".text\n.globl smc_loop\nsmc_loop:\n"
+    " push %r12\n mov %rdi, %r12\n xor %r9d, %r9d\n mov $300, %r8d\n"
+    "1: mov %r8d, %eax\n xor %edx, %edx\n mov $25, %ecx\n div %ecx\n"
+    " mov %al, 3f+2(%rip)\n cmp $1, %edx\n sbb %edx, %edx\n and $4, %edx\n"
+    " mov $7, %ecx\n sub %edx, %ecx\n mov %ecx, %edx\n"
+    " mov $10, %eax\n mov %r12, %rdi\n mov $4096, %esi\n syscall\n"
+    "3: mov $0, %r10d\n add %r10d, %r9d\n dec %r8d\n jnz 1b\n"
+    " mov %r9d, %eax\n pop %r12\n ret\n.globl smc_loop_end\nsmc_loop_end:\n"
+);
 static void sync_code(void* p) {
     (void) p;
 }
@@ -110,7 +112,7 @@ __asm__(".text\n.globl smc_loop\nsmc_loop:\n"
         " cmp w16, #0\n mov x2, #7\n mov x3, #3\n csel x2, x3, x2, eq\n"
         " mov x8, #226\n mov x0, x12\n mov x1, #4096\n svc 0\n"
         "3: movz w13, #0\n add w9, w9, w13\n subs w10, w10, #1\n b.ne 1b\n"
-        " mov w0, w9\n ret\n");
+        " mov w0, w9\n ret\n.globl smc_loop_end\nsmc_loop_end:\n");
 static void sync_code(void* p) {
     __asm__ volatile(
         "dc cvau, %0\n dsb ish\n ic ivau, %0\n dsb ish\n isb" ::"r"(p)
@@ -323,19 +325,25 @@ static void sig_async(void) {
 
 /* #region code generation */
 
+/* the mapped code is written while it is read and write and runs while it is
+ * read and execute, never both */
+#define RW 3
+#define RX 5
+
 /* mapped code, called in a loop, rewritten once through a protection flip */
 static void code_flip(void) {
     unsigned char* code = (unsigned char*) CODE_AT;
     int (*fn)(void) = (int (*)(void))(uintptr_t) code;
-    sys6(NR_MMAP, CODE_AT, 4096, 7, MAP_FIXED_ANON, -1, 0);
+    sys6(NR_MMAP, CODE_AT, 4096, RW, MAP_FIXED_ANON, -1, 0);
     put_code(code, 1);
+    sys6(NR_MPROTECT, CODE_AT, 4096, RX, 0, 0, 0);
     sync_code(code);
     long sum = 0;
     for (int i = 0; i < N; i++) {
         if (i == AT) {
-            sys6(NR_MPROTECT, CODE_AT, 4096, 3, 0, 0, 0);
+            sys6(NR_MPROTECT, CODE_AT, 4096, RW, 0, 0, 0);
             put_code(code, 2);
-            sys6(NR_MPROTECT, CODE_AT, 4096, 7, 0, 0, 0);
+            sys6(NR_MPROTECT, CODE_AT, 4096, RX, 0, 0, 0);
             sync_code(code);
         }
         sum += fn();
@@ -347,17 +355,18 @@ static void code_flip(void) {
 static void code_churn(void) {
     unsigned char* code = (unsigned char*) CODE_AT;
     int (*fn)(void) = (int (*)(void))(uintptr_t) code;
-    sys6(NR_MMAP, CODE_AT, 4096, 7, MAP_FIXED_ANON, -1, 0);
+    sys6(NR_MMAP, CODE_AT, 4096, RW, MAP_FIXED_ANON, -1, 0);
     put_code(code, 1);
+    sys6(NR_MPROTECT, CODE_AT, 4096, RX, 0, 0, 0);
     sync_code(code);
     long sum = 0, want = 0;
     int v = 1;
     for (int i = 0; i < N; i++) {
         if (i % 13 == 0) {
             v = v % 5 + 1;
-            sys6(NR_MPROTECT, CODE_AT, 4096, 3, 0, 0, 0);
+            sys6(NR_MPROTECT, CODE_AT, 4096, RW, 0, 0, 0);
             put_code(code, v);
-            sys6(NR_MPROTECT, CODE_AT, 4096, 7, 0, 0, 0);
+            sys6(NR_MPROTECT, CODE_AT, 4096, RX, 0, 0, 0);
             sync_code(code);
         }
         sum += fn();
@@ -372,14 +381,16 @@ static void code_remap(void) {
     int (*fn)(void) = (int (*)(void))(uintptr_t) code;
     long sum = 0, want = 0;
     int v = 1;
-    sys6(NR_MMAP, CODE_AT, 4096, 7, MAP_FIXED_ANON, -1, 0);
+    sys6(NR_MMAP, CODE_AT, 4096, RW, MAP_FIXED_ANON, -1, 0);
     put_code(code, v);
+    sys6(NR_MPROTECT, CODE_AT, 4096, RX, 0, 0, 0);
     sync_code(code);
     for (int i = 0; i < N; i++) {
         if (i % 17 == 0) {
             v = v % 5 + 1;
-            sys6(NR_MMAP, CODE_AT, 4096, 7, MAP_FIXED_ANON, -1, 0);
+            sys6(NR_MMAP, CODE_AT, 4096, RW, MAP_FIXED_ANON, -1, 0);
             put_code(code, v);
+            sys6(NR_MPROTECT, CODE_AT, 4096, RX, 0, 0, 0);
             sync_code(code);
         }
         sum += fn();
@@ -390,13 +401,22 @@ static void code_remap(void) {
 
 /* the code that follows a syscall is rewritten just before it, and the syscall
  * changes code generation: what runs after it is the new code */
-int smc_loop(unsigned long other);
+void smc_loop_end(void);
+extern char smc_loop[];
 static void code_smc(void) {
     unsigned long other = CODE_AT + 0x10000;
+    unsigned char* at = (unsigned char*) (CODE_AT + 0x20000);
     sys6(NR_MMAP, (long) other, 4096, 7, MAP_FIXED_ANON, -1, 0);
+    /* the loop patches itself, so it runs from a page that is writable and
+     * executable */
+    sys6(NR_MMAP, (long) at, 4096, 7, MAP_FIXED_ANON, -1, 0);
+    for (long i = 0; i < (long) ((char*) smc_loop_end - smc_loop); i++)
+        at[i] = (unsigned char) smc_loop[i];
+    for (int k = 0; k < 4; k++) sync_code(at + 64 * k);
+    int (*fn)(unsigned long) = (int (*)(unsigned long))(uintptr_t) at;
     long want = 0;
     for (long c = 300; c > 0; c--) want += c / 25;
-    report("code-smc", smc_loop(other) == (int) want);
+    report("code-smc", fn(other) == (int) want);
 }
 
 /* #endregion */

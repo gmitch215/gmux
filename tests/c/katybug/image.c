@@ -365,9 +365,16 @@ static int mode_share(void) {
            sys6(NR_WRITE, nul, (long) (rbase + 2 * PIECE), 16, 0, 0, 0) == 16;
 }
 
+/* the read-only pieces made writable, which keeps them the file's own pages
+ * until something writes one */
+static int writable(void) {
+    return !sys6(NR_MPROTECT, (long) rbase, NB * PIECE, 3, 0, 0, 0);
+}
+
 /* a store and a read() into pieces already read change those bytes only, in
  * this process */
 static int mode_sharewrite(void) {
+    if (!writable()) return 0;
     if (!rblock_is(1, 0, 16, 0) || !rblock_is(2, 0, 16, 0) ||
         !rblock_is(3, 0, 16, 0))
         return 0;
@@ -420,6 +427,7 @@ static int child_late(void) {
  * writes is its own; the parent writing after the fork changes nothing for it
  */
 static int mode_sharefork(void) {
+    if (!writable()) return 0;
     for (int k = 0; k < NB; k++) {
         if (!rblock_is(k, 0, 16, 0) || child(child_reads) != 0) return 0;
     }
@@ -439,6 +447,7 @@ static int mode_sharefork(void) {
 /* mprotect and munmap across shared pieces: both halves of a split piece keep
  * the file's bytes, and what is gone or without access faults */
 static int mode_shareprot(void) {
+    if (!writable()) return 0;
     unsigned long b = (unsigned long) rbase;
     if (!rblock_is(1, 0, 16, 0) || !rblock_is(2, 0, 16, 0) ||
         !rblock_is(3, 0, 16, 0))

@@ -6,7 +6,8 @@
  * the stubs feed them is scripted. Each scenario prints what the stream
  * returned and the digest, the same natively, with katybug's kernels off, with
  * them on, and with the host digest on (tests/c/katybug/digest.sh).
- * usage: stream-faults <coreutils> <md5|sha1|sha256|sha512> <scenario> */
+ * usage: stream-faults <coreutils> <md5|sha1|sha224|sha256|sha384|sha512|b2>
+ * <scenario> */
 #include <stdint.h>
 
 #define NR_WRITE 1
@@ -141,10 +142,11 @@ static int ferror_c(struct src* s) {
 
 static int alg_n;
 static long alg_entry;
-typedef long (*stream_fn)(struct src*, void*);
+/* the third argument is blake2b's digest length, which the others ignore */
+typedef long (*stream_fn)(struct src*, void*, long);
 
 static long run_stream(struct src* s, uint8_t* res) {
-    return ((stream_fn) alg_entry)(s, res);
+    return ((stream_fn) alg_entry)(s, res, 64);
 }
 
 static void act(struct src* s, char* buf) {
@@ -267,6 +269,14 @@ void stream_main(long* sp) {
         flush();
         sys(NR_EXIT, 1, 0, 0);
     }
+    /* the writable data: blake2b's final clears its block through a pointer to
+     * memset that sits there */
+    if (sys6(NR_MMAP, 0x581000, 0xc000, 3, MAP_FIXED_PRIVATE, fd, 0x180000) !=
+        0x581000) {
+        put("no data\n");
+        flush();
+        sys(NR_EXIT, 1, 0, 0);
+    }
     sys(NR_ARCH_PRCTL, 0x1002, (long) tls, 0);
     void* stubs[5] = {malloc_c, free_c, fread_tramp, feof_c, ferror_c};
     for (int i = 0; i < 5; i++) patch(CALLEES[i], stubs[i]);
@@ -276,6 +286,12 @@ void stream_main(long* sp) {
         alg_entry = 0x49bc30, alg_n = 20;
     else if (streq(alg, "sha256"))
         alg_entry = 0x49d980, alg_n = 32;
+    else if (streq(alg, "sha224"))
+        alg_entry = 0x49d9a0, alg_n = 28;
+    else if (streq(alg, "sha384"))
+        alg_entry = 0x4a0ec0, alg_n = 48;
+    else if (streq(alg, "b2"))
+        alg_entry = 0x411470, alg_n = 64;
     else
         alg_entry = 0x4a0ea0, alg_n = 64;
 
