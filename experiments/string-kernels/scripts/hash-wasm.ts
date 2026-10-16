@@ -3,7 +3,7 @@ import { createHash } from 'node:crypto';
 import { appendFileSync, existsSync, mkdirSync, readFileSync, rmdirSync, writeFileSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { appendCpio } from '../../../scripts/wasm/cpio-append.ts';
-import { Machine } from '../../../src/worker/machine/machine.ts';
+import { Machine, type HostDigest } from '../../../src/worker/machine/machine.ts';
 
 /**
  * md5sum, sha1sum, sha256sum, sha512sum and cksum of zeros read from a file, under a machine in node (V8) with the kernel on and
@@ -22,7 +22,10 @@ import { Machine } from '../../../src/worker/machine/machine.ts';
  * giving the program node:crypto. INPUTS (zero): zero is the files above; d8 is eight distinct FILEMIB files (natively one
  * command over all eight; in the machine one file at a time, written before its sample and removed after it, so the
  * ramfs holds one; the generated lines are the same bytes natively) and p512 a 512 MiB stream of zeros (natively from
- * a file, in the machine through a pipe from busybox head, whose own time is the gen-guest cell)
+ * a file, in the machine through a pipe from busybox head, whose own time is the gen-guest cell). TRACE (unset): the time
+ * inside the machine's __gmux_digest import and inside node's Hash.update, per sample, in the last three columns. Diagnostic
+ * arms of the host digest, all with the host digest on: nohash takes the bytes and hashes none (every cost but the hash),
+ * batch64 and batch1m stage the bytes of many calls into one buffer and hash it in one update
  */
 const env = (name: string, fallback?: string) => {
 	const v = process.env[name] ?? fallback;
@@ -61,6 +64,45 @@ registry.set(sha256(read(wasm)), new WebAssembly.Module(read(inst)));
 const cpio = `${out}.cpio`;
 const base = existsSync(join(bundle, 'initrd.cpio')) ? join(bundle, 'initrd.cpio') : join(bundle, 'initramfs.bin');
 appendCpio(base, cpio, [`/bin/katybug=${wasm}`, `/bin/coreutils=${coreutils}`]);
+const traced = env('TRACE', '') !== '';
+let updateNs = 0n;
+// the arm of the running cell: nohash takes the bytes and hashes nothing (the digest is wrong; the sample is everything but
+// the hash), batch64 and batch1m stage the bytes of many calls and hash them in one update
+let hostArm = '';
+const hasher = (algorithm: string): HostDigest => {
+	const h = createHash(algorithm);
+	const size = hostArm === 'batch64' ? 65536 : hostArm === 'batch1m' ? 1048576 : 0;
+	if (!traced && !size && hostArm !== 'nohash') return h;
+	const staged = new Uint8Array(size);
+	let n = 0;
+	const update = (data: Uint8Array) => {
+		const t = process.hrtime.bigint();
+		h.update(data);
+		updateNs += process.hrtime.bigint() - t;
+	};
+	const flush = () => {
+		if (n) update(staged.subarray(0, n));
+		n = 0;
+	};
+	return {
+		update(data) {
+			if (hostArm === 'nohash') return;
+			if (!size) return update(data);
+			if (data.length > size - n) flush();
+			if (data.length >= size) return update(data);
+			staged.set(data, n);
+			n += data.length;
+		},
+		digest() {
+			flush();
+			return h.digest();
+		},
+		copy() {
+			flush();
+			return h.copy();
+		}
+	};
+};
 const machine = new Machine({
 	vmlinux: new WebAssembly.Module(read(join(bundle, 'vmlinux.wasm'))),
 	initrd: read(cpio),
@@ -68,10 +110,24 @@ const machine = new Machine({
 	registry,
 	maximumPages: 4096,
 	sha256,
-	digest: (algorithm) => createHash(algorithm),
+	digest: (algorithm) => hasher(algorithm),
 	sharedKernel: true,
 	write: (text) => (output += text)
 });
+// TRACE: the time spent inside the machine's __gmux_digest import and its calls, per sample (the hrtime pair costs about 0.1 us a call)
+let importNs = 0n;
+let importCalls = 0;
+if (traced) {
+	const m = machine as unknown as { hostDigest: (...a: number[]) => number };
+	const host = m.hostDigest.bind(machine);
+	m.hostDigest = (...a) => {
+		const t = process.hrtime.bigint();
+		const r = host(...a);
+		importNs += process.hrtime.bigint() - t;
+		importCalls++;
+		return r;
+	};
+}
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, Math.min(ms, 5)));
 const guest = async (cmd: string) => {
 	const mark = `@@${Math.random().toString(36).slice(2)}`;
@@ -120,7 +176,7 @@ const native = (cmd: string) => {
 	return { ms: performance.now() - t, text: r.stdout };
 };
 
-writeFileSync(out, 'arm\ttool\tmib\trep\tms\tquiet_before\tquiet_after\tok\tdigest\tstatus\thost_digests\n');
+writeFileSync(out, 'arm\ttool\tmib\trep\tms\tquiet_before\tquiet_after\tok\tdigest\tstatus\thost_digests\timport_ms\timport_calls\tupdate_ms\n');
 console.log(`node ${process.version}, V8 ${process.versions.v8}, cpu ${cpu}`);
 await machine.run(() => output.includes('# '), sleep, 300_000);
 const zero = inputs.includes('zero');
@@ -199,7 +255,11 @@ for (let rep = 0; rep < Math.max(reps, bigReps); rep++)
 	for (const c of cells) {
 		if (rep >= c.n || dead.has(`${c.arm}-${c.tool}-${c.mib}`)) continue;
 		const key = `${c.tool}-${c.mib}`;
+		hostArm = c.arm;
 		const h0 = machine.stats.digests;
+		const n0 = importNs;
+		const c0 = importCalls;
+		const u0 = updateNs;
 		const run = async () => {
 			if (c.arm === 'gen-native') return native(floorOf(c.mib).native);
 			if (c.arm === 'native') return native(nat(c.tool, c.mib));
@@ -225,10 +285,12 @@ for (let rep = 0; rep < Math.max(reps, bigReps); rep++)
 		const s = c.mib === 'd8' && c.arm !== 'native' && c.arm !== 'gen-native' ? await run() : await sample(run);
 		const d = digestOf(s.text);
 		if (c.arm === 'native') want.set(key, d);
-		const ok = c.arm.startsWith('gen') ? 1 : Number(d !== 'none' && d === want.get(key) && ('status' in s ? s.status === '0' : true));
+		const exit0 = 'status' in s ? s.status === '0' : true;
+		// nohash prints a digest of nothing, so only its status can be checked
+		const ok = c.arm.startsWith('gen') ? 1 : c.arm === 'nohash' ? Number(exit0) : Number(d !== 'none' && d === want.get(key) && exit0);
 		const status = 'status' in s ? s.status : '-';
 		if (!ok) console.log(`check failed: status ${status}, digest ${d}, want ${want.get(key)}, text ${JSON.stringify(s.text.slice(-300))}`);
-		const row = [c.arm, c.tool, c.mib, rep, s.ms.toFixed(1), s.q0, s.q1, ok, d.slice(0, 8), status, machine.stats.digests - h0].join('\t');
+		const row = [c.arm, c.tool, c.mib, rep, s.ms.toFixed(1), s.q0, s.q1, ok, d.slice(0, 8), status, machine.stats.digests - h0, (Number(importNs - n0) / 1e6).toFixed(2), importCalls - c0, (Number(updateNs - u0) / 1e6).toFixed(2)].join('\t');
 		appendFileSync(out, `${row}\n`);
 		rows.push(row);
 		console.log(row);

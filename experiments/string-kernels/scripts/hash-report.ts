@@ -75,10 +75,21 @@ export function v8Report(tsv: string): string[] {
 	const quiet = new Map<string, number>();
 	const failed = new Map<string, number>();
 	const hosted = new Map<string, number>();
+	const rounds = new Map<string, Map<string, number>>();
+	const traced = new Map<string, { wall: number[]; imported: number[]; updated: number[]; calls: number }>();
 	for (const r of lines(tsv)) {
-		const [arm, tool, mib, , ms, q0, q1, ok, , , digests] = r as string[];
+		const [arm, tool, mib, rep, ms, q0, q1, ok, , , digests, importMs, importCalls, updateMs] = r as string[];
 		const key = [arm, tool, mib].join('\t');
 		cells.set(key, [...(cells.get(key) ?? []), Number(ms) / 1000]);
+		rounds.set(key, new Map([...(rounds.get(key) ?? []), [rep!, Number(ms) / 1000]]));
+		if (Number(importCalls) > 0) {
+			const t = traced.get(key) ?? { wall: [], imported: [], updated: [], calls: 0 };
+			t.wall.push(Number(ms) / 1000);
+			t.imported.push(Number(importMs) / 1000);
+			t.updated.push(Number(updateMs) / 1000);
+			t.calls = Number(importCalls);
+			traced.set(key, t);
+		}
 		quiet.set(key, Math.max(quiet.get(key) ?? 0, Number(q0), Number(q1)));
 		failed.set(key, (failed.get(key) ?? 0) + (ok === '1' ? 0 : 1));
 		hosted.set(key, Math.max(hosted.get(key) ?? 0, Number(digests ?? 0)));
@@ -98,7 +109,7 @@ export function v8Report(tsv: string): string[] {
 	out.push('', '| tool | MiB | arm | wall r | r net of start-up | r net of the read floor | vs kernel | floor s (guest / native) |', '| --- | --- | --- | --- | --- | --- | --- | --- |');
 	for (const tool of new Set([...cells.keys()].map((k) => k.split('\t')[1]!)).values())
 		for (const mib of [1, 64, 512, 'd8', 'p512'])
-			for (const arm of ['off', 'kernel', 'host']) {
+			for (const arm of [...new Set([...cells.keys()].map((k) => k.split('\t')[0]!))].filter((a) => a !== 'native' && !a.startsWith('gen'))) {
 				const w = med(arm, tool, mib);
 				const n = med('native', tool, mib);
 				if (!Number.isFinite(w) || !Number.isFinite(n)) continue;
@@ -107,6 +118,24 @@ export function v8Report(tsv: string): string[] {
 				const k = med('kernel', tool, mib);
 				out.push(`| ${tool} | ${mib} | ${arm} | ${f(w / n, 2)} | ${f(net, 2)} | ${f(floor, 2)} | ${f(w / k, 2)} | ${f(med('gen-guest', 'dd', mib))} / ${f(med('gen-native', 'dd', mib))} |`);
 			}
+	// an arm's wall over the native wall of the same round: the medians above can hide a pair that crosses 1.0
+	const pairs = ['', '| tool | MiB | arm | rounds | paired r median | min-max | rounds <= 1.0 |', '| --- | --- | --- | --- | --- | --- | --- |'];
+	for (const key of rounds.keys()) {
+		const [arm, tool, mib] = key.split('\t') as [string, string, string];
+		const control = rounds.get(['native', tool, mib].join('\t'));
+		if (!control || arm === 'native' || arm.startsWith('gen')) continue;
+		const ratios = [...rounds.get(key)!].filter(([rep]) => control.has(rep)).map(([rep, s]) => s / control.get(rep)!);
+		if (ratios.length)
+			pairs.push(`| ${tool} | ${mib} | ${arm} | ${ratios.length} | ${f(median(ratios), 2)} | ${f(Math.min(...ratios), 2)}-${f(Math.max(...ratios), 2)} | ${ratios.filter((x) => x <= 1).length} of ${ratios.length} |`);
+	}
+	if (pairs.length > 3) out.push(...pairs);
+	// TRACE rows: the time inside the machine's __gmux_digest import, and inside node's Hash.update within it
+	const inside = ['', '| arm | tool | MiB | n | wall median s | import s | update s | calls | wall minus import s |', '| --- | --- | --- | --- | --- | --- | --- | --- | --- |'];
+	for (const [key, t] of traced) {
+		const [arm, tool, mib] = key.split('\t') as [string, string, string];
+		inside.push(`| ${arm} | ${tool} | ${mib} | ${t.wall.length} | ${f(median(t.wall))} | ${f(median(t.imported))} | ${f(median(t.updated))} | ${t.calls} | ${f(median(t.wall) - median(t.imported))} |`);
+	}
+	if (inside.length > 3) out.push(...inside);
 	return out;
 }
 

@@ -128,4 +128,37 @@ describe('hash report', () => {
 		);
 		expect(out.join('\n')).not.toMatch(/NaN|Infinity/);
 	});
+
+	it('pairs each round of an arm with the native round, and shows the time inside the import', () => {
+		const vrow = (arm: string, rep: number, ms: number, traced = ['', '', '']) =>
+			[arm, 'md5sum', 'd8', rep, ms, 0.1, 0.1, 1, 'abcd1234', 0, 8, ...traced].join('\t');
+		const tsv = [
+			'arm\ttool\tmib\trep\tms\tquiet_before\tquiet_after\tok\tdigest\tstatus\thost_digests\timport_ms\timport_calls\tupdate_ms',
+			vrow('native', 0, 510),
+			vrow('host', 0, 500, [440, 16400, 430]),
+			vrow('native', 1, 520),
+			vrow('host', 1, 540, [450, 16400, 440]),
+			vrow('native', 2, 500),
+			vrow('host', 2, 480, [430, 16400, 420])
+		].join('\n');
+		const out = v8Report(tsv);
+		// the medians say 0.98 and hide the middle round at 1.04
+		expect(out.find((l) => l.startsWith('| md5sum | d8 | host | 3 |'))).toBe(
+			'| md5sum | d8 | host | 3 | 0.98 | 0.96-1.04 | 2 of 3 |'
+		);
+		expect(out.find((l) => l.includes('| 16400 |'))).toBe(
+			'| host | md5sum | d8 | 3 | 0.500 | 0.440 | 0.430 | 16400 | 0.060 |'
+		);
+		expect(out.join('\n')).not.toMatch(/NaN|Infinity/);
+	});
+
+	it('leaves the paired and import tables out when there is nothing to pair', () => {
+		const tsv = [
+			'arm\ttool\tmib\trep\tms\tquiet_before\tquiet_after\tok\tdigest\tstatus\thost_digests',
+			['host', 'md5sum', 'd8', 0, 500, 0.1, 0.1, 1, 'abcd1234', 0, 8].join('\t')
+		].join('\n');
+		const out = v8Report(tsv).join('\n');
+		expect(out).not.toContain('paired r');
+		expect(out).not.toContain('import s');
+	});
 });
