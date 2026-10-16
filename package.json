@@ -1,6 +1,6 @@
 {
 	"name": "@gmitch215/gmux",
-	"version": "1.0.0",
+	"version": "0.1.0",
 	"description": "Linux on Cloudflare Workers",
 	"author": "Gregory Mitchell <me@gmitch215.xyz>",
 	"license": "GPL-3.0-only",
