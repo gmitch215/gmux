@@ -144,7 +144,7 @@ static int structure_bytes(uint32_t i) {
 }
 
 static int one(struct dec* d, struct kb_block* blk) {
-    const uint32_t* p = (const uint32_t*) kb_host_r(d->cpu, d->pc, 4);
+    const uint32_t* p = (const uint32_t*) kb_host_x(d->cpu, d->pc, 4);
     if (!p) return -1;
     uint32_t i = *p;
     uint64_t pc = d->pc;
@@ -743,7 +743,16 @@ int kb_a64_block(struct kb_cpu* cpu, struct kb_block* b) {
     int end = 0, cap = f.trace ? 1024 : 64;
     for (int n = 0; n < cap && !end; n++) {
         end = one(&d, b);
-        if (end < 0) return -1;
+        if (end < 0) {
+            /* the instruction cannot be fetched: the ones before it run, and
+             * the block after them faults at it */
+            if (!n) {
+                free(e.ins);
+                return -1;
+            }
+            end = 0;
+            break;
+        }
         if (end && n < cap - 1 && kb_fuse(&e, b, &f, d.pc, &d.pc)) end = 0;
     }
     kb_fuse_done(b, &f, d.pc);

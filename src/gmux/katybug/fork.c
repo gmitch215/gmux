@@ -142,6 +142,8 @@ int kb_resume(struct kb_cpu* cpu, int fd) {
     }
     kb_nofile_set(nofile);
     memset(cpu->cache, 0, sizeof cpu->cache);
+    cpu->marks = NULL;
+    cpu->nmarks = cpu->capmarks = 0;
     cpu->trace = NULL;
     cpu->fault = cpu->last_fault = NULL;
     cpu->restore_mask = 0;

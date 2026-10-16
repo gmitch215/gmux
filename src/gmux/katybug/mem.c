@@ -118,6 +118,177 @@ static void changed(struct kb_cpu* cpu) {
 #endif
 }
 
+/* what an access of acc (one of KB_R, KB_W, KB_X) may do to a mapping:
+ * writable pages are readable (neither architecture has write-only), and an
+ * execute-only page is readable on AArch64 (checked on an Apple core without
+ * EPAN) but gives no data on x86-64, where Linux backs it with a protection key
+ */
+static int allowed(
+    const struct kb_cpu* cpu, const struct kb_mapping* m, int acc
+) {
+    if (acc == KB_X) return m->prot & KB_X;
+    if (acc == KB_W) return m->prot & KB_W;
+    return (m->prot & (KB_R | KB_W)) ||
+           ((m->prot & KB_X) && cpu->arch != KB_X86);
+}
+
+/** the si_code of a refused access at va */
+int kb_fault_code(const struct kb_cpu* cpu, uint64_t va) {
+    for (int i = 0; i < cpu->nmaps; i++) {
+        const struct kb_mapping* m = &cpu->maps[i];
+        if (va >= m->start && va < m->end)
+            return m->prot == KB_X && cpu->arch == KB_X86 ? 4 : 2;
+    }
+    return 1;
+}
+
+/* blocks of decoded code that are still current after a write: each page some
+ * block was decoded from has a bit per 16 bytes of it that was decoded and a
+ * version that moves when one of those bytes is written. Open addressing, a
+ * page's key is its number + 1 */
+struct kb_cmark {
+    uint64_t key, ver;
+    uint64_t bits[4];
+};
+
+static struct kb_cmark* mark_find(const struct kb_cpu* cpu, uint64_t page) {
+    if (!cpu->capmarks) return NULL;
+    uint32_t mask = cpu->capmarks - 1;
+    for (uint32_t i = (uint32_t) (page * 0x9e3779b97f4a7c15ull >> 32) & mask;;
+         i = (i + 1) & mask) {
+        struct kb_cmark* k = &cpu->marks[i];
+        if (!k->key) return NULL;
+        if (k->key == page + 1) return k;
+    }
+}
+
+static struct kb_cmark* mark_add(struct kb_cpu* cpu, uint64_t page) {
+    struct kb_cmark* k = mark_find(cpu, page);
+    if (k) return k;
+    if ((cpu->nmarks + 1) * 2 > cpu->capmarks) {
+        uint32_t cap = cpu->capmarks ? cpu->capmarks * 2 : 64;
+        struct kb_cmark* g = calloc(cap, sizeof *g);
+        if (!g) return NULL;
+        struct kb_cmark* old = cpu->marks;
+        uint32_t oldcap = cpu->capmarks;
+        cpu->marks = g, cpu->capmarks = cap;
+        for (uint32_t i = 0; i < oldcap; i++)
+            if (old[i].key) {
+                uint32_t j =
+                    (uint32_t) ((old[i].key - 1) * 0x9e3779b97f4a7c15ull >>
+                                32) &
+                    (cap - 1);
+                while (g[j].key) j = (j + 1) & (cap - 1);
+                g[j] = old[i];
+            }
+        free(old);
+    }
+    uint32_t mask = cpu->capmarks - 1;
+    uint32_t i = (uint32_t) (page * 0x9e3779b97f4a7c15ull >> 32) & mask;
+    while (cpu->marks[i].key) i = (i + 1) & mask;
+    cpu->marks[i].key = page + 1;
+    cpu->marks[i].ver = cpu->wver;
+    cpu->nmarks++;
+    return &cpu->marks[i];
+}
+
+/* 1 when a write to a mark moved a page's version (and the code generation) */
+static int code_hit;
+
+/* [va, va + len) of m is about to be written, and m is executable: the blocks
+ * decoded from the bytes it covers go stale. A lifted region is never on a page
+ * that is writable and executable, so only a write the kernel makes to a page
+ * that is not writable (kb_poke) can reach one */
+static void marks_write(
+    struct kb_cpu* cpu, const struct kb_mapping* m, uint64_t va, uint64_t len
+) {
+    if (!cpu->nmarks || !len) return;
+    uint64_t last = va + len - 1;
+    for (uint64_t p = va >> 12; p <= last >> 12; p++) {
+        struct kb_cmark* k = mark_find(cpu, p);
+        if (!k) continue;
+        uint64_t a = p == va >> 12 ? (va & 4095) >> 4 : 0;
+        uint64_t e = p == last >> 12 ? (last & 4095) >> 4 : 255;
+        int hit = 0;
+        for (uint64_t g = a; g <= e && !hit; g++)
+            hit = k->bits[g >> 6] >> (g & 63) & 1;
+        if (!hit) continue;
+        k->ver = ++cpu->wver;
+        cpu->codegen++;
+        code_hit = 1;
+        KB_BUMP_AS(map);
+#ifdef KB_AOT
+        if (!(m->prot & KB_W)) kb_aot_stale(cpu);
+#else
+        (void) m;
+#endif
+    }
+}
+
+#ifdef KB_AOT
+/** 1 when some page b's code was decoded from is writable and executable: a
+ * lifted region is never attached to such a block (a store could change the
+ * code the region holds, and the region would not see it) */
+int kb_block_wx(struct kb_cpu* cpu, const struct kb_block* b) {
+    for (int i = 0; i < b->nseg; i++) {
+        if (b->seg[2 * i + 1] <= b->seg[2 * i]) continue;
+        for (uint64_t a = b->seg[2 * i]; a < b->seg[2 * i + 1];) {
+            const struct kb_mapping* m = find(cpu, a);
+            if (!m) return 1;
+            if ((m->prot & (KB_W | KB_X)) == (KB_W | KB_X)) return 1;
+            a = m->end;
+        }
+    }
+    return 0;
+}
+#endif
+
+/** the pages b's code is on are marked, and b records their versions */
+void kb_marks_add(struct kb_cpu* cpu, struct kb_block* b) {
+    free(b->pv);
+    b->pv = NULL;
+    b->npv = 0;
+    b->hardgen = cpu->hardgen;
+    int cap = 0;
+    for (int i = 0; i < b->nseg; i++)
+        if (b->seg[2 * i + 1] > b->seg[2 * i])
+            cap += (int) (((b->seg[2 * i + 1] - 1) >> 12) -
+                          (b->seg[2 * i] >> 12) + 1);
+    if (!cap) return;
+    b->pv = malloc(sizeof *b->pv * 2 * (size_t) cap);
+    if (!b->pv) return;
+    for (int i = 0; i < b->nseg; i++) {
+        uint64_t lo = b->seg[2 * i], hi = b->seg[2 * i + 1];
+        if (hi <= lo) continue;
+        for (uint64_t p = lo >> 12; p <= (hi - 1) >> 12; p++) {
+            struct kb_cmark* k = mark_add(cpu, p);
+            if (!k) continue;
+            uint64_t a = p == lo >> 12 ? (lo & 4095) >> 4 : 0;
+            uint64_t e = p == (hi - 1) >> 12 ? ((hi - 1) & 4095) >> 4 : 255;
+            for (uint64_t g = a; g <= e; g++)
+                k->bits[g >> 6] |= 1ull << (g & 63);
+            int seen = 0;
+            for (int j = 0; j < b->npv && !seen; j++) seen = b->pv[2 * j] == p;
+            if (seen) continue;
+            b->pv[2 * b->npv] = p;
+            b->pv[2 * b->npv + 1] = k->ver;
+            b->npv++;
+        }
+    }
+}
+
+/** 1 when no page b's code is on was written since b was checked, and b is
+ * then checked again as of now; a block of an older hardgen is never current */
+int kb_marks_current(struct kb_cpu* cpu, struct kb_block* b) {
+    if (b->npv < 0 || b->hardgen != cpu->hardgen) return 0;
+    for (int i = 0; i < b->npv; i++) {
+        const struct kb_cmark* k = mark_find(cpu, b->pv[2 * i]);
+        if (!k || k->ver != b->pv[2 * i + 1]) return 0;
+    }
+    b->codegen = cpu->codegen;
+    return 1;
+}
+
 /** how many pieces of 1 << bits bytes [s, e) touches */
 uint64_t kb_pieces(uint64_t s, uint64_t e, int bits) {
     return ((e - 1) >> bits) - (s >> bits) + 1;
@@ -399,23 +570,39 @@ void kb_image_report(const struct kb_cpu* cpu) {
     );
 }
 
-/* kb_host (w: for writing), and when ic is given, ic keeps the piece; *cross
- * is set when the range starts in an accessible mapping but runs past its piece
- * (or its end, into the next mapping, which kb_read and kb_write check) */
+/* an access's rights are KB_R, KB_W or KB_X; RAW skips the check of them (the
+ * mapping must still give something), KEEP keeps an inline cache for a write to
+ * a page that is executable too */
+#define RAW 8
+#define KEEP 16
+/* a write window is refused on a page that is executable too */
+#define NOWX 32
+
+/* kb_host for an access of acc, and when ic is given, ic keeps the piece (not
+ * for a write to a page that is executable too: each such write checks the
+ * code marks); *cross is set when the range starts in an accessible mapping but
+ * runs past its piece (or its end, into the next mapping, which kb_read and
+ * kb_write check) */
 static uint8_t* translate(
     struct kb_cpu* cpu, struct kb_ic* ic, uint64_t va, uint64_t len, int* cross,
-    int w
+    int acc
 ) {
     struct kb_mapping* m = find(cpu, va);
-    if (!m || !m->prot || va + len < va) return NULL;
+    int a = acc & 7;
+    if (!m || va + len < va || ((acc & RAW) ? !m->prot : !allowed(cpu, m, a)))
+        return NULL;
+    if ((acc & NOWX) && a == KB_W && (m->prot & KB_X)) return NULL;
     uint64_t lo, hi;
-    uint8_t* p = piece(cpu, m, va, &lo, &hi, w);
+    uint8_t* p = piece(cpu, m, va, &lo, &hi, a == KB_W);
     if (!p) return NULL;
     if (va + len > hi) {
         if (cross) *cross = 1;
         return NULL;
     }
-    if (ic) *ic = (struct kb_ic){lo, hi - lo, p, cpu->mapgen};
+    int wx = a == KB_W && (m->prot & KB_X);
+    if (wx) marks_write(cpu, m, va, len);
+    if (ic && (!wx || (acc & KEEP)))
+        *ic = (struct kb_ic){lo, hi - lo, p, cpu->mapgen};
     return p + (va - lo);
 }
 
@@ -480,44 +667,93 @@ static void release(struct kb_mapping* m) {
  * inside one piece of one accessible mapping (kb_buf and kb_read cross pieces)
  */
 uint8_t* kb_host(struct kb_cpu* cpu, uint64_t va, uint64_t len) {
-    return translate(cpu, NULL, va, len, NULL, 1);
+    return translate(cpu, NULL, va, len, NULL, KB_W);
 }
 
 /** kb_host for bytes that are only read */
 const uint8_t* kb_host_r(struct kb_cpu* cpu, uint64_t va, uint64_t len) {
-    return translate(cpu, NULL, va, len, NULL, 0);
+    return translate(cpu, NULL, va, len, NULL, KB_R);
 }
 
-static uint8_t* span(struct kb_cpu* cpu, uint64_t va, uint64_t* len, int w) {
+/** kb_host for bytes an instruction fetch reads */
+const uint8_t* kb_host_x(struct kb_cpu* cpu, uint64_t va, uint64_t len) {
+    return translate(cpu, NULL, va, len, NULL, KB_X);
+}
+
+/* *len is the most bytes a write of acc KB_W goes on to touch; it comes back as
+ * how many follow va in its piece */
+static uint8_t* span(struct kb_cpu* cpu, uint64_t va, uint64_t* len, int acc) {
     struct kb_mapping* m = find(cpu, va);
-    if (!m || !m->prot) return NULL;
+    int a = acc & 7;
+    if (!m || ((acc & RAW) ? !m->prot : !allowed(cpu, m, a))) return NULL;
     uint64_t lo, hi;
-    uint8_t* p = piece(cpu, m, va, &lo, &hi, w);
+    uint8_t* p = piece(cpu, m, va, &lo, &hi, a == KB_W);
     if (!p) return NULL;
+    if (a == KB_W && (m->prot & KB_X))
+        marks_write(cpu, m, va, *len < hi - va ? *len : hi - va);
     *len = hi - va;
     return p + (va - lo);
 }
 
-/** the host bytes at va to write and, in *len, how many follow in its piece;
- * NULL when va is not accessible */
+/** the host bytes at va to write and, in *len, how many follow in its piece
+ * (on the way in, how many the caller will write); NULL when va is not
+ * accessible */
 uint8_t* kb_span(struct kb_cpu* cpu, uint64_t va, uint64_t* len) {
-    return span(cpu, va, len, 1);
+    return span(cpu, va, len, KB_W);
 }
 
 /** kb_span for bytes that are only read */
 const uint8_t* kb_span_r(struct kb_cpu* cpu, uint64_t va, uint64_t* len) {
-    return span(cpu, va, len, 0);
+    return span(cpu, va, len, KB_R);
+}
+
+/** kb_span for bytes an instruction fetch reads */
+const uint8_t* kb_span_x(struct kb_cpu* cpu, uint64_t va, uint64_t* len) {
+    return span(cpu, va, len, KB_X);
 }
 
 /** kb_host for a KB_RESOLVE whose inline cache missed; it refills the cache.
- * A lifted region may write through it, so it copies a shared piece */
+ * A lifted region may write through it, so it copies a shared piece and checks
+ * no rights */
 uint8_t* kb_host_ic(
     struct kb_cpu* cpu, struct kb_ic* ic, uint64_t va, uint64_t len
 ) {
 #ifdef KB_COUNT
     kb_count.refills++;
 #endif
-    return translate(cpu, ic, va, len, NULL, 1);
+    return translate(cpu, ic, va, len, NULL, KB_W | RAW | KEEP);
+}
+
+/** kb_host_ic for a group that needs the rights acc names */
+uint8_t* kb_host_ic_at(
+    struct kb_cpu* cpu, struct kb_ic* ic, uint64_t va, uint64_t len, int acc
+) {
+#ifdef KB_COUNT
+    kb_count.refills++;
+#endif
+    return translate(cpu, ic, va, len, NULL, (acc & 7) | NOWX);
+}
+
+/** the flat mapping holding hint, for a lifted region's fast path: its first
+ * address in *lo, in *lim how many bytes from it an access of up to 16 may
+ * start (0 for none), its block in *host */
+void kb_flat_open(
+    struct kb_cpu* cpu, uint64_t hint, int acc, uint64_t* lo, uint64_t* lim,
+    uint8_t** host
+) {
+    struct kb_mapping* m = find(cpu, hint);
+    *lo = *lim = 0;
+    *host = NULL;
+    if (!m || m->bits != KB_FLAT_BITS || m->image || !allowed(cpu, m, acc) ||
+        (acc == KB_W && (m->prot & KB_X)))
+        return;
+    uint64_t n = m->end - m->start, l, h;
+    if (n <= 16 || n > 0xffffffffull) return;
+    uint8_t* p = piece(cpu, m, m->start, &l, &h, acc == KB_W);
+    if (!p) return;
+    *lo = m->start;
+    *lim = n - 16;
+    *host = p;
 }
 
 /** copies guest [va, va + len) out to dst, or 0 when a byte is not accessible.
@@ -532,10 +768,12 @@ int kb_read(struct kb_cpu* cpu, uint64_t va, void* dst, uint64_t len) {
     return 1;
 }
 
-/** copies src to guest [va, va + len), or 0 when a byte is not accessible */
-int kb_write(struct kb_cpu* cpu, uint64_t va, const void* src, uint64_t len) {
+static int write_to(
+    struct kb_cpu* cpu, uint64_t va, const void* src, uint64_t len, int acc
+) {
     for (uint64_t done = 0, k; done < len; done += k) {
-        uint8_t* p = kb_span(cpu, va + done, &k);
+        k = len - done;
+        uint8_t* p = span(cpu, va + done, &k, acc);
         if (!p) return 0;
         if (k > len - done) k = len - done;
         memcpy(p, (const uint8_t*) src + done, k);
@@ -543,13 +781,37 @@ int kb_write(struct kb_cpu* cpu, uint64_t va, const void* src, uint64_t len) {
     return 1;
 }
 
+/** copies src to guest [va, va + len), or 0 when a byte is not writable */
+int kb_write(struct kb_cpu* cpu, uint64_t va, const void* src, uint64_t len) {
+    return write_to(cpu, va, src, len, KB_W);
+}
+
+/** kb_write that skips the rights check */
+int kb_poke(struct kb_cpu* cpu, uint64_t va, const void* src, uint64_t len) {
+    return write_to(cpu, va, src, len, KB_W | RAW);
+}
+
+/** every byte of [va, va + len) is reached, in a mapping that gives acc (no
+ * piece is copied or marked for it) */
+int kb_can(struct kb_cpu* cpu, uint64_t va, uint64_t len, int acc) {
+    if (va + len < va) return 0;
+    for (uint64_t done = 0, k; done < len; done += k) {
+        const struct kb_mapping* m = find(cpu, va + done);
+        if (!m || !allowed(cpu, m, acc & 7) ||
+            !span(cpu, va + done, &k, KB_R | RAW))
+            return 0;
+    }
+    return 1;
+}
+
 static int iov_of(
     struct kb_cpu* cpu, uint64_t va, uint64_t len, struct iovec* iov, int max,
-    int w
+    int acc
 ) {
     int n = 0;
     for (uint64_t done = 0, k; done < len; done += k) {
-        uint8_t* p = span(cpu, va + done, &k, w);
+        k = len - done;
+        uint8_t* p = span(cpu, va + done, &k, acc);
         if (!p) return -1;
         if (k > len - done) k = len - done;
         if (n < max) iov[n++] = (struct iovec){p, (size_t) k};
@@ -563,14 +825,14 @@ static int iov_of(
 int kb_iov(
     struct kb_cpu* cpu, uint64_t va, uint64_t len, struct iovec* iov, int max
 ) {
-    return iov_of(cpu, va, len, iov, max, 1);
+    return iov_of(cpu, va, len, iov, max, KB_W);
 }
 
 /** kb_iov for bytes that are only read (a host call must not write to iov) */
 int kb_iov_r(
     struct kb_cpu* cpu, uint64_t va, uint64_t len, struct iovec* iov, int max
 ) {
-    return iov_of(cpu, va, len, iov, max, 0);
+    return iov_of(cpu, va, len, iov, max, KB_R);
 }
 
 /* copies of guest ranges a syscall handler asked for as one flat buffer,
@@ -589,11 +851,11 @@ static int nstrs, capstrs;
  * up */
 uint8_t* kb_buf(struct kb_cpu* cpu, uint64_t va, uint64_t len) {
     int cross = 0;
-    uint8_t* p = translate(cpu, NULL, va, len, &cross, 1);
+    uint8_t* p = translate(cpu, NULL, va, len, &cross, KB_W);
     if (p || !cross || len > KB_BUF_MAX || nbounce == 32) return p;
     uint8_t* b = malloc(len);
     if (!b) return NULL;
-    if (!kb_read(cpu, va, b, len)) {
+    if (!kb_can(cpu, va, len, KB_W) || !kb_read(cpu, va, b, len)) {
         free(b);
         return NULL;
     }
@@ -618,7 +880,7 @@ static int keep_str(char* s) {
  * that is dropped when the syscall ends */
 const uint8_t* kb_buf_r(struct kb_cpu* cpu, uint64_t va, uint64_t len) {
     int cross = 0;
-    const uint8_t* p = translate(cpu, NULL, va, len, &cross, 0);
+    const uint8_t* p = translate(cpu, NULL, va, len, &cross, KB_R);
     if (p || !cross || len > KB_BUF_MAX) return p;
     uint8_t* b = malloc(len);
     if (!b) return NULL;
@@ -664,7 +926,7 @@ char* kb_str(struct kb_cpu* cpu, uint64_t va) {
 void kb_flush(struct kb_cpu* cpu) {
     while (nbounce) {
         nbounce--;
-        kb_write(
+        kb_poke(
             cpu, bounce[nbounce].va, bounce[nbounce].buf, bounce[nbounce].len
         );
         free(bounce[nbounce].buf);
@@ -700,16 +962,55 @@ struct kb_mapping* kb_map_bits(
     return m;
 }
 
-/** kb_map_bits with the pieces of an ordinary mapping */
+/** kb_map_bits with the pieces of an ordinary mapping, or one block when it is
+ * at most KB_FLAT bytes and inside one half of the address space */
 struct kb_mapping* kb_map(
     struct kb_cpu* cpu, uint64_t start, uint64_t len, int prot
 ) {
-    return kb_map_bits(cpu, start, len, prot, KB_PIECE_BITS);
+    uint64_t s = start & ~(PAGE - 1),
+             e = (start + len + PAGE - 1) & ~(PAGE - 1);
+    int flat = KB_FLAT && e > s && e - s <= KB_FLAT &&
+               kb_pieces(s, e, KB_FLAT_BITS) == 1;
+    return kb_map_bits(
+        cpu, start, len, prot, flat ? KB_FLAT_BITS : KB_PIECE_BITS
+    );
+}
+
+/* a flat mapping as pieces of KB_PIECE_BITS, its bytes copied; -1 when out of
+ * memory, with m as it was */
+static int unflat(struct kb_mapping* m) {
+    struct kb_mapping r = *m;
+    r.bits = KB_PIECE_BITS;
+    uint64_t n = kb_pieces(m->start, m->end, r.bits), lo, hi;
+    uint8_t** ps = calloc((size_t) n, sizeof *ps);
+    uint8_t* flat = m->pieces[0];
+    if (!ps) return -1;
+    for (uint64_t k = 0; flat && k < n; k++) {
+        bounds(&r, k, &lo, &hi);
+        ps[k] = block_new(hi - lo);
+        if (!ps[k]) {
+            while (k--) {
+                bounds(&r, k, &lo, &hi);
+                block_free(ps[k], hi - lo);
+            }
+            free(ps);
+            return -1;
+        }
+        memcpy(ps[k], flat + (lo - m->start), hi - lo);
+    }
+    block_free(flat, m->end - m->start);
+    free(m->pieces);
+    m->pieces = ps;
+    m->bits = KB_PIECE_BITS;
+    return 0;
 }
 
 /** the mapping m, ending at its end, now ends at end (page aligned, above); the
  * new bytes are zero. 0, or -1 when out of memory */
 int kb_grow(struct kb_cpu* cpu, struct kb_mapping* m, uint64_t end) {
+    if (KB_FLAT && m->bits == KB_FLAT_BITS && end - m->start > KB_FLAT &&
+        unflat(m))
+        return -1;
     uint64_t n0 = kb_pieces(m->start, m->end, m->bits),
              n1 = kb_pieces(m->start, end, m->bits);
     if (n1 > n0) {
@@ -752,7 +1053,8 @@ int kb_unmap(struct kb_cpu* cpu, uint64_t start, uint64_t len) {
     for (int i = 0; i < cpu->nmaps; i++) {
         struct kb_mapping* m = &cpu->maps[i];
         if (m->start >= start && m->end <= e) {
-            if (m->prot & 4) cpu->codegen++; /* blocks decoded from it go */
+            if (m->prot & 4)
+                cpu->codegen++, cpu->hardgen++; /* blocks decoded from it go */
             release(m);
             *m = cpu->maps[--cpu->nmaps];
             i--;
@@ -769,7 +1071,13 @@ int kb_protect(struct kb_cpu* cpu, uint64_t start, uint64_t len, int prot) {
     for (int i = 0; i < cpu->nmaps; i++) {
         struct kb_mapping* m = &cpu->maps[i];
         if (m->start >= start && m->end <= e) {
-            if ((m->prot ^ prot) & 4) cpu->codegen++;
+            if ((m->prot ^ prot) & 4) cpu->codegen++, cpu->hardgen++;
+#ifdef KB_AOT
+            /* a block of a page that becomes writable and executable leaves
+             * its region, and is not attached to one again */
+            else if ((prot & 6) == 6 && (m->prot & 6) != 6)
+                cpu->codegen++, cpu->hardgen++;
+#endif
             m->prot = prot;
         }
     }
@@ -785,13 +1093,23 @@ void kb_store(struct kb_cpu* cpu, uint64_t va, uint64_t v, int w) {
     kb_store_ic(cpu, NULL, va, v, w);
 }
 
-/* what a faulting access reports: x86 gives the first byte it cannot reach
- * (the page it ran into), AArch64 the access's own address */
-static uint64_t fault_at(struct kb_cpu* cpu, uint64_t va, int w) {
+/* what a faulting access of acc reports: x86 gives the first byte it cannot
+ * reach (the page it ran into), AArch64 the access's own address */
+static uint64_t fault_at(struct kb_cpu* cpu, uint64_t va, int w, int acc) {
     if (cpu->arch != KB_X86) return va;
-    for (uint64_t at = 0, k; at < (uint64_t) w; at += k)
-        if (!kb_span_r(cpu, va + at, &k)) return va + at;
+    for (uint64_t at = 0, k; at < (uint64_t) w; at += k) {
+        const struct kb_mapping* m = find(cpu, va + at);
+        if (!m || !allowed(cpu, m, acc) || !kb_span_r(cpu, va + at, &k))
+            return va + at;
+    }
     return va;
+}
+
+static void fault_for(struct kb_cpu* cpu, uint64_t va, int w, int acc) {
+    cpu->fault_addr = fault_at(cpu, va, w, acc);
+    cpu->fault_sig = kb_bus(cpu->fault_addr) ? 7 : 11;
+    cpu->segv_code =
+        cpu->fault_sig == 11 ? kb_fault_code(cpu, cpu->fault_addr) : 0;
 }
 
 /* the slow path of a load or store whose inline cache missed; run.c holds the
@@ -802,37 +1120,56 @@ uint64_t kb_load_ic(struct kb_cpu* cpu, struct kb_ic* ic, uint64_t va, int w) {
 #endif
     int cross = 0;
     uint64_t v = 0;
-    uint8_t* p = translate(cpu, ic, va, (uint64_t) w, &cross, 0);
+    uint8_t* p = translate(cpu, ic, va, (uint64_t) w, &cross, KB_R);
     if (p)
         memcpy(
             &v, p, (size_t) w
         ); /* hosts are little-endian, as both guests are */
     else if (!cross || !kb_read(cpu, va, &v, (uint64_t) w)) {
         cpu->fault = "load outside the address space";
-        cpu->fault_addr = fault_at(cpu, va, w);
-        cpu->fault_sig = kb_bus(cpu->fault_addr) ? 7 : 11;
+        fault_for(cpu, va, w, KB_R);
         return 0;
     }
     return v;
 }
 
-void kb_store_ic(
-    struct kb_cpu* cpu, struct kb_ic* ic, uint64_t va, uint64_t v, int w
+const char kb_smc[] = "code written";
+
+/* note: a store that wrote bytes some decoded block came from leaves kb_smc in
+ * cpu->fault, which the interpreter's check after a store already looks at */
+static void store_slow(
+    struct kb_cpu* cpu, struct kb_ic* ic, uint64_t va, uint64_t v, int w,
+    int note
 ) {
 #ifdef KB_COUNT
     kb_count.refills += ic != NULL;
 #endif
     int cross = 0;
-    uint8_t probe[8];
-    uint8_t* p = translate(cpu, ic, va, (uint64_t) w, &cross, 1);
+    code_hit = 0;
+    uint8_t* p = translate(cpu, ic, va, (uint64_t) w, &cross, KB_W);
     if (p)
         memcpy(p, &v, (size_t) w);
     else if (
-        !cross || !kb_read(cpu, va, probe, (uint64_t) w) ||
+        !cross || !kb_can(cpu, va, (uint64_t) w, KB_W) ||
         !kb_write(cpu, va, &v, (uint64_t) w)
     ) {
         cpu->fault = "store outside the address space";
-        cpu->fault_addr = fault_at(cpu, va, w);
-        cpu->fault_sig = kb_bus(cpu->fault_addr) ? 7 : 11;
+        fault_for(cpu, va, w, KB_W);
+        return;
     }
+    if (note && code_hit) cpu->fault = kb_smc;
+}
+
+void kb_store_ic(
+    struct kb_cpu* cpu, struct kb_ic* ic, uint64_t va, uint64_t v, int w
+) {
+    store_slow(cpu, ic, va, v, w, 0);
+}
+
+/** kb_store_ic for the interpreter, which ends the instruction after a store
+ * to code */
+void kb_store_smc(
+    struct kb_cpu* cpu, struct kb_ic* ic, uint64_t va, uint64_t v, int w
+) {
+    store_slow(cpu, ic, va, v, w, 1);
 }

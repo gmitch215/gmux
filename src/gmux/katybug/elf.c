@@ -29,7 +29,7 @@ static uint64_t push_bytes(
     struct kb_cpu* cpu, uint64_t* sp, const void* p, size_t n
 ) {
     *sp -= n;
-    kb_write(cpu, *sp, p, n);
+    kb_poke(cpu, *sp, p, n);
     return *sp;
 }
 
@@ -40,8 +40,15 @@ static void push_word(struct kb_cpu* cpu, uint64_t* sp, uint64_t v) {
 struct image {
     uint64_t base, entry, phdr, end;
     int phnum;
+    int exec_stack;    /* PT_GNU_STACK asks for an executable stack */
     char interp[4096]; /* PT_INTERP, empty when there is none */
 };
+
+/* the mapping rights a segment's flags ask for (PF_X, PF_W, PF_R) */
+static int seg_prot(uint32_t flags) {
+    return (flags & 4 ? KB_R : 0) | (flags & 2 ? KB_W : 0) |
+           (flags & 1 ? KB_X : 0);
+}
 
 static int phdr_at(FILE* f, const struct ehdr* eh, int i, struct phdr* ph) {
     return fseek(f, (long) (eh->phoff + (uint64_t) i * sizeof *ph), SEEK_SET) ||
@@ -55,6 +62,7 @@ static int load_bytes(
 ) {
     if (fseek(f, (long) off, SEEK_SET)) return -2;
     for (uint64_t done = 0, k; done < n; done += k) {
+        k = n - done;
         uint8_t* p = kb_span(cpu, va + done, &k);
         if (!p) return -6;
         if (k > n - done) k = n - done;
@@ -120,8 +128,11 @@ static int map_image(
     struct phdr ph;
     uint64_t lo = ~0ull, hi = 0, phdr_va = 0;
     im->interp[0] = 0;
+    im->exec_stack = 0;
     for (int i = 0; i < eh.phnum; i++) {
         if (phdr_at(f, &eh, i, &ph)) return -2;
+        if (ph.type == 0x6474e551)
+            im->exec_stack = ph.flags & 1;    /* GNU_STACK */
         if (ph.type == 6) phdr_va = ph.vaddr; /* PT_PHDR */
         if (ph.type == 3) {                   /* PT_INTERP */
             if (!ph.filesz || ph.filesz > sizeof im->interp) return -2;
@@ -150,6 +161,18 @@ static int map_image(
             int e = load_bytes(cpu, f, ph.offset, base + ph.vaddr, ph.filesz);
             if (e) return e;
         }
+    }
+    /* each segment keeps its own rights (a later one replaces an earlier one's
+     * shared page), and the pages between segments are not mapped */
+    uint64_t done = lo;
+    for (int i = 0; i < eh.phnum; i++) {
+        if (phdr_at(f, &eh, i, &ph)) return -2;
+        if (ph.type != 1 || !ph.memsz) continue;
+        uint64_t s = ph.vaddr & ~0xfffull,
+                 e = (ph.vaddr + ph.memsz + 0xfff) & ~0xfffull;
+        if (s > done && kb_unmap(cpu, base + done, s - done)) return -6;
+        if (kb_protect(cpu, base + s, e - s, seg_prot(ph.flags))) return -6;
+        if (e > done) done = e;
     }
     im->base = base, im->entry = base + eh.entry, im->phdr = base + phdr_va;
     im->end = base + hi, im->phnum = eh.phnum;
@@ -183,10 +206,15 @@ int kb_load_elf(
     cpu->brk_start = cpu->brk_end = (im.end + 0xfffull) & ~0xfffull;
     cpu->mmap_next = 0x100000000000ull;
 
-    if (!kb_map(cpu, STACK_TOP - STACK_SIZE, STACK_SIZE, 3)) return -6;
+    if (!kb_map(
+            cpu, STACK_TOP - STACK_SIZE, STACK_SIZE,
+            im.exec_stack ? KB_R | KB_W | KB_X : KB_R | KB_W
+        ))
+        return -6;
     if (cpu->arch == KB_A64) {
-        if (!kb_map(cpu, KB_A64_SIGTRAMP, 4096, 5)) return -6;
-        kb_store(cpu, KB_A64_SIGTRAMP, 0xd4000001d2801168ull, 8);
+        static const uint64_t tramp = 0xd4000001d2801168ull;
+        if (!kb_map(cpu, KB_A64_SIGTRAMP, 4096, KB_R | KB_X)) return -6;
+        kb_poke(cpu, KB_A64_SIGTRAMP, &tramp, 8);
     }
     uint64_t sp = STACK_TOP;
     int envc = 0;

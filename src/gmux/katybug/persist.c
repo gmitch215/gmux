@@ -16,7 +16,7 @@
  * every setting the plan depends on
  */
 
-#define VERSION 2
+#define VERSION 3
 
 struct header {
     char magic[4];
@@ -79,7 +79,7 @@ uint64_t kb_code_hash(struct kb_cpu* cpu, const struct kb_block* b, int* ok) {
         }
         h = fnv((const uint8_t*) &lo, 8, h);
         for (uint64_t done = 0, k; *ok && done < len; done += k) {
-            const uint8_t* p = kb_span_r(cpu, lo + done, &k);
+            const uint8_t* p = kb_span_x(cpu, lo + done, &k);
             if (!p)
                 *ok = 0;
             else {
@@ -180,8 +180,10 @@ int kb_persist_take(struct kb_cpu* cpu, struct kb_block* b) {
         b->seg = c.seg;
         t->ins[i] = NULL, t->pcs[i] = NULL,
         t->seg[i] = NULL; /* the block owns them now */
+        b->code = r->code, b->hashed = 1;
         b->codegen = cpu->codegen;
         if (kb_block_ready(cpu, b)) return 0;
+        kb_marks_add(cpu, b);
         cpu->loaded++;
         return 1;
     }
@@ -203,14 +205,10 @@ void kb_persist_save(struct kb_cpu* cpu) {
     uint32_t count = 0;
     for (int k = 0; k < 4096; k++)
         for (struct kb_block* b = cpu->cache[k]; b; b = b->chain) {
-            int ok;
-            uint64_t code = b->n && b->codegen == cpu->codegen
-                                ? kb_code_hash(cpu, b, &ok)
-                                : 0;
-            if (!b->n || b->codegen != cpu->codegen || !ok) continue;
+            if (!b->n || !b->ins || !b->hashed) continue;
             struct record r = {
                 b->pc,          b->next,         b->target,
-                code,           (uint32_t) b->n, (uint32_t) b->nseg,
+                b->code,        (uint32_t) b->n, (uint32_t) b->nseg,
                 b->taken,       b->fall,         (uint32_t) b->traced,
                 b->pcs != NULL, b->flag_writes,  b->dropped,
                 b->pruned,      b->resolves,     0

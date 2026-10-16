@@ -26,6 +26,14 @@
 #ifndef KB_SHARE
     #define KB_SHARE 0
 #endif
+/* a mapping of at most this many bytes made by kb_map is one block (a single
+ * piece, bits KB_FLAT_BITS), so a lifted region can hold its bounds in locals
+ * (kb_flat_open); 0 (default): every mapping is in pieces. A flat mapping that
+ * grows past it goes back to pieces */
+#ifndef KB_FLAT
+    #define KB_FLAT 0
+#endif
+#define KB_FLAT_BITS 63
 /* the most bytes kb_buf copies for a range across pieces */
 #define KB_BUF_MAX (64u << 10)
 
@@ -219,6 +227,15 @@ struct kb_ins {
     int64_t imm;
 };
 
+/* the rights an access needs, as mprotect's bits (mem.c: kb_host and the rest)
+ */
+enum
+{
+    KB_R = 1,
+    KB_W = 2,
+    KB_X = 4
+};
+
 /** a load or store's last translation: host bytes for [lo, lo + span) while gen
  * is cpu->mapgen */
 struct kb_ic {
@@ -228,6 +245,7 @@ struct kb_ic {
 };
 
 struct kb_cpu;
+struct kb_cmark;
 
 /** one decoded straight-line block: runs its ops, then continues at `next`
  * unless an op left */
@@ -244,13 +262,21 @@ struct kb_block {
     int flag_writes,
         dropped;      /* flag writes decoded, and those the plan took out */
     int pruned;       /* pure ops the demand plan took out */
-    uint32_t codegen; /* kb_cpu's when decoded; an older one decodes again */
+    uint32_t codegen; /* kb_cpu's when decoded or last found current; an older
+                         one is checked again (run.c, current) */
+    uint32_t hardgen; /* kb_cpu's hardgen when decoded; an older one decodes
+                         again */
+    int npv;          /* the pages its code is on: pv[2i] is a page number and
+                         pv[2i + 1] its version when the block was checked */
+    uint64_t* pv;
     struct kb_block *to_target, *to_next; /* the successors last seen */
     uint32_t taken, fall; /* runs that left to target, and to next */
     int traced;           /* decoded as a trace (or found not to be one) */
     int nseg;             /* the guest code decoded: seg[2i] to seg[2i + 1] */
     uint64_t* seg;
-    int resolves; /* the memory plan's KB_RESOLVE ops, which lead the block */
+    uint64_t code; /* hash of those bytes when decoded, with a cache dir */
+    int hashed;    /* code holds one */
+    int resolves;  /* the memory plan's KB_RESOLVE ops, which lead the block */
     struct kb_block* chain; /* the next block in its hash bucket */
 #if defined(KB_HOT) || defined(KB_COUNT)
     uint64_t runs; /* times the interpreter ran it, for kb_hot_dump */
@@ -345,8 +371,15 @@ struct kb_cpu {
         image_filled;     /* pieces made from an image's file */
     uint32_t mapgen;  /* bumped by every change to maps, which makes older kb_ic
                          entries stale */
-    uint32_t codegen; /* bumped when executable code is unmapped or changes
-                         protection, which makes older blocks stale */
+    uint32_t codegen; /* bumped when executable code is unmapped, changes
+                         protection or is written, which makes older blocks
+                         stale until found current again */
+    uint32_t hardgen; /* the part of those that decodes every block again: an
+                         unmap or a protection change (not a write) */
+    struct kb_cmark* marks; /* the code written pages hold, 16 bytes at a time
+                               (mem.c) */
+    uint32_t nmarks, capmarks;
+    uint64_t wver; /* the last version a marked page was given */
     uint64_t brk_start, brk_end, mmap_next;
     struct kb_block* cache[4096];
     const char* fault;
@@ -387,22 +420,45 @@ struct kb_cpu {
                             delivery's frame */
     int restore_mask;
     int fault_sig, fault_code, sigreturned;
+    int segv_code; /* the si_code a pending SIGSEGV carries, 0 for the default
+                    */
     uint64_t fault_addr;
 };
 
-/* mem.c: a host pointer for guest memory comes in two kinds. The plain one
- * (kb_host, kb_span, kb_buf, kb_iov, kb_piece) is for bytes the caller may
- * write: a read-only piece of an image is copied first. The _r one is for
- * bytes only read, and may point into the image's file */
+/* mem.c: a host pointer for guest memory comes in three kinds, and each is
+ * NULL for a byte whose mapping lacks the right (KB_R: readable, which a
+ * writable page is too; KB_W; KB_X). The plain one (kb_host, kb_span, kb_buf,
+ * kb_iov, kb_piece) is for bytes the caller may write: a read-only piece of an
+ * image is copied first, and a write to bytes that decoded blocks came from
+ * makes them decode again. The _r one is for bytes only read, and may point
+ * into the image's file. The _x one is for an instruction fetch. kb_span's *len
+ * is the most bytes the caller means to write, and comes back as the bytes left
+ * in the piece (the _r and _x ones only give the second) */
 uint8_t* kb_host(struct kb_cpu* cpu, uint64_t va, uint64_t len);
 const uint8_t* kb_host_r(struct kb_cpu* cpu, uint64_t va, uint64_t len);
+const uint8_t* kb_host_x(struct kb_cpu* cpu, uint64_t va, uint64_t len);
 uint8_t* kb_span(struct kb_cpu* cpu, uint64_t va, uint64_t* len);
 const uint8_t* kb_span_r(struct kb_cpu* cpu, uint64_t va, uint64_t* len);
+const uint8_t* kb_span_x(struct kb_cpu* cpu, uint64_t va, uint64_t* len);
 uint8_t* kb_buf(struct kb_cpu* cpu, uint64_t va, uint64_t len);
 const uint8_t* kb_buf_r(struct kb_cpu* cpu, uint64_t va, uint64_t len);
 void kb_flush(struct kb_cpu* cpu);
 int kb_read(struct kb_cpu* cpu, uint64_t va, void* dst, uint64_t len);
 int kb_write(struct kb_cpu* cpu, uint64_t va, const void* src, uint64_t len);
+/* the one write that skips the rights check, for what Linux writes whatever the
+ * page allows (the loader's stack and trampoline, a syscall's buffer written
+ * back after the call checked it); decoded code under it still goes stale */
+int kb_poke(struct kb_cpu* cpu, uint64_t va, const void* src, uint64_t len);
+/* every byte of [va, va + len) is in a mapping that gives acc */
+int kb_can(struct kb_cpu* cpu, uint64_t va, uint64_t len, int acc);
+/* the si_code of a refused access at va: 2 (SEGV_ACCERR) in a mapping, 4
+ * (SEGV_PKUERR) for data on an x86 execute-only page, 1 (SEGV_MAPERR) in a hole
+ */
+int kb_fault_code(const struct kb_cpu* cpu, uint64_t va);
+/* a block's code is marked, so a write to it is seen; the block is found
+ * current (1) or not (0) after writes to code since it was checked */
+void kb_marks_add(struct kb_cpu* cpu, struct kb_block* b);
+int kb_marks_current(struct kb_cpu* cpu, struct kb_block* b);
 int kb_iov(
     struct kb_cpu* cpu, uint64_t va, uint64_t len, struct iovec* iov, int max
 );
@@ -457,10 +513,23 @@ enum
     KB_HD_SHA1,
     KB_HD_SHA256,
     KB_HD_SHA512,
+    KB_HD_SHA224, /* the sha256 and sha512 block functions, their own init and
+                     finish */
+    KB_HD_SHA384,
+    KB_HD_B2, /* blake2b of 64 bytes: no block function, its update function */
     KB_HD_N
+};
+/* in the mode of a P_DIGEST function: an update function, not a finish */
+enum
+{
+    KB_HD_UPDATE = 32
 };
 int kb_digest_ready(void);
 int kb_digest_at(struct kb_cpu* cpu, uint64_t pc);
+int kb_digest_update_at(struct kb_cpu* cpu, uint64_t pc);
+int kb_digest_update(
+    struct kb_cpu* cpu, int alg, uint64_t ctx, uint64_t buf, uint64_t len
+);
 int kb_digest_block(
     struct kb_cpu* cpu, int alg, uint64_t buf, uint64_t len, uint64_t ctx
 );
@@ -478,7 +547,13 @@ struct kb_digest_row {
 };
 int kb_digest_fork(struct kb_digest_row rows[KB_HD_ROWS]);
 void kb_digest_adopt(const struct kb_digest_row* row);
-int kb_reach(struct kb_cpu* cpu, uint64_t a, uint64_t n);
+/* inflate.c: a gzip member's deflate stream on the host's zlib, found by the
+ * bytes of the static GNU gzip's inflate; kb_gzcrc is the crc loop its
+ * flush_window carries */
+int kb_inflate_ready(void);
+int kb_inflate_at(struct kb_cpu* cpu, uint64_t pc);
+int kb_inflate(struct kb_cpu* cpu, uint64_t* next);
+int kb_gzcrc(struct kb_cpu* cpu);
 /* thunk.c: library calls found by the name a loaded object imports them under;
  * the ids are prim.c's */
 enum
@@ -522,14 +597,30 @@ int kb_prim_at(struct kb_cpu* cpu, uint64_t pc);
 int kb_prim(struct kb_cpu* cpu, int id, uint64_t* next);
 void kb_prim_report(void);
 void kb_decode_report(const struct kb_cpu* cpu);
+/* a window for a KB_RESOLVE group: kb_host_ic checks no rights and always
+ * keeps its cache (a lifted region's, which is never attached to code on a page
+ * that is writable too); kb_host_ic_at checks the rights acc names, and keeps
+ * no cache for a write to a page that is both writable and executable */
 uint8_t* kb_host_ic(
     struct kb_cpu* cpu, struct kb_ic* ic, uint64_t va, uint64_t len
+);
+uint8_t* kb_host_ic_at(
+    struct kb_cpu* cpu, struct kb_ic* ic, uint64_t va, uint64_t len, int acc
 );
 struct kb_mapping* kb_map(
     struct kb_cpu* cpu, uint64_t start, uint64_t len, int prot
 );
 struct kb_mapping* kb_map_bits(
     struct kb_cpu* cpu, uint64_t start, uint64_t len, int prot, int bits
+);
+/* the flat mapping holding hint, as a lifted region's fast path wants it: its
+ * first address in *lo, in *lim how many bytes from it an access of up to 16
+ * may start (0 for none), and its block in *host. lim is 0 when hint is in no
+ * mapping, in one that is not flat, or in one without the rights acc needs
+ * (KB_W: also not when it is executable) */
+void kb_flat_open(
+    struct kb_cpu* cpu, uint64_t hint, int acc, uint64_t* lo, uint64_t* lim,
+    uint8_t** host
 );
 int kb_unmap(struct kb_cpu* cpu, uint64_t start, uint64_t len);
 int kb_protect(struct kb_cpu* cpu, uint64_t start, uint64_t len, int prot);
@@ -538,6 +629,13 @@ uint64_t kb_load(struct kb_cpu* cpu, uint64_t va, int w);
 void kb_store(struct kb_cpu* cpu, uint64_t va, uint64_t v, int w);
 uint64_t kb_load_ic(struct kb_cpu* cpu, struct kb_ic* ic, uint64_t va, int w);
 void kb_store_ic(
+    struct kb_cpu* cpu, struct kb_ic* ic, uint64_t va, uint64_t v, int w
+);
+/* kb_store_ic for the interpreter: a store to bytes a decoded block came from
+ * leaves kb_smc in cpu->fault (not a fault: the instruction ends and the code
+ * after it is looked up again) */
+extern const char kb_smc[];
+void kb_store_smc(
     struct kb_cpu* cpu, struct kb_ic* ic, uint64_t va, uint64_t v, int w
 );
 
@@ -622,6 +720,7 @@ void kb_count_report(struct kb_cpu* cpu);
 void kb_aot_attach(struct kb_cpu* cpu, struct kb_block* b);
 void kb_aot_detach(struct kb_block* b);
 void kb_aot_stale(struct kb_cpu* cpu);
+int kb_block_wx(struct kb_cpu* cpu, const struct kb_block* b);
 void kb_aot_string(struct kb_cpu* cpu, int stos, int w, int rep);
 extern volatile int* kb_pending_flag;
 #endif

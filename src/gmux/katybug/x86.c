@@ -29,7 +29,7 @@ struct dec {
 };
 
 static uint8_t byte(struct dec* d) {
-    const uint8_t* p = kb_host_r(d->cpu, d->at, 1);
+    const uint8_t* p = kb_host_x(d->cpu, d->at, 1);
     if (!p) {
         d->bad = 1;
         return 0;
@@ -155,9 +155,9 @@ static void push(struct dec* d, int v) {
             0); /* push rsp stores the value from before the push */
         v = T4;
     }
+    put(d, KB_ST, 8, v, 4, 0, -8); /* a fault leaves rsp where it was */
     put(d, KB_MOVI, 8, T5, 0, 0, 8);
     put(d, KB_SUB, 8, 4, 4, T5, 0);
-    put(d, KB_ST, 8, v, 4, 0, 0);
 }
 
 static void pop(struct dec* d, int t) {
@@ -556,8 +556,10 @@ static int one(struct dec* d, struct kb_block* blk) {
             }
             return 0;
         case 0xc9: /* leave */
-            put(d, KB_MOV, 8, 4, 5, 0, 0);
-            pop(d, T1);
+            /* load first: a fault leaves rsp and rbp as they were */
+            put(d, KB_LD, 8, T1, 5, 0, 0);
+            put(d, KB_MOVI, 8, T5, 0, 0, 8);
+            put(d, KB_ADD, 8, 4, 5, T5, 0);
             put(d, KB_MOV, 8, 5, T1, 0, 0);
             return 0;
         case 0xe8: {
@@ -920,8 +922,19 @@ int kb_x86_block(struct kb_cpu* cpu, struct kb_block* b) {
     };
     int end = 0, cap = f.trace ? 1024 : 64;
     for (int i = 0; i < cap && !end; i++) {
+        int n0 = e.n;
+        uint64_t at0 = d.at;
         end = one(&d, b);
-        if (d.bad) return -1;
+        if (d.bad) {
+            /* the instruction cannot be fetched: the ones before it run, and
+             * the block after them faults at it */
+            if (!i) {
+                free(e.ins);
+                return -1;
+            }
+            e.n = n0, d.at = at0, end = 0;
+            break;
+        }
         if (end && i < cap - 1 && kb_fuse(&e, b, &f, d.at, &d.at)) end = 0;
     }
     kb_fuse_done(b, &f, d.at);

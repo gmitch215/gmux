@@ -44,9 +44,11 @@ enum
     P_MD5,
     P_SHA1,
     P_SHA512,
-    P_CKSUM,  /* the loop of cksum, not a function: see k_cksum */
-    P_DIGEST, /* a finish function over a host digest (digest.c), the hash in
-                 the mode */
+    P_CKSUM,   /* the loop of cksum, not a function: see k_cksum */
+    P_DIGEST,  /* a finish or update function over a host digest (digest.c),
+                  the hash in the mode */
+    P_INFLATE, /* gzip's inflate over a host stream (inflate.c) */
+    P_GZCRC,   /* the crc loop of gzip's flush_window (inflate.c) */
     P_COUNT
 };
 
@@ -83,6 +85,10 @@ static const struct sig {
     /* cksum's slice-by-8 loop of the same build, its one block from the load
      * of the first word to the jne back: the table's address is in r14 */
     {KB_X86, P_CKSUM, 137, 0x834804528b44028bull, 0x3730d0954ba1a02aull},
+    /* the crc loop of flush_window in the static GNU gzip 1.13 built by
+     * tests/c/katybug/gzip-build.sh (rdx the pointer, rsi its end, rax the
+     * crc, r8 the table), up to its jne back */
+    {KB_X86, P_GZCRC, 25, 0x3101c283480ab60full, 0x4d52f4f3f299a9e8ull},
 };
 
 /* how a variant's memcmp or strcmp builds its result when the sign is not all,
@@ -135,7 +141,9 @@ static const char* const names[P_COUNT] = {
     [P_SHA1] = "sha1",
     [P_SHA512] = "sha512",
     [P_CKSUM] = "cksum",
-    [P_DIGEST] = "digest"
+    [P_DIGEST] = "digest",
+    [P_INFLATE] = "inflate",
+    [P_GZCRC] = "gzcrc"
 };
 
 static uint64_t calls[P_COUNT], gave_up[P_COUNT];
@@ -214,7 +222,7 @@ static int variant(struct kb_cpu* cpu, uint64_t pc, int id) {
     for (size_t i = 0; i < sizeof vsigs / sizeof *vsigs; i++) {
         const struct vsig* s = &vsigs[i];
         if (s->arch != cpu->arch || s->id != id) continue;
-        const uint8_t* p = kb_host_r(cpu, pc, s->len);
+        const uint8_t* p = kb_host_x(cpu, pc, s->len);
         uint64_t head, h = 0xcbf29ce484222325ull;
         if (!p) continue;
         memcpy(&head, p, 8);
@@ -281,7 +289,7 @@ int kb_prim_at(struct kb_cpu* cpu, uint64_t pc) {
     for (size_t i = 0; on && i < sizeof sigs / sizeof *sigs; i++) {
         const struct sig* s = &sigs[i];
         if (s->arch != cpu->arch || !(on >> s->id & 1)) continue;
-        const uint8_t* p = kb_host_r(cpu, pc, s->len);
+        const uint8_t* p = kb_host_x(cpu, pc, s->len);
         uint64_t head, h = 0xcbf29ce484222325ull;
         if (p)
             memcpy(&head, p, 8);
@@ -299,7 +307,12 @@ int kb_prim_at(struct kb_cpu* cpu, uint64_t pc) {
     if (on >> P_DIGEST & 1 && cpu->arch == KB_X86 && kb_digest_ready()) {
         int d = kb_digest_at(cpu, pc);
         if (d >= 0) return P_DIGEST | d << 8;
+        d = kb_digest_update_at(cpu, pc);
+        if (d >= 0) return P_DIGEST | (d | KB_HD_UPDATE) << 8;
     }
+    if (on >> P_INFLATE & 1 && cpu->arch == KB_X86 && kb_inflate_ready() &&
+        kb_inflate_at(cpu, pc))
+        return P_INFLATE;
     for (size_t i = 0; on >> P_EXP && i < sizeof libm_sigs / sizeof *libm_sigs;
          i++) {
         const struct libm_sig* s = &libm_sigs[i];
@@ -333,18 +346,11 @@ static uint64_t min3(uint64_t a, uint64_t b, uint64_t c) {
     return m < c ? m : c;
 }
 
-/* every byte of [a, a + n) can be reached; the copy kernels check both ranges
- * first so that a bad pointer leaves memory as it was and the guest's own code
- * faults at its own instruction */
-static int reach(struct kb_cpu* cpu, uint64_t a, uint64_t n) {
-    if (a + n < a) return 0;
-    for (uint64_t off = 0, k; off < n; off += k)
-        if (!kb_span_r(cpu, a + off, &k)) return 0;
-    return 1;
-}
-
-int kb_reach(struct kb_cpu* cpu, uint64_t a, uint64_t n) {
-    return reach(cpu, a, n);
+/* every byte of [a, a + n) can be reached for an access of acc; the copy
+ * kernels check both ranges first so that a bad pointer leaves memory as it was
+ * and the guest's own code faults at its own instruction */
+static int reach(struct kb_cpu* cpu, uint64_t a, uint64_t n, int acc) {
+    return kb_can(cpu, a, n, acc);
 }
 
 /* A glibc variant loads whole vectors, so a call whose answer lies within
@@ -356,7 +362,7 @@ static int ahead(
     struct kb_cpu* cpu, uint64_t p, uint64_t used, uint64_t lim, int guard
 ) {
     return !guard ||
-           reach(cpu, p + used, lim - used < GUARD ? lim - used : GUARD);
+           reach(cpu, p + used, lim - used < GUARD ? lim - used : GUARD, KB_R);
 }
 
 /* each kernel returns 0 when guest memory ends before the answer is known */
@@ -560,7 +566,7 @@ static int k_strcmp(
 static int k_copy(
     struct kb_cpu* cpu, uint64_t d, uint64_t s, uint64_t n, int move
 ) {
-    if (!reach(cpu, s, n) || !reach(cpu, d, n)) return 0;
+    if (!reach(cpu, s, n, KB_R) || !reach(cpu, d, n, KB_W)) return 0;
     if (d != s && d < s + n && s < d + n) {
         if (!move || n > KB_BUF_MAX) return 0;
         uint8_t* t = malloc((size_t) n);
@@ -571,6 +577,7 @@ static int k_copy(
     }
     for (uint64_t off = 0, k; off < n; off += k) {
         uint64_t ks, kd;
+        kd = n - off;
         uint8_t* pd = kb_span(cpu, d + off, &kd);
         const uint8_t* ps = kb_span_r(cpu, s + off, &ks);
         k = min3(ks, kd, n - off);
@@ -580,8 +587,9 @@ static int k_copy(
 }
 
 static int k_memset(struct kb_cpu* cpu, uint64_t d, uint64_t c, uint64_t n) {
-    if (!reach(cpu, d, n)) return 0;
+    if (!reach(cpu, d, n, KB_W)) return 0;
     for (uint64_t off = 0, k; off < n; off += k) {
+        k = n - off;
         uint8_t* p = kb_span(cpu, d + off, &k);
         if (k > n - off) k = n - off;
         memset(p, (int) (uint8_t) c, (size_t) k);
@@ -620,7 +628,8 @@ static int k_hash(
     uint64_t block = (uint64_t) h->block;
     uint32_t sw = (uint32_t) (h->nw * h->wsz), cl = sw + 2 * (uint32_t) h->wsz;
     if (len & (block - 1) || !kb_read(cpu, ctx, c, cl) ||
-        !reach(cpu, buf, len) || (len && buf < ctx + cl && ctx < buf + len))
+        !reach(cpu, buf, len, KB_R) ||
+        (len && buf < ctx + cl && ctx < buf + len))
         return 0;
     memcpy(&st, c, sw);
     for (uint64_t off = 0, k; off < len; off += k) {
@@ -690,7 +699,7 @@ static int k_cksum(struct kb_cpu* cpu) {
         if (!kb_read(cpu, tab, tb, sizeof tb)) return 0;
         t = tb;
     }
-    if (!reach(cpu, p, end - p)) return 0;
+    if (!reach(cpu, p, end - p, KB_R)) return 0;
     uint32_t crc = (uint32_t) r[3];
     for (uint64_t off = 0, k; off < bytes;) {
         const uint8_t* q = kb_span_r(cpu, p + off, &k);
@@ -722,7 +731,7 @@ static int k_sum(
     struct kb_cpu* cpu, int adler, uint64_t init, uint64_t buf, uint32_t n,
     uint64_t* out
 ) {
-    if (!buf || !n || !reach(cpu, buf, n)) return 0;
+    if (!buf || !n || !reach(cpu, buf, n, KB_R)) return 0;
     uLong v = (uLong) init;
     for (uint64_t off = 0, k; off < n; off += k) {
         const uint8_t* p = kb_span_r(cpu, buf + off, &k);
@@ -741,7 +750,8 @@ static int k_zlib(
 ) {
     uint64_t want;
     if (!kb_read(cpu, lenp, &want, 8) || !want || want > ZMAX || !srclen ||
-        srclen > ZMAX || !reach(cpu, dest, want) || !reach(cpu, src, srclen))
+        srclen > ZMAX || !reach(cpu, dest, want, KB_W) ||
+        !reach(cpu, src, srclen, KB_R))
         return 0;
     uint8_t* in = malloc((size_t) srclen);
     uint8_t* out = malloc((size_t) want);
@@ -790,6 +800,16 @@ int kb_prim(struct kb_cpu* cpu, int id, uint64_t* next) {
     id &= 0xff;
     if (id == P_CKSUM)
         return k_cksum(cpu) ? (calls[id]++, 2) : (gave_up[id]++, 0);
+    if (id == P_GZCRC)
+        return kb_gzcrc(cpu) ? (calls[id]++, 2) : (gave_up[id]++, 0);
+    if (id == P_INFLATE) {
+        /* 2: a stream began, 1: a call came back from the guest's own read or
+         * write of it, 0: not taken */
+        int k = kb_inflate(cpu, next);
+        if (k == 2) calls[id]++;
+        if (!k) gave_up[id]++;
+        return k ? 1 : 0;
+    }
     uint64_t* r = cpu->r;
     int x86 = cpu->arch == KB_X86;
     uint64_t a = x86 ? r[7] : r[0], b = x86 ? r[6] : r[1], n = r[2], ret, v = 0;
@@ -823,7 +843,11 @@ int kb_prim(struct kb_cpu* cpu, int id, uint64_t* next) {
         case P_SHA512:
             ok = k_block(cpu, KB_HD_SHA512, a, b, n, &h_sha512);
             break;
-        case P_DIGEST: ok = kb_digest_finish(cpu, mode, a, b); break;
+        case P_DIGEST:
+            ok = mode & KB_HD_UPDATE
+                     ? kb_digest_update(cpu, mode & ~KB_HD_UPDATE, a, b, n)
+                     : kb_digest_finish(cpu, mode, a, b);
+            break;
 #ifdef KB_ZLIB
         case P_CRC32:
         case P_ADLER32:

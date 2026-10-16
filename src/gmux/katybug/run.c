@@ -240,7 +240,7 @@ static int muldiv(struct kb_cpu* cpu, int kind, int w, uint64_t v) {
 static uint64_t string_bulk(struct kb_cpu* cpu, int stos, int w, uint64_t n) {
     uint64_t* r = cpu->r;
     if (n > (1u << 20) / (unsigned) w) n = (1u << 20) / (unsigned) w;
-    uint64_t len = n * (uint64_t) w, kd, ks = len;
+    uint64_t len = n * (uint64_t) w, kd = len, ks = len;
     uint8_t* d = kb_span(cpu, r[7], &kd);
     const uint8_t* s = stos ? NULL : kb_span_r(cpu, r[6], &ks);
     if (!d || (!stos && !s)) return 0;
@@ -867,8 +867,17 @@ static int translate_block(struct kb_cpu* cpu, struct kb_block* b) {
         b->pcs = NULL;
         return 1;
     }
+    kb_marks_add(cpu, b);
+    if (cpu->persist) b->code = kb_code_hash(cpu, b, &b->hashed);
     cpu->decoded++;
     return 0;
+}
+
+/* a block that could not be decoded stays stale, so the next look decodes again
+ */
+static void failed(struct kb_cpu* cpu, struct kb_block* b) {
+    b->codegen = cpu->codegen - 1;
+    b->npv = -1;
 }
 
 #ifdef KB_DECODE_TIME
@@ -918,7 +927,8 @@ int kb_block_ready(struct kb_cpu* cpu, struct kb_block* b) {
     b->nic = mem;
     cold_caches(b);
 #ifdef KB_AOT
-    if (!cpu->trace && !cpu->tracing) kb_aot_attach(cpu, b);
+    if (!cpu->trace && !cpu->tracing && !kb_block_wx(cpu, b))
+        kb_aot_attach(cpu, b);
 #else
     (void) cpu;
 #endif
@@ -946,11 +956,26 @@ static void reset(struct kb_block* b) {
     free(b->pcs);
     free(b->ic);
     free(b->seg);
+    free(b->pv);
 #ifdef KB_HOT
     free(b->exits);
 #endif
     struct kb_block keep = {.pc = b->pc, .chain = b->chain};
     *b = keep;
+}
+
+/* b was decoded or checked before the code generation moved: it decodes again
+ * when the code under it was unmapped or changed protection since, or when a
+ * page it was decoded from was written to where it holds bytes of it; b is
+ * then ready to run (1), or not decodable (0) */
+static int refresh(struct kb_cpu* cpu, struct kb_block* b) {
+    if (kb_marks_current(cpu, b)) return 1;
+    reset(b);
+    if (translate(cpu, b)) {
+        failed(cpu, b);
+        return 0;
+    }
+    return 1;
 }
 
 KB_NOINLINE static struct kb_block* block(struct kb_cpu* cpu, uint64_t pc) {
@@ -959,13 +984,7 @@ KB_NOINLINE static struct kb_block* block(struct kb_cpu* cpu, uint64_t pc) {
     for (struct kb_block* b = cpu->cache[h]; b; b = b->chain) {
         if (b->pc != pc) continue;
         if (b->codegen == cpu->codegen) return b;
-        /* the code under it was unmapped or changed protection since */
-        reset(b);
-        if (translate(cpu, b)) {
-            b->codegen = cpu->codegen - 1;
-            return NULL;
-        }
-        return b;
+        return refresh(cpu, b) ? b : NULL;
     }
     struct kb_block* b = calloc(1, sizeof *b);
     b->pc = pc;
@@ -999,6 +1018,7 @@ static void retrace(struct kb_cpu* cpu, struct kb_block* b) {
         free(t.pcs);
         free(t.ic);
         free(t.seg);
+        free(t.pv);
         return;
     }
     struct kb_block* chain = b->chain;
@@ -1008,7 +1028,7 @@ static void retrace(struct kb_cpu* cpu, struct kb_block* b) {
     b->traced = 1;
     cpu->traces++;
     #ifdef KB_AOT
-    if (!cpu->trace) kb_aot_attach(cpu, b);
+    if (!cpu->trace && !kb_block_wx(cpu, b)) kb_aot_attach(cpu, b);
     #endif
 }
 #endif
@@ -1100,13 +1120,55 @@ KB_NOINLINE static inline uint64_t load(
     return v;
 }
 
+/* a store to bytes a decoded block came from leaves kb_smc in cpu->fault (only
+ * the miss path can: a cache is never kept for a page that is writable and
+ * executable) */
 KB_NOINLINE static inline void store(
     struct kb_cpu* cpu, struct kb_ic* ic, uint64_t va, uint64_t v, int w
 ) {
     if (IC_MISS(cpu, ic, va, w))
-        kb_store_ic(cpu, ic, va, v, w);
+        kb_store_smc(cpu, ic, va, v, w);
     else
         memcpy(ic->host + (va - ic->lo), &v, (size_t) w);
+}
+
+static uint64_t step(struct kb_cpu* cpu, struct kb_block* blk);
+
+/* a write reached code (or a syscall changed what is executable) in the middle
+ * of blk: the guest instruction that holds op i is finished, and the code after
+ * it is looked up again; its address is returned. Katybug does this at the
+ * write, so AArch64's ic ivau and isb after it have nothing left to do */
+__attribute__((cold)) KB_NOINLINE static uint64_t smc_leave(
+    struct kb_cpu* cpu, struct kb_block* blk, int i, struct kb_ic* ic
+) {
+#if KB_EPOCH
+    if (blk->mapgen != cpu->mapgen) {
+        cold_caches(blk);
+        blk->mapgen = cpu->mapgen;
+    }
+#endif
+    int j = i + 1;
+    uint64_t at = blk->next;
+    if (blk->pcs) {
+        while (j < blk->n && blk->pcs[j] == blk->pcs[i]) j++;
+        if (j < blk->n)
+            at = blk->pc + (uint64_t) (int64_t) (int32_t) blk->pcs[j];
+    }
+    else {
+        while (j < blk->n && blk->ins[j].op != KB_PC) j++;
+        if (j < blk->n) at = (uint64_t) blk->ins[j].imm;
+    }
+    if (j == i + 1) return at;
+    /* what is left of the instruction runs as a block of its own */
+    struct kb_block sub = *blk;
+    sub.ins = blk->ins + i + 1;
+    sub.n = j - i - 1;
+    sub.resolves = 0;
+    sub.ic = ic;
+    sub.nic = (int) (blk->ic + blk->nic - ic);
+    if (blk->pcs) sub.pcs = blk->pcs + i + 1;
+    sub.next = at;
+    return step(cpu, &sub);
 }
 
 /* an op's b and c registers, read only in the cases that use them */
@@ -1123,6 +1185,11 @@ KB_NOINLINE static inline void store(
 /* only the ops that can raise a fault check for one after them */
 #define CHECK()                                                                \
     if (KB_CK(ck_fault) || cpu->fault) return FAULTED()
+/* after an op that writes through the host (not a plain store): code it wrote
+ * to ends the instruction (a syscall ends its block, so the next lookup sees
+ * what it wrote) */
+#define SMC()                                                                  \
+    if (__builtin_expect(blk->codegen != cpu->codegen, 0)) goto smc
 
 /* runs one block; returns the next pc. The memory plan's groups are for lifted
  * code: the interpreter skips the leading KB_RESOLVE ops and checks each access
@@ -1131,7 +1198,8 @@ static uint64_t step(struct kb_cpu* cpu, struct kb_block* blk) {
     uint64_t* r = cpu->r;
     struct kb_ic* ic = blk->ic + blk->resolves; /* the next load or store's; ops
                                                    never jump inside a block */
-    for (int i = blk->resolves; i < blk->n; i++) {
+    int i;
+    for (i = blk->resolves; i < blk->n; i++) {
         struct kb_ins* x = &blk->ins[i];
         switch (x->op) {
             case KB_MOVI: r[x->a] = (uint64_t) x->imm; break;
@@ -1195,7 +1263,8 @@ static uint64_t step(struct kb_cpu* cpu, struct kb_block* blk) {
                     blk->mapgen = cpu->mapgen;
                 }
 #endif
-                CHECK();
+                if (__builtin_expect(KB_CK(ck_fault) || cpu->fault, 0))
+                    goto stored;
                 break;
             case KB_FLAGS:
 #if KB_LAZY
@@ -1319,6 +1388,7 @@ static uint64_t step(struct kb_cpu* cpu, struct kb_block* blk) {
                     cpu->fault_sig = 4;
                 }
                 CHECK();
+                SMC();
                 break;
             case KB_SSE:
                 KB_SYNC(cpu);
@@ -1327,6 +1397,7 @@ static uint64_t step(struct kb_cpu* cpu, struct kb_block* blk) {
                     cpu->fault_sig = 4;
                 }
                 CHECK();
+                SMC();
                 break;
             case KB_A64V:
                 KB_SYNC(cpu);
@@ -1335,6 +1406,7 @@ static uint64_t step(struct kb_cpu* cpu, struct kb_block* blk) {
                     cpu->fault_sig = 4;
                 }
                 CHECK();
+                SMC();
                 break;
             case KB_CARRY:
                 KB_SYNC(cpu);
@@ -1397,6 +1469,7 @@ static uint64_t step(struct kb_cpu* cpu, struct kb_block* blk) {
                         CHECK();
                     }
                     r[x->a] = !held;
+                    SMC();
                 }
                 break;
             case KB_CPUID: {
@@ -1470,6 +1543,7 @@ static uint64_t step(struct kb_cpu* cpu, struct kb_block* blk) {
             case KB_X86STR:
                 string(cpu, (int) x->imm, x->w, x->c);
                 CHECK();
+                SMC();
                 break;
             case KB_PRIM: {
                 uint64_t ret;
@@ -1479,6 +1553,11 @@ static uint64_t step(struct kb_cpu* cpu, struct kb_block* blk) {
         }
     }
     return blk->next;
+stored:
+    if (cpu->fault != kb_smc) return FAULTED();
+    cpu->fault = NULL;
+smc:
+    return smc_leave(cpu, blk, i, ic);
 }
 
 #ifdef KB_COUNT
@@ -1637,11 +1716,7 @@ int kb_run(struct kb_cpu* cpu) {
             }
             if (b->codegen != cpu->codegen) {
                 (void) KB_CK(deopt_code);
-                reset(b);
-                if (translate(cpu, b)) {
-                    b->codegen = cpu->codegen - 1;
-                    b = prev = NULL;
-                }
+                if (!refresh(cpu, b)) b = prev = NULL;
             }
             if (b && b->mapgen != cpu->mapgen) {
                 (void) KB_CK(deopt_map);
@@ -1653,10 +1728,13 @@ int kb_run(struct kb_cpu* cpu) {
 #endif
         if (!b) {
             /* no instruction here at all: the jump itself faulted */
-            cpu->fault = "jump outside the address space";
-            if (kb_bus(cpu->pc) ? kb_fault(cpu, 7, 2, cpu->pc)
-                                : kb_fault(cpu, 11, 1, cpu->pc))
+            const char* why = "jump outside the address space";
+            cpu->last_fault = why;
+            if (kb_bus(cpu->pc)
+                    ? kb_fault(cpu, 7, 2, cpu->pc)
+                    : kb_fault(cpu, 11, kb_fault_code(cpu, cpu->pc), cpu->pc))
                 continue;
+            cpu->fault = why;
             break;
         }
         cpu->ipc = b->pc;
@@ -1695,12 +1773,12 @@ int kb_run(struct kb_cpu* cpu) {
             /* the context resumes at the faulting instruction */
             cpu->pc = cpu->ipc;
             const char* why = cpu->fault;
-            cpu->fault_sig = 0;
+            int code = s == 11 && cpu->segv_code ? cpu->segv_code : codes[s];
+            cpu->fault_sig = cpu->segv_code = 0;
             cpu->fault = NULL;
             cpu->last_fault = why;
             if (!kb_fault(
-                    cpu, s, codes[s],
-                    s == 11 || s == 7 ? cpu->fault_addr : cpu->ipc
+                    cpu, s, code, s == 11 || s == 7 ? cpu->fault_addr : cpu->ipc
                 )) {
                 cpu->fault = why;
                 break;

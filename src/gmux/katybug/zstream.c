@@ -188,10 +188,15 @@ static void drop(struct zs* z) {
     memset(z, 0, sizeof *z);
 }
 
-/* how many of [va, va + want) the guest has mapped, from its start */
-static uint64_t reach_n(struct kb_cpu* cpu, uint64_t va, uint64_t want) {
+/* how many of [va, va + want) the guest has mapped with the right acc, from its
+ * start */
+static uint64_t reach_n(
+    struct kb_cpu* cpu, uint64_t va, uint64_t want, int acc
+) {
     uint64_t n = 0, k;
-    while (n < want && va + n >= va && kb_span_r(cpu, va + n, &k)) n += k;
+    while (n < want && va + n >= va && kb_can(cpu, va + n, 1, acc) &&
+           kb_span_r(cpu, va + n, &k))
+        n += k;
     return n < want ? n : want;
 }
 
@@ -257,6 +262,7 @@ static int fault(struct kb_cpu* cpu, uint64_t addr) {
     cpu->fault = "zlib: a buffer the guest gave is not mapped";
     cpu->fault_sig = 11;
     cpu->fault_addr = addr;
+    cpu->segv_code = kb_fault_code(cpu, addr);
     return 2;
 }
 
@@ -293,9 +299,10 @@ static int run(
         uint64_t win = rin, wout = rout;
         /* a null pointer goes to the host as it is: it refuses before reading
          */
-        if (nin && rin) win = reach_n(cpu, nin + ci, rin < cap ? rin : cap);
+        if (nin && rin)
+            win = reach_n(cpu, nin + ci, rin < cap ? rin : cap, KB_R);
         if (nout && rout)
-            wout = reach_n(cpu, nout + co, rout < cap ? rout : cap);
+            wout = reach_n(cpu, nout + co, rout < cap ? rout : cap, KB_W);
         if (nin && rin && !win) {
             *at = nin + ci;
             break;
@@ -466,7 +473,7 @@ static int dict(
     uint8_t* buf = NULL;
     if (d && n) {
         if (n > ZMAX) return *v = (uint32_t) Z_MEM_ERROR, 1;
-        uint64_t r = reach_n(cpu, d, n);
+        uint64_t r = reach_n(cpu, d, n, KB_R);
         if (r < n) return fault(cpu, d + r);
         if (!(buf = malloc(n)) || !kb_read(cpu, d, buf, n)) {
             free(buf);
@@ -492,7 +499,7 @@ static int getdict(struct kb_cpu* cpu, int e, struct zs* z, uint64_t* v) {
                  : inflateGetDictionary(&z->hs, d ? buf : NULL, &len);
     uint64_t at = 0;
     if (rc == Z_OK) {
-        uint64_t r = d ? reach_n(cpu, d, len) : 0;
+        uint64_t r = d ? reach_n(cpu, d, len, KB_W) : 0;
         if (d && r) kb_write(cpu, d, buf, r);
         if (d && r < len)
             at = d + r;
