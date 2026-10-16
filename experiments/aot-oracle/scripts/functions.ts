@@ -246,7 +246,11 @@ export function splitRanges(fns: Fn[], total: bigint, rank: number, minShare = 0
 
 /** one ranges text per function for the `n` with the most self ops, without their callees, for one region each */
 export function topRanges(fns: Fn[], n: number): string[] {
-	return fns.slice(0, n).map((f) => mergedRanges([f]));
+	return fns
+		.slice(0, n)
+		.map((f) => mergedRanges([f]))
+		// a function another one claimed has no ranges, and no ranges lifts the whole program
+		.filter((r) => r !== '');
 }
 
 if (process.argv[1]?.endsWith('functions.ts')) {

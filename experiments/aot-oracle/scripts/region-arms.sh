@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # one more lifted-region arm for a workload, next to region.sh's: the ranges (fn and fnc as region.sh wrote
 # them, rank:N for function N with the callees that run 1% of ops, - for the dump's own cover), the cover
-# (share of executed ops, with no ranges) and lift.ts's flags. rank:"0 1 2" lifts those functions together. Builds it natively, checks stdout against the
+# (share of executed ops, with no ranges) and lift.ts's flags. rank:"0 1 2" lifts those functions together, split:"0 1 2" each as its own region (--calls --noinline). Builds it natively, checks stdout against the
 # binary's in each form it can run, and prints region.sh's columns plus regs.sh's counters per 1,000 guest
 # instructions, one csv row per form. Reuses the dumps in the out dir and makes them when they are not there.
 # CLANG_TIMEOUT (seconds, 600) per clang run; past it at -O2 the arm is built at -O1 (same limit) and the row says so.
@@ -34,8 +34,13 @@ if [ ! -d "$out/hot-$w" ]; then
 	KATYBUG_SEGMENTS=1 KATYBUG_HOT=$out/hot-$w sh -c "$(cmd "$out/hot" "$w")" > /dev/null 2>&1
 fi
 hot=$(ls -S "$out/hot-$w"/*.hot | head -1)
+specs=()
 case $ranges in
 	- ) range=() ;;
+	split:*)
+		for n in ${ranges#split:}; do specs+=("$hot@$(fn --emit="$n" "$fine")"); done
+		range=(--calls --noinline)
+		;;
 	fn) range=(--ranges="$(fn --emit=0 "$fine")") ;;
 	fnc) range=(--ranges="$(fn --emit=0+callees "$fine")") ;;
 	rank:*)
@@ -44,7 +49,7 @@ case $ranges in
 		range=(--ranges="$list")
 		;;
 esac
-"$node" --no-warnings --experimental-strip-types "$here/lift.ts" "$@" "${range[@]}" "$out/aot-$arm-$w.c" "$cover" "$hot" 2> "$out/lift-$arm-$w.log"
+"$node" --no-warnings --experimental-strip-types "$here/lift.ts" "$@" "${range[@]}" "$out/aot-$arm-$w.c" "$cover" "${specs[@]:-$hot}" 2> "$out/lift-$arm-$w.log"
 inc=(-I"$K" -I"$here/../src")
 read -ra extra <<< "${CC_EXTRA:-}"
 opt=-O2

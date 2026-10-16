@@ -17,7 +17,7 @@ import { Machine } from '../../../src/worker/machine/machine.ts';
  * (arm:form), the variants are `katybug-<arm>-<workload>.wasm` with their `.inst.wasm`; the arm `binary` runs NATIVE_CMD
  * pinned to NATIVE_CPU in each round. For a timed sweep set LOCK (taken per sample), QUIET_CPUS, SAMPLES and PROCESS (see
  * the block below `Arm`); a bundle may hold `initramfs.bin` in place of `initrd.cpio`, and the workloads are sha256, gzip,
- * bzip2, sqlite and bash.
+ * bzip2, sqlite, bash and entry (a guest ELF of GUEST_FILE, placed in the machine as /bin/entry-guest).
  */
 const [bundle = '', dir = '', roundsArg = '3', workload = 'gzip', scaleArg = '1'] = process.argv.slice(2);
 const rounds = Number(roundsArg);
@@ -31,7 +31,8 @@ const workloads: Record<string, string> = {
 	gzip: '$B/busybox-amd64 gzip -9 -c /tmp/in',
 	bzip2: '$B/busybox-amd64 bzip2 -9 -c /tmp/in',
 	sqlite: `$B/sqlite3 :memory: 'with recursive c(x) as (select 1 union all select x+1 from c where x<${100000 * scale}) select count(*), sum(x*x) % 1000003 from c;'`,
-	bash: `$B/bash -c 'i=0; s=0; while [ $i -lt ${20000 * scale} ]; do s=$((s+i*i%7)); i=$((i+1)); done; echo $s'`
+	bash: `$B/bash -c 'i=0; s=0; while [ $i -lt ${20000 * scale} ]; do s=$((s+i*i%7)); i=$((i+1)); done; echo $s'`,
+	entry: '$B/entry-guest'
 };
 // a bundle holds initrd.cpio, build/kernel holds initramfs.bin
 const initrdBase = existsSync(join(bundle, 'initrd.cpio')) ? join(bundle, 'initrd.cpio') : join(bundle, 'initramfs.bin');
@@ -42,7 +43,7 @@ function machine(name: string) {
 	const path = join(dir, `katybug-${name}-${workload}.wasm`);
 	registry.set(sha256(read(path)), new WebAssembly.Module(read(path.replace(/\.wasm$/, '.inst.wasm'))));
 	const cpio = join(dir, `${name}-${workload}.cpio`);
-	appendCpio(initrdBase, cpio, [`/bin/katybug=${path}`]);
+	appendCpio(initrdBase, cpio, [`/bin/katybug=${path}`, ...(process.env.GUEST_FILE ? [`/bin/entry-guest=${process.env.GUEST_FILE}`] : [])]);
 	let output = '';
 	const m = new Machine({
 		vmlinux: new WebAssembly.Module(read(join(bundle, 'vmlinux.wasm'))),

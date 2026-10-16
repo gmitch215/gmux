@@ -13,7 +13,8 @@
 # header rewritten too (a stale file the first check accepts, so only the per-block code hash stands in the way), and
 # no cache. Every output must be the patched copy's, and the region must hold fewer blocks (a lower lifted share).
 # startup: wall per run of a tiny input, cold against warm, which is what decoding and attaching the blocks cost
-# (run it under the host's timing lock, on a pinned core, with BUILD=run-fnc-gzip).
+# (run it on a pinned core, with BUILD=run-fnc-gzip; CELLS="gzip:run-fnc-gzip sqlite:run-tbl-all" names a build per
+# workload, SAMPLE_LOCK, QUIET_SH and QUIET_CPUS take a lock and read quiet.sh per sample).
 # usage: [BUILD=aot-fnc-gzip] regions-cache.sh <bin dir with busybox-amd64> <region.sh out dir> <out dir> [cold|patch|startup]
 set -euo pipefail
 here=$(cd "$(dirname "$0")" && pwd)
@@ -115,33 +116,91 @@ fi
 if [ "$mode" = startup ]; then
 	# a tiny input, so the run is the decode and attach of the blocks: wall per run, cold (no cache) against warm
 	# (the file a first run left), with the binary itself for the process cost; REPS runs per sample, ROUNDS samples
+	# CELLS is a list of <workload>:<build> (workload gzip, bzip2, sqlite or bash; the build a file under the region.sh
+	# out dir, run-* the timing builds), default gzip:$BUILD. SAMPLE_LOCK (a lock directory) is taken per sample and
+	# never held across samples; QUIET_SH and QUIET_CPUS run quiet.sh beside each sample (above 0.5 busy cores outside
+	# the pinned ones the sample is noisy and left out of the medians); LOCK_WAIT seconds is how long a sample waits
 	reps=${REPS:-50}
 	rounds=${ROUNDS:-7}
+	cells=${CELLS:-gzip:$build}
+	lock=${SAMPLE_LOCK:-}
 	echo 1 > "$res/tiny"
-	warm=$res/cache-startup
-	mkdir -p "$warm"
-	for n in 1 2; do KATYBUG_CACHE="$warm" "$out/$build" "$elf" gzip -9 -c "$res/tiny" > /dev/null 2>&1; done
-	for arm in cold warm; do
-		extra=()
-		[ "$arm" = warm ] && extra=(KATYBUG_CACHE="$warm")
-		env "${extra[@]}" KATYBUG_STATS=1 "$out/$build" "$elf" gzip -9 -c "$res/tiny" 2>&1 > /dev/null | grep -o '[0-9]* decoded, [0-9]* from the cache' | sed "s/^/# $arm: /"
+	startup_cmd() {
+		case $1 in
+			gzip) echo "$bin/busybox-amd64 gzip -9 -c $res/tiny" ;;
+			bzip2) echo "$bin/busybox-amd64 bzip2 -9 -c $res/tiny" ;;
+			sqlite) echo "$bin/sqlite3 :memory: select(1);" ;;
+			bash) echo "$bin/bash -c echo" ;;
+		esac
+	}
+	run_cell() { # workload, build, warm cache dir or empty; the command is the workload's, under the build
+		local cmd w=$1 b=$2 dir=$3
+		cmd=$(startup_cmd "$w")
+		if [ -n "$dir" ]; then env KATYBUG_CACHE="$dir" "$out/$b" $cmd; else "$out/$b" $cmd; fi
+	}
+	workloads=$(for c in $cells; do echo "${c%%:*}"; done | awk '!s[$0]++')
+	for w in $workloads; do
+		binary_md=$($(startup_cmd "$w") 2> /dev/null | md)
+		for c in $cells; do
+			[ "${c%%:*}" = "$w" ] || continue
+			b=${c#*:}
+			warm=$res/cache-$w-$b
+			mkdir -p "$warm"
+			for n in 1 2; do run_cell "$w" "$b" "$warm" > /dev/null 2>&1; done
+			for arm in cold warm; do
+				dir=
+				[ "$arm" = warm ] && dir=$warm
+				got=$(run_cell "$w" "$b" "$dir" 2> /dev/null | md)
+				[ "$got" = "$binary_md" ] || { echo "# $w $b $arm: output $got DIFFERS from $binary_md"; failed=1; }
+				if [ -n "$dir" ]; then
+					echo "# $w $b $arm: $(env KATYBUG_STATS=1 KATYBUG_CACHE="$dir" "$out/$b" $(startup_cmd "$w") 2>&1 > /dev/null | grep -o '[0-9]* decoded, [0-9]* from the cache')"
+				else
+					echo "# $w $b $arm: $(env KATYBUG_STATS=1 "$out/$b" $(startup_cmd "$w") 2>&1 > /dev/null | grep -o '[0-9]* decoded, [0-9]* from the cache')"
+				fi
+			done
+		done
 	done
-	echo "round,arm,ms per run,load1"
-	sample() {
-		local arm=$1 t0 t1
-		shift
+	[ "$failed" = 0 ] || exit 1
+	echo "round,workload,arm,ms per run,outside_busy"
+	sample() { # workload, arm, command...
+		local w=$1 arm=$2 t0 t1 q=0 waited=0
+		shift 2
+		if [ -n "$lock" ]; then
+			until mkdir "$lock" 2> /dev/null; do
+				sleep 2
+				waited=$((waited + 2))
+				[ "$waited" -lt "${LOCK_WAIT:-3600}" ] || { echo "# lock $lock held for ${LOCK_WAIT:-3600} s" >&2; exit 3; }
+			done
+		fi
+		if [ -n "${QUIET_SH:-}" ]; then "$QUIET_SH" "${QUIET_CPUS:?QUIET_CPUS with QUIET_SH}" 2 > "$res/quiet.txt" & fi
 		t0=$(date +%s%N)
 		for ((i = 0; i < reps; i++)); do "$@" > /dev/null 2>&1; done
 		t1=$(date +%s%N)
-		echo "$round,$arm,$(awk -v a="$t0" -v b="$t1" -v n="$reps" 'BEGIN { printf "%.2f", (b - a) / 1e6 / n }'),$(cut -d' ' -f1 /proc/loadavg)"
+		wait
+		[ -z "$lock" ] || rmdir "$lock"
+		[ -z "${QUIET_SH:-}" ] || q=$(awk '{ print $2 }' "$res/quiet.txt")
+		echo "$round,$w,$arm,$(awk -v a="$t0" -v b="$t1" -v n="$reps" 'BEGIN { printf "%.2f", (b - a) / 1e6 / n }'),$q"
 	}
 	for ((round = 1; round <= rounds; round++)); do
-		sample binary "$elf" gzip -9 -c "$res/tiny"
-		sample cold "$out/$build" "$elf" gzip -9 -c "$res/tiny"
-		sample warm env KATYBUG_CACHE="$warm" "$out/$build" "$elf" gzip -9 -c "$res/tiny"
+		for w in $workloads; do
+			sample "$w" binary $(startup_cmd "$w")
+			for c in $cells; do
+				[ "${c%%:*}" = "$w" ] || continue
+				b=${c#*:}
+				sample "$w" "$b cold" "$out/$b" $(startup_cmd "$w")
+				sample "$w" "$b warm" env KATYBUG_CACHE="$res/cache-$w-$b" "$out/$b" $(startup_cmd "$w")
+			done
+		done
 	done | tee "$res/startup.csv"
-	for arm in binary cold warm; do
-		echo "# $arm median $(awk -F, -v a="$arm" '$2 == a { print $3 }' "$res/startup.csv" | sort -n | awk '{ v[NR] = $1 } END { print v[int((NR + 1) / 2)] }') ms, min $(awk -F, -v a="$arm" '$2 == a { print $3 }' "$res/startup.csv" | sort -n | head -1), max $(awk -F, -v a="$arm" '$2 == a { print $3 }' "$res/startup.csv" | sort -n | tail -1)"
-	done
+	awk -F, '$1 ~ /^[0-9]+$/ && $5 <= 0.5 { k = $2 "," $3; n[k]++; v[k, n[k]] = $4 }
+		$1 ~ /^[0-9]+$/ && $5 > 0.5 { noisy[$2 "," $3]++ }
+		END {
+			for (k in n) {
+				m = n[k]
+				for (i = 1; i <= m; i++) a[i] = v[k, i]
+				for (i = 1; i <= m; i++) for (j = i + 1; j <= m; j++) if (a[j] < a[i]) { t = a[i]; a[i] = a[j]; a[j] = t }
+				printf "# %s: median %s ms, min %s, max %s, %d kept, %d noisy\n", k, a[int((m + 1) / 2)], a[1], a[m], m, noisy[k] + 0
+			}
+		}' "$res/startup.csv" | sort
 fi
 exit $failed

@@ -1,5 +1,33 @@
 import { readFileSync, writeFileSync } from 'node:fs';
-import { follow } from './bounds.ts';
+import {
+	KB_ZERO,
+	MAX_SLOTS,
+	SP,
+	SPAN,
+	deadFlags,
+	edgesOf,
+	findLoops,
+	hex,
+	imm64,
+	isTemp,
+	liveInTemps,
+	opName,
+	parseRanges,
+	regionRegs,
+	registerFields,
+	rw,
+	selectBlocks,
+	touches,
+	windowPlanner,
+	constJump,
+	type Acc,
+	type Block,
+	type Hit,
+	type Ins,
+	type Loop,
+	type Touch,
+	type Win
+} from './region-ir.ts';
 import { analyze, vecWrite, type Cls } from './slots.ts';
 
 /**
@@ -57,7 +85,29 @@ import { analyze, vecWrite, type Cls } from './slots.ts';
  * caches, no fault check. Only a runtime that maps the guest at its own addresses can run it, and a bad guest access
  * kills the host; measurement only.
  *
- * `--flags=live` drops a flag write that a backward liveness over the region's blocks proves unread. Every exit, helper
+ * `--classes` (build with -DAOT_CLASS) makes each access report its kind (window, group, checked, slot in a local,
+ * frame window), load or store and the mapping it lands in, per access and per generated source line (aot.h), to
+ * `$KATYBUG_COUNT` at exit; the generated code is otherwise the same. `--plainchk` runs the accesses that would be
+ * checked one by one as plain accesses through `AOT_HOST(va)` while windows stay as they are: a ceiling for any form that
+ * proves those accesses, unsafe like `--identity` (a runtime that maps guests at their own addresses, or -DKB_WINDOW).
+ *
+ * `--bind=<count file>` is for a measurement of what a flat mapping table could give the checked accesses: the count
+ * file is the `$KATYBUG_COUNT` of a `--classes` run of the same lift (same flags and dumps, so the site ids agree, run
+ * on the window runtime so the mappings sit where the arm will see them). A checked load or store whose site saw one
+ * mapping first tests its address against that mapping's bounds (`va - lo <= span - width`) and reads or writes
+ * `AOT_HOST(lo) + (va - lo)`; a miss takes the site's cache as before. The bounds are locals a region loads when it
+ * is entered from `aot_flat` (filled at start up, so the compiler cannot fold them); `--bindconst` writes them as
+ * constants instead (a floor for any site-bound form: no loads at all). `--bindexit` makes a miss leave the region through
+ * the fault exit (pc and ipc of the access, no fault set) and drops the cache fallback: what a form that leaves to the
+ * interpreter on a miss would cost. Unsound outside the layout of the counted run.
+ *
+ * `--flat=<count file>` (with `--epochs`, built with -DKB_EPOCH=1 and -DKB_FLAT=<bytes>) is the same site-bound check in a
+ * form that is sound anywhere: the census only says which mapping to look for. A region's epoch slow path finds each one
+ * again by its first address (`kb_flat_open`: one block, the right the site needs) and a region reads its bounds from that
+ * table as it is entered; a mapping that is gone, in pieces, or without the right has no bound, and every access of its sites
+ * takes its cache. A site's fast path is `va - lo < lim`, where lim is 16 less than the mapping's size.
+ *
+ * `--flags=live` (the default; `--flags=all` keeps every flag write) drops a flag write that a backward liveness over the region's blocks proves unread. Every exit, helper
  * call, syscall and fault point (a load or store, unless `--identity`) reads all five flags, except an exit whose target
  * block is in the dump and writes all five before it reads any. `--flags=none` is the same pass with the exits, helpers,
  * syscalls and fault points reading nothing, so only flags a later op of the region reads survive: unsound where the
@@ -77,98 +127,84 @@ const opt = {
 	noinline: flags.has('--noinline'),
 	epochs: flags.has('--epochs'),
 	identity: flags.has('--identity'),
+	classes: flags.has('--classes'),
+	plainchk: flags.has('--plainchk'),
+	bindconst: flags.has('--bindconst'),
+	bindexit: flags.has('--bindexit'),
 	bounds: [...flags].some((f) => f === '--bounds' || f.startsWith('--bounds=')),
 	two: flags.has('--bounds=two'),
 	loops: flags.has('--loop-guards')
 };
 const flagsFlag = [...flags].find((f) => f.startsWith('--flags'));
-const flagsMode = flagsFlag === undefined ? 'all' : (/^--flags=(live|none)$/.exec(flagsFlag)?.[1] ?? '');
-if (!flagsMode) throw new Error('--flags takes live or none (--flags=live)');
+const flagsMode = flagsFlag === undefined ? 'live' : (/^--flags=(all|live|none)$/.exec(flagsFlag)?.[1] ?? '');
+if (!flagsMode) throw new Error('--flags takes all, live or none (--flags=live)');
 // a cache that is not cold is current under epochs, so the generation compare is left out
 const G = opt.epochs ? '' : 'q->gen == gen && ';
 const mutate = process.env.LIFT_MUTATE ?? '';
 if (opt.slots && !(opt.temps && opt.windows)) throw new Error('--slots needs --temps and --windows');
 if (opt.loops && !(opt.temps && opt.windows)) throw new Error('--loop-guards needs --temps and --windows');
-if ((opt.two || opt.loops) && opt.epochs) throw new Error('--bounds=two and --loop-guards need the generation compare, not --epochs');
 if (opt.two && opt.identity) throw new Error('--bounds=two has no windows under --identity');
+const bindFile = [...flags].find((f) => f.startsWith('--bind='))?.slice(7);
+if ((opt.bindconst || opt.bindexit) && !bindFile) throw new Error('--bindconst and --bindexit need --bind=<count file>');
+if (bindFile && (opt.identity || opt.plainchk)) throw new Error('--bind has no checked accesses under --identity or --plainchk');
+const flatFile = [...flags].find((f) => f.startsWith('--flat='))?.slice(7);
+if (flatFile && (bindFile || opt.identity || opt.plainchk)) throw new Error('--flat has no checked accesses under --identity or --plainchk, and replaces --bind');
+if (flatFile && !opt.epochs) throw new Error('--flat needs --epochs (the mapping table is made again when kb_epoch has moved)');
+// the mapping each checked site saw in a --classes run of the same lift (same flags, so the site ids agree); a site that saw
+// two mappings, or a store site whose mapping is not writable, is left to its cache. Under --flat a table entry is a mapping
+// and what its sites do (load or store): a region finds the mapping again at run time from its first address
+const flat: { lo: bigint; span: bigint; st: number }[] = [];
+const bound = new Map<number, number>();
+const censusFile = bindFile ?? flatFile;
+if (censusFile) {
+	const text = readFileSync(censusFile, 'utf8');
+	const ends = new Map<string, { end: bigint; prot: number; bits: number }>();
+	for (const m of text.matchAll(/^katybug cls: kind 2 st \d start ([0-9a-f]+) end ([0-9a-f]+) prot (-?\d+) bits (\d+)/gm)) {
+		const end = BigInt(`0x${m[2]}`);
+		const had = ends.get(m[1]!);
+		if (!had || end > had.end) ends.set(m[1]!, { end, prot: Number(m[3]), bits: Number(m[4]) });
+	}
+	for (const m of text.matchAll(/^katybug site: id (\d+) kind 2 st (\d) w \d+ n \d+ page \d+ same \d+ multi 0 map ([0-9a-f]+)/gm)) {
+		const row = ends.get(m[3]!);
+		const st = Number(m[2]);
+		if (!row || (st && !(row.prot & 2))) continue;
+		// a site on a mapping that was in pieces, or a store to one that is executable too, never takes the table's fast path
+		if (flatFile && (row.bits !== 63 || (!st && !(row.prot & 3)) || (st && row.prot & 4))) continue;
+		const lo = BigInt(`0x${m[3]}`);
+		let k = flat.findIndex((f) => f.lo === lo && f.lo + f.span === row.end && (!flatFile || f.st === st));
+		if (k < 0) k = flat.push({ lo, span: row.end - lo, st }) - 1;
+		bound.set(Number(m[1]), k);
+	}
+	console.error(`--${flatFile ? 'flat' : 'bind'}: ${bound.size} checked sites in ${flat.length} mappings`);
+}
+// one number per load or store emitted, in emission order, with or without --classes or --bind
+let siteSeq = 0;
 const onlyFlag = [...flags].find((f) => f.startsWith('--only'));
-const only = onlyFlag === undefined ? undefined : Number(/^--only=([012])$/.exec(onlyFlag)?.[1] ?? NaN);
-if (only !== undefined && Number.isNaN(only)) throw new Error('--only takes 0, 1 or 2 (--only=1)');
-if (only === 1 && !opt.regs) throw new Error('--only=1 needs --regs');
-if (only === 2 && !opt.slots) throw new Error('--only=2 needs --slots');
+const globalOnly = onlyFlag === undefined ? undefined : Number(/^--only=([012])$/.exec(onlyFlag)?.[1] ?? NaN);
+// the form of the region being lifted: --only, or the dump's own `#<form>`
+let only = globalOnly;
+const checkForm = (f: number | undefined) => {
+	if (f !== undefined && Number.isNaN(f)) throw new Error('--only takes 0, 1 or 2 (--only=1)');
+	if (f === 1 && !opt.regs) throw new Error('--only=1 needs --regs');
+	if (f === 2 && !opt.slots) throw new Error('--only=2 needs --slots');
+};
+checkForm(globalOnly);
 const coverage = Number(coverageArg);
-type Ranges = [bigint, bigint][];
-const parseRanges = (text: string) => text.split(',').map((r) => r.split('-').map((v) => BigInt(v)) as [bigint, bigint]);
 // `--ranges=<lo>-<hi>,...` lifts the blocks that start in those code ranges (a function and its callees), however hot
 const globalRanges = [...flags].find((f) => f.startsWith('--ranges='))?.slice(9);
+// a dump of its own form reads <dump>#<0|1|2>[@<lo>-<hi>,...]: ELFs lifted into one table need not share one form
 const specs = dumps.map((d) => {
-	const [path = '', own] = d.split('@');
+	const [head = '', own] = d.split('@');
+	const [path = '', formText] = head.split('#');
+	const form = formText === undefined ? undefined : Number(/^[012]$/.test(formText) ? formText : NaN);
+	checkForm(form);
 	const text = own ?? globalRanges;
-	return { path, ranges: text ? parseRanges(text) : undefined };
+	return { path, form, ranges: text === undefined ? undefined : parseRanges(text) };
 });
-const inRanges = (ranges: Ranges, pc: bigint) => ranges.some(([lo, hi]) => pc >= lo && pc < hi);
-const root = new URL('../../../', import.meta.url).pathname;
-
-// the IR's op numbers, in kb.h's order
-const header = readFileSync(`${root}src/gmux/katybug/kb.h`, 'utf8');
-const opBody = header.match(/enum kb_op\s*\{([\s\S]*?)\};/)![1]!.replace(/\/\*[\s\S]*?\*\//g, '');
-const OPS = opBody
-	.split(',')
-	.map((s) => s.trim())
-	.filter(Boolean);
-const op = Object.fromEntries(OPS.map((name, i) => [name.replace(/^KB_/, ''), i])) as Record<string, number>;
-const opName = (o: number) => OPS[o]!.replace(/^KB_/, '');
-const KB_ZERO = 63;
-const KB_T0 = 32;
-const SP = 4; // rsp
-const SPAN = 16 * 255; // the memory plan's window (run.c plan_mem)
 // one piece of a mapping (kb.h KB_PIECE_BITS) is the widest window a resolve can cover; --bounds=<bytes> takes less
 const BIG = BigInt(opt.two ? 1 << 16 : ([...flags].find((f) => f.startsWith('--bounds='))?.slice(9) ?? 1 << 16));
-const MAX_WINDOWS = 8;
-const MAX_SLOTS = 12;
+const { windowsOf, accessesOf, group } = windowPlanner({ identity: opt.identity, bounds: opt.bounds, two: opt.two, big: BIG, mutate });
 
-interface Ins {
-	op: number;
-	w: number;
-	a: number;
-	b: number;
-	c: number;
-	imm: bigint;
-}
-interface Block {
-	pc: bigint;
-	next: bigint;
-	target: bigint;
-	runs: bigint;
-	ins: Ins[];
-	pcs?: number[];
-}
-
-function parse(path: string): Block[] {
-	const lines = readFileSync(path, 'utf8').split('\n');
-	const blocks: Block[] = [];
-	for (let i = 0; i < lines.length; i++) {
-		const m = lines[i]!.match(/^block (\w+) (\w+) (\w+) (\d+) (\d+)$/);
-		if (!m) continue;
-		const n = Number(m[4]);
-		const ins: Ins[] = [];
-		for (let k = 1; k <= n; k++) {
-			const f = lines[i + k]!.split(' ');
-			ins.push({ op: +f[0]!, w: +f[1]!, a: +f[2]!, b: +f[3]!, c: +f[4]!, imm: BigInt(f[5]!) });
-		}
-		i += n;
-		if ((lines[i + 1] ?? '').startsWith('exits')) i++;
-		// each op's guest instruction as an offset from the block's pc (the interpreter's side table)
-		let pcs: number[] | undefined;
-		if ((lines[i + 1] ?? '').startsWith('pcs ')) pcs = lines[++i]!.split(' ').slice(1).map((v) => Number(v) | 0);
-		blocks.push({ pc: BigInt(`0x${m[1]}`), next: BigInt(`0x${m[2]}`), target: BigInt(`0x${m[3]}`), runs: BigInt(m[5]!), ins, pcs });
-	}
-	return blocks;
-}
-
-// ops a region cannot run: AArch64-only state and traps stay with the interpreter
-const unliftable = new Set(['TRAP', 'WTRAP', 'WEXIT', 'CCMP', 'TPIDR', 'SETTP', 'CLOCK', 'CPUID', 'EXCL', 'PRIM', 'A64V'].map((n) => op[n]!));
-const liftable = (b: Block) => b.ins.every((x) => !unliftable.has(x.op));
 // a region's direct edges: inside it (a goto), leaving it (an exit to the interpreter), and the jumps through a register
 function edgeReport(dump: string, chosen: Block[], direct = 0) {
 	const starts = new Set(chosen.map((b) => b.pc));
@@ -186,437 +222,33 @@ function edgeReport(dump: string, chosen: Block[], direct = 0) {
 	console.error(`${dump}: region ${chosen.length} blocks, ${inside} direct edges inside, ${outside} leaving, ${indirect} jumps through a register, ${syscalls} syscalls${direct ? `, ${direct} of the leaving go straight into another region` : ''}`);
 }
 
-// the constant a block's final jump goes to (a MOVI into the jump's register just before), if it has one
-function constJump(b: Block) {
-	const last = b.ins.at(-1)!;
-	const before = b.ins.at(-2);
-	return opName(last.op) === 'JMP' && before && opName(before.op) === 'MOVI' && before.a === last.b ? BigInt.asUintN(64, before.imm) : undefined;
-}
-// the pcs a block can go to without a register: its branches and exits, its jump's constant, its fall-through
-function edgesOf(b: Block) {
-	const to: bigint[] = [];
-	for (const x of b.ins) {
-		const name = opName(x.op);
-		if (name === 'BR' || name === 'BRZ') to.push(b.target);
-		else if (name === 'EXIT') to.push(BigInt.asUintN(64, b.pc + BigInt.asIntN(32, x.imm >> 16n)));
-	}
-	const last = b.ins.at(-1)!;
-	if (opName(last.op) === 'JMP') {
-		const t = constJump(b);
-		if (t !== undefined) to.push(t);
-	} else if (opName(last.op) !== 'SYSCALL') to.push(b.next);
-	return to;
-}
-const hex = (v: bigint) => `0x${BigInt.asUintN(64, v).toString(16)}ull`;
-const imm64 = (v: bigint) => `(uint64_t) ${hex(v)}`;
-
-// the registers an op reads and writes, for the temporaries' liveness
-function rw(x: Ins): { r: number[]; w: number[] } {
-	const name = opName(x.op);
-	switch (name) {
-		case 'MOVI':
-		case 'CARRY':
-		case 'SETCC':
-		case 'FSBASE':
-			return { r: [], w: [x.a] };
-		case 'MOV':
-		case 'ZEXT':
-		case 'SEXT':
-		case 'BSWAP':
-		case 'CLZ':
-		case 'CTZ':
-		case 'POPCNT':
-		case 'LD':
-		case 'LDS':
-			return { r: [x.b], w: [x.a] };
-		case 'ADD':
-		case 'SUB':
-		case 'AND':
-		case 'OR':
-		case 'XOR':
-		case 'SHL':
-		case 'SHR':
-		case 'SAR':
-		case 'ROR':
-		case 'MUL':
-		case 'UMULH':
-		case 'SMULH':
-		case 'UDIV':
-		case 'SDIV':
-		case 'UREM':
-		case 'SREM':
-		case 'SEL':
-			return { r: [x.b, x.c], w: [x.a] };
-		case 'INS':
-			return { r: [x.a, x.b], w: [x.a] };
-		case 'X86SHD':
-			return { r: [x.a, x.b, x.c], w: [x.a] };
-		case 'ST':
-		case 'FLAGS':
-			return { r: name === 'ST' ? [x.a, x.b] : [x.a, x.b, x.c], w: [] };
-		case 'BRZ':
-			return { r: [x.a], w: [] };
-		case 'EXIT':
-			return { r: x.imm & 0x100n ? [x.a] : [], w: [] };
-		case 'JMP':
-		case 'X86MD':
-		case 'RESOLVE':
-		case 'SSE':
-		case 'X87':
-			return { r: [x.b], w: [] };
-		case 'X86FLAGS':
-			return x.imm === 0n ? { r: [], w: [x.a] } : x.imm === 1n ? { r: [x.a], w: [] } : { r: [], w: [] };
-		default:
-			return { r: [], w: [] };
-	}
-}
-const isTemp = (r: number) => r >= KB_T0 && r < KB_ZERO;
-
-// what an SSE, x87 or string helper reads and writes besides xmm, x87 and memory state (sse.c,
-// x87.c, run.c string): GPRs, the five flags and df. A register it may write is also spilled
-interface Touch {
-	r: number[];
-	w: number[];
-	flags: boolean;
-	df: boolean;
-}
-function touches(x: Ins): Touch {
-	const name = opName(x.op);
-	const mem = (x.c & 0x80) !== 0;
-	const t: Touch = { r: [], w: [], flags: false, df: false };
-	if (name === 'X86STR') {
-		t.r.push(1, 6, 7);
-		t.w.push(1, 6, 7);
-		if (x.imm === 1n) t.r.push(0);
-		t.df = true;
-		return t;
-	}
-	if (mem) t.r.push(x.b);
-	if (name === 'SSE') {
-		const code = Number(x.imm & 0xffn);
-		const pre = Number((x.imm >> 8n) & 0xffn);
-		if (!mem && [0x2a, 0x6e, 0xc4].includes(code)) t.r.push(x.c & 15);
-		if (!mem && code === 0x7e && pre === 0x66) t.w.push(x.c & 15);
-		if ([0x2c, 0x2d, 0x50, 0xc5, 0xd7].includes(code)) t.w.push(x.a & 15);
-		if (code === 0x2e || code === 0x2f) t.flags = true;
-	} else {
-		const op = Number((x.imm >> 8n) & 7n);
-		const modrm = Number(x.imm & 0xffn);
-		if (op === 7 && modrm === 0xe0) t.r.push(0), t.w.push(0);
-		if (!mem && (op === 2 || op === 3 || op === 7)) t.flags = true;
-	}
-	return t;
-}
-
-// #region flag liveness (--flags)
-const FK = header
-	.match(/enum kb_fk\s*\{([\s\S]*?)\};/)![1]!
-	.replace(/\/\*[\s\S]*?\*\//g, '')
-	.split(',')
-	.map((s) => s.trim().replace(/^KB_F_/, ''))
-	.filter(Boolean);
-const [FN, FZ, FC, FV, FP] = [1, 2, 4, 8, 16];
-const FALL = 31;
-// what aot_flags writes for a kind: may (some path writes it), def (every path does), use (reads it first)
-function kindFlags(kind: string) {
-	const w = (may: number, def = may, use = 0) => ({ may, def, use });
-	switch (kind) {
-		case 'INC':
-		case 'DEC':
-			return w(FN | FZ | FV | FP);
-		case 'ADC':
-		case 'SBB':
-			return w(FALL, FALL, FC);
-		case 'SHL':
-		case 'SHR':
-		case 'SAR':
-			return w(FALL, 0);
-		case 'ROL':
-		case 'ROR':
-			return w(FC | FV, 0);
-		case 'MULOV':
-			return w(FC | FV);
-		case 'NZCV':
-			return w(FN | FZ | FC | FV);
-		case 'SETC':
-			return w(FC);
-		case 'ZERO':
-			return w(FZ);
-		case 'CNT':
-			return w(FC | FZ);
-		default:
-			return w(FALL);
-	}
-}
-// the flags aot_cond reads
-function condReads(cond: number) {
-	if (cond < 16) return [FV, FC, FZ, FC | FZ, FN, FP, FN | FV, FZ | FN | FV][cond >> 1]!;
-	const k = cond - 16;
-	return k >= 14 ? 0 : [FZ, FC, FN, FV, FC | FZ, FN | FV, FZ | FN | FV][k >> 1]!;
-}
-// an op's effect on the five flags; all is a read of every flag (a helper, a syscall, or a fault point when `fault`)
-function flagEffect(x: Ins, fault: boolean) {
-	const e = { use: 0, def: 0, may: 0, all: false };
-	switch (opName(x.op)) {
-		case 'FLAGS':
-			return { ...e, ...kindFlags(FK[Number(x.imm)]!) };
-		case 'SETCC':
-		case 'SEL':
-			return { ...e, use: condReads(Number(x.imm)) };
-		case 'CARRY':
-			return { ...e, use: FC };
-		case 'X86SHD':
-			return { ...e, may: FALL };
-		case 'X86FLAGS':
-			if (x.imm === 0n) return { ...e, use: FALL };
-			if (x.imm === 1n) return { ...e, may: FALL, def: FALL };
-			if (x.imm === 2n) return { ...e, may: FC, def: FC, use: FC };
-			return x.imm <= 4n ? { ...e, may: FC, def: FC } : e;
-		case 'LD':
-		case 'LDS':
-		case 'ST':
-			return { ...e, all: fault };
-		case 'X86MD':
-		case 'SSE':
-		case 'X87':
-		case 'X86STR':
-		case 'SYSCALL':
-			return { ...e, all: true };
-		default:
-			return e;
-	}
-}
-// the FLAGS ops (as `block:op`) that write only flags no later op reads, over a region's blocks. `dump` holds every
-// block of the dump, for the exits that land on one
-function deadFlags(chosen: Block[], index: Map<bigint, number>, calls: Map<bigint, number>, dump: Map<bigint, Block>) {
-	const none = flagsMode === 'none';
-	const exitAll = none ? 0 : FALL;
-	// a block that writes all five flags before it reads any (a branch, a fault point or a helper first reads them)
-	const killsAll = (t: Block) => {
-		let def = 0;
-		for (const x of t.ins) {
-			if (['BR', 'BRZ', 'EXIT', 'JMP'].includes(opName(x.op))) return false;
-			const e = flagEffect(x, true);
-			if (e.use || e.all) return false;
-			def |= e.def;
-			if (def === FALL) return true;
-		}
-		return false;
-	};
-	const live = chosen.map(() => 0);
-	const edge = (to: bigint) => {
-		const k = index.get(to);
-		if (k !== undefined) return live[k]!;
-		if (calls.has(to)) return exitAll;
-		if (mutate === 'exitdead') return 0;
-		const t = dump.get(to);
-		return t && killsAll(t) ? 0 : exitAll;
-	};
-	const dead = new Set<string>();
-	// the flags live at the start of block j, recording the dead FLAGS ops when asked
-	const walk = (b: Block, j: number, record: boolean) => {
-		const lastName = opName(b.ins.at(-1)!.op);
-		let now = lastName === 'JMP' || lastName === 'SYSCALL' ? 0 : edge(b.next);
-		for (let i = b.ins.length - 1; i >= 0; i--) {
-			const x = b.ins[i]!;
-			const name = opName(x.op);
-			if (name === 'BR') now |= edge(b.target) | condReads(Number(x.imm));
-			else if (name === 'BRZ') now |= edge(b.target);
-			else if (name === 'EXIT') now |= edge(BigInt.asUintN(64, b.pc + BigInt.asIntN(32, x.imm >> 16n))) | (x.imm & 0x100n ? 0 : condReads(Number(x.imm & 0xffn)));
-			else if (name === 'JMP') {
-				const k = constJump(b);
-				now = k !== undefined ? edge(k) : mutate === 'exitdead' ? 0 : exitAll;
-			} else {
-				const e = flagEffect(x, !opt.identity && mutate !== 'faultdead');
-				if (name === 'FLAGS' && !(e.may & now)) {
-					if (record) dead.add(`${j}:${i}`);
-					continue;
-				}
-				now = (now & ~e.def) | e.use | (e.all ? exitAll : 0);
-			}
-		}
-		return now;
-	};
-	for (let changed = true; changed; ) {
-		changed = false;
-		for (let j = chosen.length - 1; j >= 0; j--) {
-			const v = live[j]! | walk(chosen[j]!, j, false);
-			if (v !== live[j]) {
-				live[j] = v;
-				changed = true;
-			}
-		}
-	}
-	chosen.forEach((b, j) => walk(b, j, true));
-	return dead;
-}
-// #endregion
-
-// the entry-relative windows of a block: accesses whose base is a register's entry value or a
-// constant, plus an offset, grouped into spans the memory plan's size, at most MAX_WINDOWS
-interface Win {
-	root: number; // register, or -1 for a constant address
-	lo: bigint;
-	hi: bigint;
-	// --bounds=two: wider than the memory plan's span, so it may cross one piece boundary and holds two resolved pieces
-	two?: boolean;
-	// the window's first inline cache in the region's window array (a two-piece window takes the next one as well)
-	ic?: number;
-}
-interface Hit {
-	win: number;
-	off: bigint;
-	// the address is a base plus an index with a bound, so the access is at the window plus its own distance from the window's start
-	dyn: boolean;
-	// a loop window (--loop-guards): resolved when its loop is entered, not at the block's entry
-	loop?: boolean;
-}
-interface Acc {
-	i: number;
-	root: number;
-	off: bigint;
-	hi: bigint;
-	w: number;
-}
-// `slots` leaves out the stores and the rsp-based accesses, which the block's frame window serves; `skip` the accesses a loop window serves
-function windowsOf(b: Block, slots = false, skip?: ReadonlySet<number>): { wins: Win[]; hits: Map<number, Hit>; hard: boolean[] } {
-	if (opt.identity) return { wins: [], hits: new Map(), hard: [] };
-	return group(accessesOf(b, slots).filter((a) => !skip?.has(a.i)));
-}
-function accessesOf(b: Block, slots: boolean): Acc[] {
-	return follow(b.ins, op, opt.bounds)
-		.filter((f) => !(slots && (f.store || f.root === SP)) && (f.hi === f.lo || f.hi - f.lo + BigInt(f.w) <= BIG))
-		.map((f) => ({ i: f.i, root: f.root, off: f.lo, hi: f.hi, w: f.w }));
-}
-// the accesses grouped into windows of at most the memory plan's span (an indexed access wider than that is a window of its own)
-function group(acc: Acc[]): { wins: Win[]; hits: Map<number, Hit>; hard: boolean[] } {
-	const wins: Win[] = [];
-	const hits = new Map<number, Hit>();
-	const hard: boolean[] = [];
-	const roots = [...new Set(acc.map((a) => a.root))];
-	const found: { win: Win; list: typeof acc }[] = [];
-	for (const rt of roots) {
-		const list = acc.filter((a) => a.root === rt).sort((p, q) => (p.off < q.off ? -1 : p.off > q.off ? 1 : 0));
-		for (let s = 0; s < list.length; ) {
-			let e = s + 1;
-			let hi = list[s]!.hi + BigInt(list[s]!.w);
-			// an access with an index bound wider than the span is a window of its own
-			while (e < list.length) {
-				const end = list[e]!.hi + BigInt(list[e]!.w);
-				if (Number((end > hi ? end : hi) - list[s]!.off) > SPAN) break;
-				if (end > hi) hi = end;
-				e++;
-			}
-			found.push({ win: { root: rt, lo: list[s]!.off, hi }, list: list.slice(s, e) });
-			s = e;
-		}
-	}
-	found.sort((p, q) => q.list.length - p.list.length);
-	for (const f of found.slice(0, MAX_WINDOWS)) {
-		const idx = f.list.filter((a) => a.hi > a.off);
-		if (opt.two && f.win.hi - f.win.lo > BigInt(SPAN)) f.win.two = true;
-		// the mutants move the end of an indexed window by one element: short is unsound, long only costs a resolve
-		if (idx.length && mutate === 'shortwindow') f.win.hi -= BigInt(idx[0]!.w);
-		if (idx.length && mutate === 'longwindow') f.win.hi += BigInt(idx[0]!.w);
-		wins.push(f.win);
-		// a window with only indexed accesses falls back access by access, so one that does not resolve leaves the others be
-		hard.push(f.list.some((a) => a.hi === a.off));
-		for (const a of f.list) hits.set(a.i, { win: wins.length - 1, off: a.off - f.win.lo, dyn: a.hi > a.off });
-	}
-	return { wins, hits, hard };
-}
-
-// #region loops (--loop-guards)
-// the strongly connected sets of `nodes` over succ, each with its members
-function sccs(nodes: number[], succ: number[][]): number[][] {
-	const member = new Set(nodes);
-	const idx = new Map<number, number>();
-	const low = new Map<number, number>();
-	const onStack = new Set<number>();
-	const stack: number[] = [];
-	const out: number[][] = [];
-	let counter = 0;
-	const visit = (v: number) => {
-		idx.set(v, counter);
-		low.set(v, counter++);
-		stack.push(v);
-		onStack.add(v);
-	};
-	for (const root of nodes) {
-		if (idx.has(root)) continue;
-		visit(root);
-		const work: [number, number][] = [[root, 0]];
-		while (work.length) {
-			const top = work[work.length - 1]!;
-			const v = top[0];
-			const edges = succ[v]!;
-			if (top[1] < edges.length) {
-				const w = edges[top[1]++]!;
-				if (!member.has(w)) continue;
-				if (!idx.has(w)) {
-					visit(w);
-					work.push([w, 0]);
-				} else if (onStack.has(w)) low.set(v, Math.min(low.get(v)!, idx.get(w)!));
-				continue;
-			}
-			work.pop();
-			if (work.length) {
-				const p = work[work.length - 1]![0];
-				low.set(p, Math.min(low.get(p)!, low.get(v)!));
-			}
-			if (low.get(v) !== idx.get(v)) continue;
-			const comp: number[] = [];
-			let w: number;
-			do {
-				w = stack.pop()!;
-				onStack.delete(w);
-				comp.push(w);
-			} while (w !== v);
-			out.push(comp);
-		}
-	}
-	return out;
-}
-interface Loop {
-	id: number;
-	// every block of the strongly connected set, the blocks of the loops inside it included
-	blocks: Set<number>;
-	parent: number; // the loop around it, -1 for none
-}
-// each cyclic strongly connected set of the region's blocks is a loop; the cycles left once its header (the member entered
-// from outside the most) is taken out are the loops inside it. `of` is each block's innermost loop, -1 for none
-function findLoops(succ: number[][], runs: bigint[]): { loops: Loop[]; of: number[] } {
-	const loops: Loop[] = [];
-	const of = succ.map(() => -1);
-	const preds = succ.map(() => [] as number[]);
-	succ.forEach((to, j) => to.forEach((k) => preds[k]!.push(j)));
-	const decompose = (nodes: number[], parent: number) => {
-		for (const comp of sccs(nodes, succ)) {
-			if (comp.length === 1 && !succ[comp[0]!]!.includes(comp[0]!)) continue;
-			const id = loops.length;
-			const set = new Set(comp);
-			loops.push({ id, blocks: set, parent });
-			for (const j of comp) of[j] = id;
-			let header = comp[0]!;
-			let best = -1n;
-			for (const j of comp) {
-				const outside = preds[j]!.filter((p) => !set.has(p)).length;
-				const score = BigInt(outside) * (1n << 62n) + runs[j]!;
-				if (score > best) {
-					best = score;
-					header = j;
-				}
-			}
-			decompose(comp.filter((j) => j !== header), id);
-		}
-	};
-	decompose(succ.map((_, j) => j), -1);
-	return { loops, of };
-}
-// #endregion
-
-const lines: string[] = [...(opt.epochs ? ['#define AOT_EPOCHS 1'] : []), '#include <string.h>', '#include "aot.h"', ''];
-const table: { pc: bigint; next: bigint; target: bigint; n: number; region: number; idx: number; name: string }[] = [];
+// --bind: the mappings' bounds sit in a table filled at start up, so a region loads them as it is entered and the compiler
+// cannot fold them into the code
+const flatTable = bindFile && !opt.bindconst && flat.length
+	? [`static uint64_t aot_flat[${flat.length}][2];`, '__attribute__((constructor)) static void aot_flat_init(void) {', ...flat.map((f, k) => `\taot_flat[${k}][0] = ${hex(f.lo)}; aot_flat[${k}][1] = ${hex(f.span)};`), '}', '']
+	: [];
+// --flat: the mappings are found again from their first address when the mapping generation has moved since the table was
+// made (a region's epoch slow path calls this, so a region that is entered finds the table current); lim 0 gives no fast path
+// LIFT_MUTATE=flatrights asks for read rights for a store's mapping, noflatsync makes the table again only while an entry is empty
+const flatSync = flatFile && flat.length
+	? [
+			`static const uint64_t aot_fhint[${flat.length}][2] = {${flat.map((f) => `{${hex(f.lo)}, ${f.st && mutate !== 'flatrights' ? 'KB_W' : 'KB_R'}}`).join(', ')}};`,
+			`static struct { uint64_t lo, lim; uint8_t* host; } aot_flat[${flat.length}];`,
+			'static uint32_t aot_flat_mg;',
+			'static int aot_flat_ok;',
+			'static void aot_flat_sync(struct kb_cpu* cpu) {',
+			`\tif (__builtin_expect(${mutate === 'noflatsync' ? `${flat.map((_, k) => `aot_flat[${k}].lim == 0`).join(' || ')} || ` : 'aot_flat_mg != cpu->mapgen || '}!aot_flat_ok, 0)) {`,
+			'\t\tAOT_STAT(flat_sync, 1);',
+			`\t\tfor (int k = 0; k < ${flat.length}; k++) kb_flat_open(cpu, aot_fhint[k][0], (int) aot_fhint[k][1], &aot_flat[k].lo, &aot_flat[k].lim, &aot_flat[k].host);`,
+			'\t\taot_flat_ok = 1;',
+			'\t\taot_flat_mg = cpu->mapgen;',
+			'\t}',
+			'}',
+			''
+		]
+	: [];
+const lines: string[] = [...(opt.epochs ? ['#define AOT_EPOCHS 1'] : []), '#include <string.h>', '#include "aot.h"', '', ...flatTable, ...flatSync];
+const table: { pc: bigint; next: bigint; target: bigint; n: number; region: number; idx: number; name: string; pcs: string }[] = [];
 const regionNames: string[] = [];
 const regionSizes: number[] = [];
 const regionSlotted: boolean[] = [];
@@ -624,42 +256,31 @@ let irIns = 0;
 let windowCount = 0;
 
 // each region's blocks, chosen before any is lifted so a call can name the region it enters
-const selected = specs.map(({ path, ranges }) => {
-	const all = parse(path);
-	const weight = (b: Block) => b.runs * BigInt(b.ins.length);
-	const total = all.reduce((s, b) => s + weight(b), 0n);
-	const sorted = [...all].sort((x, y) => (weight(y) > weight(x) ? 1 : weight(y) < weight(x) ? -1 : 0));
-	const chosen: Block[] = [];
-	let covered = 0n;
-	for (const b of sorted) {
-		if (ranges ? !inRanges(ranges, b.pc) : Number(covered) >= coverage * Number(total)) {
-			if (ranges) continue;
-			break;
-		}
-		if (!liftable(b)) continue;
-		chosen.push(b);
-		covered += weight(b);
-	}
-	return { all, chosen, share: Number(covered) / Number(total) };
-});
+const selected = specs.map(({ path, ranges }) => selectBlocks(path, ranges, coverage));
 
 // a region of no blocks (a function the run never reached) is dropped unless it is the only one
 const keep = (_: unknown, r: number) => selected[r]!.chosen.length > 0 || specs.length === 1;
 const live = specs.filter(keep);
 const picked = selected.filter(keep);
+// a build holds one form of every region or every form of every region: aot_run points at a region's only body
+const formOf = (r: number) => live[r]!.form ?? globalOnly;
+const oneForm = live.every((_, r) => formOf(r) !== undefined);
+if (!oneForm && live.some((_, r) => formOf(r) !== undefined)) throw new Error('a dump with its own form needs every dump to have one (or --only)');
 
 // direct calls: an edge from a block to a block of another region that has no syscall (a syscall can fork or switch
 // threads, and needs every register in the cpu) runs that region inline, from that block to wherever it leaves. An
 // edge that would close a cycle between regions leaves instead, so each callee is emitted before its callers
-const owner = new Map<bigint, number>();
-picked.forEach((p, r) => p.chosen.forEach((b) => owner.has(b.pc) || owner.set(b.pc, r)));
+// a pc names a block of its own dump's program only: dumps of other programs in the same table reuse the addresses
+const owner = new Map<string, number>();
+const ownerKey = (r: number, pc: bigint) => `${live[r]!.path} ${pc}`;
+picked.forEach((p, r) => p.chosen.forEach((b) => owner.has(ownerKey(r, b.pc)) || owner.set(ownerKey(r, b.pc), r)));
 const noSyscall = picked.map((p) => p.chosen.every((b) => b.ins.every((x) => opName(x.op) !== 'SYSCALL')));
 const calleesOf = picked.map((p, r) => {
 	const out = new Map<bigint, number>();
 	if (opt.calls)
 		for (const b of p.chosen)
 			for (const t of edgesOf(b)) {
-				const to = owner.get(t);
+				const to = owner.get(ownerKey(r, t));
 				if (to !== undefined && to !== r && noSyscall[to]) out.set(t, to);
 			}
 	return out;
@@ -681,6 +302,7 @@ const called = new Set([...calleesOf].flatMap((m) => [...m.values()]));
 const info: { name: string; regList: number[]; index: Map<bigint, number>; slotted: boolean }[] = [];
 
 order.forEach((region) => {
+	only = formOf(region);
 	const dump = live[region]!.path;
 	const { all, chosen, share } = picked[region]!;
 	const ranges = live[region]!.ranges;
@@ -692,7 +314,7 @@ order.forEach((region) => {
 	regionNames[region] = `${R}_run`;
 	regionSizes[region] = chosen.length;
 	const index = new Map(chosen.map((b, j) => [b.pc, j]));
-	const dead = flagsMode === 'all' ? new Set<string>() : deadFlags(chosen, index, calls, new Map(all.map((b) => [b.pc, b])));
+	const dead = flagsMode === 'all' ? new Set<string>() : deadFlags(chosen, index, calls, new Map(all.map((b) => [b.pc, b])), { mode: flagsMode, mutate, identity: opt.identity });
 	if (flagsMode !== 'all') console.error(`${dump}: --flags=${flagsMode} drops ${dead.size} of ${chosen.reduce((n, b) => n + b.ins.filter((x) => opName(x.op) === 'FLAGS').length, 0)} flag writes`);
 	const arch =/^arch (\d+)$/m.exec(readFileSync(dump, 'utf8'));
 	const found = opt.slots && (only === undefined || only === 2) && (!arch || arch[1] === '0') ? analyze(chosen, index, { name: opName, rw, sp: SP, zero: KB_ZERO, span: SPAN, maxSlots: MAX_SLOTS }) : undefined;
@@ -701,41 +323,17 @@ order.forEach((region) => {
 		const loads = plan.slots.length;
 		console.error(`${dump}: ${plan.promoted.filter(Boolean).length} blocks in ${plan.wins.length} frames, ${loads} slots, windows ${plan.wins.map((w) => w.hi - w.lo).join(' ')} bytes`);
 	}
-	// the fields that name registers: SSE and x87 carry an xmm index and a memory marker in a and c,
-	// and string ops read theirs through the cpu after the spill
-	const registerFields = (x: Ins) => {
-		const name = opName(x.op);
-		if (name === 'SSE' || name === 'X87') return [x.b];
-		if (name === 'X86STR' || name === 'PC' || name === 'SYSCALL') return [];
-		// an access's c and a resolve's a are memory-plan groups
-		if (name === 'LD' || name === 'LDS' || name === 'ST') return [x.a, x.b];
-		if (name === 'RESOLVE') return [x.b];
-		return [x.a, x.b, x.c];
-	};
-	const regs = new Set<number>([0, 2]);
-	for (const b of chosen) for (const x of b.ins) for (const r of registerFields(x)) if (r !== KB_ZERO) regs.add(r);
 	// a region that can be called or that calls holds every register a helper reads or writes and every register of
 	// its callees, so a register is never in the cpu on one side of a call and in a local on the other
+	const regs = regionRegs(chosen, opt.calls);
 	const callee = new Set(calls.values());
-	if (opt.calls)
-		for (const b of chosen)
-			for (const x of b.ins) if (['SSE', 'X87', 'X86STR'].includes(opName(x.op))) for (const r of [...touches(x).r, ...touches(x).w]) regs.add(r);
 	const extraCross = new Set<number>();
 	for (const c of callee)
 		for (const r of info[c]!.regList) {
 			regs.add(r);
 			extraCross.add(r);
 		}
-	// a temporary read before it is written in a block lives across blocks and stays region state
-	const liveIn = new Set<number>();
-	for (const b of chosen) {
-		const written = new Set<number>();
-		for (const x of b.ins) {
-			const { r, w } = rw(x);
-			for (const t of r) if (isTemp(t) && t !== 62 && !written.has(t)) liveIn.add(t);
-			for (const t of w) written.add(t);
-		}
-	}
+	const liveIn = liveInTemps(chosen);
 	if (liveIn.size) console.error(`${dump}: temporaries live across blocks: ${[...liveIn].join(' ')}`);
 	const cross = (r: number) => !opt.temps || !isTemp(r) || liveIn.has(r) || extraCross.has(r);
 	const reg = (r: number) => (r === KB_ZERO ? '(uint64_t) 0' : `g${r}`);
@@ -745,14 +343,18 @@ order.forEach((region) => {
 	// the window array's index of each window of a block's fast body
 	const winBase = new Map<number, number[]>();
 	// the statements that resolve a window into its variables (a two-piece one through aot_open2)
+	// a window that serves a store resolves for writing, one that only loads for reading (the mutant `storeread` resolves
+	// a store window for reading)
+	const rights = (store: boolean) => (store && mutate !== 'storeread' ? 'KB_W' : 'KB_R');
 	const open = (w: Win, v: { w: string; va: string; x: string; bd: string }, ic: number, setVa: boolean) => {
 		const len = Number(w.hi - w.lo);
 		const at = w.root < 0 ? hex(w.lo) : `${reg(w.root)} + ${imm64(w.lo)}`;
+		const acc = rights(!!w.store);
 		if (w.two)
-			return [`\t{ uint64_t va = ${at}; ${v.va} = va; ${v.w} = aot_open2(cpu, &${R}_win[${ic}], &${R}_win[${ic + 1}], gen, va, ${len}u, &${v.x}, &${v.bd}); }`];
+			return [`\t{ uint64_t va = ${at}; ${v.va} = va; ${v.w} = aot_open2(cpu, &${R}_win[${ic}], &${R}_win[${ic + 1}], ${opt.epochs ? '0' : 'gen'}, va, ${len}u, ${acc}, &${v.x}, &${v.bd}); }`];
 		return [
 			`\t{ uint64_t va = ${at}; struct kb_ic* q = &${R}_win[${ic}];${setVa ? ` ${v.va} = va;` : ''}`,
-			`\t  ${v.w} = ${G}${len}u <= q->span && va - q->lo <= q->span - ${len}u ? q->host + (va - q->lo) : kb_host_ic(cpu, q, va, ${len}u); }`
+			`\t  ${v.w} = ${G}${len}u <= q->span && va - q->lo <= q->span - ${len}u ? q->host + (va - q->lo) : kb_host_ic_at(cpu, q, va, ${len}u, ${acc}); }`
 		];
 	};
 	// #region loops (--loop-guards)
@@ -960,7 +562,50 @@ order.forEach((region) => {
 			return `${loop}AOT_WINCHK(${B} + ${imm64(x.imm)} - ${nm(h)}va${h.win}, ${Number(w.hi - w.lo) - x.w}u); `;
 		};
 		const soft = (h: Hit) => !!h.loop || (h.dyn && !pin.hard[h.win]);
-		const hitStat = (h: Hit) => ['\tAOT_STAT(win_acc, 1);', ...(h.dyn ? ['\tAOT_STAT(win_idx, 1);'] : [])];
+		// --classes: each access reports its kind (0 window, 1 group, 2 checked, 3 slot in a local, 4 frame window), store or load, address and width to aot.h's AOT_CLS
+		const cls = (site: number, kind: number, st: number, va: string, w: number) => (opt.classes ? `\tAOT_CLS(${site}, ${kind}, ${st}, ${va}, ${w});` : '');
+		const hitStat = (site: number, h: Hit, st = 0, va = '0', w = 0) => ['\tAOT_STAT(win_acc, 1);', ...(h.dyn ? ['\tAOT_STAT(win_idx, 1);'] : []), ...(opt.classes ? [cls(site, 0, st, va, w)] : [])];
+		// --bind: a checked access at a bound site tests its address against its mapping's bounds first, in locals the region
+		// loaded when it was entered (flo, fsp, fh), or as constants under --bindconst; a miss takes the site's cache as before
+		const flatOf = (site: number) => {
+			const k = bound.get(site);
+			if (k === undefined) return undefined;
+			const f = flat[k]!;
+			const t = opt.bindconst ? { lo: hex(f.lo), sp: hex(f.span), h: `AOT_HOST(${hex(f.lo)})` } : { lo: `flo${k}`, sp: `fsp${k}`, h: `fh${k}` };
+			// --flat: sp is how many bytes an access may start in (16 less than the mapping), so one compare and no width
+			// LIFT_MUTATE=flatlow32 compares the low 32 bits of the distance alone, so an address 4 GiB above the mapping hits it
+			const dist = mutate === 'flatlow32' ? `(uint32_t) (va - ${t.lo})` : `va - ${t.lo}`;
+			return { ...t, in: (W: number) => (flatFile ? `${dist} < ${t.sp}` : `va - ${t.lo} <= ${t.sp} - ${W}`), hit: flatFile ? 'AOT_STAT(flat_hit, 1); ' : '' };
+		};
+		// the checked copy of a load or store, closed by `close` on its last line
+		const loadChk = (site: number, W: number, D: string, v: string, close: string) => {
+			const f = flatOf(site);
+			const head = `\t  AOT_STAT(chk_acc, 1);${cls(site, 2, 0, 'va', W)}`;
+			if (f && opt.bindexit) return [head, `\t  if (__builtin_expect(${f.in(W)}, 1)) memcpy(&v, ${f.h} + (va - ${f.lo}), ${W}); else ${fault()}`, `\t  ${D} = ${v}; ${close}`];
+			return [
+				head,
+				...(f
+					? [
+							'\t  int slow = 0;',
+							`\t  if (__builtin_expect(${f.in(W)}, 1)) { ${f.hit}memcpy(&v, ${f.h} + (va - ${f.lo}), ${W}); }`,
+							`\t  else { slow = AOT_SLOW(q, gen, va, ${W}); if (slow) v = kb_load_ic(cpu, q, va, ${W}); else memcpy(&v, q->host + (va - q->lo), ${W}); }`
+						]
+					: [`\t  int slow = __builtin_expect(AOT_SLOW(q, gen, va, ${W}), 0);`, `\t  if (slow) v = kb_load_ic(cpu, q, va, ${W}); else memcpy(&v, q->host + (va - q->lo), ${W});`]),
+				`\t  ${D} = ${v};`,
+				`\t  if (slow && cpu->fault) ${fault()} ${close}`
+			];
+		};
+		const storeChk = (site: number, W: number, close: string) => {
+			const f = flatOf(site);
+			const head = `\t  AOT_STAT(chk_acc, 1);${cls(site, 2, 1, 'va', W)}`;
+			if (f && opt.bindexit) return [head, `\t  if (__builtin_expect(${f.in(W)}, 1)) memcpy(${f.h} + (va - ${f.lo}), &v, ${W}); else ${fault()} ${close}`];
+			const miss = `if (__builtin_expect(AOT_SLOW(q, gen, va, ${W}), 0)) { kb_store_ic(cpu, q, va, v, ${W}); if (cpu->fault) ${fault()} }`;
+			return [
+				head,
+				...(f ? [`\t  if (__builtin_expect(${f.in(W)}, 1)) { ${f.hit}memcpy(${f.h} + (va - ${f.lo}), &v, ${W}); }`, `\t  else ${miss}`] : [`\t  ${miss}`]),
+				`\t  else memcpy(q->host + (va - q->lo), &v, ${W}); ${close}`
+			];
+		};
 		const revalidate = () => {
 			if (!loops || mutate === 'noreval') return [];
 			const ids = loopIds(loops, j);
@@ -1003,29 +648,29 @@ order.forEach((region) => {
 				const sl = c?.t === 'slot' ? plan!.slots[c.slot]! : undefined;
 				const ext = (v: string) => (name === 'LDS' ? `(uint64_t) aot_sext(${v}, ${W})` : v);
 				if (name !== 'ST' && sl) {
-					if (V.has(sl.id)) body.push(`\t${D} = ${ext(`s${sl.id}`)};`, ...cnt('AOT_C_SLOT', 0), '\tAOT_STAT(win_acc, 1);');
+					if (V.has(sl.id)) body.push(`\t${D} = ${ext(`s${sl.id}`)};`, ...cnt('AOT_C_SLOT', 0), '\tAOT_STAT(win_acc, 1);', ...(opt.classes ? [cls(65535, 3, 0, `fl + ${sl.off - lo}`, W)] : []));
 					else {
-						body.push(`\t{ uint64_t v = 0; memcpy(&v, wf + ${sl.off - lo}, ${W}); s${sl.id} = v; ${D} = ${ext('v')}; }`, ...cnt('AOT_C_MEM', 0), '\tAOT_STAT(win_acc, 1);');
+						body.push(`\t{ uint64_t v = 0; memcpy(&v, wf + ${sl.off - lo}, ${W}); s${sl.id} = v; ${D} = ${ext('v')}; }`, ...cnt('AOT_C_MEM', 0), '\tAOT_STAT(win_acc, 1);', ...(opt.classes ? [cls(65535, 4, 0, `fl + ${sl.off - lo}`, W)] : []));
 						V.add(sl.id);
 					}
 					m++;
 					return;
 				}
 				if (name !== 'ST' && c?.t === 'win') {
-					body.push(`\t{ uint64_t v = 0; memcpy(&v, wf + ${c.off - lo}, ${W}); ${D} = ${ext('v')}; }`, ...cnt('AOT_C_MEM', 0), '\tAOT_STAT(win_acc, 1);');
+					body.push(`\t{ uint64_t v = 0; memcpy(&v, wf + ${c.off - lo}, ${W}); ${D} = ${ext('v')}; }`, ...cnt('AOT_C_MEM', 0), '\tAOT_STAT(win_acc, 1);', ...(opt.classes ? [cls(65535, 4, 0, `fl + ${c.off - lo}`, W)] : []));
 					m++;
 					return;
 				}
 				if (name === 'ST' && sl) {
 					const write = mutate === 'nowrite' ? '' : `memcpy(wf + ${sl.off - lo}, &v, ${W}); `;
-					body.push(`\t{ uint64_t v = ${A} & aot_mask(${W}); ${write}s${sl.id} = v; }`, ...cnt('AOT_C_SLOT', 1), '\tAOT_STAT(win_acc, 1);');
+					body.push(`\t{ uint64_t v = ${A} & aot_mask(${W}); ${write}s${sl.id} = v; }`, ...cnt('AOT_C_SLOT', 1), '\tAOT_STAT(win_acc, 1);', ...(opt.classes ? [cls(65535, 4, 1, `fl + ${sl.off - lo}`, W)] : []));
 					kill(plan!.overlapping(plan!.comp[j]!, sl.off, sl.w));
 					V.add(sl.id);
 					m++;
 					return;
 				}
 				if (name === 'ST' && c?.t === 'win') {
-					body.push(`\t{ uint64_t v = ${A}; memcpy(wf + ${c.off - lo}, &v, ${W}); }`, ...cnt('AOT_C_MEM', 1), '\tAOT_STAT(win_acc, 1);');
+					body.push(`\t{ uint64_t v = ${A}; memcpy(wf + ${c.off - lo}, &v, ${W}); }`, ...cnt('AOT_C_MEM', 1), '\tAOT_STAT(win_acc, 1);', ...(opt.classes ? [cls(65535, 4, 1, `fl + ${c.off - lo}`, W)] : []));
 					kill(plan!.overlapping(plan!.comp[j]!, c.off, W));
 					m++;
 					return;
@@ -1065,6 +710,7 @@ order.forEach((region) => {
 				case 'LD':
 				case 'LDS': {
 					const v = name === 'LDS' ? `(uint64_t) aot_sext(v, ${W})` : 'v';
+					const site = siteSeq++;
 					if (opt.identity) {
 						body.push(`\t{ uint64_t v = 0; memcpy(&v, AOT_HOST(${B} + ${imm64(x.imm)}), ${W}); ${D} = ${v}; }`);
 						m++;
@@ -1074,18 +720,19 @@ order.forEach((region) => {
 					if (hit && soft(hit)) {
 						body.push(
 							`\t{ uint64_t va = ${B} + ${imm64(x.imm)}, v = 0; struct kb_ic* q = &ic[${m}];${pick(hit, W)}`,
-							`\t  if (__builtin_expect(${have(hit)}, 1)) { ${hitCheck(hit, B, x)}memcpy(&v, ${hitAt(hit, B, x)}, ${W}); ${D} = ${v}; ${hitStat(hit).join(' ').replace(/\t/g, '')} } else {`,
-							'\t  AOT_STAT(chk_acc, 1);',
-							`\t  int slow = __builtin_expect(AOT_SLOW(q, gen, va, ${W}), 0);`,
-							`\t  if (slow) v = kb_load_ic(cpu, q, va, ${W}); else memcpy(&v, q->host + (va - q->lo), ${W});`,
-							`\t  ${D} = ${v};`,
-							`\t  if (slow && cpu->fault) ${fault()} } }`
+							`\t  if (__builtin_expect(${have(hit)}, 1)) { ${hitCheck(hit, B, x)}memcpy(&v, ${hitAt(hit, B, x)}, ${W}); ${D} = ${v}; ${hitStat(site, hit, 0, 'va', W).join(' ').replace(/\t/g, '')} } else {`,
+							...(opt.plainchk ? [`\t  memcpy(&v, AOT_HOST(va), ${W}); ${D} = ${v}; } }`] : loadChk(site, W, D, v, '} }'))
 						);
 						m++;
 						break;
 					}
 					if (hit) {
-						body.push(`\t{ uint64_t v = 0; ${hitCheck(hit, B, x)}memcpy(&v, ${hitAt(hit, B, x)}, ${W}); ${D} = ${v}; }`, ...hitStat(hit));
+						body.push(`\t{ uint64_t v = 0; ${hitCheck(hit, B, x)}memcpy(&v, ${hitAt(hit, B, x)}, ${W}); ${D} = ${v}; }`, ...hitStat(site, hit, 0, `${B} + ${imm64(x.imm)}`, W));
+						m++;
+						break;
+					}
+					if (opt.plainchk) {
+						body.push(`\t{ uint64_t v = 0; memcpy(&v, AOT_HOST(${B} + ${imm64(x.imm)}), ${W}); ${D} = ${v}; }`);
 						m++;
 						break;
 					}
@@ -1095,17 +742,14 @@ order.forEach((region) => {
 					// the interpreter writes a faulting load's destination before it checks, and so does this
 					body.push(
 						`\t{ uint64_t va = ${B} + ${imm64(x.imm)}, v = 0; struct kb_ic* q = &ic[${m}];`,
-						...(gr ? [`\t  if (gh[${g}]) { AOT_STAT(grp_acc, 1); memcpy(&v, gh[${g}] + (va - gva[${g}]), ${W}); ${D} = ${v}; } else {`] : []),
-							'\t  AOT_STAT(chk_acc, 1);',
-						`\t  int slow = __builtin_expect(AOT_SLOW(q, gen, va, ${W}), 0);`,
-						`\t  if (slow) v = kb_load_ic(cpu, q, va, ${W}); else memcpy(&v, q->host + (va - q->lo), ${W});`,
-						`\t  ${D} = ${v};`,
-						`\t  if (slow && cpu->fault) ${fault()} ${gr ? '} ' : ''}}`
+						...(gr ? [`\t  if (gh[${g}]) { AOT_STAT(grp_acc, 1);${cls(site, 1, 0, 'va', W)} memcpy(&v, gh[${g}] + (va - gva[${g}]), ${W}); ${D} = ${v}; } else {`] : []),
+						...loadChk(site, W, D, v, `${gr ? '} ' : ''}}`)
 					);
 					m++;
 					break;
 				}
 				case 'ST': {
+					const site = siteSeq++;
 					if (opt.identity) {
 						body.push(`\t{ uint64_t v = ${A}; memcpy(AOT_HOST(${B} + ${imm64(x.imm)}), &v, ${W}); }`);
 						m++;
@@ -1115,16 +759,19 @@ order.forEach((region) => {
 					if (hit && soft(hit)) {
 						body.push(
 							`\t{ uint64_t va = ${B} + ${imm64(x.imm)}, v = ${A}; struct kb_ic* q = &ic[${m}];${pick(hit, W)}`,
-							`\t  if (__builtin_expect(${have(hit)}, 1)) { ${hitCheck(hit, B, x)}memcpy(${hitAt(hit, B, x)}, &v, ${W}); ${hitStat(hit).join(' ').replace(/\t/g, '')} } else {`,
-							'\t  AOT_STAT(chk_acc, 1);',
-							`\t  if (__builtin_expect(AOT_SLOW(q, gen, va, ${W}), 0)) { kb_store_ic(cpu, q, va, v, ${W}); if (cpu->fault) ${fault()} }`,
-							`\t  else memcpy(q->host + (va - q->lo), &v, ${W}); } }`
+							`\t  if (__builtin_expect(${have(hit)}, 1)) { ${hitCheck(hit, B, x)}memcpy(${hitAt(hit, B, x)}, &v, ${W}); ${hitStat(site, hit, 1, 'va', W).join(' ').replace(/\t/g, '')} } else {`,
+							...(opt.plainchk ? [`\t  memcpy(AOT_HOST(va), &v, ${W}); } }`] : storeChk(site, W, '} }'))
 						);
 						m++;
 						break;
 					}
 					if (hit) {
-						body.push(`\t{ uint64_t v = ${A}; ${hitCheck(hit, B, x)}memcpy(${hitAt(hit, B, x)}, &v, ${W}); }`, ...hitStat(hit));
+						body.push(`\t{ uint64_t v = ${A}; ${hitCheck(hit, B, x)}memcpy(${hitAt(hit, B, x)}, &v, ${W}); }`, ...hitStat(site, hit, 1, `${B} + ${imm64(x.imm)}`, W));
+						m++;
+						break;
+					}
+					if (opt.plainchk) {
+						body.push(`\t{ uint64_t v = ${A}; memcpy(AOT_HOST(${B} + ${imm64(x.imm)}), &v, ${W}); }`);
 						m++;
 						break;
 					}
@@ -1132,10 +779,8 @@ order.forEach((region) => {
 					const gr = grouped(x);
 					body.push(
 						`\t{ uint64_t va = ${B} + ${imm64(x.imm)}, v = ${A}; struct kb_ic* q = &ic[${m}];`,
-						...(gr ? [`\t  if (gh[${g}]) { AOT_STAT(grp_acc, 1); memcpy(gh[${g}] + (va - gva[${g}]), &v, ${W}); } else {`] : []),
-							'\t  AOT_STAT(chk_acc, 1);',
-						`\t  if (__builtin_expect(AOT_SLOW(q, gen, va, ${W}), 0)) { kb_store_ic(cpu, q, va, v, ${W}); if (cpu->fault) ${fault()} }`,
-						`\t  else memcpy(q->host + (va - q->lo), &v, ${W}); ${gr ? '} ' : ''}}`
+						...(gr ? [`\t  if (gh[${g}]) { AOT_STAT(grp_acc, 1);${cls(site, 1, 1, 'va', W)} memcpy(gh[${g}] + (va - gva[${g}]), &v, ${W}); } else {`] : []),
+						...storeChk(site, W, `${gr ? '} ' : ''}}`)
 					);
 					m++;
 					break;
@@ -1145,7 +790,7 @@ order.forEach((region) => {
 					if (!opt.nogroups && !opt.identity && !fast)
 						body.push(
 							`\t{ uint64_t va = ${B} + ${imm64(x.imm)}; struct kb_ic* q = &ic[${m}]; gva[${x.a}] = va;`,
-							`\t  gh[${x.a}] = ${G}${16 * W}u <= q->span && va - q->lo <= q->span - ${16 * W}u ? q->host + (va - q->lo) : kb_host_ic(cpu, q, va, ${16 * W}u); }`
+							`\t  gh[${x.a}] = ${G}${16 * W}u <= q->span && va - q->lo <= q->span - ${16 * W}u ? q->host + (va - q->lo) : kb_host_ic_at(cpu, q, va, ${16 * W}u, ${rights(b.ins.some((y) => opName(y.op) === 'ST' && y.c === x.a + 1))}); }`
 						);
 					m++;
 					break;
@@ -1286,7 +931,7 @@ order.forEach((region) => {
 			`\tfl = fb + ${imm64(BigInt(lo))};`,
 			opt.identity
 				? '\twf = AOT_HOST(fl);'
-				: `\t{ struct kb_ic* q = &${R}_fw[${c}]; wf = ${G}${len}u <= q->span && fl - q->lo <= q->span - ${len}u ? q->host + (fl - q->lo) : kb_host_ic(cpu, q, fl, ${len}u); }`,
+				: `\t{ struct kb_ic* q = &${R}_fw[${c}]; wf = ${G}${len}u <= q->span && fl - q->lo <= q->span - ${len}u ? q->host + (fl - q->lo) : kb_host_ic_at(cpu, q, fl, ${len}u, ${rights(true)}); }`,
 			`\tif (!wf) goto S${j};`,
 			...loads,
 			`\tAOT_COUNT_CAT(AOT_C_FIX, 0, ${loads.length});`,
@@ -1360,7 +1005,8 @@ order.forEach((region) => {
 		lines.push(`static const struct kb_ins ${R}_i${j}[] = {`);
 		for (const x of b.ins) lines.push(`\t{${x.op}, ${x.w}, ${x.a}, ${x.b}, ${x.c}, (int64_t) ${hex(x.imm)}},`);
 		lines.push('};');
-		table.push({ pc: b.pc, next: b.next, target: b.target, n: b.ins.length, region, idx: j, name: `${R}_i${j}` });
+		if (b.pcs) lines.push(`static const uint32_t ${R}_p${j}[] = {${b.pcs.map((v) => `${v >>> 0}u`).join(', ')}};`);
+		table.push({ pc: b.pc, next: b.next, target: b.target, n: b.ins.length, region, idx: j, name: `${R}_i${j}`, pcs: b.pcs ? `${R}_p${j}` : 'NULL' });
 	});
 	lines.push(`static unsigned char ${R}_ok[${chosen.length}];`, `static struct kb_block* ${R}_blk[${chosen.length}];`);
 	if (opt.windows) lines.push(`static struct kb_ic ${R}_win[${Math.max(1, windowCount)}];`);
@@ -1404,6 +1050,8 @@ order.forEach((region) => {
 			'\t(void) sink;',
 			...(opt.epochs ? [] : ['\t(void) fuel;'])
 		);
+		if (bindFile && !opt.bindconst)
+			flat.forEach((_, k) => lines.push(`\tuint64_t flo${k} = aot_flat[${k}][0], fsp${k} = aot_flat[${k}][1];`, `\tuint8_t* fh${k} = AOT_HOST(flo${k});`, `\t(void) flo${k}; (void) fsp${k}; (void) fh${k};`));
 		if (opt.loops)
 			loopData(!!slotted).wins.forEach((w, g) =>
 				lines.push(
@@ -1414,7 +1062,11 @@ order.forEach((region) => {
 				)
 			);
 		// the region's caches are checked against the mapping generation when kb_epoch has moved since the last entry
-		if (opt.epochs) lines.push('\tAOT_STAT(ep_in, 1);', `\tif (__builtin_expect(${R}_ep != ep, 0)) { AOT_STAT(ep_slow, 1); if (${R}_mg != cpu->mapgen) { ${R}_cold(); ${R}_mg = cpu->mapgen; } ${R}_ep = ep; }`);
+		// LIFT_MUTATE=noepoch never makes them cold, so a cache from before a remap is trusted
+		if (opt.epochs && mutate !== 'noepoch') lines.push('\tAOT_STAT(ep_in, 1);', `\tif (__builtin_expect(${R}_ep != ep, 0)) { AOT_STAT(ep_slow, 1); if (${R}_mg != cpu->mapgen) { ${R}_cold(); ${R}_mg = cpu->mapgen; }${flat.length && flatFile ? ' aot_flat_sync(cpu);' : ''} ${R}_ep = ep; }`);
+		// --flat: the table is current once the slow path above has run, so the bounds are read after it
+		if (flatFile)
+			flat.forEach((_, k) => lines.push(`\tuint64_t flo${k} = aot_flat[${k}].lo, fsp${k} = aot_flat[${k}].lim;`, `\tuint8_t* fh${k} = aot_flat[${k}].host;`, `\t(void) flo${k}; (void) fsp${k}; (void) fh${k};`));
 		if (precise) lines.push(`\tuint64_t gfs = ${from('io->gfs', 'cpu->fs')};`, '\t(void) gfs;');
 		if (slotted) {
 			lines.push('\tuint64_t fb = 0, fl = 0;', '\tuint8_t* wf = NULL;', '\t(void) fb;', '\t(void) fl;', '\t(void) wf;');
@@ -1471,14 +1123,14 @@ order.forEach((region) => {
 table.sort((a, b) => (a.pc < b.pc ? -1 : a.pc > b.pc ? 1 : 0));
 lines.push(
 	'static const struct aot_entry aot_table[] = {',
-	...table.map((e) => `\t{${hex(e.pc)}, ${hex(e.next)}, ${hex(e.target)}, ${e.n}, ${e.region}, ${e.idx}, ${e.name}},`),
+	...table.map((e) => `\t{${hex(e.pc)}, ${hex(e.next)}, ${hex(e.target)}, ${e.n}, ${e.region}, ${e.idx}, ${e.name}, ${e.pcs}},`),
 	'};',
 	`static unsigned char* const aot_ok[] = {${regionNames.map((n) => n.replace('_run', '_ok')).join(', ')}};`,
 	`static struct kb_block** const aot_blk[] = {${regionNames.map((n) => n.replace('_run', '_blk')).join(', ')}};`,
 	`static const int aot_n[] = {${regionSizes.join(', ')}};`,
 	`static uint64_t (*const aot_run[])(struct kb_cpu*, uint64_t) = {${regionNames.join(', ')}};`,
-	...(opt.regs && only === undefined ? [`static uint64_t (*const aot_runp[])(struct kb_cpu*, uint64_t) = {${regionNames.map((n) => n.replace('_run', 'p_run')).join(', ')}};`] : []),
-	...(opt.slots && only === undefined ? [`static uint64_t (*const aot_runs[])(struct kb_cpu*, uint64_t) = {${regionNames.map((n, k) => n.replace('_run', regionSlotted[k] ? 's_run' : 'p_run')).join(', ')}};`] : []),
+	...(opt.regs && !oneForm ? [`static uint64_t (*const aot_runp[])(struct kb_cpu*, uint64_t) = {${regionNames.map((n) => n.replace('_run', 'p_run')).join(', ')}};`] : []),
+	...(opt.slots && !oneForm ? [`static uint64_t (*const aot_runs[])(struct kb_cpu*, uint64_t) = {${regionNames.map((n, k) => n.replace('_run', regionSlotted[k] ? 's_run' : 'p_run')).join(', ')}};`] : []),
 	'',
 	'void kb_aot_detach(struct kb_block* b) {',
 	`\tfor (int r = 0; r < ${regionNames.length}; r++)`,
@@ -1505,9 +1157,10 @@ lines.push(
 	'\t\t\tsame = x->op == y->op && x->w == y->w && x->a == y->a && x->b == y->b && x->c == y->c && x->imm == y->imm;',
 	'\t\t}',
 	'\t\tif (!same) continue;',
+	'\t\tif (e->pcs && b->pcs && memcmp(e->pcs, b->pcs, (size_t) e->n * sizeof *e->pcs)) continue;',
 	'\t\taot_ok[e->region][e->idx] = 1;',
 	'\t\taot_blk[e->region][e->idx] = b;',
-	only !== undefined
+	oneForm
 		? '\t\tb->aot = aot_run[e->region];'
 		: opt.slots
 		? '\t\tb->aot = aot_regs() == 2 ? aot_runs[e->region] : aot_regs() ? aot_runp[e->region] : aot_run[e->region];'

@@ -207,6 +207,12 @@ describe('functions', () => {
 		expect(topRanges(fns, 9)).toHaveLength(3);
 	});
 
+	it('leaves out a function that has no blocks of its own, which would lift the whole program', () => {
+		const fns = functions(blocks, op, 0x1000n);
+		const empty = { ...fns[0]!, blocks: [], self: 0n };
+		expect(topRanges([...fns, empty], 9)).toEqual(topRanges(fns, 9));
+	});
+
 	it('prints them through --emit-top', () => {
 		const dir = mkdtempSync(join(tmpdir(), 'fn-'));
 		const hot = join(dir, 'd.hot');

@@ -23,7 +23,7 @@ source_of() {
 	case $1 in faults) echo x86-faults.c ;; prim) echo prim-faults.c ;; regs) echo x86-regs.c ;; slots) echo x86-slots.c ;; flags) echo x86-flags.c ;; *) echo "$1.c" ;; esac
 }
 flags_of() {
-	case $1 in regs) echo "" ;; slots) echo "-mno-sse -mno-mmx -mno-red-zone" ;; prim) echo "-I$T -mno-sse -mno-mmx -mno-red-zone" ;; epochs) echo "-Wl,-N -mno-sse -mno-mmx" ;; *) echo "-mno-sse -mno-mmx" ;; esac
+	case $1 in regs) echo "" ;; slots) echo "-mno-sse -mno-mmx -mno-red-zone" ;; prim) echo "-I$T -mno-sse -mno-mmx -mno-red-zone" ;; *) echo "-mno-sse -mno-mmx" ;; esac
 }
 epoch_cc=
 epoch_lift=

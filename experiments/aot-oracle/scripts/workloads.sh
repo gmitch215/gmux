@@ -9,6 +9,7 @@ cmd() {
 		gzip) echo "$p $bin/busybox-amd64 gzip -9 -c $out/in" ;;
 		bzip2) echo "$p $bin/busybox-amd64 bzip2 -9 -c $out/in" ;;
 		curl) echo "$p $bin/curl -s file://$out/in" ;;
+		entry) echo "$p $out/entry-guest" ;;
 		bash) echo "$p $bin/bash -c 'i=0; s=0; while [ \$i -lt 20000 ]; do s=\$((s+i*i%7)); i=\$((i+1)); done; echo \$s'" ;;
 	esac
 }

@@ -201,6 +201,7 @@ struct aot_stat {
     uint64_t win_enter, win_acc, chk_acc, grp_acc, cont, polls;
     uint64_t ep_in, ep_slow, ep_back;
     uint64_t win_idx, win_slow, win_fail, reval;
+    uint64_t flat_hit, flat_sync;
 };
 static struct aot_stat aot_stat;
     #define AOT_STAT(f, n) (aot_stat.f += (n))
@@ -210,6 +211,114 @@ static struct aot_stat aot_stat;
     #define AOT_STAT(f, n) ((void) 0)
     #define AOT_NOTE(polled) ((void) 0)
     #define AOT_NOTE_EP(back) ((void) 0)
+#endif
+/* -DAOT_CLASS (lifted with --classes): each access reports its kind (0 window,
+   1 group, 2 checked, 3 slot held in a local, 4 frame window), load or store
+   and the mapping it lands in; the tally is appended to $KATYBUG_COUNT at exit
+ */
+#ifdef AOT_CLASS
+struct aot_cls_row {
+    uint64_t start, end, n[5][2], straddle[5][2], cross[5][2];
+    int prot, bits;
+};
+static struct aot_cls_row aot_cls_rows[256];
+static int aot_cls_nrows;
+static uint64_t aot_cls_none[5][2];
+/* one entry per load or store the lifter emitted (its site id, counted in
+   emission order, so a second lift with the same flags numbers them the same):
+   accesses, those on the page of the site's previous access, those at the
+   previous address, the mapping start */
+static struct aot_site {
+    uint64_t n, page, same, last, map;
+    int kind, st, w, multi;
+} aot_sites[1 << 16];
+
+static __attribute__((noinline)) void aot_cls(
+    struct kb_cpu* cpu, int kind, int st, uint64_t va, int w, int site
+) {
+    static int last = -1;
+    const struct kb_mapping* m = NULL;
+    if (last >= 0 && last < cpu->nmaps && va >= cpu->maps[last].start &&
+        va < cpu->maps[last].end)
+        m = &cpu->maps[last];
+    for (int i = 0; !m && i < cpu->nmaps; i++)
+        if (va >= cpu->maps[i].start && va < cpu->maps[i].end)
+            m = &cpu->maps[last = i];
+    struct aot_site* s = &aot_sites[site & 0xffff];
+    if (!m) {
+        aot_cls_none[kind][st]++;
+        s->multi |= s->n != 0;
+        s->n++;
+        return;
+    }
+    if (s->n && s->map != m->start) s->multi = 1;
+    s->page += s->n && (s->last >> 12) == (va >> 12);
+    s->same += s->n && s->last == va;
+    s->n++, s->last = va, s->map = m->start, s->kind = kind, s->st = st,
+            s->w = w;
+    struct aot_cls_row* r = NULL;
+    for (int i = 0; i < aot_cls_nrows && !r; i++)
+        if (aot_cls_rows[i].start == m->start &&
+            aot_cls_rows[i].end == m->end && aot_cls_rows[i].prot == m->prot &&
+            aot_cls_rows[i].bits == m->bits)
+            r = &aot_cls_rows[i];
+    if (!r) {
+        if (aot_cls_nrows == 256) return;
+        r = &aot_cls_rows[aot_cls_nrows++];
+        r->start = m->start, r->end = m->end, r->prot = m->prot,
+        r->bits = m->bits;
+    }
+    r->n[kind][st]++;
+    r->straddle[kind][st] +=
+        (va >> m->bits) != ((va + (uint64_t) w - 1) >> m->bits);
+    r->cross[kind][st] += va + (uint64_t) w > m->end;
+}
+
+__attribute__((destructor)) static void aot_cls_report(void) {
+    const char* path = getenv("KATYBUG_COUNT");
+    FILE* f = path ? fopen(path, "a") : NULL;
+    if (!f) return;
+    for (int k = 0; k < 5; k++)
+        for (int s = 0; s < 2; s++) {
+            if (aot_cls_none[k][s])
+                fprintf(
+                    f,
+                    "katybug cls: kind %d st %d start 0 end 0 prot -1 bits 0 n "
+                    "%llu straddle 0 cross 0\n",
+                    k, s, (unsigned long long) aot_cls_none[k][s]
+                );
+            for (int i = 0; i < aot_cls_nrows; i++) {
+                const struct aot_cls_row* r = &aot_cls_rows[i];
+                if (!r->n[k][s]) continue;
+                fprintf(
+                    f,
+                    "katybug cls: kind %d st %d start %llx end %llx prot %d "
+                    "bits %d n %llu straddle %llu cross %llu\n",
+                    k, s, (unsigned long long) r->start,
+                    (unsigned long long) r->end, r->prot, r->bits,
+                    (unsigned long long) r->n[k][s],
+                    (unsigned long long) r->straddle[k][s],
+                    (unsigned long long) r->cross[k][s]
+                );
+            }
+        }
+    for (int i = 0; i < 1 << 16; i++)
+        if (aot_sites[i].n >= 1000)
+            fprintf(
+                f,
+                "katybug site: id %d kind %d st %d w %d n %llu page %llu "
+                "same %llu multi %d map %llx\n",
+                i, aot_sites[i].kind, aot_sites[i].st, aot_sites[i].w,
+                (unsigned long long) aot_sites[i].n,
+                (unsigned long long) aot_sites[i].page,
+                (unsigned long long) aot_sites[i].same, aot_sites[i].multi,
+                (unsigned long long) aot_sites[i].map
+            );
+    fclose(f);
+}
+    #define AOT_CLS(site, kind, st, va, w) aot_cls(cpu, kind, st, va, w, site)
+#else
+    #define AOT_CLS(site, kind, st, va, w) ((void) 0)
 #endif
 /* -DAOT_WIN_CHECK: an access with an index bound stops the run when its address
    is outside its window (a verification build of the lifter's bounds) */
@@ -264,27 +373,34 @@ static struct aot_stat aot_stat;
 /* a resolve that fails (the span is not in one accessible piece) is counted
    where the lifted code makes it */
 #ifdef KB_COUNT
-static inline uint8_t* aot_host_ic(
-    struct kb_cpu* cpu, struct kb_ic* ic, uint64_t va, uint64_t len
+static inline uint8_t* aot_host_ic_at(
+    struct kb_cpu* cpu, struct kb_ic* ic, uint64_t va, uint64_t len, int acc
 ) {
-    uint8_t* p = kb_host_ic(cpu, ic, va, len);
+    uint8_t* p = kb_host_ic_at(cpu, ic, va, len, acc);
     aot_stat.win_fail += !p;
     return p;
 }
-    #define kb_host_ic aot_host_ic
+    #define kb_host_ic_at aot_host_ic_at
 #endif
 
 /* lift.ts --bounds=two: a window of len bytes from va that may cross one piece
    boundary. Returns the host bytes of va's piece; *h1 is the next piece's and
    *bd the guest address where it starts, or (uint64_t) -1 when the window ends
-   in the first. NULL when either piece does not resolve */
+   in the first. NULL when either piece does not resolve for acc (KB_R for a
+   window that only loads, KB_W for one that stores) */
 static inline __attribute__((always_inline)) uint8_t* aot_open2(
     struct kb_cpu* cpu, struct kb_ic* q0, struct kb_ic* q1, uint32_t gen,
-    uint64_t va, uint64_t len, uint8_t** h1, uint64_t* bd
+    uint64_t va, uint64_t len, int acc, uint8_t** h1, uint64_t* bd
 ) {
-    uint8_t* p = q0->gen == gen && va - q0->lo < q0->span
+    /* under epochs a cache is cold (no span) or current, so no generation */
+#ifdef AOT_EPOCHS
+    #define AOT_GEN(q) ((void) gen, 1)
+#else
+    #define AOT_GEN(q) ((q)->gen == gen)
+#endif
+    uint8_t* p = AOT_GEN(q0) && va - q0->lo < q0->span
                      ? q0->host + (va - q0->lo)
-                     : kb_host_ic(cpu, q0, va, 1);
+                     : kb_host_ic_at(cpu, q0, va, 1, acc);
     if (!p) return NULL;
     uint64_t end = q0->lo + q0->span;
     if (va + len <= end) {
@@ -293,9 +409,9 @@ static inline __attribute__((always_inline)) uint8_t* aot_open2(
     }
     uint64_t need = va + len - end;
     uint8_t* r =
-        q1->gen == gen && need <= q1->span && end - q1->lo <= q1->span - need
+        AOT_GEN(q1) && need <= q1->span && end - q1->lo <= q1->span - need
             ? q1->host + (end - q1->lo)
-            : kb_host_ic(cpu, q1, end, need);
+            : kb_host_ic_at(cpu, q1, end, need, acc);
     if (!r) return NULL;
     *h1 = r;
     *bd = end;
@@ -320,13 +436,18 @@ static inline __attribute__((always_inline)) uint8_t* aot_open2(
             fprintf(stderr, "katybug: loop window used past a remap\n");       \
             abort();                                                           \
         } while (0)
+    #ifdef AOT_EPOCHS
+        #define AOT_LGEN cpu->mapgen
+    #else
+        #define AOT_LGEN gen
+    #endif
     #define AOT_LCHK(q)                                                        \
         do {                                                                   \
-            if ((q)->gen != gen) AOT_LCHK_FAIL();                              \
+            if ((q)->gen != AOT_LGEN) AOT_LCHK_FAIL();                         \
         } while (0)
     #define AOT_LCHK1(q, bd)                                                   \
         do {                                                                   \
-            if ((bd) != ~0ull && (q)->gen != gen) AOT_LCHK_FAIL();             \
+            if ((bd) != ~0ull && (q)->gen != AOT_LGEN) AOT_LCHK_FAIL();        \
         } while (0)
 #else
     #define AOT_LCHK(q) ((void) 0)
@@ -434,6 +555,11 @@ __attribute__((destructor)) static void aot_stat_report(void) {
         (unsigned long long) aot_stat.win_fail,
         (unsigned long long) aot_stat.reval
     );
+    fprintf(
+        f, "katybug flat: hit %llu sync %llu\n",
+        (unsigned long long) aot_stat.flat_hit,
+        (unsigned long long) aot_stat.flat_sync
+    );
     fclose(f);
 }
 #else
@@ -472,6 +598,7 @@ struct aot_entry {
     uint64_t pc, next, target;
     int n, region, idx;
     const struct kb_ins* ins;
+    const uint32_t* pcs; /* each op's instruction offset, or NULL */
 };
 
 #endif
