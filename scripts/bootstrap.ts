@@ -15,7 +15,8 @@ import { hostRuntime } from './wasm/router-modules.ts';
  * booting: build/assets/_gmux/bootstrap/index.json plus a file per 1 MiB of memory that holds a
  * nonzero byte. The image names build/kernel/manifest.json's `image` hash; a site built from anything
  * else boots as before. The written image is then restored 30 s and 41 min after its checkpoint,
- * and the build fails (and removes the image) if either restore prints anything but a clean prompt.
+ * and 60 more checkpoints are taken of it and restored 30 s on; the build fails (and removes the
+ * image) if any restore prints anything but a clean prompt.
  * GMUX_BUILD names another build directory.
  * `node --no-warnings --experimental-strip-types scripts/bootstrap.ts [--run <line> --until <text>]...`
  */
@@ -24,6 +25,8 @@ const build = process.env.GMUX_BUILD ?? join(root, 'build');
 const kernel = (f: string) => readFileSync(join(build, 'kernel', f));
 // both over the 21 s of CONFIG_RCU_CPU_STALL_TIMEOUT
 const GAPS_S = [30, 2460];
+// checkpoints of the restored image, each restored 30 s on; a kernel without the jiffies fix failed one within 38 in each of 100 builds
+const CHAIN = 60;
 const manifest = JSON.parse(kernel('manifest.json').toString()) as {
 	busybox: string;
 	katybug: string;
@@ -97,7 +100,7 @@ writeFileSync(join(out, 'index.json'), JSON.stringify(index));
 const held = blocks.reduce((n, b) => n + b.length, 0);
 const gated = performance.now();
 try {
-	await checkRestores(join(build, 'assets'), join(build, 'kernel'), GAPS_S, !steps.length);
+	await checkRestores(join(build, 'assets'), join(build, 'kernel'), GAPS_S, !steps.length, CHAIN);
 } catch (error) {
 	rmSync(out, { recursive: true, force: true });
 	throw error;

@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { clean, type GapReading } from '../../scripts/restore-gap.ts';
+import { clean, firstNoisy, type GapReading } from '../../scripts/restore-gap.ts';
 
 const reading = (over: Partial<GapReading> = {}): GapReading => ({
 	idle: '',
@@ -31,5 +31,14 @@ describe('restore gap check', () => {
 
 	it('rejects a crashed machine', () => {
 		expect(clean(reading({ crashed: true }))).toBe(false);
+	});
+});
+
+describe('restore chain check', () => {
+	it('finds the first checkpoint whose restore printed or crashed', () => {
+		const quiet = reading({ command: '' });
+		expect(firstNoisy([quiet, quiet])).toBe(-1);
+		expect(firstNoisy([quiet, reading({ idle: 'rcu: INFO\r\n' }), quiet])).toBe(1);
+		expect(firstNoisy([quiet, quiet, reading({ crashed: true })])).toBe(2);
 	});
 });

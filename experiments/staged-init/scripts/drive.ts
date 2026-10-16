@@ -12,11 +12,12 @@ import { writeFileSync } from 'node:fs';
  * - `port`: for an image taken after such an init (scripts/bootstrap.ts --run ... --until READY),
  *   types a line to the shell parked in `read` and times the answer.
  * `node --experimental-strip-types drive.ts <start|survive|port> <base url>` (N=3000000,
- * REDEPLOY="<command>")
+ * 24000000 for survive, REDEPLOY="<command>")
  */
 const [mode, baseArg] = process.argv.slice(2);
 const base = (baseArg ?? 'http://localhost:8787').replace(/\/$/, '');
-const N = Number(process.env.N ?? 3_000_000);
+// survive must outlast a redeploy's replacement of a warm-socket object (262-343 s on Free)
+const N = Number(process.env.N ?? (mode === 'survive' ? 24_000_000 : 3_000_000));
 const log = (event: string, data: object = {}) =>
 	console.log(JSON.stringify({ at: new Date().toISOString(), event, ...data }));
 
