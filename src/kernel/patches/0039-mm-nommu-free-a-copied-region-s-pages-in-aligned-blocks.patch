@@ -1,0 +1,68 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Gregory Mitchell <me@gmitch215.xyz>
+Date: Fri, 9 Oct 2026 09:00:00 +0000
+Subject: [PATCH] mm/nommu: free a copied region's pages in aligned blocks
+
+A copied region's pages come out of alloc_pages_exact(), which splits
+them, and free_page_series() put each one back on its own. Every page
+went through the per-cpu list and was merged into the buddy allocator
+separately; in a run of short-lived programs that was more than half of
+exit_group.
+
+free_page_series() now takes the references of an aligned block of
+pages together (page_ref_freeze, so a page another holder still has is
+left to put_page) and hands the block to free_frozen_pages(). A
+program's 32-page stack is one block, its 52-page data mapping three.
+---
+ mm/nommu.c | 28 +++++++++++++++++++++++++++-
+ 1 file changed, 27 insertions(+), 1 deletion(-)
+
+diff --git a/mm/nommu.c b/mm/nommu.c
+index 42aaf7fc9..d08395016 100644
+--- a/mm/nommu.c
++++ b/mm/nommu.c
+@@ -516,14 +516,40 @@ static void delete_nommu_region(struct vm_region *region)
+ 
+ /*
+  * free a contiguous series of pages
++ *
++ * The pages of a copied region come out of alloc_pages_exact() split, so each holds one reference
++ * of its own. A page at a time they go through the per-cpu lists and are merged back one by one,
++ * which was most of an exec'd program's exit. Where the series has an aligned block of pages that
++ * nobody else holds, take their references together and give the buddy allocator the block.
+  */
+ static void free_page_series(unsigned long from, unsigned long to)
+ {
+-	for (; from < to; from += PAGE_SIZE) {
++	while (from < to) {
+ 		struct page *page = virt_to_page((void *)from);
++		unsigned long pfn = page_to_pfn(page);
++		unsigned long left = (to - from) >> PAGE_SHIFT;
++		unsigned int order = min3(pfn ? (unsigned int)__ffs(pfn) : MAX_PAGE_ORDER,
++					  (unsigned int)fls_long(left) - 1,
++					  (unsigned int)MAX_PAGE_ORDER);
++		unsigned long n = 1UL << order;
++		unsigned long i;
++
++		for (i = 0; i < n; i++)
++			if (!page_ref_freeze(page + i, 1))
++				break;
++		if (i == n) {
++			atomic_long_sub(n, &mmap_pages_allocated);
++			free_frozen_pages(page, order);
++			from += n << PAGE_SHIFT;
++			continue;
++		}
+ 
++		/* another reference somewhere: this page goes the usual way */
++		while (i--)
++			page_ref_unfreeze(page + i, 1);
+ 		atomic_long_dec(&mmap_pages_allocated);
+ 		put_page(page);
++		from += PAGE_SIZE;
+ 	}
+ }
+ 
+-- 
+2.43.0
+

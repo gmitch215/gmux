@@ -1,0 +1,60 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Gregory Mitchell <me@gmitch215.xyz>
+Date: Fri, 9 Oct 2026 09:01:00 +0000
+Subject: [PATCH] wasm: read a program stub's abi section from the bytes exec
+ already has
+
+wasm_stack_abi() walked a program's sections with a kernel_read() for
+each. A stub (the file the initramfs holds for a program the host runs)
+is under 256 bytes and exec has already read them into bprm->buf, so
+the walk takes the headers from there and reads the file only past them.
+---
+ fs/binfmt_wasm.c | 15 ++++++++++++---
+ 1 file changed, 12 insertions(+), 3 deletions(-)
+
+diff --git a/fs/binfmt_wasm.c b/fs/binfmt_wasm.c
+index 8d11dc1e2..0b8ef667c 100644
+--- a/fs/binfmt_wasm.c
++++ b/fs/binfmt_wasm.c
+@@ -201,8 +201,9 @@ static bool wasm_consume_varU32_user(
+  * The stack ABI version in the file's gmux.abi section, 0 when it has none. The sections are
+  * walked by their headers, a few bytes each, so the code and data are never read.
+  */
+-static u32 wasm_stack_abi(struct file *file)
++static u32 wasm_stack_abi(struct linux_binprm *bprm)
+ {
++	struct file *file = bprm->file;
+ 	loff_t size = i_size_read(file_inode(file));
+ 	loff_t pos = 8;
+ 	u8 head[24];
+@@ -210,9 +211,17 @@ static u32 wasm_stack_abi(struct file *file)
+ 
+ 	for (count = 0; count < 128 && pos < size; count++) {
+ 		loff_t at = pos;
+-		ssize_t got = kernel_read(file, head, sizeof(head), &at);
+ 		unsigned int i = 1, shift = 0;
+ 		u64 len = 0;
++		ssize_t got;
++
++		/* a stub is all in the first bytes exec has already read */
++		if (pos + sizeof(head) <= min_t(loff_t, size, BINPRM_BUF_SIZE)) {
++			memcpy(head, bprm->buf + pos, sizeof(head));
++			got = sizeof(head);
++		} else {
++			got = kernel_read(file, head, sizeof(head), &at);
++		}
+ 
+ 		if (got < 2)
+ 			break;
+@@ -299,7 +308,7 @@ static int load_wasm_file(struct linux_binprm *bprm, unsigned long extra_stack)
+ 	 * Before begin_new_exec, so a refusal fails the exec and leaves the process as it was. Not
+ 	 * -ENOEXEC: a shell would try the file as a script.
+ 	 */
+-	abi = wasm_stack_abi(bprm->file);
++	abi = wasm_stack_abi(bprm);
+ 	if (abi != WASM_STACK_ABI) {
+ 		pr_err("exec %s: it is built for stack ABI %u (0: built before the word), this kernel runs %u; rebuild it\n",
+ 			bprm->filename, abi, WASM_STACK_ABI);
+-- 
+2.43.0
+
