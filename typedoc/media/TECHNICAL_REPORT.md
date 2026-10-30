@@ -16,7 +16,7 @@ wall clock and a deployed `cpuTime` reading are not interchangeable.
 
 ## 🧭 Executive Summary
 
-Linux 7.0 (the `joelseverin/linux` wasm fork [1]) boots to a BusyBox shell inside a Free-plan Durable
+Linux 7.3 (the `joelseverin/linux` wasm fork [1], merged with mainline 7.3) boots to a BusyBox shell inside a Free-plan Durable
 Object, runs pipelines and background jobs, and finishes a job that needs more CPU than one event
 allows. Blocking is JSPI [6]; checkpointing is Asyncify [7] for the kernel, and either Asyncify or
 resumable frames for user programs, paid only when a machine leaves memory.
@@ -2294,7 +2294,8 @@ compressed bytes once, and its cpio is the same.
 | a program stub's `gmux.abi` section is read from the bytes `exec` already has (0040) | the check that refuses a program built for another stack layout (0037) reads its section from the buffer `exec` already holds; a failing `execve` costs 0.3-0.5 us, so PATH-search failures were not the spawn path's cost |
 | the relay lends its buffers to the host and the host hands them to the response body without a copy (0041) | a 6.9 MB served request's mean CPU falls 13.0% (BusyBox httpd) and 10.6% (lighttpd) on paisley-park, 3 runs of 25 rounds, with a view ceiling of 34.0% and 34.5%; the kernel keeps a lent buffer until the host releases its address, and a release of an address that is not a live buffer frees nothing |
 | a non-root exec runs in a memory of its own, and a `kernel.gmux_own_exec` sysctl turns the rule off (0042) | the kernel marks the new address space private after `begin_new_exec` has committed the credentials and before the first mapping, so the image, data, stack and arguments go to a host memory and the uaccess routines reach only that; the rule is the effective uid after the exec, whatever memory the old address space was in, and the auxiliary vector is written with `copy_to_user` instead of `memcpy`; `isolation` 169 checks, the three-mode gate 28 of 28 |
-| the IPv4 options of a TCP socket are freed after an RCU grace period, not at once (0043, upstream commit e3f33b0a1d89 [27]) | a retransmitted SYN on another cpu can read `ireq_opt` after the child socket took it; a guest process can set the options (`setsockopt` returned 0 for 3,000 of 3,000 loopback connections on a build with and without the patch), and those connections free real option objects without a crash or a visible memory difference (about 2 MB lost over the loop on both builds); the probe does not exercise the race |
+| the IPv4 options of a TCP socket are freed after an RCU grace period, not at once (upstream commit e3f33b0a1d89 [27]; patch 0043 on the 7.0 base, in 7.3 itself) | a retransmitted SYN on another cpu can read `ireq_opt` after the child socket took it; a guest process can set the options (`setsockopt` returned 0 for 3,000 of 3,000 loopback connections on a build with and without the patch), and those connections free real option objects without a crash or a visible memory difference (about 2 MB lost over the loop on both builds); the probe does not exercise the race |
+| cache-aware scheduling is left off (0043) | `CONFIG_SCHED_CACHE` is new in 7.3 and on by default; the machine has one host thread and no last-level cache to aggregate on. On native x86-64 a failing exec of a non-ELF file is +15.0% and +18.6% slower with it on and +0.9% and -0.4% with it off; on gmux `execve-enoexec` is +33.5% with it on and +9.6% with it off (30 to 70 samples per arm, bootstrap intervals) |
 
 The host boots the kernel without `nohz_full`. With it, the timekeeping cpu never stops its tick,
 so an idle machine woke the host about 220 times a second, and context tracking reads the clock
@@ -2840,7 +2841,10 @@ page or file was read, not its full text. A date of "n.d." means the year was no
 
 [1] joelseverin, "linux, branch wasm-7.0: the Linux kernel with a WebAssembly architecture port," GitHub,
 commit 039e5f3e583f56f329657d1fe9945510dba10f41 on upstream Linux v7.0 (commit
-028ef9c96e96197026887c0f092424679298aae8), pinned in `src/sources.json`, n.d. [Online]. Available:
+028ef9c96e96197026887c0f092424679298aae8), n.d. Measurements in this report before Oct. 29, 2026 were
+taken on that pin. `src/sources.json` now pins branch wasm-7.3 of gmitch215/linux, commit
+21201145af28d2e8cef2402e364a942785951f37: the fork merged with stable v7.0.14 and mainline v7.3
+(commit c03c1a14507dfaf8b856c2608f9ac216021fc222), plus the port's 7.3 adaptations. [Online]. Available:
 https://github.com/joelseverin/linux
 
 [2] WebAssembly Community Group, "WebAssembly Specification," W3C, n.d. [Online]. Available:
@@ -2937,8 +2941,8 @@ https://github.com/userland-run/nano (read as extractions, accessed Oct. 16, 202
 [27] E. Dumazet, "ipv4: free inet_opt and ireq_opt after an RCU grace period," Linux kernel commit
 e3f33b0a1d89d738e2b913dab519226eaf76e15b, Oct. 1, 2026. [Online]. Available:
 https://patch.msgid.link/20261001221253.2964024-1-edumazet@kernel.org (the patch text, read whole and
-applied as kernel patch 0043 with one added body line naming the upstream commit; accessed Oct. 29,
-2026).
+applied as kernel patch 0043 on the 7.0 base with one added body line naming the upstream commit;
+7.3 carries the fix itself; accessed Oct. 29, 2026).
 
 [28] A. Zakai et al., "Emscripten," whose setjmp and longjmp ABI the toolchain follows, n.d. [Online].
 Available: https://emscripten.org/
