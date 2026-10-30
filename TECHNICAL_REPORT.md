@@ -38,7 +38,7 @@ resumable frames for user programs, paid only when a machine leaves memory.
 | `vfork`, `$(...)`, pthreads, a signal handler that blocks, the POSIX surface | **all pass** (execve, `_exit`, failed execve; 4 threads x 10,000 locked increments; sockets, flock, epoll, eventfd, timerfd, inotify) | `experiments/vfork`, `posix`, Free |
 | Lua 5.4.7's [8] own suite, file by file | **30 of 32** on Free, against **29 of 32** native musl; the two agree on 31 files | `tests/suites/lua.sh`, Alpine reference on paisley-park |
 | libc-test's pthread suite | **20 of 24** on Free | `tests/suites/`, Free |
-| A non-root process reaching memory it does not own | `SIGSEGV` from the load or store, `EFAULT` from a syscall; the checked build costs **1.26-2.86x** on the census in Node and **1.94-3.78x** on Free (stores alone 1.09-1.46x); a fork child in its own memory computes at **0.93-1.00x** | `tests/c/isolation.c` (Node and Free), `experiments/mmu` |
+| A non-root process reaching memory it does not own | `SIGSEGV` from the load or store, `EFAULT` from a syscall; the checked build costs **1.26-2.86x** on the census in Node and **1.94-3.78x** on Free (stores alone 1.09-1.46x); a fork child in its own memory computes at **0.93-1.00x**; every non-root exec now runs in a memory of its own, **169** `isolation` checks (the checked build's 90 unchanged, four launch forms, 75 in the own-memory pass) | `tests/c/isolation.c` (Node and Free), `experiments/mmu` |
 | Checkpoint tax on user programs | resumable frames **0.977-1.023x** of the plain build on six census programs, against Asyncify's +63% | local wall clock, Node, interleaved |
 | Restore of an evicted machine | exact **6 of 6** into its predecessor's pooled memory, 0 of 6 into a fresh allocation | `experiments/evicted-memory`, Free |
 | Checkpoint of the whole booted machine, mid-pipeline | **18-53 ms**, 73 stacks in 17.3 KB; restore 19-52 ms; 11 of 11 exact | local wall clock, Node |
@@ -55,7 +55,7 @@ resumable frames for user programs, paid only when a machine leaves memory.
 | Whole digests on the host's crypto, eight distinct 64 MiB files | sha1sum **0.75**, sha224sum **0.40**, sha256sum **0.40**, sha384sum **0.84**, sha512sum **0.85** under 1.0 on 5 of 5 paired rounds; md5sum **1.09**, b2sum **1.25** above; the native control is the pinned static coreutils 9.5 (portable C) | wall time over native, V8 under node, paisley-park, 5 rounds, `experiments/string-kernels` |
 | `gzip -dc` with the deflate stream decoded on the host's zlib, eight 64 MiB files | **0.37-0.41** to a file and **0.40-0.43** to a pipe against GNU gzip 1.13, 10 of 10 samples; **31.3-33.4** when the input is a pipe | wall time over native, 5 samples a cell, V8 under node, paisley-park |
 | Bash with every function lifted (99.1%) | **33.49** and **33.97** under V8 and **19.05** on x86-64, against 80.33, 80.56 and 60.55 for 24 functions | wall time over native, `experiments/aot-oracle`, paisley-park |
-| Emitted wasm against the clang route [16] for the same regions | exact, and **1.10-1.85x** slower under V8 on every timed pair | wall time, 8 kept samples a cell in two processes, paisley-park |
+| Emitted wasm against the clang route [16] for the same regions | exact, and **1.10-1.85x** slower under V8 on every timed pair; on bash **1.158x** the cycles on 1.068x the instructions, on gzip **1.339x** on 1.255x (`perf stat`); recipes across block edges take 1.95% of the instructions and 2.6% of the cycles out of the emitted bash arm and leave it 9.8-12.7% above the clang route | wall time, 8 kept samples a cell in two processes, `perf stat`, 7 samples a cell, paisley-park |
 | Burrow's interpreter on the guest's own memory, zlib endpoint | **1.000** of the untouched guest (rebased form 1.110); **1.15** of native `-O2` | wall time, V8 under node, paisley-park |
 | A 6.9 MB served request, buffers lent to the host | mean CPU **-13.0%** (BusyBox httpd) and **-10.6%** (lighttpd) | CPU per request, 3 runs of 25 rounds, paisley-park |
 | Process start, share build against today's registry | busy samples **-59.1%** (configure), **-64.5%** (fork), fork+exec wall **-61.6%** | profile samples, `experiments/syscall-cost`, paisley-park |
@@ -477,7 +477,7 @@ it maps and whether it may write them. A non-root process runs a build of its pr
 each load and store against both (`scripts/wasm/guard-pass.ts`), and `access_ok` refuses a non-root
 task's syscall buffers outside its own pages and regions. A non-root process that reads or writes the
 kernel's memory, another process's, or a shared segment it never attached gets `SIGSEGV`, and
-`EFAULT` from a syscall (`tests/c/isolation.c`, 90 checks, in Node and on Free). A shared mapping
+`EFAULT` from a syscall (`tests/c/isolation.c`, 90 checks under the checked build, in Node and on Free). A shared mapping
 with no region id left fails with `ENOMEM` (patch 0025); before it took a tag open to every non-root
 task once 4,095 regions were live. Root processes run
 the plain build. Four of the checks take a page away while the reader is parked: a sibling thread
@@ -530,6 +530,23 @@ in a fork child, and as uid 1000 under the checked build (`scripts/own-memory.ts
 Compute runs at native speed in its own memory. A syscall that copies a user buffer crosses into the
 host for each copy (1.5 us more per `stat`, 0.6 us per 4 KiB write and read), and the memory is
 charged to the process's highest address (42 MB here).
+
+An exec that leaves a task non-root now gives it that memory (kernel patch 0042), so a non-root process
+no longer runs the checked build by default. The kernel marks the new address space private before it
+maps the image, the stack and the arguments, and the host runs the plain build on a memory of its own
+for a fork child and for any non-root exec, a vfork child's included (a `$(...)` or a pipeline command
+of a non-root shell). A setuid-root program run by uid 1000 is root after the exec and stays in the
+shared memory. `kernel.gmux_own_exec` is a root-writable sysctl (default 1); at 0 a non-root exec runs
+the checked build in the shared memory again, which the probe uses as its control. `isolation` runs 169
+checks: 94 in the checked pass (the 90 of the old run, whose lines equal its own, and four launch
+forms that run in both passes) and 75 in the own-memory pass. In that memory a load or store at the kernel's or a
+peer's address reads or writes the process's own bytes, and root's bytes stay unchanged; a host scan
+of the machine's 268,238,848 bytes finds none of the 16 bytes the uid 1000 process stored. A process
+that calls `setuid` without an exec keeps the shared memory. A shared mapping is copied into the
+process when it maps it and is not shared afterwards. `/proc/PID/cmdline`, `environ` and `mem` of such
+a process read zeros, and a checkpoint is refused while one exists. Thirty non-root execs of the probe
+took 25 ms against 12 ms for root ones through the same launcher, a smoke run under load 7.8 and not
+a measurement.
 
 ### Foreign Executables
 
@@ -1262,6 +1279,30 @@ lifted route, and each of three mutants fails one named case. Memory of whole on
 outside gzip, and the function-region, sqlite and sha256 arms, are not measured; 70% of the gap to the
 floor remains.
 
+Where the emitted route loses was attributed on today's runtime and fresh dumps (gzip 99.85% lifted,
+bash 99.14% with 15.8 million entries). `perf` samples V8's optimized code under node v26.10.0 with
+named region functions [13], joined to V8's position table and a category map of each operation;
+`d8` 14.6.202.34 was tried and its debug entries are no finer than the position table. The region
+functions hold 77.7% of the samples of the emitted gzip arm, 72.7% of the clang route's, 70.7% of the
+emitted bash arm and 66.5% of the clang route's, about 433, 296, 2,132 and 1,733 ms (shares times a
+timed median, not per-category timings); the rest is the interpreter and the runtime the regions
+call. Frame traffic (spill stores and loads) is 28% to 31% of region samples in every arm and the
+emitter's share is no larger than the clang route's (25.5% against 27.0% of the hottest function's
+samples on gzip, 24.6% against 29.1% on bash). Under `perf stat` (7 of 7 samples a cell, none noisy)
+the emitted arm runs 1.255 times the instructions and 1.339 times the cycles of the clang route on
+gzip (IPC 5.53 against 5.89), and 1.068 times and 1.158 times on bash (IPC 2.91 against 3.15, L1d
+misses 1.54 times). On x86-64 the clang bash arm runs 20.5 times the native binary's instructions at
+the same IPC (3.33 against 3.32), and 51.2% of its samples are the dispatch rows. The category rows
+are bounds: two readings of a stretch of operations differ by tens of points on guards, dispatch and
+guest, and 6.8% to 10.0% of bash samples stay unattributed. Passing flag recipes across block edges
+(exact: 73 of 73 cases twice, a guest that carries flags over an edge, every mutant caught) takes
+0.12% of the instructions and 1.35% of the cycles out of the hottest bash region, a tie against 1.72%
+of spread, and 1.95% and 2.6% over every region; each emitted arm still runs 9.8% to 12.7% more
+cycles than the clang route with about 50% more L1d misses, and bash's `r` with the transform is
+37.2 against 34.2 (two processes, 5 rounds). A window shared across blocks does not apply to bash: the
+same base reaches the next block in 2.1% of the windowed accesses (196 of 9,136). The emitted region
+has 17.7% fewer static instructions than the clang one and runs more cycles.
+
 ### Related Systems
 
 Four public projects translate or run foreign code in a browser or a Worker. gmux borrowed no code from
@@ -1276,7 +1317,13 @@ left out.
   bounds a module at 3 pages and starts translating a page after 200,000 runs because very large wasm
   functions and wide `br_table`s made V8 use too much memory, and tracks writes to pages that hold
   translated code. It compiles wasm at run time, which a Free Worker refuses at request time, and has no
-  x86-64, so only the patterns used at emission time carry over to Katybug's emitter.
+  x86-64, so only the patterns used at emission time carry over to Katybug's emitter. A second read on
+  Oct. 29 took `jit.rs`, `codegen.rs`, `control_flow.rs` and `how-it-works.md` whole at commit
+  cc37f35 and confirmed the 3-page bound and the 200,000-run threshold; it also found a bound of 250
+  extra blocks for duplicating a multi-entry loop once per entry, which gmux's emitter does not do (it
+  uses an entry switch, which one of gzip's 82 blocks goes through). v86's last-result local is
+  32-bit only; the emitter keeps recipe operands at every width, and its typed 32-bit operations timed
+  the same as wide ones. No v86 code was copied.
 - elfconv [22] lifts static AArch64 executables through Remill to LLVM IR and then to wasm. Its README
   compares the output with wasm built from the same source: 82%, 78% and 96% of source-wasm speed for
   Sieve, LINPACK and MNIST under Emscripten, and 60%, 56% and 96% under WASI. The baseline is
@@ -2246,6 +2293,8 @@ compressed bytes once, and its cpio is the same.
 | a copied region's pages are freed in aligned blocks instead of one by one (0039) | process teardown spent its time in `exit_group`; on paisley-park its samples fall from 340 to 154 (9.86% to 4.79% of busy samples, configure run at pool size 8), `mmput` inclusive from 251 to 82, pool8 configure wall from 660.3 to 626.3 ms and busy samples from 3,451 to 3,213, pool8 fork wall from 303.7 to 285.0 ms; `vmlinux.wasm` of the series is byte-equal to the earlier pipeline's |
 | a program stub's `gmux.abi` section is read from the bytes `exec` already has (0040) | the check that refuses a program built for another stack layout (0037) reads its section from the buffer `exec` already holds; a failing `execve` costs 0.3-0.5 us, so PATH-search failures were not the spawn path's cost |
 | the relay lends its buffers to the host and the host hands them to the response body without a copy (0041) | a 6.9 MB served request's mean CPU falls 13.0% (BusyBox httpd) and 10.6% (lighttpd) on paisley-park, 3 runs of 25 rounds, with a view ceiling of 34.0% and 34.5%; the kernel keeps a lent buffer until the host releases its address, and a release of an address that is not a live buffer frees nothing |
+| a non-root exec runs in a memory of its own, and a `kernel.gmux_own_exec` sysctl turns the rule off (0042) | the kernel marks the new address space private after `begin_new_exec` has committed the credentials and before the first mapping, so the image, data, stack and arguments go to a host memory and the uaccess routines reach only that; the rule is the effective uid after the exec, whatever memory the old address space was in, and the auxiliary vector is written with `copy_to_user` instead of `memcpy`; `isolation` 169 checks, the three-mode gate 28 of 28 |
+| the IPv4 options of a TCP socket are freed after an RCU grace period, not at once (0043, upstream commit e3f33b0a1d89 [27]) | a retransmitted SYN on another cpu can read `ireq_opt` after the child socket took it; a guest process can set the options (`setsockopt` returned 0 for 3,000 of 3,000 loopback connections on a build with and without the patch), and those connections free real option objects without a crash or a visible memory difference (about 2 MB lost over the loop on both builds); the probe does not exercise the race |
 
 The host boots the kernel without `nohz_full`. With it, the timekeeping cpu never stops its tick,
 so an idle machine woke the host about 220 times a second, and context tracking reads the clock
@@ -2301,7 +2350,7 @@ booted kernel.
 musl's wasm port shipped `setjmp` returning 0 and `longjmp` calling `abort()`. `cc-strict` now
 compiles every program with LLVM's wasm exception-handling lowering (`-mexception-handling -mllvm
 -wasm-enable-sjlj`) and links its runtime, `src/gmux/sjlj.c` and `src/gmux/sjlj-tag.S`. LLVM 18 emits
-the Emscripten [27] ABI: `saveSetjmp`, `testSetjmp`, `getTempRet0`, `__wasm_longjmp`, and the tag
+the Emscripten [28] ABI: `saveSetjmp`, `testSetjmp`, `getTempRet0`, `__wasm_longjmp`, and the tag
 `__c_longjmp`, which nothing else in the link defines and which clang 18 crashes on as file-scope asm
 in C. Only functions that call `setjmp` are instrumented. The lowering matches calls named `setjmp`
 and `_setjmp` but not `sigsetjmp`, so `src/gmux/include/setjmp.h` routes `sigsetjmp` through
@@ -2566,6 +2615,42 @@ pages; with that and a kernel of 32 cpu slots (a patch that is not installed, +1
 boot) the suite passes 302 of 516 at 800 pages, with 56 oom-killer lines left, 8 TIMEOUT and one
 machine that ended silently (18 `ls` tests lost). Without the trim, 64 slots pass 0 of 40.
 
+### Language Runtimes
+
+JavaScript engines and Go were tried on `wasm32-linux` and, as upstream binaries, through Katybug. The
+JavaScript workload (`experiments/js-engines/src/bench.js`) prints seven checksums: `fib(27)`, a
+200,000-element `map`, `sort` and `reduce`, a 1.19 MB `JSON` round trip, a 100,000-character string
+build and a `matchAll` pass.
+
+QuickJS 2024-01-13 [29] builds for `wasm32-linux` in 15 s as a 4.4 MB module and runs five of the
+seven lines equal to native; the sixth runs out of memory at the 64 MiB guest cap. V8 through Node's
+source tree [30] does not configure for wasm32: `--dest-cpu=wasm32` is not a valid CPU, and V8's
+`build_config.h` has no wasm branch. JavaScriptCore with its C loop interpreter (WebKitGTK 2.54.2
+[31]) configures for x86-64 (2,670 build steps for `jsc`, not built) and stops at ICU on wasm32, where
+the tree has no ICU of the required version 70.1. libc++ and libc++abi build for `wasm-linux-musl` and
+a program that allocates nothing runs, but a program that calls `operator new` leaves the allocator's
+symbols unresolved in the shared-module link the toolchain uses. Through Katybug, a static `-O0`
+QuickJS starts in 59 ms against 1.793 ms for a native start (32.9 times, 5 of 5 samples; the clocks
+differ, a bare process against a typed command in a booted machine), runs three of the seven parts
+equal to native, and stops at the first 200,000-element array fill on `movntdq` (66 0F E7), which
+Katybug's SSE decoder does not handle. The `-O1` and `-O2` static builds fail at startup on a path not
+located. `node --jitless` v26.10.0 [30] runs the workload natively with output equal to QuickJS's; it
+is a 149.7 MB dynamic binary, 2.3 times the guest memory cap.
+
+Go 1.27.3 [32] has no `linux/wasm` target and no `wasm32` architecture. With the pair allowed in a copy
+of the tree, the first package to build fails on missing syscall definitions, and after two small
+fixes `runtime` fails with 913 error lines and 66 undefined names. TinyGo 0.44.0 [33] runs goroutines,
+its `net` is a stub (`Netdev not set`) and `os/exec` fails at run time. A Go program, `gobench`
+(1,000 goroutines passing a token 200,000 times, 50 TCP clients with 1,000 round trips, 400
+`os/exec` runs, 200,000 `sha256` rounds, `experiments/go`), built for AArch64 runs the goroutine and
+`sha256` sections under Katybug with output equal to native: `r` 117.7 [116.0-118.9] and 394.8
+[393.9-398.1], five samples, against the amd64 build run natively (a cross-ISA ratio, since there is no
+native AArch64 host). Its TCP and `exec` sections stop at `epoll_create1` and `eventfd2` returning
+`ENOSYS`. The amd64 build hangs in every section at `rcr $1,%rbx`, which Go emits for a division by a
+constant and Katybug does not decode. The `wasip1` build under Node's WASI runs the goroutine section
+in 83.3 ms against 20.5 ms native and the `sha256` section in 76.2 ms against 11.0 ms, one sample
+each, a different binary on a different engine.
+
 ---
 
 ## Defect Classes
@@ -2791,7 +2876,11 @@ https://sqlite.org/
 [12] D. Stenberg et al., "curl," version 8.10.1, n.d. [Online]. Available: https://curl.se/
 
 [13] Google, "V8 JavaScript engine," as shipped in Node.js v26.10.0 (V8 14.6.202.34-node.34) for the
-timed arms; the version in Workers is not exposed, n.d. [Online]. Available: https://v8.dev/
+timed arms, and `d8` 14.6.202.34 (`v8-linux64-rel-14.6.202.34.zip`, 19,826,988 bytes, sha256
+7e72cd5061f2a950abf355510187d5599929e08321f5b03b83290c825e717d1d, from
+https://storage.googleapis.com/chromium-v8/official/14.6/v8-linux64-rel-14.6.202.34.zip, accessed
+Oct. 29, 2026) for the attribution run; the version in Workers is not exposed, n.d. [Online].
+Available: https://v8.dev/
 
 [14] J. Gailly and M. Adler, "zlib," version 1.3.1, sha256
 9a93b2b7dfdac77ceba5a558a580e74667dd6fede4585b91eefb60f03b72df23, pinned in `src/sources.json`, n.d.
@@ -2820,9 +2909,10 @@ https://packages.ubuntu.com/noble/coreutils (accessed Oct. 16, 2026).
 box's system coreutils, n.d. [Online]. Available: https://www.openssl.org/
 
 [21] copy and contributors, "v86: x86 PC emulator and x86-to-WebAssembly compiler," GitHub, files
-`src/rust/jit.rs`, `src/rust/codegen.rs`, `src/rust/control_flow.rs`, `src/rust/cpu/memory.rs` and
-`docs/how-it-works.md` at master (commit not recorded), BSD-2-Clause, n.d. [Online]. Available:
-https://github.com/copy/v86 (files read as extractions, accessed Oct. 16, 2026)
+`src/rust/jit.rs`, `src/rust/codegen.rs`, `src/rust/control_flow.rs`, `docs/how-it-works.md` and
+`LICENSE` at commit cc37f35c43bf14865d74ad76879ecf9410f69eb1, BSD-2-Clause. [Online]. Available:
+https://github.com/copy/v86 (those five files read whole, accessed Oct. 29, 2026; `src/rust/cpu/memory.rs`
+was read only as an extraction at master, accessed Oct. 16, 2026)
 
 [22] yomaytk and contributors, "elfconv: AArch64 ELF to WebAssembly through Remill and LLVM," GitHub,
 `README.md`, `runtime/Memory.cpp`, `lifter/MainLifter.cpp` and the releases page at main (commit not
@@ -2844,5 +2934,36 @@ https://github.com/userland-run/nano (read as extractions, accessed Oct. 16, 202
 
 [26] lighttpd project, "lighttpd," version 1.4.76, n.d. [Online]. Available: https://www.lighttpd.net/
 
-[27] A. Zakai et al., "Emscripten," whose setjmp and longjmp ABI the toolchain follows, n.d. [Online].
+[27] E. Dumazet, "ipv4: free inet_opt and ireq_opt after an RCU grace period," Linux kernel commit
+e3f33b0a1d89d738e2b913dab519226eaf76e15b, Oct. 1, 2026. [Online]. Available:
+https://patch.msgid.link/20261001221253.2964024-1-edumazet@kernel.org (the patch text, read whole and
+applied as kernel patch 0043 with one added body line naming the upstream commit; accessed Oct. 29,
+2026).
+
+[28] A. Zakai et al., "Emscripten," whose setjmp and longjmp ABI the toolchain follows, n.d. [Online].
 Available: https://emscripten.org/
+
+[29] bellard.org, "QuickJS Javascript Engine," release 2024-01-13 (`quickjs-2024-01-13.tar.xz`, 765,800
+bytes, sha256 3c4bf8f895bfa54beb486c8d1218112771ecfc5ac3be1036851ef41568212e03), downloaded and built
+for `wasm32-linux` and for static x86-64. [Online]. Available: https://bellard.org/quickjs/ (accessed
+Oct. 29, 2026)
+
+[30] Node.js project, "Node.js," v26.10.0 (`node-v26.10.0-linux-x64.tar.xz`, 33,934,532 bytes, sha256
+ca70e9e349de048b9522abb3adc05b3bd6f43c5ffd3ec57916c7da292f59f022, and the source tarball, sha256
+7b3a546d33cb7e15a43bdd7a57e0be5d5fd5ffc553e6e4c120033e66f0ba20c5, both equal to the published
+`SHASUMS256.txt`); the source's `configure.py` and `deps/v8/src/base/build_config.h` were read.
+[Online]. Available: https://nodejs.org/dist/v26.10.0/ (accessed Oct. 29, 2026)
+
+[31] WebKit project, "WebKitGTK," version 2.54.2 (`webkitgtk-2.54.2.tar.xz`), its CMake files read for
+the JSCOnly port's options and configured, not built. [Online]. Available:
+https://webkitgtk.org/releases/webkitgtk-2.54.2.tar.xz (accessed Oct. 29, 2026)
+
+[32] Go project, "The Go Programming Language," version 1.27.3 (`go1.27.3.linux-amd64.tar.gz`, 70,588,678
+bytes, sha256 65efbc80fdc1fa2cd2631cad5b481777a68e8725f34e89f50fc6ac714e379b40, equal to the sha256 in
+the download page's JSON; the source tarball's sha256 is
+6e7749035cf360f06b2575d162ea79df9fda8ef671889e5c375f8e50777f26bb). [Online]. Available:
+https://go.dev/dl/ (accessed Oct. 29, 2026)
+
+[33] TinyGo project, "TinyGo," version 0.44.0 (`tinygo0.44.0.linux-amd64.tar.gz`, 188,295,677 bytes,
+sha256 ed0f45543a49ff2a99120a5a1b8814a0750e1fda1a66f8e2a0a172576134aaf9, equal to the release's
+digest). [Online]. Available: https://github.com/tinygo-org/tinygo/releases (accessed Oct. 29, 2026)
