@@ -1,0 +1,123 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Gregory Mitchell <me@gmitch215.xyz>
+Date: Thu, 29 Oct 2026 19:00:00 -0400
+Subject: [PATCH] wasm: run every non-root exec in a memory of its own
+
+A non-root exec took a new mm in the kernel's memory and ran under the
+guarded build, which checks each load and store. load_wasm_file now
+calls wasm_exec_own_memory after begin_new_exec has committed the
+credentials: when the effective uid is not 0, the new mm gets
+private_memory before its first mapping, so the image, data, stack and
+arguments go to a host memory of their own and the uaccess routines
+reach only that. The rule is the euid after the exec, whatever memory the
+old mm was in (a vfork child's is its parent's); a setuid-root program
+run by uid 1000 is root after the exec and keeps the shared memory.
+
+create_wasm_tables wrote the auxiliary vector with memcpy, which lands in
+the kernel's memory for such an mm; it uses copy_to_user.
+
+kernel.gmux_own_exec (default 1) turns the rule off for root, so the
+guarded build stays available to compare against.
+---
+--- a/fs/binfmt_wasm.c
++++ b/fs/binfmt_wasm.c
+@@ -125,7 +125,8 @@
+ 		return -EFAULT;
+ 	current->mm->env_end = (unsigned long)p;
+ 
+-	memcpy(sp, wasm_auxv, sizeof(wasm_auxv));
++	if (copy_to_user(sp, wasm_auxv, sizeof(wasm_auxv)))
++		return -EFAULT;
+ 
+ 	return 0;
+ }
+@@ -326,6 +327,13 @@
+ 
+ 	set_personality(PER_LINUX_32BIT);
+ 	setup_new_exec(bprm);
++
++	/*
++	 * The credentials are committed, so the effective uid is the one the program runs with: a
++	 * process that is not root then gets a memory of its own before its first mapping, whatever
++	 * memory the old mm was in (a vfork child's is its parent's).
++	 */
++	wasm_exec_own_memory(current->mm);
+ 
+ 	whole_start = vm_mmap(bprm->file, 0, whole_size,
+ 			PROT_READ | PROT_EXEC, MAP_PRIVATE, 0);
+--- a/arch/wasm/mm/private.c
++++ b/arch/wasm/mm/private.c
+@@ -2,13 +2,47 @@
+ /*
+  * A fork child's memory: nommu gives every process the kernel's memory, and a fork child the same
+  * addresses as its parent, so on wasm its bytes live in a memory of its own that the host keeps. The
+- * uaccess routines (asm/uaccess.h) and futex atomics go through the host for such an mm.
++ * uaccess routines (asm/uaccess.h) and futex atomics go through the host for such an mm. An exec
++ * that leaves the task non-root gets the same (wasm_exec_own_memory), so no byte of the kernel or
++ * of another process is at an address such a process can reach.
+  */
+ 
++#include <linux/cred.h>
++#include <linux/init.h>
+ #include <linux/mm.h>
+ #include <linux/sched.h>
++#include <linux/sysctl.h>
++#include <linux/uidgid.h>
+ #include <asm/wasm.h>
+ 
++/* 0: a non-root exec runs in the kernel's memory under the guarded build, for tests to compare */
++static int own_exec = 1;
++
++static const struct ctl_table own_exec_table[] = {
++	{
++		.procname	= "gmux_own_exec",
++		.data		= &own_exec,
++		.maxlen		= sizeof(int),
++		.mode		= 0644,
++		.proc_handler	= proc_dointvec_minmax,
++		.extra1		= SYSCTL_ZERO,
++		.extra2		= SYSCTL_ONE,
++	},
++};
++
++static int __init wasm_own_exec_init(void)
++{
++	register_sysctl_init("kernel", own_exec_table);
++	return 0;
++}
++device_initcall(wasm_own_exec_init);
++
++void wasm_exec_own_memory(struct mm_struct *mm)
++{
++	if (READ_ONCE(own_exec) && !uid_eq(current_euid(), GLOBAL_ROOT_UID))
++		mm->context.private_memory = 1;
++}
++
+ int wasm_user_private(void)
+ {
+ 	struct mm_struct *mm = current->mm;
+--- a/arch/wasm/include/asm/wasm.h
++++ b/arch/wasm/include/asm/wasm.h
+@@ -53,6 +53,8 @@
+ struct mm_struct;
+ extern void wasm_user_mapped(struct mm_struct *mm, unsigned long start, unsigned long end);
+ extern void wasm_user_forget(struct mm_struct *mm);
++/* gmux: an exec that left the task non-root gives its new mm a memory of its own (private.c) */
++extern void wasm_exec_own_memory(struct mm_struct *mm);
+ /* gmux: a lazy restore's pages in [addr, addr + len), brought in before the kernel reaches them */
+ extern void wasm_user_touch(unsigned long addr, unsigned long len);
+ 
+--- a/arch/wasm/include/asm/mmu.h
++++ b/arch/wasm/include/asm/mmu.h
+@@ -7,7 +7,7 @@
+ typedef struct {
+ 	unsigned long end_brk;
+ 	unsigned int owner;
+-	/* a fork child's: its bytes are in a memory of its own, reached through the host */
++	/* a fork child's or a non-root exec's: its bytes are in a memory of its own, via the host */
+ 	unsigned int private_memory;
+ } mm_context_t;
+ 
+-- 
+2.43.0
+
