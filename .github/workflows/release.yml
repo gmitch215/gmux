@@ -277,7 +277,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: bun run hydrate
       - name: Set Up QEMU
-        uses: docker/setup-qemu-action@v3
+        uses: docker/setup-qemu-action@v4
       - name: Set Up Buildx
         uses: docker/setup-buildx-action@v3
       - name: Log In to ghcr.io
