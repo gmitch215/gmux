@@ -7,6 +7,7 @@
 #include <sched.h>
 #include <signal.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/epoll.h>
 #include <sys/eventfd.h>
@@ -196,6 +197,91 @@ static void cgroups(void) {
     );
 }
 
+#define IP_OPTION_CYCLES 3000
+
+static long free_kb(void) {
+    char buf[512];
+    int fd = open("/proc/meminfo", O_RDONLY);
+    ssize_t n = fd < 0 ? -1 : read(fd, buf, sizeof buf - 1);
+    if (fd >= 0) close(fd);
+    if (n <= 0) return -1;
+    buf[n] = 0;
+    char* p = strstr(buf, "MemFree:");
+    return p ? strtol(p + 8, 0, 10) : -1;
+}
+
+/* loopback connections whose syn carries ip options: the server's child takes
+ * the request's options and frees them when it closes; a record route option
+ * is one the server echoes, NOP padding is not */
+static void ip_options(void) {
+    unsigned char opts[8] = {7, 7, 4, 0, 0, 0, 0, 0};
+    int one = 1;
+    int l = socket(AF_INET, SOCK_STREAM, 0);
+    struct sockaddr_in a = {
+        .sin_family = AF_INET,
+        .sin_port = htons(8082),
+        .sin_addr.s_addr = htonl(INADDR_LOOPBACK)
+    };
+    setsockopt(l, SOL_SOCKET, SO_REUSEADDR, &one, sizeof one);
+    int ok = l >= 0 && bind(l, (void*) &a, sizeof a) == 0 && listen(l, 16) == 0;
+    int setup_errno = ok ? 0 : errno;
+    long before = free_kb();
+    int done = 0, failed = 0, first_rc = 0, first_errno = 0;
+    int held_rc = -2, held = -1, client_held = -1;
+    for (int i = 0; ok && i < IP_OPTION_CYCLES; i++) {
+        int c = socket(AF_INET, SOCK_STREAM, 0);
+        errno = 0;
+        int rc = setsockopt(c, IPPROTO_IP, IP_OPTIONS, opts, sizeof opts);
+        if (i == 0) {
+            first_rc = rc;
+            first_errno = errno;
+        }
+        failed += rc != 0;
+        char b = 0;
+        int s = -1;
+        ok = c >= 0 && connect(c, (void*) &a, sizeof a) == 0 &&
+             (s = accept(l, 0, 0)) >= 0 && write(c, "x", 1) == 1 &&
+             read(s, &b, 1) == 1 && b == 'x';
+        if (ok && i == 0) {
+            unsigned char got[40];
+            socklen_t len = sizeof got;
+            held_rc = getsockopt(s, IPPROTO_IP, IP_OPTIONS, got, &len);
+            held = held_rc == 0 ? (int) len : -1;
+            len = sizeof got;
+            client_held = getsockopt(c, IPPROTO_IP, IP_OPTIONS, got, &len) == 0
+                              ? (int) len
+                              : -1;
+        }
+        if (!ok) setup_errno = errno;
+        done += ok;
+        if (c >= 0) close(c);
+        if (s >= 0) close(s);
+    }
+    close(l);
+    long after = free_kb();
+    for (int i = 0; i < 1024; i++) getppid();
+    long settled = free_kb();
+    printf(
+        "ip options: setsockopt rc %d errno %d on the first socket, %d of %d "
+        "refused\n",
+        first_rc, first_errno, failed, IP_OPTION_CYCLES
+    );
+    printf(
+        "ip options: the first client holds %d option bytes, the first "
+        "accepted socket %d (getsockopt rc %d)\n",
+        client_held, held, held_rc
+    );
+    printf(
+        "ip options: %d of %d cycles completed, errno %d\n", done,
+        IP_OPTION_CYCLES, setup_errno
+    );
+    printf(
+        "ip options: MemFree %ld kB before, %ld kB after, %ld kB settled\n",
+        before, after, settled
+    );
+    CHECK("tcp loopback connections with IP_OPTIONS", done == IP_OPTION_CYCLES);
+}
+
 int main(void) {
     int sv[2];
     char b[16] = {0};
@@ -271,6 +357,7 @@ int main(void) {
         nb && shutdown(c, SHUT_WR) == 0 && read(s, b, 3) == 0 &&
             write(s, "ok", 2) == 2 && read(c, b, 2) == 2 && !strcmp(b, "ok")
     );
+    ip_options();
     memory();
     io();
     cgroups();
