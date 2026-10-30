@@ -1,0 +1,62 @@
+name: Check Kernel Bump
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '17 6 * * 1'
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - latest-stable
+          - latest-mainline
+
+    permissions:
+      contents: read
+
+    steps:
+      - uses: actions/checkout@v7
+      - name: Set up Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 'latest'
+      - name: Merge the Fork into the Target
+        id: check
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          status=0
+          bun scripts/kernel-bump.ts check --target "$TARGET" --work "$RUNNER_TEMP/kernel-bump" --json \
+            > "$RUNNER_TEMP/kernel-bump-$TARGET.json" || status=$?
+          echo "status=$status" >> "$GITHUB_OUTPUT"
+      - name: Summarize
+        env:
+          TARGET: ${{ matrix.target }}
+          STATUS: ${{ steps.check.outputs.status }}
+        run: |
+          case "$STATUS" in
+            0) verdict='The merges are clean. A compile can still fail.' ;;
+            1) verdict='The merges conflict. That is a result, not a failure.' ;;
+            *) verdict='The check failed.' ;;
+          esac
+          {
+            echo "### $TARGET"
+            jq -r '.summary // .error' "$RUNNER_TEMP/kernel-bump-$TARGET.json"
+            echo
+            echo "$verdict"
+          } >> "$GITHUB_STEP_SUMMARY"
+      - name: Keep the Report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: kernel-bump-${{ matrix.target }}
+          path: ${{ runner.temp }}/kernel-bump-${{ matrix.target }}.json
+      - name: Fail on an Error
+        if: steps.check.outputs.status == '2'
+        run: exit 1
