@@ -1,4 +1,4 @@
 var searchData=
 [
-  ['gmux_0',['gmux',['../index.html',1,'']]]
+  ['a_20foreign_20binary_0',['Running a Foreign Binary',['../index.html#running-a-foreign-binary',1,'']]]
 ];
