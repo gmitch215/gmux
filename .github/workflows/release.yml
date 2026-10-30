@@ -305,7 +305,7 @@ jobs:
             type=raw,value=${{ env.VERSION }}
             type=raw,value=latest,enable=${{ github.ref_name == 'master' }}
       - name: Build Image
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@v7
         with:
           context: .
           file: docker/Dockerfile
@@ -319,7 +319,7 @@ jobs:
           docker stop gmux-check
       - name: Push Multi-Arch to ghcr.io
         id: push
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@v7
         with:
           context: .
           file: docker/Dockerfile
