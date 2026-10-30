@@ -12,7 +12,76 @@
 #include <sys/stat.h>
 #include <sys/wait.h>
 #include <unistd.h>
-#define CHECK(name, ok) printf("%s %s\n", (ok) ? "PASS" : "FAIL", name)
+/* the second pass runs with kernel.gmux_own_exec 1 and prints "own: " before
+ * each name */
+static int own_mode(void) {
+    return getenv("ISOLATION_OWN") != NULL;
+}
+#define TAG (own_mode() ? "own: " : "")
+#define CHECK(name, ok) printf("%s %s%s\n", (ok) ? "PASS" : "FAIL", TAG, name)
+
+/* 0: a non-root exec runs in the machine's memory under the guarded build; 1:
+ * in a memory of its own */
+static void own_exec(int on) {
+    int fd = open("/proc/sys/kernel/gmux_own_exec", O_WRONLY);
+    if (fd < 0 || write(fd, on ? "1" : "0", 1) != 1)
+        printf("FAIL kernel.gmux_own_exec could not be set\n");
+    if (fd >= 0) close(fd);
+}
+
+enum
+{
+    KIND_OWN = 20,
+    KIND_SHARED = 21
+};
+
+/* the build this process runs, by what a load at a kernel address finds: the
+ * guarded build ends it, the plain build in the shared memory reads the
+ * kernel's bytes, a memory of its own reads zeros */
+static int kind_code(const char* at) {
+    volatile const unsigned char* p =
+        (volatile const unsigned char*) strtoul(at, 0, 0);
+    unsigned char sum = 0;
+    for (int i = 0; i < 16; i++) sum |= p[i];
+    return sum ? KIND_SHARED : KIND_OWN;
+}
+
+/* the bytes the own-memory stores write, xor 0x5a so the program's image does
+ * not hold them; the host scans the machine's memory for GMUXOWNSTOREMARK after
+ * the run */
+static const unsigned char stored[16] = {0x1d, 0x17, 0x0f, 0x02, 0x15, 0x0d,
+                                         0x14, 0x09, 0x0e, 0x15, 0x08, 0x1f,
+                                         0x17, 0x1b, 0x08, 0x11};
+
+/* as a process in a memory of its own: an address that is another owner's reads
+ * zeros, and a store and the syscalls that name it reach only this process's
+ * bytes */
+static int reach(char* addr) {
+    volatile unsigned char* p = (volatile unsigned char*) addr;
+    volatile unsigned char key = 0x5a;
+    unsigned char got[16];
+    int fds[2], bad = 0, i;
+    if (pipe(fds)) return 100;
+    for (i = 0; i < 16; i++)
+        if (p[i]) bad |= 1;
+    if (write(fds[1], addr, 16) != 16 || read(fds[0], got, 16) != 16)
+        bad |= 2;
+    else
+        for (i = 0; i < 16; i++)
+            if (got[i]) bad |= 4;
+    if (write(fds[1], "abcdefghijklmnop", 16) != 16 ||
+        read(fds[0], addr, 16) != 16)
+        bad |= 8;
+    else if (memcmp(addr, "abcdefghijklmnop", 16))
+        bad |= 16;
+    for (i = 0; i < 16; i++) p[i] = stored[i] ^ key;
+    for (i = 0; i < 16; i++)
+        if (p[i] != (stored[i] ^ key)) bad |= 32;
+    close(fds[0]);
+    close(fds[1]);
+    if (bad) printf("reach %p: %d\n", (void*) addr, bad);
+    return bad;
+}
 
 static int attach_as_child(int id) {
     char* p = shmat(id, 0, 0);
@@ -90,6 +159,9 @@ static int read_revoked(const char* how) {
     for (long i = 0; i < 400000000; i++) {
         if (revoked) seen++;
         sum += page[0];
+        /* in a memory of its own the load has no page to lose; it reads this
+         * process's bytes */
+        if (seen && own_mode()) return 0;
         if (seen > 1) return 3;
         go = 1;
         if (yielding) sched_yield();
@@ -104,7 +176,7 @@ static int status(int got) {
 }
 
 static void check(const char* kind, const char* what, int ok) {
-    printf("%s %s: %s\n", ok ? "PASS" : "FAIL", kind, what);
+    printf("%s %s%s: %s\n", ok ? "PASS" : "FAIL", TAG, kind, what);
 }
 
 /* the shared objects, one kind each: a System V segment (arg: its id), a POSIX
@@ -182,6 +254,66 @@ static int stale(char** a) {
     return 0;
 }
 
+/* as uid 1000 in a memory of its own: maps a page, says where on `up` and
+ * unmaps it; once root has mapped pages of its own, one of which took the
+ * address (a byte on `down`), the address holds none of root's bytes */
+static int newowner(char** a) {
+    int up = atoi(a[2]), down = atoi(a[3]);
+    volatile char* page = mmap(
+        0, 4096, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0
+    );
+    if (page == MAP_FAILED) return 2;
+    page[0] = 1;
+    char at[32], c;
+    snprintf(at, sizeof at, "%p", (void*) page);
+    write(up, at, sizeof at);
+    if (munmap((void*) page, 4096) || read(down, &c, 1) != 1) return 2;
+    for (int i = 0; i + 8 <= 4096; i++)
+        if (!memcmp((char*) page + i, "NEWOWNER", 8)) return 3;
+    return 0;
+}
+
+/* root maps pages with its marker until one lands where the uid 1000 process's
+ * page was */
+static int new_owner_check(void) {
+    int up[2], down[2];
+    if (pipe(up) || pipe(down)) return 0;
+    char from[8], to[8];
+    snprintf(from, sizeof from, "%d", up[1]);
+    snprintf(to, sizeof to, "%d", down[0]);
+    char* args[] = {"isolation", "newowner", from, to, NULL};
+    pid_t pid = vfork();
+    if (pid == 0) {
+        if (setuid(1000) == 0) execv("/bin/isolation", args);
+        _exit(127);
+    }
+    char at[32] = "";
+    int ready = read(up[0], at, sizeof at) == sizeof at;
+    char* want = (char*) strtoul(at, 0, 0);
+    char* maps[512];
+    int n = 0, hit = 0;
+    while (ready && n < 512 && !hit) {
+        maps[n] = mmap(
+            0, 4096, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0
+        );
+        if (maps[n] == MAP_FAILED) break;
+        memcpy(maps[n], "NEWOWNER", 8);
+        hit = maps[n++] == want;
+    }
+    write(down[1], "g", 1);
+    int st = -1;
+    waitpid(pid, &st, 0);
+    while (n) munmap(maps[--n], 4096);
+    close(up[0]);
+    close(up[1]);
+    close(down[0]);
+    close(down[1]);
+    int ok = ready && hit && WIFEXITED(st) && !WEXITSTATUS(st);
+    if (!ok)
+        printf("ready %d, address taken %d, wait status %d\n", ready, hit, st);
+    return ok;
+}
+
 /* as uid 1000: maps the object and detaches it, then touches it; a store or a
  * load must end the process, a syscall must be refused */
 static int detached(const char* kind, const char* arg, const char* how) {
@@ -190,6 +322,22 @@ static int detached(const char* kind, const char* arg, const char* how) {
     if (p == (char*) -1 || pipe(fds)) return 2;
     p[64] = 'x';
     if (unmap_kind(kind, (char*) p)) return 2;
+    if (own_mode()) {
+        /* nothing faults: the address is this process's own bytes */
+        char in[4];
+        if (!strcmp(how, "sys"))
+            return write(fds[1], (char*) p, 4) == 4 &&
+                           read(fds[0], in, 4) == 4 &&
+                           write(fds[1], "abcd", 4) == 4 &&
+                           read(fds[0], (char*) p, 4) == 4
+                       ? 0
+                       : 3;
+        if (!strcmp(how, "load"))
+            (void) *p;
+        else
+            *p = 'z';
+        return 0;
+    }
     if (!strcmp(how, "sys")) {
         int out = write(fds[1], (char*) p, 4) < 0 && errno == EFAULT;
         write(fds[1], "abcd", 4);
@@ -232,7 +380,11 @@ static int inherited(const char* kind, const char* arg, const char* how) {
     char at[32];
     snprintf(at, sizeof at, "%p", (void*) p);
     char* poke[] = {"isolation", "poke", at, NULL};
-    return run(poke) == 128 + SIGSEGV ? 0 : 3;
+    /* the child's program has a memory of its own: the store lands in its own
+     * bytes, or past the end of that memory (an address above everything it
+     * maps) and ends it */
+    int got = run(poke);
+    return got == 128 + SIGSEGV || (own_mode() && got == 0) ? 0 : 3;
 }
 
 static int run_mode(
@@ -300,6 +452,111 @@ static void of_kind(const char* kind, const char* arg, char* addr) {
         kind, "a store still ends it after a member exited holding the mapping",
         run_mode("held", kind, arg, 0) == 0 && run(poke) == 128 + SIGSEGV
     );
+}
+
+/* as uid 1000 in a memory of its own, against the root process's mapping of an
+ * object of this kind: nothing of root's is at the address, and nothing the
+ * process does there is root's */
+static void of_kind_own(const char* kind, const char* arg, char* addr) {
+    char at[32];
+    snprintf(at, sizeof at, "%p", (void*) addr);
+    check(
+        kind,
+        "a non-member's loads, stores and syscalls reach only its own bytes",
+        reach(addr) == 0
+    );
+    check(
+        kind, "a member stores, loads and passes it to syscalls",
+        run_mode("member", kind, arg, 0) == 0
+    );
+    check(
+        kind, "a store after detach reaches only its own bytes",
+        run_mode("detached", kind, arg, "store") == 0
+    );
+    check(
+        kind, "a load after detach reaches only its own bytes",
+        run_mode("detached", kind, arg, "load") == 0
+    );
+    check(
+        kind, "a syscall after detach reaches only its own bytes",
+        run_mode("detached", kind, arg, "sys") == 0
+    );
+    check(
+        kind, "a vfork child shares the membership",
+        run_mode("inherit", kind, arg, "vfork") == 0
+    );
+    check(
+        kind, "a thread shares the membership",
+        run_mode("inherit", kind, arg, "thread") == 0
+    );
+    check(
+        kind, "a program the child execs has a memory of its own",
+        run_mode("inherit", kind, arg, "exec") == 0
+    );
+}
+
+/* as uid 1000 in a memory of its own: the kernel's memory (`kaddr`), another
+ * process's and a segment it never attached are not reachable; every access
+ * lands in this process's bytes and root checks afterwards that its own did not
+ * change. `objects` is as in nonroot() */
+static int nonroot_own(
+    char* other, char* shared, char* open_id, char* kaddr, char** objects
+) {
+    void* theirs = (void*) strtoul(other, 0, 0);
+    int fds[2];
+    pipe(fds);
+    write(fds[1], "0123456789abcdef0123456789abcdef", 32);
+    CHECK(
+        "nonroot syscall on its own memory",
+        read(fds[0], own, 32) == 32 && !memcmp(own, "0123456789abcdef", 16)
+    );
+    char* own_poke[] = {"isolation", "poke", "own", NULL};
+    char* own_peek[] = {"isolation", "peek", "own", NULL};
+    CHECK("nonroot store to its own memory", run(own_poke) == 0);
+    CHECK("nonroot load from its own memory", run(own_peek) == 0);
+    CHECK(
+        "nonroot loads, stores and syscalls at a kernel address reach only its "
+        "own bytes",
+        reach((char*) strtoul(kaddr, 0, 0)) == 0
+    );
+    CHECK(
+        "nonroot loads, stores and syscalls at another process's address reach "
+        "only its own bytes",
+        reach((char*) theirs) == 0
+    );
+    CHECK(
+        "nonroot loads, stores and syscalls at a segment it never attached "
+        "reach only its own bytes",
+        reach((char*) strtoul(shared, 0, 0)) == 0
+    );
+    char* attach[] = {"isolation", "attach", open_id, NULL};
+    CHECK("nonroot store and load in a segment it attached", run(attach) == 0);
+    char* unmapped[] = {"isolation", "revoke", "munmap", NULL};
+    char* unmapped_syscall[] = {"isolation", "revoke", "syscall", NULL};
+    char* detached[] = {"isolation", "revoke", "shmdt", NULL};
+    CHECK(
+        "nonroot load after a sibling unmaps the page reads its own bytes",
+        run(unmapped) == 0
+    );
+    CHECK(
+        "nonroot load after a sibling unmaps the page during a syscall reads "
+        "its own bytes",
+        run(unmapped_syscall) == 0
+    );
+    CHECK(
+        "nonroot load after a sibling detaches the segment reads its own bytes",
+        run(detached) == 0
+    );
+    void* mine = mmap(
+        0, 4096, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0
+    );
+    void* fixed = mmap(
+        mine, 4096, PROT_READ, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0
+    );
+    CHECK("MAP_FIXED refused", fixed == MAP_FAILED && errno == EINVAL);
+    for (; objects[0]; objects += 3)
+        of_kind_own(objects[0], objects[1], (char*) strtoul(objects[2], 0, 0));
+    return 0;
 }
 
 /* as uid 1000: the kernel's memory, another process's and a segment it never
@@ -502,7 +759,9 @@ static int span_once(int last) {
     close(down[1]);
     unlink(name);
     unlink(other);
-    int ok = ready && WIFSIGNALED(st) && WTERMSIG(st) == SIGSEGV;
+    /* in a memory of its own the store lands in the process's own bytes */
+    int ok = ready && (own_mode() ? WIFEXITED(st) && !WEXITSTATUS(st)
+                                  : WIFSIGNALED(st) && WTERMSIG(st) == SIGSEGV);
     if (!ok) printf("ready %d, wait status %d\n", ready, st);
     return ok;
 }
@@ -577,11 +836,154 @@ static void regions(void) {
     }
 }
 
+static char* kern;
+static unsigned char kbefore[16];
+
+/* a window of the kernel's static data (the first 192 KiB from 0x10000, below
+ * the pages processes are given) that is not all zero and does not change over
+ * 150 ms: what a process in the machine's memory reads, and one in its own does
+ * not */
+static void find_kernel(void) {
+    enum
+    {
+        WANT = 64
+    };
+    char* at[WANT];
+    unsigned char first[WANT][16];
+    int n = 0;
+    for (char* p = (char*) 0x10000; p < (char*) 0x40000 && n < WANT; p += 16) {
+        int set = 0;
+        for (int i = 0; i < 16; i++) set += p[i] != 0;
+        if (set < 8) continue;
+        at[n] = p;
+        memcpy(first[n++], p, 16);
+    }
+    usleep(150000);
+    for (int i = 0; i < n && !kern; i++)
+        if (!memcmp(first[i], at[i], 16)) kern = at[i];
+    if (kern)
+        printf(
+            "kernel window at 0x10000 + %lu\n",
+            (unsigned long) (kern - (char*) 0x10000)
+        );
+}
+
+/* a command as uid 1000, by fork or vfork, which sets the uid and execs: its
+ * exit status, or 128 + the signal */
+static int launch(int forked, const char* path, char* const* args) {
+    int st = -1;
+    pid_t pid = forked ? fork() : vfork();
+    if (pid == 0) {
+        if (setuid(1000) == 0) execv(path, args);
+        _exit(127);
+    }
+    if (pid < 0) return 100 + errno;
+    waitpid(pid, &st, 0);
+    return WIFSIGNALED(st) ? 128 + WTERMSIG(st) : WEXITSTATUS(st);
+}
+
+/* a copy of this program that is setuid root */
+static int suid_copy(const char* dst) {
+    char buf[4096];
+    ssize_t n = -1;
+    int in = open("/bin/isolation", O_RDONLY),
+        out = open(dst, O_CREAT | O_WRONLY | O_TRUNC, 0755);
+    while (in >= 0 && out >= 0 && (n = read(in, buf, sizeof buf)) > 0)
+        if (write(out, buf, n) != n) break;
+    int ok = in >= 0 && out >= 0 && n == 0 && !fchmod(out, 04755);
+    if (in >= 0) close(in);
+    if (out >= 0) close(out);
+    return ok;
+}
+
+/* what a non-root shell's $(...) and a pipeline command report as their build
+ */
+static int shell_kinds(const char* kaddr, int want_own) {
+    char script[200], out[256] = "";
+    char* args[] = {"sh", "-c", script, NULL};
+    int fds[2], st = -1;
+    snprintf(
+        script, sizeof script,
+        "x=$(/bin/isolation kind %s); echo \"dollar $x\"; /bin/isolation kind "
+        "%s | cat",
+        kaddr, kaddr
+    );
+    if (pipe(fds)) return 0;
+    pid_t pid = vfork();
+    if (pid == 0) {
+        dup2(fds[1], 1);
+        if (setuid(1000) == 0) execv("/bin/sh", args);
+        _exit(127);
+    }
+    close(fds[1]);
+    ssize_t n = 0, got;
+    while (n < (ssize_t) sizeof out - 1 &&
+           (got = read(fds[0], out + n, sizeof out - 1 - n)) > 0)
+        n += got;
+    waitpid(pid, &st, 0);
+    close(fds[0]);
+    int ok = want_own ? strstr(out, "dollar KIND own\n") &&
+                            strstr(out, "\nKIND own\n")
+                      : strstr(out, "dollar \n") && !strstr(out, "KIND");
+    if (!ok) printf("shell printed \"%s\", status %d\n", out, st);
+    return ok;
+}
+
+/* each way a uid 1000 process starts reports the build it got: the guarded
+ * build ends the probe with SIGSEGV, the plain build in the machine's memory
+ * reads kernel bytes, and a memory of its own reads zeros */
+static void launch_forms(int owned) {
+    char at[32], suid[] = "/tmp/isolation-suid";
+    snprintf(at, sizeof at, "%p", (void*) kern);
+    int want = owned ? KIND_OWN : 128 + SIGSEGV;
+    char* args[] = {"isolation", "kind", at, NULL};
+    char* suid_args[] = {"isolation-suid", "kind", at, NULL};
+    check(
+        "launch", "root forks, the child setuids and execs",
+        launch(1, "/bin/isolation", args) == want
+    );
+    check(
+        "launch", "root vforks, the child setuids and execs",
+        launch(0, "/bin/isolation", args) == want
+    );
+    check(
+        "launch",
+        "uid 1000 runs a setuid-root helper, which is root in the machine's "
+        "memory",
+        suid_copy(suid) && launch(0, suid, suid_args) == KIND_SHARED
+    );
+    unlink(suid);
+    check(
+        "launch", "a non-root shell's $(...) and pipeline commands",
+        shell_kinds(at, owned)
+    );
+    pid_t pid = vfork();
+    if (pid == 0) _exit(setuid(1000) ? 127 : kind_code(at));
+    int st = -1;
+    waitpid(pid, &st, 0);
+    printf(
+        "TRUST setuid without exec: %s\n",
+        WIFEXITED(st) && WEXITSTATUS(st) == KIND_SHARED
+            ? "machine's memory, plain build"
+            : "other"
+    );
+}
+
+static int root_flow(char* argv0, int owned);
+
 int main(int argc, char** argv) {
     if (argc == 3 && !strcmp(argv[1], "child"))
         return attach_as_child(atoi(argv[2]));
     if (argc >= 5 && !strcmp(argv[1], "nonroot"))
         return nonroot(argv[2], argv[3], argv[4], argv + 5);
+    if (argc >= 6 && !strcmp(argv[1], "ownroot"))
+        return nonroot_own(argv[2], argv[3], argv[4], argv[5], argv + 6);
+    if (argc == 4 && !strcmp(argv[1], "newowner")) return newowner(argv);
+    if (argc == 3 && !strcmp(argv[1], "kind")) {
+        int k = kind_code(argv[2]);
+        printf("KIND %s\n", k == KIND_OWN ? "own" : "shared");
+        return k;
+    }
     if (argc >= 4 && !strcmp(argv[1], "member"))
         return member(argv[2], argv[3]);
     if (argc == 5 && !strcmp(argv[1], "detached"))
@@ -613,6 +1015,21 @@ int main(int argc, char** argv) {
         return 0;
     }
 
+    /* the first pass is the guarded build's, as before; the second runs the
+     * same program as uid 1000 in a memory of its own */
+    find_kernel();
+    if (!kern) {
+        printf("FAIL no window of kernel memory to probe\n");
+        return 1;
+    }
+    own_exec(0);
+    if (root_flow(argv[0], 0)) return 1;
+    own_exec(1);
+    setenv("ISOLATION_OWN", "1", 1);
+    return root_flow(argv[0], 1);
+}
+
+static int root_flow(char* argv0, int owned) {
     /* below the program image: kernel memory on gmux, unmapped on native Linux
      */
     int fds[2];
@@ -647,7 +1064,7 @@ int main(int argc, char** argv) {
     int st = -1;
     pid_t pid = vfork();
     if (pid == 0) {
-        char* args[] = {argv[0], "child", ids, NULL};
+        char* args[] = {argv0, "child", ids, NULL};
         execv("/bin/isolation", args);
         _exit(127);
     }
@@ -683,7 +1100,13 @@ int main(int argc, char** argv) {
     char* seg = seg_id >= 0 ? shmat(seg_id, 0, 0) : (char*) -1;
     CHECK("root-only segment", seg != (char*) -1);
     if (seg == (char*) -1) return 1;
+    if (owned) {
+        strcpy(seg, "SEGMARK");
+        memcpy(kbefore, kern, 16);
+    }
     snprintf(seg_addr, sizeof seg_addr, "%p", (void*) seg);
+    char kern_addr[32];
+    snprintf(kern_addr, sizeof kern_addr, "%p", (void*) kern);
     /* a segment anyone may attach, which the nonroot process attaches itself */
     int open_seg = shmget(IPC_PRIVATE, 4096, IPC_CREAT | 0666);
     CHECK("open segment", open_seg >= 0);
@@ -694,10 +1117,11 @@ int main(int argc, char** argv) {
     static const char* const kinds[] = {"sysv", "posix", "file", "anon"};
     char names[4][64], places[4][32];
     char* at[4];
-    char* args[5 + 3 * 4 + 1] = {
-        "isolation", "nonroot", addr, seg_addr, open_id
+    char* args[6 + 3 * 4 + 1] = {
+        "isolation", owned ? "ownroot" : "nonroot", addr, seg_addr, open_id
     };
     int shown = 5;
+    if (owned) args[shown++] = kern_addr;
     for (int k = 0; k < 4; k++) {
         at[k] = make_object(kinds[k], names[k], sizeof names[k]);
         check(kinds[k], "object mapped by root", at[k] != (char*) -1);
@@ -727,6 +1151,17 @@ int main(int argc, char** argv) {
             WIFSIGNALED(st) ? WTERMSIG(st) : 0
         );
     CHECK("root's segment untouched by the nonroot store", *seg != 'x');
+    if (owned) {
+        CHECK("root's segment still holds its marker", !strcmp(seg, "SEGMARK"));
+        int same = !memcmp(kern, kbefore, 16);
+        if (!same)
+            for (int i = 0; i < 16; i++)
+                printf(
+                    "kernel byte %d: %02x then %02x\n", i, kbefore[i],
+                    (unsigned char) kern[i]
+                );
+        CHECK("the kernel's memory is unchanged by the nonroot stores", same);
+    }
     shmdt(seg);
     shmctl(seg_id, IPC_RMID, 0);
     shmctl(open_seg, IPC_RMID, 0);
@@ -743,6 +1178,14 @@ int main(int argc, char** argv) {
         "a reused region id does not reach the pages a part left tagged",
         span_once(0) && span_once(1)
     );
+    launch_forms(owned);
+    if (owned)
+        check(
+            "own",
+            "a page unmapped and mapped again by another process holds none of "
+            "its bytes",
+            new_owner_check()
+        );
     regions();
     return 0;
 }

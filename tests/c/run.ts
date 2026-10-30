@@ -114,13 +114,36 @@ function taskcapCheck(section: string): string[] {
 	return oom ? [`the kernel ran the OOM killer: ${oom[0]}`] : [];
 }
 
+/**
+ * what tests/c/isolation.c's own-memory pass stores at kernel, peer and segment addresses (the
+ * program holds it xor 0x5a): a process in a memory of its own writes it nowhere in the machine's
+ * memory, so a scan of that memory after the run must not find it
+ */
+const OWN_STORE = 'GMUXOWNSTOREMARK';
+function ownStores(machine: ArrayBufferLike): string[] {
+	const found = leaks([OWN_STORE], [machine]).map(
+		(l) => `own-memory store found in the machine: ${l}`
+	);
+	// the scan finds a marker that is there (the command line the host put in the memory)
+	if (!leaks(['rootfstype=ramfs'], [machine]).length)
+		found.push('the own-store scan misses the command line');
+	console.log(
+		`isolation: ${OWN_STORE} searched in the machine's memory (${machine.byteLength} bytes): ${found.length ? 'found' : 'absent'}`
+	);
+	return found;
+}
+
 const probes: Record<string, Probe> = {
-	// SECURITY.md: root is trusted with the machine; a non-root task runs its guarded build, which
-	// checks loads and stores, and reaches a shared mapping (System V, POSIX, a file, anonymous)
-	// only while it holds it; past 4,095 regions a mapping is refused
+	// SECURITY.md: root is trusted with the machine. The first pass runs a non-root exec under its
+	// guarded build (kernel.gmux_own_exec 0), which checks loads and stores and reaches a shared
+	// mapping (System V, POSIX, a file, anonymous) only while it holds it; past 4,095 regions a
+	// mapping is refused. The second pass runs the same program in a memory of its own, where no
+	// byte of the kernel or of a peer is at an address it can reach; the host scans for what it
+	// stored. The program forks, so it is built with resumable frames
 	isolation: {
-		lines: ['TRUST kernel-address write accepted'],
-		passes: 90
+		evacuate: true,
+		lines: ['TRUST kernel-address write accepted', 'TRUST setuid without exec: machine'],
+		passes: 169
 	},
 	// SECURITY.md's authority domains: root looks through all of the machine's memory for what the
 	// host holds (a Worker env's secret, a host secret, the owner token), and for a device or a
@@ -341,7 +364,7 @@ const probes: Record<string, Probe> = {
 	posix: {
 		setup: 'ifconfig lo 127.0.0.1 up; mkdir -p /lua-tests',
 		lines: [],
-		passes: 30
+		passes: 31
 	},
 	// perl's core XS modules as side modules: every extension loads through dlopen, and the script
 	// prints what the same perl prints natively (perl-xs.out)
@@ -651,6 +674,8 @@ if (names.includes('isolation')) {
 		sha256(read(program('isolation')!)),
 		new WebAssembly.Module(readFileSync(join(scratch, 'isolation.guard.fuel.wasm')))
 	);
+	// the shell the guarded pass's non-root commands run under
+	guarded.set(manifest.busybox, new WebAssembly.Module(read('kernel/busybox.guard.wasm')));
 }
 const initrd = join(scratch, 'initramfs.cpio');
 appendCpio(join(build, 'kernel/initramfs.bin'), initrd, [
@@ -740,12 +765,13 @@ if (seen) {
 
 let failed = 0;
 for (const name of names) {
-	const { output, hostLog } = boots.get(name)!;
+	const { output, hostLog, machine: booted } = boots.get(name)!;
 	const at = output.lastIndexOf(`== ${name}\r\n`);
 	const section = at < 0 ? '' : output.slice(at, output.indexOf('== end', at));
 	const { lines, passes = 0, host } = probes[name]!;
 	const problems = [
 		...(name === 'authority' ? hostSide : []),
+		...(name === 'isolation' ? ownStores(booted.memory.buffer) : []),
 		...(probes[name]!.check?.(section) ?? []),
 		...(host && !hostLog.some((line) => line.includes(host))
 			? [`host never logged "${host}"`]

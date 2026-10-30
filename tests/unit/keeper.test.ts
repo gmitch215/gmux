@@ -183,6 +183,22 @@ describe('Keeper', () => {
 		expect(keeper.machine).toBe(machine);
 	});
 
+	it('refuses a checkpoint while a process has a memory of its own, and saves once it is gone', async () => {
+		const r = rig();
+		const keeper = new Keeper(r.host, { minMs: 1 });
+		const { machine } = await keeper.open();
+		await r.run(machine, () => r.output().includes('parent ok'));
+		const own = (machine as any).privateMemories as Map<number, WebAssembly.Memory>;
+		own.set(7, new WebAssembly.Memory({ initial: 1, maximum: 8, shared: true }));
+		expect(await keeper.ran(10)).toBeNull();
+		expect(keeper.counts).toMatchObject({ checkpoints: 0, refused: 1 });
+		expect(keeper.last.refused).toMatch(/with their own memory are not saved yet/);
+		expect(keeper.machine).toBe(machine);
+		own.delete(7);
+		expect(await keeper.ran(10)).not.toBeNull();
+		expect(keeper.counts).toMatchObject({ checkpoints: 1, refused: 1 });
+	});
+
 	it('wakes an unattended machine at its next Linux deadline, no sooner than a quiet period that doubles', async () => {
 		const r = rig();
 		const keeper = new Keeper(r.host);

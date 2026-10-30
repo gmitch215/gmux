@@ -1240,7 +1240,7 @@ export class Machine {
 					});
 					if (binStart) {
 						// the parent's own program, which the host already accepted at its exec
-						const user = self.lookup(me, binStart, binEnd, dataStart, tableStart);
+						const user = self.lookup(me, binStart, binEnd, dataStart, tableStart, true);
 						if (!user) throw new Error(`fork of an executable the host refused`);
 						task.user = user;
 					}
@@ -1453,19 +1453,28 @@ export class Machine {
 		};
 	}
 
-	/** the module for an executable the calling task runs: its guarded build when the task is not root */
+	/** the module for an executable the calling task runs: its guarded build when the task is not root and in the shared memory */
 	private lookup(
 		caller: Runner,
 		binStart: number,
 		binEnd: number,
 		dataStart: number,
-		tableStart: number
+		tableStart: number,
+		forked = false
 	) {
 		const bytes = this.bytes(binStart, binEnd);
 		const hash = stubHash(bytes) ?? this.options.sha256(bytes);
 		let module = this.options.registry.get(hash);
 		const guarded = this.options.guarded;
-		if (module && guarded && Number(this.exp(caller).wasm_current_euid?.() ?? 0) !== 0) {
+		// a fork child and a non-root exec have a memory of their own and run the plain build; the
+		// guarded build is for a non-root task in the shared memory (kernel.gmux_own_exec = 0)
+		const own = forked || this.userMemory(caller) !== this.memory;
+		if (
+			module &&
+			guarded &&
+			!own &&
+			Number(this.exp(caller).wasm_current_euid?.() ?? 0) !== 0
+		) {
 			module = guarded.get(hash);
 			if (!module)
 				this.stats.unknownExecutables.push(
@@ -1662,7 +1671,7 @@ export class Machine {
 		// a shareable program imports its memory base mutable, and runs alone just as well
 		const memoryBase = base(user.dataStart, shareable(user.module));
 		const env = this.userEnv(runner, global, memoryBase, base(user.tableStart));
-		const loader = this.dlProcess(user.dataStart);
+		const loader = this.dlProcess(user.dataStart, this.userMemory(runner));
 		loader.exe = { hash: user.hash };
 		const dl = loader.view();
 		Object.assign(env, dl.imports());
@@ -3517,10 +3526,10 @@ export class Machine {
 		return this.privateMemories.get(mm) ?? this.memory;
 	}
 
-	private dlProcess(dataStart: number): DlProcess {
+	private dlProcess(dataStart: number, memory = this.memory): DlProcess {
 		let dl = this.dls.get(dataStart);
 		if (!dl) {
-			dl = new DlProcess(this.memory, this.options.registry, this.options.sha256, dataStart, {
+			dl = new DlProcess(memory, this.options.registry, this.options.sha256, dataStart, {
 				misses: this.dlMisses,
 				interpreter: !!this.options.interpret,
 				onMiss: (exe, lib) => this.stats.dlMisses.push(`${lib} for ${exe}`)

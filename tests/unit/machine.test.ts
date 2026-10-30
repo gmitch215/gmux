@@ -970,6 +970,26 @@ describe('Machine', () => {
 		expect(machine.crashed).toBeNull();
 	});
 
+	it('runs a non-root exec on its own memory under the plain build', async () => {
+		const r = rig({
+			sharedKernel: true,
+			registry: new Map([['X', toyUser()]]),
+			guarded: new Map()
+		});
+		const machine = new Machine(r.machineOptions);
+		await r.run(machine, () => r.output().includes('parent ok'));
+		new DataView(machine.memory.buffer).setUint32(0x81c, 1000, true);
+		// the toy kernel's current mm is 1
+		(machine as any).privateMemories.set(
+			1,
+			new WebAssembly.Memory({ initial: 8, maximum: 64, shared: true })
+		);
+		machine.type('x');
+		await r.run(machine, () => /exec (refused|taken)/.test(r.output()));
+		expect(r.output()).toContain('exec taken\n');
+		expect(machine.stats.unknownExecutables).toEqual([]);
+	});
+
 	describe('checkpoint and restore', () => {
 		async function checkpointed(
 			beforeCheckpoint: (r: ReturnType<typeof rig>) => void = () => {}

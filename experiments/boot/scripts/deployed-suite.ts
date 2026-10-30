@@ -4,7 +4,7 @@ if (!B) throw new Error('set WORKER_URL to the deployed worker, e.g. https://<na
 const taskCount = Number(process.env.TASKS ?? 96);
 const passes = (n) => (o) => (o.match(/^PASS /gm) ?? []).length === n && !/^FAIL /m.test(o);
 const probes = [
-	['isolation', 'isolation', (o) => o.includes('TRUST kernel-address write accepted') && passes(90)(o)],
+	['isolation', 'isolation', (o) => o.includes('TRUST kernel-address write accepted') && passes(169)(o)],
 	['vf', 'vf', (o) => o.includes('second exited 7') && o.includes('third exited 9')],
 	['sig', 'sig', (o) => o.includes('handler slept') && o.includes('after pause')],
 	['thr', 'thr', (o) => o.includes('threads count 40000')],
@@ -48,7 +48,7 @@ const probes = [
 			['zlib 1.3.1', 'crc32 273b7535', 'compressed 639 bytes (rc 0), adler32 99df58be', 'round trip same (rc 0)'].every((l) => o.includes(l)) &&
 			passes(8)(o)
 	],
-	['posix', 'ifconfig lo 127.0.0.1 up; mkdir -p /lua-tests; posix', passes(30)],
+	['posix', 'ifconfig lo 127.0.0.1 up; mkdir -p /lua-tests; posix', passes(31)],
 	['maps', 'maps', passes(12)],
 	[
 		'abi',
