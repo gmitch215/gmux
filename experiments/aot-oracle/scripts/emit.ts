@@ -39,7 +39,7 @@ import {
  * entry, across one piece boundary, the checked path with the block's inline cache elsewhere) and every exit and fault
  * stores the cpu words the C route stores. A block with an op this does not take is an exit: the region leaves at it.
  *
- * `emit.ts [--flags=live|all|none] [--wide] [--calls[=live|all]] [--stats] [--ranges=<lo>-<hi>,...] <out dir> <coverage 0..1> <dump.hot>[@<lo>-<hi>,...]...`
+ * `emit.ts [--flags=live|all|none] [--wide] [--calls[=live|all]] [--stats] [--loc] [--ranges=<lo>-<hi>,...] <out dir> <coverage 0..1> <dump.hot>[@<lo>-<hi>,...]...`
  * writes `regions.s` (the region functions) and `tables.c` (what the runtime attaches blocks through) into the out dir.
  * `EMIT_MUTATE=skipreg` makes every exit skip restoring one register (`skipret`: register 0), `badpc` returns the pc plus one at
  * every exit, `width` computes a wide value in 32 bits; all are unsound on purpose, so a check can show it fails.
@@ -85,7 +85,13 @@ export interface EmitConfig {
 	// `live` makes an edge into another region (one with no syscall) a wasm call that passes the callee's registers and flags as
 	// parameters and takes back the ones it writes; `all` takes back every register it holds. Off, every such edge is an exit
 	calls?: 'off' | 'live' | 'all';
+	// a `.loc` before each run of ops of one category and guest pc, the category as the file name and the pc as the line
+	loc?: boolean;
+	// with `recipe` flags: a recipe crosses an edge into a block that reads flags (the block takes it as its entry state and reads the
+	// five locals when the interpreter entered it), in the regions listed (all of them when true). Off, such an op computes its flags at once
+	edge?: boolean | number[];
 }
+export const LOC_FILES = ['arith', 'state', 'flags', 'address', 'guards', 'guest', 'dispatch', 'calls', 'safepoints'];
 export interface RegionIn {
 	all: Block[];
 	chosen: Block[];
@@ -110,6 +116,8 @@ export interface RegionReport {
 	windows: number;
 	accesses: number;
 	windowed: number;
+	// --edge: blocks that take a recipe in, edges that pass one (static, and weighted by the dump's block runs) and edges that compute the flags
+	edge?: { entries: number; passed: number; passedW: bigint; materialized: number; materializedW: bigint };
 	asmLines: number;
 	// FLAGS ops by what the emitter did with them: dropped (no reader), kept as a recipe, computed at once (and why), each weighted
 	// by the dump's block runs; cold stubs that make the five flags from a recipe; branches and sets that read a recipe
@@ -255,7 +263,12 @@ export function layoutChecks(): string[] {
 }
 
 export function emitRegions(regions: RegionIn[], cfg: EmitConfig): { asm: string; tables: string; reports: RegionReport[] } {
-	const asm: string[] = ['\t.globaltype\t__memory_base, i32, immutable', ...HELPERS.map((h) => `\t.functype\t${h.replace(' ', '\t')}`), '\t.text'];
+	const asm: string[] = [
+		'\t.globaltype\t__memory_base, i32, immutable',
+		...HELPERS.map((h) => `\t.functype\t${h.replace(' ', '\t')}`),
+		...(cfg.loc ? LOC_FILES.map((f, k) => `\t.file\t${k + 1} "${f}"`) : []),
+		'\t.text'
+	];
 	const tab: string[] = ['#include <stddef.h>', '#include <string.h>', '#include "aot.h"', '', ...layoutChecks(), ''];
 	const reports: RegionReport[] = [];
 	const entries: { pc: bigint; next: bigint; target: bigint; n: number; region: number; idx: number; name: string; pcs: string }[] = [];
@@ -410,11 +423,15 @@ function emitRegion(region: RegionIn, rn: number, cfg: EmitConfig, calls: Map<bi
 	// edge it came by). Those FLAGS ops stay eager, with the reason
 	const recipes = new Set<string>();
 	const eagerWhy = new Map<string, string>();
+	// edge mode: the flags each block reads at its start (a mask), and below the recipe each one takes in
+	const edgeOn = recipeMode && (cfg.edge === true || (Array.isArray(cfg.edge) && cfg.edge.includes(rn)));
+	let flagsIn: number[] = [];
 	if (recipeMode) {
 		const live = flagLiveness(chosen, index, calls, dumpMap, { mode: 'live', mutate: '', identity: false });
+		flagsIn = live.live;
 		const demand = (pc: bigint) => {
 			const k = index.get(pc);
-			if (k !== undefined) return live.live[k]! ? 'live-in' : '';
+			if (k !== undefined) return live.live[k]! && !edgeOn ? 'live-in' : '';
 			return calls.has(pc) ? 'call' : '';
 		};
 		chosen.forEach((b, j) => {
@@ -475,6 +492,79 @@ function emitRegion(region: RegionIn, rn: number, cfg: EmitConfig, calls: Map<bi
 				if (why) eagerWhy.set(`${j}:${i}`, why);
 				else recipes.add(`${j}:${i}`);
 			});
+		});
+	}
+	// edge mode: the recipe a block takes in. A block reads it until its first full definition, so it takes one only if nothing before that
+	// reads the five locals (a helper, a partial flags op, a call, an indirect jump). The candidates are the recipes held where a block leaves for
+	// one that reads flags, weighted by the leaving block's runs; the heaviest kind and width wins, and the other edges compute the flags
+	interface Held {
+		kind: string;
+		w: number;
+	}
+	const entryRec: (Held | undefined)[] = chosen.map(() => undefined);
+	if (edgeOn) {
+		const accepts = (k: number) => {
+			const b = chosen[k]!;
+			for (let i = 0; i < b.ins.length; i++) {
+				const x = b.ins[i]!;
+				switch (opName(x.op)) {
+					case 'FLAGS':
+						if (dead.has(`${k}:${i}`)) break;
+						return RECIPE_KINDS.has(FK[Number(x.imm)]!);
+					case 'X86FLAGS':
+						if (x.imm > 4n) break;
+						return x.imm === 1n;
+					case 'X86SHD':
+					case 'X86MD':
+					case 'SSE':
+					case 'X87':
+					case 'X86STR':
+					case 'SYSCALL':
+						return false;
+					case 'BR':
+					case 'BRZ':
+						if (calls.has(b.target)) return false;
+						break;
+					case 'EXIT':
+						if (calls.has(BigInt.asUintN(64, b.pc + BigInt.asIntN(32, x.imm >> 16n)))) return false;
+						break;
+					case 'JMP': {
+						const t = constJump(b);
+						return t !== undefined && !calls.has(t);
+					}
+				}
+			}
+			return !calls.has(b.next);
+		};
+		const votes = chosen.map(() => new Map<string, bigint>());
+		chosen.forEach((b, j) => {
+			let held: Held | null = null;
+			const vote = (pc: bigint) => {
+				const k = index.get(pc);
+				if (!held || k === undefined || !flagsIn[k]) return;
+				const key = `${held.kind}:${held.w}`;
+				votes[k]!.set(key, (votes[k]!.get(key) ?? 0n) + b.runs);
+			};
+			b.ins.forEach((x, i) => {
+				const name = opName(x.op);
+				if (name === 'FLAGS') {
+					if (!dead.has(`${j}:${i}`)) held = recipes.has(`${j}:${i}`) ? { kind: FK[Number(x.imm)]!, w: x.w } : null;
+				} else if (name === 'X86FLAGS' && x.imm === 1n) held = null;
+				else if (name === 'BR' || name === 'BRZ') vote(b.target);
+				else if (name === 'EXIT') vote(BigInt.asUintN(64, b.pc + BigInt.asIntN(32, x.imm >> 16n)));
+			});
+			const last = opName(b.ins.at(-1)!.op);
+			if (last === 'JMP') {
+				const t = constJump(b);
+				if (t !== undefined) vote(t);
+			} else if (last !== 'SYSCALL') vote(b.next);
+		});
+		chosen.forEach((_, k) => {
+			if (!accepts(k)) return;
+			let best = '';
+			let most = -1n;
+			for (const [key, v] of votes[k]!) if (v > most) [best, most] = [key, v];
+			if (best) entryRec[k] = { kind: best.split(':')[0]!, w: Number(best.split(':')[1]) };
 		});
 	}
 
@@ -559,11 +649,24 @@ function emitRegion(region: RegionIn, rn: number, cfg: EmitConfig, calls: Map<bi
 		if (op === 'if' || op === 'else' || /\.(eq|ne|eqz|lt_[us]|le_[us]|gt_[us]|ge_[us]|and|or)$/.test(op)) return 'guards';
 		return 'address';
 	};
+	let locPc = 0;
+	let locCat = '';
+	let locKey = '';
 	const o = (...ls: string[]) =>
 		ls.forEach((l) => {
-			out.push(`\t${l}`);
-			if (/^(#|end|block|loop|local\.|i32\.const|i64\.const|drop)/.test(l)) return;
+			const counted = !/^(#|end|block|loop|local\.|i32\.const|i64\.const|drop)/.test(l);
 			const c = cat === 'access' ? classify(l) : cat;
+			if (cfg.loc && l[0] !== '#') {
+				const lc = counted || cat !== 'access' ? c : locCat || 'address';
+				const key = `${lc}:${locPc}`;
+				if (key !== locKey) {
+					locKey = key;
+					locCat = lc;
+					out.push(`\t.loc\t${LOC_FILES.indexOf(lc === 'helpers' ? 'calls' : lc) + 1} ${locPc} 0`);
+				}
+			}
+			out.push(`\t${l}`);
+			if (!counted) return;
 			const e = catStat.get(c) ?? catStat.set(c, { static: 0, weighted: 0n }).get(c)!;
 			e.static++;
 			e.weighted += runsNow;
@@ -597,12 +700,15 @@ function emitRegion(region: RegionIn, rn: number, cfg: EmitConfig, calls: Map<bi
 	interface Recipe {
 		kind: string;
 		w: number;
+		// taken in at the block's start (edge mode): the operands hold the flags only while `warm` is set, else the five locals do
+		dual?: boolean;
 	}
 	let cur: Recipe | null = null;
 	const fstat = { total: 0, dead: 0, recipe: 0, eager: 0, deadW: 0n, recipeW: 0n, eagerW: 0n, why: {} as Record<string, number>, whyW: {} as Record<string, bigint>, stubs: 0, predicates: 0 };
+	const edgeStats = { entries: entryRec.filter(Boolean).length, passed: 0, passedW: 0n, materialized: 0, materializedW: 0n };
 	const slot = () => ({ qa: local('qa', 'i64'), qb: local('qb', 'i64'), qr: local('qr', 'i64'), qc: local('qc', 'i64') });
 	// one flag of a recipe, as an i32 on the stack (the same arithmetic as the eager flags, on the saved operands)
-	const rflag = (rc: Recipe, f: 'n' | 'z' | 'c' | 'v' | 'p') => {
+	const rflag0 = (rc: Recipe, f: 'n' | 'z' | 'c' | 'v' | 'p') => {
 		const { qa, qb, qr, qc } = slot();
 		const w = rc.w;
 		const sg = SIGN(w);
@@ -690,9 +796,46 @@ function emitRegion(region: RegionIn, rn: number, cfg: EmitConfig, calls: Map<bi
 				}
 		}
 	};
+	// a recipe taken in at a block's start holds only when an edge of the region entered the block (`warm`); entered by the interpreter,
+	// the five locals hold the flags. The carry of INC and DEC is in its local either way
+	const warm = () => local('warm', 'i32');
+	const flagLocals5 = { n: fl.n, z: fl.z, c: fl.c, v: fl.v, p: fl.p };
+	const rflag = (rc: Recipe, f: 'n' | 'z' | 'c' | 'v' | 'p') => {
+		if (!rc.dual || ((rc.kind === 'INC' || rc.kind === 'DEC') && f === 'c')) return rflag0(rc, f);
+		lget(warm());
+		o('if\ti32');
+		rflag0(rc, f);
+		o('else');
+		lget(flagLocals5[f]);
+		o('end_if');
+	};
+	// a condition code (the x86 ones, 0..15) from the five locals
+	const condLocals = (c: number) => {
+		const f = (x: number) => lget(x);
+		switch (c >> 1) {
+			case 0: f(fl.v); break;
+			case 1: f(fl.c); break;
+			case 2: f(fl.z); break;
+			case 3: f(fl.c); f(fl.z); o('i32.or'); break;
+			case 4: f(fl.n); break;
+			case 5: f(fl.p); break;
+			case 6: f(fl.n); f(fl.v); o('i32.xor'); break;
+			default: f(fl.z); f(fl.n); f(fl.v); o('i32.xor'); o('i32.or'); break;
+		}
+		if (c & 1) o('i32.eqz');
+	};
 	// a condition code (the x86 ones, 0..15) from a recipe: after a compare the signed and unsigned orderings are one comparison of
 	// the saved operands
 	const rcond = (rc: Recipe, c: number) => {
+		if (!rc.dual) return rcond0(rc, c);
+		lget(warm());
+		o('if\ti32');
+		rcond0({ ...rc, dual: false }, c);
+		o('else');
+		condLocals(c);
+		o('end_if');
+	};
+	const rcond0 = (rc: Recipe, c: number) => {
 		const { qa, qb } = slot();
 		const sub = rc.kind === 'SUB';
 		const cmp = (op: string, signed: boolean) => {
@@ -728,6 +871,13 @@ function emitRegion(region: RegionIn, rn: number, cfg: EmitConfig, calls: Map<bi
 	};
 	// the five flag locals from a recipe (the stub of a fault or exit)
 	const rmaterialize = (rc: Recipe) => {
+		if (rc.dual) {
+			lget(warm());
+			o('if');
+			rmaterialize({ ...rc, dual: false });
+			o('end_if');
+			return;
+		}
 		for (const [f, local5] of [['n', fl.n], ['z', fl.z], ['c', fl.c], ['v', fl.v], ['p', fl.p]] as const) {
 			if (f === 'c' && (rc.kind === 'INC' || rc.kind === 'DEC')) continue;
 			if (f === 'z' && mutate === 'stubflag') continue;
@@ -1067,8 +1217,9 @@ function emitRegion(region: RegionIn, rn: number, cfg: EmitConfig, calls: Map<bi
 			ownWindows += own.wins.length;
 		}
 		o(`# block ${b.pc.toString(16)} (${j})`);
+		locPc = Number(b.pc & 0x7fffffffn);
 		runsNow = b.runs;
-		cur = null;
+		cur = entryRec[j] ? { ...entryRec[j]!, dual: true } : null;
 		// per-block state
 		const rep = new Map<number, Rep>();
 		const isCross = cross;
@@ -1246,10 +1397,38 @@ function emitRegion(region: RegionIn, rn: number, cfg: EmitConfig, calls: Map<bi
 				o(`i32.load8_u\t${k}:p2align=0`);
 				o('i32.and');
 				open('if', '#if');
+				if (edgeOn) as('flags', () => carryOver(k));
 				edge(j, k);
 				close('end_if');
 				exitTo(to);
 			});
+		// edge mode, at an edge into block k: the recipe this block holds goes in if k takes that kind and width in, else the five locals get
+		// the flags k reads (and `warm` says which, for a block that takes a recipe in)
+		const carryOver = (k: number) => {
+			if (!flagsIn[k]) return;
+			const want = entryRec[k];
+			const spill = () => {
+				if (cur && mutate !== 'edgeskip') {
+					rmaterialize(cur);
+					edgeStats.materialized++;
+					edgeStats.materializedW += b.runs;
+				}
+			};
+			if (want && cur && cur.kind === want.kind && cur.w === want.w) {
+				if (!cur.dual) {
+					i32c(1);
+					lset(warm());
+				}
+				edgeStats.passed++;
+				edgeStats.passedW += b.runs;
+				return;
+			}
+			spill();
+			if (want) {
+				i32c(0);
+				lset(warm());
+			}
+		};
 		const cond = (c: number) => as('flags', () => {
 			if (cur) return rcond(cur, c);
 			const r = c >> 1;
@@ -1650,6 +1829,7 @@ function emitRegion(region: RegionIn, rn: number, cfg: EmitConfig, calls: Map<bi
 
 		b.ins.forEach((x, i) => {
 			if (b.pcs) ipc = BigInt.asUintN(64, b.pc + BigInt(b.pcs[i]!));
+			locPc = Number(ipc & 0x7fffffffn);
 			const name = opName(x.op);
 			cat = ['JMP', 'BR', 'BRZ', 'EXIT'].includes(name) ? 'dispatch' : 'arith';
 			// these read or keep the five flags as they are: the recipe was not asked for across them
@@ -2340,6 +2520,7 @@ function emitRegion(region: RegionIn, rn: number, cfg: EmitConfig, calls: Map<bi
 	const item = (it: Item, level: number) => {
 		cat = 'dispatch';
 		runsNow = 0n;
+		locPc = 0;
 		if (it.kind === 'block') return emitBlock(it.j);
 		openLoop(it.loop.id);
 		open('loop', `L${it.loop.id}`);
@@ -2391,6 +2572,10 @@ function emitRegion(region: RegionIn, rn: number, cfg: EmitConfig, calls: Map<bi
 			lget(okb);
 			o(`i32.load8_u\t${e.j}:p2align=0`);
 			open('if', '#if');
+			if (entryRec[e.j] && mutate !== 'warmstale') {
+				i32c(0);
+				lset(warm());
+			}
 			const lvl = -1;
 			const at = itemAt.get(`${lvl}:${e.j}`)!;
 			const lp = itemIsLoop.get(`${lvl}:${at}`);
@@ -2431,6 +2616,7 @@ function emitRegion(region: RegionIn, rn: number, cfg: EmitConfig, calls: Map<bi
 	const flagOffs = [L.cpuN, L.cpuZ, L.cpuC, L.cpuV, L.cpuP, L.cpuDf];
 	cat = 'state';
 	runsNow = 0n;
+	locPc = 0;
 	if (isCallee) {
 		// the pc, the registers it wrote, the flags and the generation go back to the caller
 		lget(PC);
@@ -2510,6 +2696,7 @@ function emitRegion(region: RegionIn, rn: number, cfg: EmitConfig, calls: Map<bi
 		windows: windowCount,
 		accesses: blockReports.accesses,
 		windowed: blockReports.windowed,
+		edge: edgeOn ? edgeStats : undefined,
 		asmLines: asm.length,
 		flagOps: fstat,
 		cats: Object.fromEntries(catStat)
@@ -2536,7 +2723,9 @@ if (import.meta.main) {
 		return { all, chosen };
 	});
 	const t0 = performance.now();
-	const done = emitRegions(regions, { flags: flagsMode, mutate: process.env.EMIT_MUTATE ?? '', wide: flagArgs.includes('--wide'), calls: callsMode });
+	const edgeArg = flagArgs.find((f) => f === '--edge' || f.startsWith('--edge='));
+	const edge = edgeArg === undefined ? false : edgeArg === '--edge' ? true : edgeArg.slice(7).split(',').map(Number);
+	const done = emitRegions(regions, { flags: flagsMode, mutate: process.env.EMIT_MUTATE ?? '', wide: flagArgs.includes('--wide'), calls: callsMode, loc: flagArgs.includes('--loc'), edge });
 	mkdirSync(outDir, { recursive: true });
 	writeFileSync(`${outDir}/regions.s`, done.asm);
 	writeFileSync(`${outDir}/tables.c`, done.tables);
@@ -2555,6 +2744,8 @@ if (import.meta.main) {
 			`${r.name} flags: ${f.total} ops, ${f.dead} dropped (${pct(f.deadW, all)}% weighted), ${f.recipe} recipes (${pct(f.recipeW, all)}%), ${f.eager} computed at once (${pct(f.eagerW, all)}%: ${why || '-'}); ${f.stubs} stubs make the flags from a recipe, ${f.predicates} reads of a recipe`
 		);
 	}
+	for (const r of done.reports)
+		if (r.edge) console.error(`${r.name} edge: ${r.edge.entries} blocks take a recipe in, ${r.edge.passed} edges pass one (${r.edge.passedW} weighted), ${r.edge.materialized} edges compute the flags a block reads (${r.edge.materializedW} weighted)`);
 	if (flagArgs.includes('--stats')) {
 		const total = new Map<string, { static: number; weighted: bigint }>();
 		for (const r of done.reports)

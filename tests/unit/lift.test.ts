@@ -959,3 +959,24 @@ describe('lift tables', () => {
 		expect(c).not.toContain('r0p_go(cpu, 0x2000ull');
 	});
 });
+
+describe('lift --lines', () => {
+	it('adds only #line lines, and writes the category as the file and the guest pc as the line', () => {
+		const plain = lift([]).c;
+		const lines = lift(['--lines']).c;
+		expect(plain).not.toContain('#line');
+		expect(
+			lines
+				.split('\n')
+				.filter((l) => !l.startsWith('#line '))
+				.join('\n')
+		).toBe(plain);
+		expect(lines).toMatch(/#line 4096 "arith"\n\t[^\n]*= [^\n]* \+ [^\n]*;\n/);
+		expect(lines).toMatch(/#line 8192 "arith"\n/);
+	});
+
+	it('puts a branch under dispatch and a flag write under flags', () => {
+		const lines = lift(['--lines'], {}, 'BRZ').c;
+		expect(lines).toMatch(/#line \d+ "dispatch"\n[^\n]*goto/);
+	});
+});

@@ -133,7 +133,40 @@ const opt = {
 	bindexit: flags.has('--bindexit'),
 	bounds: [...flags].some((f) => f === '--bounds' || f.startsWith('--bounds=')),
 	two: flags.has('--bounds=two'),
-	loops: flags.has('--loop-guards')
+	loops: flags.has('--loop-guards'),
+	lines: flags.has('--lines')
+};
+// --lines: a `#line <guest pc> "<category>"` before every statement, so the compiler's line table names the category
+const LINE_ALU = new Set('MOVI MOV ADD SUB AND OR XOR SHL SHR SAR ROR MUL UMULH SMULH UDIV SDIV UREM SREM ZEXT SEXT INS BSWAP CLZ CTZ POPCNT FSBASE PC'.split(' '));
+const LINE_FLAGS = new Set('FLAGS SETCC SEL CARRY X86FLAGS'.split(' '));
+const LINE_CALLS = new Set('X86MD X86SHD SSE X87 X86STR SYSCALL'.split(' '));
+const LINE_MEM = new Set('LD LDS ST RESOLVE'.split(' '));
+const lineCat = (name: string, l: string) => {
+	if (LINE_ALU.has(name)) return 'arith';
+	if (LINE_FLAGS.has(name)) return 'flags';
+	if (LINE_CALLS.has(name)) return 'calls';
+	if (!LINE_MEM.has(name)) return 'dispatch';
+	if (/AOT_STAT|AOT_COUNT/.test(l)) return 'state';
+	if (/kb_host_ic_at|kb_load_ic|kb_store_ic|__builtin_expect|AOT_SLOW|fault/.test(l)) return 'guards';
+	return /memcpy/.test(l) ? 'guest' : 'address';
+};
+interface LineMark {
+	from: number;
+	to: number;
+	name: string;
+	pc: number;
+}
+const tagLines = (body: string[], marks: LineMark[], head: number) => {
+	const tagged: string[] = [];
+	let k = 0;
+	body.forEach((l, i) => {
+		while (k < marks.length && marks[k]!.to <= i) k++;
+		const m = marks[k];
+		const inOp = m !== undefined && i >= m.from;
+		if (l.trimStart().startsWith('#')) tagged.push(l);
+		else tagged.push(`#line ${inOp ? m.pc : head} "${lineCat(inOp ? m.name : '', l)}"`, l);
+	});
+	return tagged;
 };
 const flagsFlag = [...flags].find((f) => f.startsWith('--flags'));
 const flagsMode = flagsFlag === undefined ? 'live' : (/^--flags=(all|live|none)$/.exec(flagsFlag)?.[1] ?? '');
@@ -470,6 +503,7 @@ order.forEach((region) => {
 		let ipcNow = 0n;
 		let ipc = b.pc;
 		let m = 0;
+		const marks: LineMark[] = [];
 		const grouped = (x: Ins) => !opt.nogroups && !opt.identity && x.c !== 0 && !sm;
 		const frame = sm ? plan!.wins[plan!.comp[j]!]! : { lo: 0, hi: 0 };
 		const V = new Set<number>(sm ? plan!.need[j] : []);
@@ -634,7 +668,7 @@ order.forEach((region) => {
 			body.push(`\tAOT_STAT(win_enter, ${pin.wins.length});`);
 			if (must.length) body.push(`\tif (!(${must.map((k) => `w${k}`).join(' && ')})) goto S${j};`);
 		}
-		b.ins.forEach((x, i) => {
+		const op = (x: Ins, i: number) => {
 			if (b.pcs) ipc = BigInt.asUintN(64, b.pc + BigInt(b.pcs[i]!));
 			ipcNow = ipc;
 			const [A, B, C, W] = [reg(x.a), reg(x.b), reg(x.c), x.w];
@@ -908,11 +942,16 @@ order.forEach((region) => {
 					throw new Error(`no lifting for ${name}`);
 			}
 			body.push(...after);
+		};
+		b.ins.forEach((x, i) => {
+			const from = body.length;
+			op(x, i);
+			if (opt.lines) marks.push({ from, to: body.length, name: opName(x.op), pc: Number(ipcNow & 0x7fffffffn) });
 		});
 		const lastOp = opName(b.ins.at(-1)!.op);
 		if (lastOp !== 'JMP' && !(lastOp === 'SYSCALL')) body.push(`\t${leave(b.pc, b.next, -1)}`);
 		body.push('}');
-		return body;
+		return opt.lines ? tagLines(body, marks, Number(b.pc & 0x7fffffffn)) : body;
 	};
 
 	const twins = new Set<number>();

@@ -445,6 +445,99 @@ describe('emit', () => {
 			expect(asm).not.toContain('i64.lt_s');
 		});
 
+		describe('across an edge', () => {
+			const edge = { flags: 'recipe' as const, edge: true };
+			const reader: Blk = {
+				pc: 0x2000,
+				next: 0x2001,
+				target: 0x3000,
+				ins: [['BR', 8, 0, 0, 0, JZ]]
+			};
+			const ADD = kind('ADD');
+
+			it('leaves a recipe a block that reads flags takes in as it is, and says so in the report', () => {
+				const off = emit(cmpBranch(reader), '', recipe);
+				expect(off.reports[0]!.edge).toBeUndefined();
+				const on = emit(cmpBranch(reader), '', edge);
+				expect(on.reports[0]!.flagOps).toMatchObject({ eager: 0 });
+				expect(on.reports[0]!.flagOps.why['live-in']).toBeUndefined();
+				expect(on.reports[0]!.edge).toMatchObject({
+					entries: 1,
+					passed: 1,
+					materialized: 0
+				});
+			});
+
+			it('reads the recipe when an edge entered the block and the five locals when the interpreter did', () => {
+				const { asm } = emit(cmpBranch(reader), '', edge);
+				// the block the interpreter enters clears the entry state before it branches into the block
+				expect(asm).toMatch(
+					/\ti32\.const\t0\n\tlocal\.set\t(\d+)\n\ti32\.const\t-1\n\tlocal\.set\t\d+\n\tbr/
+				);
+				// and the reader takes either: the zero flag from the operands when warm, from its local otherwise
+				expect(asm).toMatch(
+					/\tlocal\.get\t\d+\n\tif\ti32\n\tlocal\.get\t\d+\n\ti64\.eqz\n\telse\n\tlocal\.get\t\d+\n\tend_if/
+				);
+				const stale = emit(cmpBranch(reader), 'warmstale', edge);
+				expect(stale.asm).not.toBe(asm);
+				expect(stale.asm).not.toMatch(
+					/\ti32\.const\t0\n\tlocal\.set\t\d+\n\ti32\.const\t-1\n\tlocal\.set\t\d+\n\tbr/
+				);
+			});
+
+			it('computes the flags at an edge from a block whose recipe is another kind, and the edgeskip mutant leaves them out', () => {
+				const mixed: Blk[] = [
+					{
+						pc: 0x1000,
+						next: 0x2000,
+						target: 0x4000,
+						ins: [
+							['SUB', 8, T0, 1, 2, 0],
+							['FLAGS', 8, T0, 1, 2, SUB],
+							['BR', 8, 0, 0, 0, JL]
+						]
+					},
+					{
+						pc: 0x2000,
+						next: 0x4000,
+						ins: [
+							['ADD', 8, T0, 1, 2, 0],
+							['FLAGS', 8, T0, 1, 2, ADD]
+						]
+					},
+					{ pc: 0x4000, next: 0x4001, target: 0x5000, ins: [['BR', 8, 0, 0, 0, JZ]] },
+					{ pc: 0x5000, next: 0x5001, ins: [['FLAGS', 8, 3, 3, 3, kind('LOGIC')]] }
+				];
+				const ok = emit(mixed, '', edge);
+				expect(ok.reports[0]!.edge).toMatchObject({
+					entries: 1,
+					passed: 1,
+					materialized: 1
+				});
+				const skip = emit(mixed, 'edgeskip', edge);
+				expect(skip.asm).not.toBe(ok.asm);
+				expect(skip.asm.split('\n').length).toBeLessThan(ok.asm.split('\n').length);
+			});
+
+			it('keeps the flags in their locals for a block that a helper or a partial flags op comes first in', () => {
+				const shifts: Blk = {
+					pc: 0x2000,
+					next: 0x2001,
+					ins: [
+						['FLAGS', 8, 3, 3, 4, kind('SHL')],
+						['BR', 8, 0, 0, 0, JZ]
+					],
+					target: 0x3000
+				};
+				const r = emit(cmpBranch(shifts), '', edge);
+				expect(r.reports[0]!.edge).toMatchObject({
+					entries: 0,
+					passed: 0,
+					materialized: 1
+				});
+			});
+		});
+
 		it('takes the carry in from the recipe an add with carry replaces, and the adc mutant drops it', () => {
 			const chain: Blk[] = [
 				{
@@ -491,6 +584,41 @@ describe('emit', () => {
 				quiet
 			];
 			expect(emit(push, 'rspfirst').asm).not.toBe(emit(push).asm);
+		});
+	});
+
+	describe('loc', () => {
+		const strip = (asm: string) => asm.replace(/\t\.(loc|file)\t[^\n]*\n/g, '');
+		it('adds nothing unless asked, and only .loc and .file lines when asked', () => {
+			const plain = emit(ring).asm;
+			expect(plain).not.toContain('\t.loc\t');
+			const loc = emit(ring, '', { loc: true }).asm;
+			expect(loc).toContain('\t.file\t1 "arith"\n');
+			expect(strip(loc)).toBe(plain);
+		});
+
+		it('names the category as the file and the guest pc as the line, once per run', () => {
+			const { asm } = emit(ring, '', { loc: true });
+			expect(asm).toMatch(/\t\.loc\t1 4096 0\n/);
+			const locs = asm.split('\n').filter((l) => l.startsWith('\t.loc\t'));
+			locs.forEach((l, k) => expect(l).not.toBe(locs[k - 1]));
+			expect(locs.length).toBeGreaterThan(3);
+		});
+
+		it('gives an access its address, guard and guest ops three different files', () => {
+			const ld: Blk[] = [
+				{ pc: 0x1000, next: 0x2000, ins: [['LD', 8, 3, 4, 0, 16]] },
+				{ pc: 0x2000, next: 0x2001, ins: [['JMP', 8, 0, 5, 0, 0]] }
+			];
+			const { asm } = emit(ld, '', { loc: true });
+			const files = new Set(
+				asm
+					.split('\n')
+					.filter((l) => l.startsWith('\t.loc\t'))
+					.map((l) => l.split(/\s/)[2])
+			);
+			// address 4, guards 5, guest 6
+			for (const f of ['4', '5', '6']) expect(files).toContain(f);
 		});
 	});
 
