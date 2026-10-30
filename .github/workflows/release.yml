@@ -153,7 +153,7 @@ jobs:
           bun run release:sbom dist/kernel payload/gmux.spdx.json
           npm pack --ignore-scripts --pack-destination payload
       - name: Attest the Build Provenance
-        uses: actions/attest-build-provenance@v2
+        uses: actions/attest-build-provenance@v4
         with:
           subject-path: |
             payload/*.tgz
