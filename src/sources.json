@@ -6,7 +6,7 @@
 		"license": "GPL-2.0-only"
 	},
 	"linux": {
-		"repo": "https://github.com/joelseverin/linux.git",
+		"repo": "https://github.com/gmitch215/linux.git",
 		"ref": "wasm-7.3",
 		"commit": "21201145af28d2e8cef2402e364a942785951f37",
 		"base": {

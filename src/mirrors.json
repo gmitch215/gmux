@@ -1,5 +1,4 @@
 {
 	"linux-wasm": "https://github.com/gmitch215/linux-wasm.git",
-	"linux": "https://github.com/gmitch215/linux.git",
 	"llvm": "https://github.com/gmitch215/llvm.git"
 }
