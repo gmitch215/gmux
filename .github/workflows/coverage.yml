@@ -68,7 +68,7 @@ jobs:
       - name: Install the Toolchain
         run: sudo apt-get install -y clang lld llvm wabt
       - name: Set up QEMU for arm64
-        uses: docker/setup-qemu-action@v3
+        uses: docker/setup-qemu-action@v4
         with:
           platforms: arm64
       - name: Set up Bun
