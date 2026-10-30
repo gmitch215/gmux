@@ -103,28 +103,28 @@ mount namespace and has its root on that filesystem; otherwise 0.
  	fs->root = *path;
 --- a/fs/inode.c
 +++ b/fs/inode.c
-@@ -2775,6 +2775,7 @@
+@@ -2828,6 +2828,7 @@ struct timespec64 inode_set_ctime_to_ts(struct inode *inode, struct timespec64 t
  {
  	trace_inode_set_ctime_to_ts(inode, &ts);
  	set_normalized_timespec64(&ts, ts.tv_sec, ts.tv_nsec);
 +	wasm_fs_changed(inode);
- 	inode->i_ctime_sec = ts.tv_sec;
- 	inode->i_ctime_nsec = ts.tv_nsec;
+ 	WRITE_ONCE(inode->i_ctime_sec, ts.tv_sec);
+ 	WRITE_ONCE(inode->i_ctime_nsec, ts.tv_nsec);
  	return ts;
-@@ -2871,6 +2872,7 @@
+@@ -2924,6 +2925,7 @@ struct timespec64 inode_set_ctime_current(struct inode *inode)
  	/* Try to swap the nsec value into place. */
  	if (try_cmpxchg(&inode->i_ctime_nsec, &cur, now.tv_nsec)) {
  		/* If swap occurred, then we're (mostly) done */
 +		wasm_fs_changed(inode);
- 		inode->i_ctime_sec = now.tv_sec;
+ 		WRITE_ONCE(inode->i_ctime_sec, now.tv_sec);
  		trace_ctime_ns_xchg(inode, cns, now.tv_nsec, cur);
  		mgtime_counter_inc(mg_ctime_swaps);
-@@ -2945,6 +2947,7 @@
+@@ -2998,6 +3000,7 @@ struct timespec64 inode_set_ctime_deleg(struct inode *inode, struct timespec64 u
  retry:
  	old = cur;
  	if (try_cmpxchg(&inode->i_ctime_nsec, &cur, update.tv_nsec)) {
 +		wasm_fs_changed(inode);
- 		inode->i_ctime_sec = update.tv_sec;
+ 		WRITE_ONCE(inode->i_ctime_sec, update.tv_sec);
  		mgtime_counter_inc(mg_ctime_swaps);
  		return update;
 --- a/fs/namespace.c
@@ -140,7 +140,7 @@ mount namespace and has its root on that filesystem; otherwise 0.
  	emptied_ns = NULL;
 --- a/include/linux/fs.h
 +++ b/include/linux/fs.h
-@@ -1153,8 +1153,37 @@
+@@ -1149,8 +1149,37 @@ static inline loff_t i_size_read(const struct inode *inode)
   * (normally i_rwsem), otherwise on 32bit/SMP an update of i_size_seqcount
   * can be lost, resulting in subsequent i_size_read() calls spinning forever.
   */
@@ -178,21 +178,21 @@ mount namespace and has its root on that filesystem; otherwise 0.
  #if BITS_PER_LONG==32 && defined(CONFIG_SMP)
  	preempt_disable();
  	write_seqcount_begin(&inode->i_size_seqcount);
-@@ -1621,6 +1650,9 @@
+@@ -1617,6 +1646,9 @@ static inline struct timespec64 inode_get_atime(const struct inode *inode)
  static inline struct timespec64 inode_set_atime_to_ts(struct inode *inode,
  						      struct timespec64 ts)
  {
 +	/* relatime stores an unchanged atime whenever it is not newer than the ctime */
 +	if (inode->i_atime_sec != ts.tv_sec || inode->i_atime_nsec != ts.tv_nsec)
 +		wasm_fs_changed(inode);
- 	inode->i_atime_sec = ts.tv_sec;
- 	inode->i_atime_nsec = ts.tv_nsec;
+ 	WRITE_ONCE(inode->i_atime_sec, ts.tv_sec);
+ 	WRITE_ONCE(inode->i_atime_nsec, ts.tv_nsec);
  	return ts;
-@@ -1655,6 +1687,7 @@
+@@ -1651,6 +1683,7 @@ static inline struct timespec64 inode_get_mtime(const struct inode *inode)
  static inline struct timespec64 inode_set_mtime_to_ts(struct inode *inode,
  						      struct timespec64 ts)
  {
 +	wasm_fs_changed(inode);
- 	inode->i_mtime_sec = ts.tv_sec;
- 	inode->i_mtime_nsec = ts.tv_nsec;
+ 	WRITE_ONCE(inode->i_mtime_sec, ts.tv_sec);
+ 	WRITE_ONCE(inode->i_mtime_nsec, ts.tv_nsec);
  	return ts;

@@ -211,9 +211,9 @@ index f8a7fb7f6..166dfa062 100644
  }
  
  static void cleanup_vma_from_mm(struct vm_area_struct *vma)
-@@ -1207,7 +1209,11 @@ unsigned long do_mmap(struct file *file,
- 	if (vma_iter_prealloc(&vmi, vma))
- 		goto error_just_free;
+@@ -1212,7 +1214,11 @@ unsigned long do_mmap(struct file *file,
+ 
+ 	add_nommu_region(region);
  
 -	setup_vma_to_mm(vma, current->mm);
 +	ret = setup_vma_to_mm(vma, current->mm);
@@ -224,7 +224,7 @@ index f8a7fb7f6..166dfa062 100644
  	current->mm->map_count++;
  	/* add the VMA to the tree */
  	vma_iter_store_new(&vmi, vma);
-@@ -1239,6 +1245,17 @@ unsigned long do_mmap(struct file *file,
+@@ -1253,6 +1259,17 @@ unsigned long do_mmap(struct file *file,
  	vm_area_free(vma);
  	return ret;
  
@@ -240,8 +240,8 @@ index f8a7fb7f6..166dfa062 100644
 +#endif
 +
  sharing_violation:
- 	up_write(&nommu_region_sem);
  	pr_warn("Attempt to share mismatched mappings\n");
+ 	ret = -EINVAL;
 -- 
 2.43.0
 

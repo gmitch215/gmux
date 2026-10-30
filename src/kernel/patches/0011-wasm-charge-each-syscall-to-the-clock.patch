@@ -99,8 +99,8 @@ wasm_clock_now.
  		if (user_mode(regs)) {						\
 +			wasm_charge_syscall();					\
  			do {							\
- 				syscall = syscall_enter_from_user_mode(		\
- 					regs, syscall);				\
+ 				enter_from_user_mode(regs);			\
+ 				instrumentation_begin();			\
 --- a/arch/wasm/include/asm/wasm.h
 +++ b/arch/wasm/include/asm/wasm.h
 @@ -30,6 +30,11 @@

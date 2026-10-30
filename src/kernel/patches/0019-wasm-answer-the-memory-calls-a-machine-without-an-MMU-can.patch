@@ -16,25 +16,12 @@ wipe-on-fork advice stay EINVAL, as on a kernel built without them.
 
 memfd_create is built too. The defconfig asked for TMPFS, which needs
 SHMEM and so an MMU, and MEMFD_CREATE came only with TMPFS; on its own it
-backs a memfd with the ramfs-based shmem a no-MMU kernel has. That path
-had never created an empty file: ramfs_nommu_expand_for_mapping() took
-get_order(0), which is not 0, and every memfd_create failed with EFBIG.
-An empty file needs no pages.
+backs a memfd with the ramfs-based shmem a no-MMU kernel has. Before
+Linux 7.3 that path never created an empty file:
+ramfs_nommu_expand_for_mapping() took get_order(0), which is not 0, and
+every memfd_create failed with EFBIG. 7.3 returns early for an empty
+file, so this patch no longer touches fs/ramfs.
 ---
-diff --git a/fs/ramfs/file-nommu.c b/fs/ramfs/file-nommu.c
---- a/fs/ramfs/file-nommu.c
-+++ b/fs/ramfs/file-nommu.c
-@@ -69,6 +69,10 @@ int ramfs_nommu_expand_for_mapping(struct inode *inode, size_t newsize)
- 	gfp_t gfp = mapping_gfp_mask(inode->i_mapping);
-
- 	/* make various checks */
-+	/* an empty file, as memfd_create makes one, needs no pages; get_order(0) is not 0 */
-+	if (!newsize)
-+		return 0;
-+
- 	order = get_order(newsize);
- 	if (unlikely(order > MAX_PAGE_ORDER))
- 		return -EFBIG;
 diff --git a/arch/wasm/configs/wasm32_nommu_defconfig b/arch/wasm/configs/wasm32_nommu_defconfig
 --- a/arch/wasm/configs/wasm32_nommu_defconfig
 +++ b/arch/wasm/configs/wasm32_nommu_defconfig

@@ -13,15 +13,25 @@ free_page_series() now takes the references of an aligned block of
 pages together (page_ref_freeze, so a page another holder still has is
 left to put_page) and hands the block to free_frozen_pages(). A
 program's 32-page stack is one block, its 52-page data mapping three.
+Since Linux 7.3 free_frozen_pages() is declared in mm/page_alloc.h, so
+nommu.c includes that header.
 ---
- mm/nommu.c | 28 +++++++++++++++++++++++++++-
- 1 file changed, 27 insertions(+), 1 deletion(-)
+ mm/nommu.c | 29 ++++++++++++++++++++++++++++-
+ 1 file changed, 28 insertions(+), 1 deletion(-)
 
 diff --git a/mm/nommu.c b/mm/nommu.c
 index 42aaf7fc9..d08395016 100644
 --- a/mm/nommu.c
 +++ b/mm/nommu.c
-@@ -516,14 +516,40 @@ static void delete_nommu_region(struct vm_region *region)
+@@ -45,6 +45,7 @@
+ #include <asm/tlbflush.h>
+ #include <asm/mmu_context.h>
+ #include "internal.h"
++#include "page_alloc.h"
+ 
+ unsigned long highest_memmap_pfn;
+ int heap_stack_gap = 0;
+@@ -516,14 +517,40 @@ static void delete_nommu_region(struct vm_region *region)
  
  /*
   * free a contiguous series of pages
@@ -62,6 +72,7 @@ index 42aaf7fc9..d08395016 100644
 +		from += PAGE_SIZE;
  	}
  }
+ 
  
 -- 
 2.43.0
