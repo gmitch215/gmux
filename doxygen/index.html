@@ -216,6 +216,7 @@ Running a Foreign Binary</h3>
 <div class="line">scripts/build-kernel.sh ~/gmux-build/out # staged into build/</div>
 <div class="line">bun run test:probes                      # C probes booted in a machine</div>
 </div><!-- fragment --><p>Two clean builds produce the same bytes in every artifact. The probes refuse a <code>build/kernel</code> staged from other pins or patches than the tree's.</p>
+<p>The kernel, LLVM and linux-wasm forks are fetched from mirrors listed in <code>src/mirrors.json</code>, so a build does not depend on their authors keeping them online. <code>bun scripts/sync-mirrors.ts</code> reports new and moved branches and checks that every pinned commit is on its mirror; <code>--apply</code> copies the new and moved branches to the mirrors with a <code>gh</code> login that can write to them.</p>
 <div class="fragment"><div class="line">bun run typecheck</div>
 <div class="line">bun run test</div>
 <div class="line">bun run format:check</div>
