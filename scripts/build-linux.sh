@@ -89,8 +89,14 @@ image=gmux-lw-base:$(pin linux-wasm commit | cut -c1-7)
 docker image inspect "$image" > /dev/null 2>&1 || docker build -q -t "$image" "$lw/docker/linux-wasm-base"
 llvm=()
 [ -n "${LLVM:-}" ] && llvm=(-v "$LLVM:/rig/linux-wasm/workspace/install/llvm:ro")
+# linux-wasm.sh clones the LLVM fork from a fixed URL; git sends it to the mirror (src/mirrors.json)
+mirror=(-e GIT_CONFIG_COUNT=1 -e "GIT_CONFIG_KEY_0=url.$(pin llvm repo).insteadOf"
+-e "GIT_CONFIG_VALUE_0=$(pin llvm origin)")
+# kernels from 7.2 on link their host tools with -fuse-ld=lld, which the image's gcc cannot satisfy
+mirror+=(-e HOSTLDFLAGS=-fuse-ld=bfd)
 run() {
-	docker run --rm --memory "${MEMORY:-12g}" --cpus "$cpus" -v "$work:/rig" "${llvm[@]}" "${identity[@]}" \
+	docker run --rm --memory "${MEMORY:-12g}" --cpus "$cpus" -v "$work:/rig" "${llvm[@]}" \
+		"${mirror[@]}" "${identity[@]}" \
 		-e "LW_JOBS_KERNEL_COMPILE=$cpus" -e "LW_JOBS_MUSL_COMPILE=$cpus" -e "LW_JOBS_LLVM_COMPILE=$cpus" \
 		"$image" bash -c "set -euo pipefail; $1" >> "$work/out/build.log" 2>&1
 }

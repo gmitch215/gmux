@@ -212,6 +212,11 @@ bun run test:probes                      # C probes booted in a machine
 Two clean builds produce the same bytes in every artifact. The probes refuse a `build/kernel`
 staged from other pins or patches than the tree's.
 
+The kernel, LLVM and linux-wasm forks are fetched from mirrors listed in `src/mirrors.json`, so a
+build does not depend on their authors keeping them online. `bun scripts/sync-mirrors.ts` reports
+new and moved branches and checks that every pinned commit is on its mirror; `--apply` copies the new
+and moved branches to the mirrors with a `gh` login that can write to them.
+
 ```sh
 bun run typecheck
 bun run test

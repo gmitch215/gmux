@@ -1,0 +1,25 @@
+name: Check the Source Mirrors
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '23 7 * * 1'
+
+jobs:
+  mirrors:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    permissions:
+      contents: read
+
+    steps:
+      - uses: actions/checkout@v7
+      - name: Set up Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 'latest'
+      - name: Compare the Mirrors with Their Origins
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: bun scripts/sync-mirrors.ts
