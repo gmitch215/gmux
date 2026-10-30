@@ -31,7 +31,7 @@ Durable Object with a BusyBox userland and a browser terminal.
 
 ## 🎯 Why gmux
 
-Serverless platforms run functions, not machines. gmux runs the machine: Linux 7.0 boots to a shell
+Serverless platforms run functions, not machines. gmux runs the machine: Linux 7.3 boots to a shell
 inside a Durable Object, and ordinary Linux programs run on it unmodified, with processes, pipes,
 job control, signals, threads, sockets, `fork` and `dlopen`. A job that needs more CPU than one
 event allows continues across events. The host can turn a running machine into bytes
