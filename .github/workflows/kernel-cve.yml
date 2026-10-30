@@ -1,0 +1,30 @@
+name: Triage Kernel CVEs
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '41 7 * * 1'
+
+jobs:
+  triage:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    permissions:
+      contents: read
+
+    steps:
+      - uses: actions/checkout@v7
+      - name: Set up Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 'latest'
+      - name: List the CVEs to Review
+        run: bun scripts/kernel-cve-triage.ts --fetch | tee "$RUNNER_TEMP/kernel-cves.tsv"
+      - name: Summarize
+        run: head -n 1 "$RUNNER_TEMP/kernel-cves.tsv" >> "$GITHUB_STEP_SUMMARY"
+      - name: Keep the List
+        uses: actions/upload-artifact@v4
+        with:
+          name: kernel-cves
+          path: ${{ runner.temp }}/kernel-cves.tsv
