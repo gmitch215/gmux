@@ -13,7 +13,7 @@ RUN test -f build/kernel/vmlinux.wasm && test -f build/kernel/manifest.json \
 RUN mkdir /runtime && cd /runtime && echo '{ "private": true }' > package.json \
 	&& bun add "wrangler@$(bun -e 'console.log(require("/src/node_modules/wrangler/package.json").version)')"
 
-FROM node:24-bookworm-slim
+FROM node:26-bookworm-slim
 RUN groupadd --system gmux \
 	&& useradd --system --gid gmux --home-dir /var/lib/gmux --create-home gmux \
 	&& mkdir /opt/gmux && chown gmux:gmux /opt/gmux
