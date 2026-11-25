@@ -906,6 +906,11 @@ void kb_decode_report(const struct kb_cpu* cpu) {
 #ifdef KB_DECODE_TIME
     fprintf(kb_log, " in %llu us", (unsigned long long) decode_ns / 1000);
 #endif
+    if (cpu->loaded)
+        fprintf(
+            kb_log, ", %llu taken from a table",
+            (unsigned long long) cpu->loaded
+        );
     fprintf(kb_log, "\n");
 }
 
@@ -942,7 +947,10 @@ int kb_block_ready(struct kb_cpu* cpu, struct kb_block* b) {
 void kb_aot_stale(struct kb_cpu* cpu) {
     for (int h = 0; h < 4096; h++)
         for (struct kb_block* b = cpu->cache[h]; b; b = b->chain)
-            if (b->aot) kb_aot_detach(b);
+            if (b->aot) {
+                kb_aot_detach(b);
+                b->codegen = cpu->codegen - 1; /* refresh puts it back */
+            }
 }
 #endif
 
@@ -969,7 +977,18 @@ static void reset(struct kb_block* b) {
  * page it was decoded from was written to where it holds bytes of it; b is
  * then ready to run (1), or not decodable (0) */
 static int refresh(struct kb_cpu* cpu, struct kb_block* b) {
-    if (kb_marks_current(cpu, b)) return 1;
+    if (kb_marks_current(cpu, b)) {
+#ifdef KB_AOT
+        /* a block kb_aot_stale took out of its region goes back in unless its
+         * page is writable and executable now */
+        if (b->aot) {
+            kb_aot_detach(b);
+            b->aot = NULL;
+            if (!cpu->trace && !kb_block_wx(cpu, b)) kb_aot_attach(cpu, b);
+        }
+#endif
+        return 1;
+    }
     reset(b);
     if (translate(cpu, b)) {
         failed(cpu, b);
@@ -1012,6 +1031,14 @@ static void retrace(struct kb_cpu* cpu, struct kb_block* b) {
     cpu->tracing = 1;
     int bad = translate(cpu, &t), exits = 0;
     cpu->tracing = 0;
+    #ifdef KB_AOT
+    /* a trace that runs on into a promoted block would keep that block's loop
+     * in the interpreter, where its region never runs */
+    for (int i = 1; !bad && i < t.nseg; i++) {
+        const struct kb_block* q = peek(cpu, t.seg[2 * i]);
+        bad = q && q->aot;
+    }
+    #endif
     for (int i = 0; !bad && i < t.n; i++) exits += t.ins[i].op == KB_EXIT;
     if (bad || !exits) {
         free(t.ins);
@@ -1094,6 +1121,10 @@ void kb_hot_dump(struct kb_cpu* cpu) {
                     fprintf(f, " %u", (unsigned) b->pcs[i]);
                 fprintf(f, "\n");
             }
+    #if KB_TRACE > 1
+            if (b->taken || b->fall)
+                fprintf(f, "branch %u %u\n", b->taken, b->fall);
+    #endif
         }
     fclose(f);
 }
@@ -1121,8 +1152,8 @@ KB_NOINLINE static inline uint64_t load(
 }
 
 /* a store to bytes a decoded block came from leaves kb_smc in cpu->fault (only
- * the miss path can: a cache is never kept for a page that is writable and
- * executable) */
+ * the miss path can: a cache of a page that is writable and executable spans
+ * only bytes that no block came from) */
 KB_NOINLINE static inline void store(
     struct kb_cpu* cpu, struct kb_ic* ic, uint64_t va, uint64_t v, int w
 ) {

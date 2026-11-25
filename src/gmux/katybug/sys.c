@@ -982,8 +982,12 @@ static void syscall_body(struct kb_cpu* cpu) {
                 break;                 /* utimes */
             case 261: nr = -11; break; /* futimesat */
         }
-        r[1] = cpu->pc; /* syscall leaves rcx = return address, r11 = flags */
-        r[11] = 0x246;
+        /* syscall leaves rcx = return address, r11 = the flags it found */
+        KB_SYNC(cpu);
+        r[1] = cpu->pc;
+        r[11] = 0x202 | (uint64_t) cpu->c | ((uint64_t) cpu->p << 2) |
+                ((uint64_t) cpu->z << 6) | ((uint64_t) cpu->n << 7) |
+                ((uint64_t) cpu->df << 10) | ((uint64_t) cpu->v << 11);
     }
     else {
         uint64_t x[6] = {r[0], r[1], r[2], r[3], r[4], r[5]};

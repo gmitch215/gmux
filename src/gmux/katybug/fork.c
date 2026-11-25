@@ -1,5 +1,6 @@
 #include <errno.h>
 #include <fcntl.h>
+#include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -17,7 +18,104 @@ extern char** environ;
    bytes in order; a piece that was never made (an image's, not yet read from
    its file) is not sent, and the child reads it from the descriptor on the
    file, which the exec keeps at its number; a piece the parent shares with
-   the file is only named, and the child maps it from the same descriptor */
+   the file is only named, and the child maps it from the same descriptor.
+   The stream ends with the decoded blocks that earlier children ran (see
+   below), which the child takes instead of decoding again */
+
+#define BLOCKS_MAX (256ull << 20)
+#define HINTS_MAX (1u << 20)
+
+/* the pcs a child's cache held when it exited, sent to the parent down a
+   pipe that stays open in every child (nonblocking, in writes that are whole
+   words, so a full pipe loses a report and a cut one cannot happen); the next
+   fork sends the parent's blocks at those pcs and no others */
+static int hint_r = -1, hint_w = -1, hint_out = -1;
+static uint64_t* hints;
+static size_t hint_cap, hint_n;
+static const struct kb_cpu* reporter;
+static uint8_t* packed;
+static size_t packed_len;
+static uint64_t packed_key[4];
+
+static size_t hint_slot(uint64_t pc) {
+    size_t i = (size_t) (pc * 0x9e3779b97f4a7c15ull >> 40) & (hint_cap - 1);
+    while (hints[i] && hints[i] != pc) i = (i + 1) & (hint_cap - 1);
+    return i;
+}
+
+static int hint_has(uint64_t pc) {
+    return hint_cap && hints[hint_slot(pc)] == pc;
+}
+
+static void hint_add(uint64_t pc) {
+    if (!pc || hint_n >= HINTS_MAX) return;
+    if (2 * (hint_n + 1) > hint_cap) {
+        size_t cap = hint_cap ? 2 * hint_cap : 4096;
+        uint64_t* old = hints;
+        size_t oldcap = hint_cap;
+        hints = calloc(cap, sizeof *hints);
+        if (!hints) {
+            hints = old;
+            return;
+        }
+        hint_cap = cap;
+        for (size_t i = 0; i < oldcap; i++)
+            if (old[i]) hints[hint_slot(old[i])] = old[i];
+        free(old);
+    }
+    size_t i = hint_slot(pc);
+    if (!hints[i]) hints[i] = pc, hint_n++;
+}
+
+/* the pipe is made once, at the first fork; a process that cannot make it
+   sends no blocks */
+static void hint_open(void) {
+    if (hint_r != -1) return;
+    hint_r = -2;
+    int q[2];
+    if (pipe(q) < 0) return;
+    int r = kb_keep_fd(q[0]), w = kb_keep_fd(q[1]);
+    close(q[0]);
+    close(q[1]);
+    if (r < 0 || w < 0) {
+        if (r >= 0) close(r);
+        if (w >= 0) close(w);
+        return;
+    }
+    fcntl(r, F_SETFL, fcntl(r, F_GETFL) | O_NONBLOCK);
+    fcntl(w, F_SETFL, fcntl(w, F_GETFL) | O_NONBLOCK);
+    hint_r = r, hint_w = w;
+}
+
+static void hint_drain(void) {
+    uint64_t buf[512];
+    ssize_t got;
+    while (hint_r >= 0 && (got = read(hint_r, buf, sizeof buf)) > 0)
+        for (size_t i = 0; i < (size_t) got / sizeof *buf; i++)
+            hint_add(buf[i]);
+}
+
+/* at exit, in the child */
+static void hint_report(void) {
+    if (hint_out < 0 || !reporter) return;
+    enum
+    {
+        ROOM = PIPE_BUF / 8 < 512 ? PIPE_BUF / 8 : 512
+    };
+    uint64_t buf[ROOM];
+    size_t k = 0, room = ROOM;
+    for (int h = 0; h < 4096; h++)
+        for (const struct kb_block* b = reporter->cache[h]; b; b = b->chain) {
+            if (!b->n) continue;
+            buf[k++] = b->pc;
+            if (k == room) {
+                if (write(hint_out, buf, sizeof buf) != (ssize_t) sizeof buf)
+                    return;
+                k = 0;
+            }
+        }
+    if (k) (void) !write(hint_out, buf, k * sizeof *buf);
+}
 
 static int put(int fd, const void* p, size_t n) {
     const uint8_t* b = p;
@@ -56,6 +154,7 @@ int kb_fork_by_exec(void) {
 
 /** the parent's half: the child's pid, or a negative Linux errno */
 int64_t kb_fork(struct kb_cpu* cpu) {
+    hint_open();
     int p[2];
     if (pipe(p) < 0) return kb_err(errno);
     fcntl(p[1], F_SETFD, FD_CLOEXEC);
@@ -110,6 +209,23 @@ int64_t kb_fork(struct kb_cpu* cpu) {
         bad = put(p[1], &nrow, sizeof nrow) ||
               put(p[1], rows, sizeof *rows * (size_t) nrow);
     }
+    if (!bad) {
+        int32_t out = hint_w;
+        hint_drain();
+        /* the packed table is kept while nothing it holds can have changed;
+           the child checks each block's bytes again whatever the table says */
+        uint64_t key[4] = {cpu->decoded, cpu->traces, cpu->codegen, hint_n};
+        if (!packed_len || memcmp(key, packed_key, sizeof key)) {
+            free(packed);
+            packed =
+                hint_n ? kb_persist_pack(cpu, &packed_len, hint_has) : NULL;
+            if (!packed) packed_len = 0;
+            memcpy(packed_key, key, sizeof key);
+        }
+        uint64_t sent = packed_len;
+        bad = put(p[1], &out, sizeof out) || put(p[1], &sent, sizeof sent) ||
+              (sent && put(p[1], packed, packed_len));
+    }
     close(p[1]);
     /* a child that got no state exits 127 on its own; the parent still sees a
      * fork that happened */
@@ -145,6 +261,8 @@ int kb_resume(struct kb_cpu* cpu, int fd) {
     cpu->marks = NULL;
     cpu->nmarks = cpu->capmarks = 0;
     cpu->trace = NULL;
+    cpu->persist = NULL;
+    cpu->decoded = cpu->loaded = 0;
     cpu->fault = cpu->last_fault = NULL;
     cpu->restore_mask = 0;
     for (int i = 0; i < cpu->nmaps; i++) {
@@ -171,6 +289,30 @@ int kb_resume(struct kb_cpu* cpu, int fd) {
     for (int i = 0; i < nrow; i++) {
         if (get(fd, &row, sizeof row)) return -1;
         kb_digest_adopt(&row);
+    }
+    /* the blocks are a hint: a stream that ends here leaves the child decoding
+     */
+    int32_t out = -1;
+    uint64_t sent;
+    uint8_t* blocks = NULL;
+    if (!get(fd, &out, sizeof out) && !get(fd, &sent, sizeof sent) && sent) {
+        blocks = sent <= BLOCKS_MAX ? malloc(sent) : NULL;
+        if (blocks && get(fd, blocks, sent)) {
+            free(blocks);
+            blocks = NULL;
+        }
+        uint8_t skip[4096];
+        for (uint64_t left = blocks ? 0 : sent; left;) {
+            size_t k = left < sizeof skip ? (size_t) left : sizeof skip;
+            if (get(fd, skip, k)) break;
+            left -= k;
+        }
+    }
+    if (blocks) kb_persist_adopt(cpu, blocks, (size_t) sent);
+    if (out >= 0 && fcntl(out, F_GETFD) >= 0) {
+        hint_out = out;
+        reporter = cpu;
+        atexit(hint_report);
     }
     close(fd);
     for (int i = 0; i < n; i++) fcntl(cloexec[i], F_SETFD, FD_CLOEXEC);

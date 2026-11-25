@@ -1,6 +1,10 @@
 #ifndef AOT_H
 #define AOT_H
 
+#ifndef KB_AOT
+    #error "lifted regions need -DKB_AOT"
+#endif
+
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>

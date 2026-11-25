@@ -196,13 +196,14 @@ static struct kb_cmark* mark_add(struct kb_cpu* cpu, uint64_t page) {
 static int code_hit;
 
 /* [va, va + len) of m is about to be written, and m is executable: the blocks
- * decoded from the bytes it covers go stale. A lifted region is never on a page
- * that is writable and executable, so only a write the kernel makes to a page
- * that is not writable (kb_poke) can reach one */
-static void marks_write(
+ * decoded from the bytes it covers go stale; 1 when some did. A lifted region
+ * is never on a page that is writable and executable, so only a write the
+ * kernel makes to a page that is not writable (kb_poke) can reach one */
+static int marks_write(
     struct kb_cpu* cpu, const struct kb_mapping* m, uint64_t va, uint64_t len
 ) {
-    if (!cpu->nmarks || !len) return;
+    if (!cpu->nmarks || !len) return 0;
+    int any = 0;
     uint64_t last = va + len - 1;
     for (uint64_t p = va >> 12; p <= last >> 12; p++) {
         struct kb_cmark* k = mark_find(cpu, p);
@@ -216,6 +217,7 @@ static void marks_write(
         k->ver = ++cpu->wver;
         cpu->codegen++;
         code_hit = 1;
+        any = 1;
         KB_BUMP_AS(map);
 #ifdef KB_AOT
         if (!(m->prot & KB_W)) kb_aot_stale(cpu);
@@ -223,6 +225,31 @@ static void marks_write(
         (void) m;
 #endif
     }
+    return any;
+}
+
+/* a store cache for a page that is writable and executable: a cache that spans
+ * the unmarked 16-byte units around va, inside its page, so a store through it
+ * never reaches a byte some block came from. Marking more bytes of such a page
+ * moves mapgen (kb_marks_add), which drops every cache like a mapping change.
+ * p is the host bytes of the piece [plo, phi) that holds [va, va + len) */
+static void wx_cache(
+    struct kb_cpu* cpu, struct kb_ic* ic, uint8_t* p, uint64_t plo,
+    uint64_t phi, uint64_t va, uint64_t len
+) {
+    uint64_t page = va >> 12, base = page << 12;
+    if ((va + len - 1) >> 12 != page) return;
+    uint64_t s = base, e = base + 4096;
+    const struct kb_cmark* k = mark_find(cpu, page);
+    if (k) {
+        uint64_t g = (va - base) >> 4, h = (va + len - 1 - base) >> 4;
+        while (g > 0 && !(k->bits[(g - 1) >> 6] >> ((g - 1) & 63) & 1)) g--;
+        while (h < 255 && !(k->bits[(h + 1) >> 6] >> ((h + 1) & 63) & 1)) h++;
+        s = base + g * 16, e = base + (h + 1) * 16;
+    }
+    if (s < plo) s = plo;
+    if (e > phi) e = phi;
+    *ic = (struct kb_ic){s, e - s, p + (s - plo), cpu->mapgen};
 }
 
 #ifdef KB_AOT
@@ -257,6 +284,7 @@ void kb_marks_add(struct kb_cpu* cpu, struct kb_block* b) {
     if (!cap) return;
     b->pv = malloc(sizeof *b->pv * 2 * (size_t) cap);
     if (!b->pv) return;
+    int fresh = 0;
     for (int i = 0; i < b->nseg; i++) {
         uint64_t lo = b->seg[2 * i], hi = b->seg[2 * i + 1];
         if (hi <= lo) continue;
@@ -265,8 +293,15 @@ void kb_marks_add(struct kb_cpu* cpu, struct kb_block* b) {
             if (!k) continue;
             uint64_t a = p == lo >> 12 ? (lo & 4095) >> 4 : 0;
             uint64_t e = p == (hi - 1) >> 12 ? ((hi - 1) & 4095) >> 4 : 255;
-            for (uint64_t g = a; g <= e; g++)
+            int add = 0;
+            for (uint64_t g = a; g <= e; g++) {
+                add |= !(k->bits[g >> 6] >> (g & 63) & 1);
                 k->bits[g >> 6] |= 1ull << (g & 63);
+            }
+            if (add) {
+                const struct kb_mapping* m = find(cpu, p << 12);
+                fresh |= m && (m->prot & (KB_W | KB_X)) == (KB_W | KB_X);
+            }
             int seen = 0;
             for (int j = 0; j < b->npv && !seen; j++) seen = b->pv[2 * j] == p;
             if (seen) continue;
@@ -275,6 +310,7 @@ void kb_marks_add(struct kb_cpu* cpu, struct kb_block* b) {
             b->npv++;
         }
     }
+    if (fresh) cpu->mapgen++, KB_BUMP_AS(map);
 }
 
 /** 1 when no page b's code is on was written since b was checked, and b is
@@ -578,10 +614,10 @@ void kb_image_report(const struct kb_cpu* cpu) {
 /* a write window is refused on a page that is executable too */
 #define NOWX 32
 
-/* kb_host for an access of acc, and when ic is given, ic keeps the piece (not
- * for a write to a page that is executable too: each such write checks the
- * code marks); *cross is set when the range starts in an accessible mapping but
- * runs past its piece (or its end, into the next mapping, which kb_read and
+/* kb_host for an access of acc, and when ic is given, ic keeps the piece (for a
+ * write to a page that is executable too, the unmarked bytes around va in its
+ * page: wx_cache); *cross is set when the range starts in an accessible mapping
+ * but runs past its piece (or its end, into the next mapping, which kb_read and
  * kb_write check) */
 static uint8_t* translate(
     struct kb_cpu* cpu, struct kb_ic* ic, uint64_t va, uint64_t len, int* cross,
@@ -600,9 +636,11 @@ static uint8_t* translate(
         return NULL;
     }
     int wx = a == KB_W && (m->prot & KB_X);
-    if (wx) marks_write(cpu, m, va, len);
+    int hit = wx && marks_write(cpu, m, va, len);
     if (ic && (!wx || (acc & KEEP)))
         *ic = (struct kb_ic){lo, hi - lo, p, cpu->mapgen};
+    else if (ic && !hit)
+        wx_cache(cpu, ic, p, lo, hi, va, len);
     return p + (va - lo);
 }
 

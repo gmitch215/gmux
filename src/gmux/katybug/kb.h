@@ -369,8 +369,13 @@ struct kb_cpu {
     int nfiles;
     uint64_t image_total, /* pieces the image mappings had when loaded */
         image_filled;     /* pieces made from an image's file */
-    uint32_t mapgen;  /* bumped by every change to maps, which makes older kb_ic
-                         entries stale */
+    uint32_t mapgen; /* bumped by every change to maps, which makes older kb_ic
+                        entries stale */
+    struct {
+        uint64_t lo, end, tab;
+        uint32_t gen;
+    } ckno; /* the cksum loop declined at lo up to end over tab while mapgen
+               was gen (prim.c) */
     uint32_t codegen; /* bumped when executable code is unmapped, changes
                          protection or is written, which makes older blocks
                          stale until found current again */
@@ -505,6 +510,9 @@ void kb_sha512_blocks(uint64_t st[8], const uint8_t* p, size_t n);
 uint32_t kb_cksum_blocks(
     uint32_t crc, const uint8_t* tab, const uint8_t* p, size_t n
 );
+int kb_cksum_canon(const uint8_t* tab);
+uint32_t kb_cksum_fast(uint32_t crc, const uint8_t* p, size_t n);
+const char* kb_cksum_path(void);
 /* digest.c: a coreutils stream's whole digest on the host's crypto; prim.c's
  * block kernel stays the path for anything not proven private */
 enum
@@ -855,6 +863,10 @@ void kb_fuse_done(struct kb_block* b, struct kb_fuse* f, uint64_t end);
 void kb_persist_load(struct kb_cpu* cpu, const char* elf);
 int kb_persist_take(struct kb_cpu* cpu, struct kb_block* b);
 void kb_persist_save(struct kb_cpu* cpu);
+uint8_t* kb_persist_pack(
+    struct kb_cpu* cpu, size_t* n, int (*want)(uint64_t pc)
+);
+void kb_persist_adopt(struct kb_cpu* cpu, uint8_t* blob, size_t n);
 uint64_t kb_code_hash(struct kb_cpu* cpu, const struct kb_block* b, int* ok);
 int kb_block_ready(struct kb_cpu* cpu, struct kb_block* b);
 

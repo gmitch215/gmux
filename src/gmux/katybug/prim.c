@@ -688,9 +688,10 @@ static int k_block(
  * then faults where it always did: fewer than two iterations, rcx not an
  * 8-byte multiple above rdx, and a table or data (the last iteration's too:
  * a fault there would show the temporaries of the one before) not all there */
-static int k_cksum(struct kb_cpu* cpu) {
+static int cksum_run(
+    struct kb_cpu* cpu, uint64_t p, uint64_t end, uint64_t tab
+) {
     uint64_t* r = cpu->r;
-    uint64_t p = r[2], end = r[1], tab = r[14];
     if (end <= p || (end - p) & 7 || end - p < 16) return 0;
     uint64_t bytes = end - p - 8;
     uint8_t tb[8192];
@@ -700,6 +701,8 @@ static int k_cksum(struct kb_cpu* cpu) {
         t = tb;
     }
     if (!reach(cpu, p, end - p, KB_R)) return 0;
+    /* the table is read again on every call: a guest can change it */
+    int canon = kb_cksum_canon(t);
     uint32_t crc = (uint32_t) r[3];
     for (uint64_t off = 0, k; off < bytes;) {
         const uint8_t* q = kb_span_r(cpu, p + off, &k);
@@ -709,17 +712,36 @@ static int k_cksum(struct kb_cpu* cpu) {
             /* a group across two pieces of host memory */
             uint8_t g[8];
             if (!kb_read(cpu, p + off, g, 8)) return 0;
-            crc = kb_cksum_blocks(crc, t, g, 1);
+            crc = canon ? kb_cksum_fast(crc, g, 1)
+                        : kb_cksum_blocks(crc, t, g, 1);
             off += 8;
         }
         else {
-            crc = kb_cksum_blocks(crc, t, q, (size_t) (k / 8));
+            crc = canon ? kb_cksum_fast(crc, q, (size_t) (k / 8))
+                        : kb_cksum_blocks(crc, t, q, (size_t) (k / 8));
             off += k & ~7ull;
         }
     }
     r[2] = p + bytes;
     r[3] = crc;
     return 1;
+}
+
+/* a declined loop is remembered by where it started, its end and its table,
+ * and skipped for entries at the same stride until a mapping changes: what it
+ * is declined for depends on the mappings and those three registers only, and
+ * the guest's own code is always right, so a skip can cost speed, never
+ * exactness */
+static int k_cksum(struct kb_cpu* cpu) {
+    uint64_t p = cpu->r[2], end = cpu->r[1], tab = cpu->r[14];
+    if (cpu->ckno.gen == cpu->mapgen && end == cpu->ckno.end &&
+        tab == cpu->ckno.tab && p >= cpu->ckno.lo && p < end &&
+        !((p - cpu->ckno.lo) & 7))
+        return -1;
+    if (cksum_run(cpu, p, end, tab)) return 1;
+    cpu->ckno.lo = p, cpu->ckno.end = end, cpu->ckno.tab = tab;
+    cpu->ckno.gen = cpu->mapgen;
+    return 0;
 }
 
 #ifdef KB_ZLIB
@@ -798,8 +820,12 @@ static int k_libm(struct kb_cpu* cpu, int id, int flavor) {
 int kb_prim(struct kb_cpu* cpu, int id, uint64_t* next) {
     int mode = id >> 8 & ~V_GUARD, guard = id >> 8 & V_GUARD;
     id &= 0xff;
-    if (id == P_CKSUM)
-        return k_cksum(cpu) ? (calls[id]++, 2) : (gave_up[id]++, 0);
+    if (id == P_CKSUM) {
+        int k = k_cksum(cpu);
+        if (k > 0) return calls[id]++, 2;
+        if (!k) gave_up[id]++;
+        return 0;
+    }
     if (id == P_GZCRC)
         return kb_gzcrc(cpu) ? (calls[id]++, 2) : (gave_up[id]++, 0);
     if (id == P_INFLATE) {

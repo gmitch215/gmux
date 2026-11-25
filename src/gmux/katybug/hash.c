@@ -255,6 +255,232 @@ uint32_t kb_cksum_blocks(
     return crc;
 }
 
+#define CK_POLY 0x04c11db7u
+
+/* rows 0-15 of the polynomial's own table (row k: a byte followed by k zero
+ * bytes), and the folding constants x^d and x^(d + 64) mod the polynomial for
+ * d = 128, 256, 384 and 512 bits; all derived at first use */
+static uint32_t ck_rows[16][256];
+static uint64_t ck_k[4][2];
+static int ck_ready;
+
+static uint32_t ck_xpow(unsigned n) {
+    uint32_t r = 1;
+    while (n--) r = r << 1 ^ (r >> 31 ? CK_POLY : 0);
+    return r;
+}
+
+#if !defined(__wasm__) && !defined(KB_NO_FOLD)
+    #if defined(__x86_64__)
+        #include <immintrin.h>
+        #define CK_FOLD "pclmul"
+        #define CK_TARGET __attribute__((target("pclmul,ssse3")))
+typedef __m128i ckv;
+        #define CK_XOR(a, b) _mm_xor_si128(a, b)
+        #define CK_K(lo, hi) _mm_set_epi64x((long long) (hi), (long long) (lo))
+        #define CK_CRC(c) _mm_set_epi32((int) (c), 0, 0, 0)
+CK_TARGET static ckv ck_ld(const uint8_t* p) {
+    return _mm_shuffle_epi8(
+        _mm_loadu_si128((const __m128i*) p),
+        _mm_set_epi8(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15)
+    );
+}
+CK_TARGET static void ck_st(uint8_t* p, ckv a) {
+    _mm_storeu_si128(
+        (__m128i*) p,
+        _mm_shuffle_epi8(
+            a,
+            _mm_set_epi8(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15)
+        )
+    );
+}
+/* a * x^d mod p, unreduced: k holds x^d in its low and x^(d + 64) in its high
+ * quad word */
+CK_TARGET static ckv ck_fx(ckv a, ckv k) {
+    return _mm_xor_si128(
+        _mm_clmulepi64_si128(a, k, 0x00), _mm_clmulepi64_si128(a, k, 0x11)
+    );
+}
+static int ck_has_fold(void) {
+    __builtin_cpu_init();
+    return __builtin_cpu_supports("pclmul") && __builtin_cpu_supports("ssse3");
+}
+    #elif defined(__aarch64__) && (defined(__linux__) || defined(__APPLE__))
+        #include <arm_neon.h>
+        #ifdef __APPLE__
+            #include <sys/sysctl.h>
+        #else
+            #include <sys/auxv.h>
+        #endif
+        #define CK_FOLD "pmull"
+        #ifdef __clang__
+            #define CK_TARGET __attribute__((target("aes")))
+        #else
+            #define CK_TARGET __attribute__((target("+crypto")))
+        #endif
+typedef uint8x16_t ckv;
+        #define CK_XOR(a, b) veorq_u8(a, b)
+        #define CK_K(lo, hi)                                                   \
+            vreinterpretq_u8_u64(vcombine_u64(vcreate_u64(lo), vcreate_u64(hi)))
+        #define CK_CRC(c)                                                      \
+            vreinterpretq_u8_u32(vsetq_lane_u32((c), vdupq_n_u32(0), 3))
+CK_TARGET static ckv ck_ld(const uint8_t* p) {
+    ckv v = vrev64q_u8(vld1q_u8(p));
+    return vextq_u8(v, v, 8);
+}
+CK_TARGET static void ck_st(uint8_t* p, ckv a) {
+    ckv v = vrev64q_u8(a);
+    vst1q_u8(p, vextq_u8(v, v, 8));
+}
+CK_TARGET static ckv ck_fx(ckv a, ckv k) {
+    poly64x2_t pa = vreinterpretq_p64_u8(a), pk = vreinterpretq_p64_u8(k);
+    poly128_t lo = vmull_p64(vgetq_lane_p64(pa, 0), vgetq_lane_p64(pk, 0));
+    poly128_t hi = vmull_high_p64(pa, pk);
+    return veorq_u8(vreinterpretq_u8_p128(lo), vreinterpretq_u8_p128(hi));
+}
+static int ck_has_fold(void) {
+        #ifdef __APPLE__
+    int v = 0;
+    size_t n = sizeof v;
+    return sysctlbyname("hw.optional.arm.FEAT_PMULL", &v, &n, NULL, 0) == 0 &&
+           v;
+        #else
+            #ifndef HWCAP_PMULL
+                #define HWCAP_PMULL (1ul << 4)
+            #endif
+    return (getauxval(AT_HWCAP) & HWCAP_PMULL) != 0;
+        #endif
+}
+    #endif
+#endif
+
+#ifdef CK_FOLD
+static int ck_fold_ok;
+#endif
+
+static void ck_init(void) {
+    if (ck_ready) return;
+    for (unsigned i = 0; i < 256; i++) {
+        uint32_t c = i << 24;
+        for (int b = 0; b < 8; b++) c = c << 1 ^ (c >> 31 ? CK_POLY : 0);
+        ck_rows[0][i] = c;
+    }
+    for (int k = 1; k < 16; k++)
+        for (int i = 0; i < 256; i++) {
+            uint32_t c = ck_rows[k - 1][i];
+            ck_rows[k][i] = c << 8 ^ ck_rows[0][c >> 24];
+        }
+    for (unsigned j = 0; j < 4; j++) {
+        ck_k[j][0] = ck_xpow(128 * (j + 1));
+        ck_k[j][1] = ck_xpow(128 * (j + 1) + 64);
+    }
+#ifdef CK_FOLD
+    ck_fold_ok = ck_has_fold();
+#endif
+    ck_ready = 1;
+}
+
+/** 1 when tab (8 rows of 256 little-endian words) is the polynomial's own
+ * table, so the fast steps over derived rows give the guest's answer */
+int kb_cksum_canon(const uint8_t* tab) {
+#if defined(__BYTE_ORDER__) && __BYTE_ORDER__ == __ORDER_BIG_ENDIAN__
+    (void) tab;
+    return 0;
+#else
+    ck_init();
+    return memcmp(tab, ck_rows, 8 * 256 * 4) == 0;
+#endif
+}
+
+#define CKR(k, i) ck_rows[k][i]
+
+/* n groups of 8 bytes over the derived rows */
+static uint32_t ck_s8(uint32_t crc, const uint8_t* p, size_t n) {
+    for (; n; n--, p += 8) {
+        uint32_t second = BE32(ld32(p + 4));
+        crc ^= BE32(ld32(p));
+        crc = CKR(7, crc >> 24) ^ CKR(6, crc >> 16 & 255) ^
+              CKR(5, crc >> 8 & 255) ^ CKR(4, crc & 255) ^
+              CKR(3, second >> 24) ^ CKR(2, second >> 16 & 255) ^
+              CKR(1, second >> 8 & 255) ^ CKR(0, second & 255);
+    }
+    return crc;
+}
+
+/* n groups of 16 bytes over the derived rows */
+static uint32_t ck_s16(uint32_t crc, const uint8_t* p, size_t n) {
+    for (; n; n--, p += 16) {
+        uint32_t a = BE32(ld32(p)) ^ crc, b = BE32(ld32(p + 4));
+        uint32_t c = BE32(ld32(p + 8)), d = BE32(ld32(p + 12));
+        crc = CKR(15, a >> 24) ^ CKR(14, a >> 16 & 255) ^
+              CKR(13, a >> 8 & 255) ^ CKR(12, a & 255) ^ CKR(11, b >> 24) ^
+              CKR(10, b >> 16 & 255) ^ CKR(9, b >> 8 & 255) ^ CKR(8, b & 255) ^
+              CKR(7, c >> 24) ^ CKR(6, c >> 16 & 255) ^ CKR(5, c >> 8 & 255) ^
+              CKR(4, c & 255) ^ CKR(3, d >> 24) ^ CKR(2, d >> 16 & 255) ^
+              CKR(1, d >> 8 & 255) ^ CKR(0, d & 255);
+    }
+    return crc;
+}
+
+#ifdef CK_FOLD
+    /* below this many 16-byte blocks the table steps do as well */
+    #define CK_FOLD_MIN 8
+
+/* n >= 1 blocks of 16 bytes: four accumulators a stride of 64 bytes apart,
+ * joined, then the last 16 bytes of folded data go through the table */
+CK_TARGET static uint32_t ck_fold(uint32_t crc, const uint8_t* p, size_t n) {
+    ckv k128 = CK_K(ck_k[0][0], ck_k[0][1]),
+        k256 = CK_K(ck_k[1][0], ck_k[1][1]);
+    ckv k384 = CK_K(ck_k[2][0], ck_k[2][1]),
+        k512 = CK_K(ck_k[3][0], ck_k[3][1]);
+    ckv a = CK_XOR(ck_ld(p), CK_CRC(crc));
+    p += 16, n--;
+    if (n >= 3) {
+        ckv b = ck_ld(p), c = ck_ld(p + 16), d = ck_ld(p + 32);
+        p += 48, n -= 3;
+        for (; n >= 4; n -= 4, p += 64) {
+            a = CK_XOR(ck_fx(a, k512), ck_ld(p));
+            b = CK_XOR(ck_fx(b, k512), ck_ld(p + 16));
+            c = CK_XOR(ck_fx(c, k512), ck_ld(p + 32));
+            d = CK_XOR(ck_fx(d, k512), ck_ld(p + 48));
+        }
+        a = CK_XOR(
+            CK_XOR(ck_fx(a, k384), ck_fx(b, k256)), CK_XOR(ck_fx(c, k128), d)
+        );
+    }
+    for (; n; n--, p += 16) a = CK_XOR(ck_fx(a, k128), ck_ld(p));
+    uint8_t last[16];
+    ck_st(last, a);
+    return ck_s8(0, last, 2);
+}
+#endif
+
+/** crc advanced over n groups of 8 bytes at p by the polynomial's own table:
+ * the carry-less fold where the host has one, else slice-by-16 (only after
+ * kb_cksum_canon said so) */
+uint32_t kb_cksum_fast(uint32_t crc, const uint8_t* p, size_t n) {
+    ck_init();
+#ifdef CK_FOLD
+    if (ck_fold_ok && n >= 2 * CK_FOLD_MIN) {
+        size_t b = n / 2;
+        crc = ck_fold(crc, p, b);
+        p += b * 16, n &= 1;
+    }
+#endif
+    crc = ck_s16(crc, p, n / 2);
+    p += n / 2 * 16;
+    return n & 1 ? ck_s8(crc, p, 1) : crc;
+}
+
+/** which step kb_cksum_fast runs here: "pclmul", "pmull" or "slice16" */
+const char* kb_cksum_path(void) {
+    ck_init();
+#ifdef CK_FOLD
+    if (ck_fold_ok) return CK_FOLD;
+#endif
+    return "slice16";
+}
+
 // #endregion
 
 // #region sha512
