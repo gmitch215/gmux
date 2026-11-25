@@ -1,0 +1,104 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Gregory Mitchell <me@gmitch215.xyz>
+Date: Mon, 23 Nov 2026 17:00:00 -0500
+Subject: [PATCH] wasm: leave a program's data mapping to the host to zero
+
+An exec mapped the program's data and bss anonymously, so nommu's
+do_mmap cleared every page of it (52 of the 85 pages a BusyBox exec
+zeroes), and the host then wrote the module's data image over most of
+the same bytes, or copied a pristine image over all of them.
+
+load_wasm_file now maps the data with MAP_UNINITIALIZED when the mm is
+in the kernel's memory, and wasm_load_program (the new name of
+wasm_load_executable, with the mapping's length as a fifth argument)
+tells the host that the mapping is not zeroed, so the host writes every
+byte of it before the program runs. A host without the new import
+cannot instantiate the kernel, so no old host runs a program on the
+bytes of another. A mm in a memory of its own (a non-root exec) is
+copied to the host's memory as mapped, so it keeps the zeroing and
+passes 0.
+
+The flag needs CONFIG_MMAP_ALLOW_UNINITIALIZED, which honours it from
+user space too: ksys_mmap_pgoff clears it, so a program's mmap still
+returns zeroed memory. The stack and argument mappings stay zeroed.
+---
+--- a/arch/wasm/configs/wasm32_nommu_defconfig
++++ b/arch/wasm/configs/wasm32_nommu_defconfig
+@@ -56,3 +56,4 @@
+ CONFIG_MULTIUSER=y
+ CONFIG_POSIX_TIMERS=y
+ CONFIG_CGROUPS=y
++CONFIG_MMAP_ALLOW_UNINITIALIZED=y
+--- a/arch/wasm/include/asm/wasm.h
++++ b/arch/wasm/include/asm/wasm.h
+@@ -19,8 +19,14 @@
+ extern struct task_struct *wasm_serialize_tasks(struct task_struct *prev_task,
+ 	struct task_struct *next_task);
+ 
+-extern int wasm_load_executable(unsigned long bin_start, unsigned long bin_end,
+-	unsigned long data_start, unsigned long table_start);
++/*
++ * gmux: data_unzeroed is the length of the data mapping from data_start when the kernel left it
++ * as the page allocator had it (0: it is zeroed). The host writes every byte of those before the
++ * program runs. A host without this import cannot instantiate the kernel, so it never runs a
++ * program on another's bytes.
++ */
++extern int wasm_load_program(unsigned long bin_start, unsigned long bin_end,
++	unsigned long data_start, unsigned long table_start, unsigned long data_unzeroed);
+ extern void wasm_reload_program(void);
+ 
+ extern void wasm_clone_callback(void);
+--- a/fs/binfmt_wasm.c
++++ b/fs/binfmt_wasm.c
+@@ -429,13 +429,19 @@
+ 	}
+ 
+ 	/*
+-	 * MAP_ANMONYMOUS clears the data (and bss). In Wasm, the runtime
+-	 * manages bss inside the data area. The runtime may rely on the data
+-	 * being zeroed as it is placing bss inside (or rather not touchhing bss
+-	 * pages at all). Thus data and bss are the same and zeroed.
++	 * In Wasm, the runtime manages bss inside the data area, and may rely on
++	 * the data being zeroed as it is placing bss inside (or rather not
++	 * touching bss pages at all). Thus data and bss are the same and zeroed.
++	 * In the kernel's memory the host zeroes or restores every byte of the
++	 * mapping before the program runs (wasm_load_program), so the kernel
++	 * leaves it alone. A mm in a memory of its own is copied to it as
++	 * mapped, and that copy must be zeros.
+ 	 */
+ 	data_start = vm_mmap(NULL, 0, data_size,
+-			PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS, 0);
++			PROT_READ|PROT_WRITE,
++			MAP_PRIVATE|MAP_ANONYMOUS|
++			(current->mm->context.private_memory ?
++				0 : MAP_UNINITIALIZED), 0);
+ 	if (!data_start || IS_ERR_VALUE(data_start)) {
+ 		ret = data_start ? (int)data_start : -ENOMEM;
+ 		pr_err("Unable to allocate RAM for process data, errno: %d\n",
+@@ -540,8 +546,10 @@
+ 	 * The host refuses code it holds no build of. That is past the point
+ 	 * of no return, so exec kills the process with SIGSEGV.
+ 	 */
+-	if (wasm_load_executable(current->mm->start_code, current->mm->end_code,
+-			current->mm->start_data, 0U))
++	if (wasm_load_program(current->mm->start_code, current->mm->end_code,
++			current->mm->start_data, 0U,
++			current->mm->context.private_memory ? 0 :
++				current->mm->end_data - current->mm->start_data))
+ 		return -ENOEXEC;
+ 
+ 	finalize_exec(bprm);
+--- a/mm/nommu.c
++++ b/mm/nommu.c
+@@ -1339,6 +1339,8 @@
+ 	struct file *file = NULL;
+ 	unsigned long retval = -EBADF;
+ 
++	/* a program's anonymous memory is always zeroed; only the kernel's own mappings skip it */
++	flags &= ~MAP_UNINITIALIZED;
+ 	audit_mmap_fd(fd, flags);
+ 	if (!(flags & MAP_ANONYMOUS)) {
+ 		file = fget(fd);
+--
+2.43.0
+

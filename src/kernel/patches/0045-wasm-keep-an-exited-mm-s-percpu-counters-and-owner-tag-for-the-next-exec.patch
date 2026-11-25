@@ -1,0 +1,168 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Gregory Mitchell <me@gmitch215.xyz>
+Date: Mon, 23 Nov 2026 18:00:00 -0500
+Subject: [PATCH] wasm: keep an exited mm's percpu counters and owner tag for the next exec
+
+Every exec made an mm: mm_init allocated the four rss counters' percpu
+memory and the first mapping took an owner tag (an id, a 1 KiB set and
+an xarray slot), and the exit of the previous process freed them.
+
+__mmdrop now keeps up to eight sets of counters, and
+wasm_owner_release keeps up to eight tags with their sets zeroed, for
+the next mm to take. The mm_struct itself is still allocated, cleared
+and initialised as before, so no field of an old mm survives into a new
+one. A taken set of counters is zeroed, a kept tag's set is zeroed
+before it goes back, and an mm in a memory of its own never keeps a
+tag. percpu_counter's hotplug list holds the counters' addresses, so
+the copy is refused at build time where that list exists.
+---
+--- a/arch/wasm/mm/owner.c
++++ b/arch/wasm/mm/owner.c
+@@ -44,6 +44,35 @@
+ 	return owners ? 0 : -ENOMEM;
+ }
+ core_initcall(wasm_owner_init);
++
++/* tags of exited mms, kept with their zeroed sets for the next exec's mm */
++#define WASM_OWNER_KEPT 8
++static unsigned int kept_tags[WASM_OWNER_KEPT];
++static unsigned int kept_count;
++static DEFINE_SPINLOCK(kept_lock);
++
++static unsigned int kept_take(void)
++{
++	unsigned int tag = 0;
++
++	spin_lock(&kept_lock);
++	if (kept_count)
++		tag = kept_tags[--kept_count];
++	spin_unlock(&kept_lock);
++	return tag;
++}
++
++static bool kept_put(unsigned int tag)
++{
++	bool kept;
++
++	spin_lock(&kept_lock);
++	kept = kept_count < WASM_OWNER_KEPT;
++	if (kept)
++		kept_tags[kept_count++] = tag;
++	spin_unlock(&kept_lock);
++	return kept;
++}
+ 
+ static unsigned int mm_owner(struct mm_struct *mm)
+ {
+@@ -53,6 +82,15 @@
+ 
+ 	if (tag)
+ 		return tag;
++	fresh = kept_take();
++	if (fresh) {
++		tag = cmpxchg(&mm->context.owner, 0, fresh);
++		if (tag && !kept_put(fresh)) {
++			kfree(xa_erase(&owner_sets, fresh));
++			ida_free(&owner_ida, fresh);
++		}
++		return tag ?: fresh;
++	}
+ 	fresh = ida_alloc_range(&owner_ida, 1, WASM_OWNER_REGION - 1, GFP_KERNEL);
+ 	if (fresh < 0)
+ 		return 0;
+@@ -203,6 +241,16 @@
+ 	if (mm->context.private_memory)
+ 		wasm_user_forget(mm);
+ 	if (mm->context.owner) {
++		u8 *set = xa_load(&owner_sets, mm->context.owner);
++
++		/* the next mm to take the tag must reach no region of this one's */
++		if (set && !mm->context.private_memory) {
++			memset(set, 0, WASM_REGIONS / 4);
++			if (kept_put(mm->context.owner)) {
++				mm->context.owner = 0;
++				return;
++			}
++		}
+ 		kfree(xa_erase(&owner_sets, mm->context.owner));
+ 		ida_free(&owner_ida, mm->context.owner);
+ 	}
+--- a/kernel/fork.c
++++ b/kernel/fork.c
+@@ -625,7 +625,53 @@
+ static inline int mm_alloc_id(struct mm_struct *mm) { return 0; }
+ static inline void mm_free_id(struct mm_struct *mm) {}
+ #endif /* CONFIG_MM_ID */
++
++#ifdef CONFIG_WASM
++/*
++ * The percpu counters of exited mms, kept for the next exec's mm: allocating and freeing them
++ * took a percpu allocation per process. A kept set is a copy of the counters' structs, so the
++ * hotplug list of percpu_counter (which holds their addresses) must not exist.
++ */
++#define MM_KEPT 8
++static struct percpu_counter mm_kept[MM_KEPT][NR_MM_COUNTERS];
++static unsigned int mm_nkept;
++static DEFINE_SPINLOCK(mm_kept_lock);
++
++/* the counters of a kept set, zeroed, or false when none is kept */
++static bool mm_counters_take(struct mm_struct *mm)
++{
++	int i;
++
++	BUILD_BUG_ON(IS_ENABLED(CONFIG_HOTPLUG_CPU));
++	spin_lock(&mm_kept_lock);
++	if (!mm_nkept) {
++		spin_unlock(&mm_kept_lock);
++		return false;
++	}
++	memcpy(mm->rss_stat, mm_kept[--mm_nkept], sizeof(mm->rss_stat));
++	spin_unlock(&mm_kept_lock);
++	for (i = 0; i < NR_MM_COUNTERS; i++)
++		percpu_counter_set(&mm->rss_stat[i], 0);
++	return true;
++}
+ 
++/* keeps the counters for the next mm, or false when the set is full */
++static bool mm_counters_put(struct mm_struct *mm)
++{
++	bool kept;
++
++	spin_lock(&mm_kept_lock);
++	kept = mm_nkept < MM_KEPT;
++	if (kept)
++		memcpy(mm_kept[mm_nkept++], mm->rss_stat, sizeof(mm->rss_stat));
++	spin_unlock(&mm_kept_lock);
++	return kept;
++}
++#else
++static inline bool mm_counters_take(struct mm_struct *mm) { return false; }
++static inline bool mm_counters_put(struct mm_struct *mm) { return false; }
++#endif
++
+ static void check_mm(struct mm_struct *mm)
+ {
+ 	int i;
+@@ -739,7 +785,8 @@
+ 	check_mm(mm);
+ 	mm_pasid_drop(mm);
+ 	mm_destroy_cid(mm);
+-	percpu_counter_destroy_many(mm->rss_stat, NR_MM_COUNTERS);
++	if (!mm_counters_put(mm))
++		percpu_counter_destroy_many(mm->rss_stat, NR_MM_COUNTERS);
+ 
+ 	free_mm(mm);
+ }
+@@ -1146,7 +1193,8 @@
+ 	if (mm_alloc_sched(mm))
+ 		goto fail_sched;
+ 
+-	if (percpu_counter_init_many(mm->rss_stat, 0, GFP_KERNEL_ACCOUNT,
++	if (!mm_counters_take(mm) &&
++	    percpu_counter_init_many(mm->rss_stat, 0, GFP_KERNEL_ACCOUNT,
+ 				     NR_MM_COUNTERS))
+ 		goto fail_pcpu;
+ 
+--
+2.43.0
+
