@@ -1,9 +1,14 @@
 import { spawnSync } from 'node:child_process';
-import { mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
-import { emitRegions, L, layoutOf } from '../../experiments/aot-oracle/scripts/emit.ts';
+import {
+	emitRegions,
+	L,
+	layoutChecks,
+	layoutOf
+} from '../../experiments/aot-oracle/scripts/emit.ts';
 import { opNumbers } from '../../experiments/aot-oracle/scripts/functions.ts';
 import {
 	findLoops,
@@ -177,6 +182,53 @@ describe('emit', () => {
 		);
 		expect(tables).toContain(`_Static_assert(sizeof(struct kb_ic) == ${L.icSize}, `);
 		expect(tables).toContain(`_Static_assert(offsetof(struct kb_block, ic) == ${L.blkIc}, `);
+	});
+
+	// the wasm32 reading of kb.h without a sysroot: libc is a few declarations, and `clang --target=wasm32 -fsyntax-only` needs no linker
+	const layoutAgainstKbH = (checks: string[]) => {
+		const dir = mkdtempSync(join(tmpdir(), 'emit-layout-'));
+		mkdirSync(join(dir, 'sys'));
+		writeFileSync(join(dir, 'stdio.h'), 'typedef struct FILE FILE;\n');
+		writeFileSync(join(dir, 'stdlib.h'), 'char* getenv(const char*);\n');
+		writeFileSync(join(dir, 'string.h'), '');
+		writeFileSync(
+			join(dir, 'sys/uio.h'),
+			'struct iovec { void* iov_base; unsigned long iov_len; };\n'
+		);
+		writeFileSync(
+			join(dir, 'layout.c'),
+			`#include <stddef.h>\n#include "aot.h"\n${checks.join('\n')}\n`
+		);
+		return spawnSync('clang', [
+			'--target=wasm32',
+			'-fsyntax-only',
+			'-ffreestanding',
+			'-nostdinc',
+			'-isystem',
+			dir,
+			'-isystem',
+			spawnSync('clang', ['-print-resource-dir']).stdout.toString().trim() + '/include',
+			'-DKB_AOT',
+			'-D_DEFAULT_SOURCE',
+			'-Isrc/gmux/katybug',
+			'-Iexperiments/aot-oracle/src',
+			join(dir, 'layout.c')
+		]);
+	};
+	const wasm32 = has('clang') && layoutAgainstKbH([]).status === 0;
+
+	it.skipIf(!wasm32)('holds the offsets L names against kb.h under the wasm32 layout', () => {
+		const run = layoutAgainstKbH(layoutChecks());
+		expect(run.stderr.toString()).toBe('');
+		expect(run.status).toBe(0);
+	});
+
+	it.skipIf(!wasm32)('fails the layout check when an offset in L is off', () => {
+		const moved = layoutChecks().map((c) =>
+			c.replace(`fault) == ${L.cpuFault}`, `fault) == ${L.cpuFault - 40}`)
+		);
+		expect(moved).not.toEqual(layoutChecks());
+		expect(layoutAgainstKbH(moved).status).not.toBe(0);
 	});
 
 	it('orders a loop header first and every forward edge forward', () => {

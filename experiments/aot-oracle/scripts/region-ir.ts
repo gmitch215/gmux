@@ -38,6 +38,9 @@ export interface Block {
 	runs: bigint;
 	ins: Ins[];
 	pcs?: number[];
+	exits?: Map<number, bigint>;
+	taken?: bigint;
+	fall?: bigint;
 }
 
 export function parse(path: string): Block[] {
@@ -53,11 +56,21 @@ export function parse(path: string): Block[] {
 			ins.push({ op: +f[0]!, w: +f[1]!, a: +f[2]!, b: +f[3]!, c: +f[4]!, imm: BigInt(f[5]!) });
 		}
 		i += n;
-		if ((lines[i + 1] ?? '').startsWith('exits')) i++;
+		// runs that left at each interior exit, by op index
+		let exits: Map<number, bigint> | undefined;
+		if ((lines[i + 1] ?? '').startsWith('exits')) exits = new Map(lines[++i]!.split(' ').slice(1).map((e) => e.split(':') as [string, string]).map(([k, v]) => [Number(k), BigInt(v)]));
 		// each op's guest instruction as an offset from the block's pc (the interpreter's side table)
 		let pcs: number[] | undefined;
 		if ((lines[i + 1] ?? '').startsWith('pcs ')) pcs = lines[++i]!.split(' ').slice(1).map((v) => Number(v) | 0);
-		blocks.push({ pc: BigInt(`0x${m[1]}`), next: BigInt(`0x${m[2]}`), target: BigInt(`0x${m[3]}`), runs: BigInt(m[5]!), ins, pcs });
+		// runs that left the final branch to `target` and to `next`; dumps from before the line existed have none
+		let taken: bigint | undefined;
+		let fall: bigint | undefined;
+		const br = /^branch (\d+) (\d+)$/.exec(lines[i + 1] ?? '');
+		if (br) {
+			[taken, fall] = [BigInt(br[1]!), BigInt(br[2]!)];
+			i++;
+		}
+		blocks.push({ pc: BigInt(`0x${m[1]}`), next: BigInt(`0x${m[2]}`), target: BigInt(`0x${m[3]}`), runs: BigInt(m[5]!), ins, pcs, exits, taken, fall });
 	}
 	return blocks;
 }

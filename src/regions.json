@@ -1,0 +1,18 @@
+{
+	"bash": {
+		"sha256": "609906f95898a77634e5b1122e848077ac160308d9886aa1b2b8972bd7d298d0",
+		"license": "GPL-3.0-or-later"
+	},
+	"busybox-amd64": {
+		"sha256": "3d9f2889d6782537624a4e1a10e68a2ddd53e0ee8bac02676f27308f42ec6bf6",
+		"license": "GPL-2.0-only"
+	},
+	"coreutils": {
+		"sha256": "43b71aff00beb8c0debc6b58605343017a5556471eb134124cf82a6b04d1de06",
+		"license": "GPL-3.0-or-later"
+	},
+	"sqlite3": {
+		"sha256": "e0764161f6817e8eef20a73932f1af346da1cda5161cead694c12f84e17a20f9",
+		"license": "blessing"
+	}
+}

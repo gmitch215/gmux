@@ -19,7 +19,7 @@ import { Machine, type MachineOptions } from '../../../src/worker/machine/machin
  * `WORKLOADS=gzip,bzip2,sqlite,bash,sha256,ls WANTS=gzip=<md5>,bzip2=<md5>,... [RUNS=2]` runs those programs of the variant
  * dir (busybox-amd64, sqlite3, bash, coreutils) in one machine instead: runs 1 and 2 of each, the checkpoint and restore
  * of runs 3 and 4 only when RUNS is not 2 (and then only for the first workload). NORESUME=1 runs the fuel build as it is,
- * for a check with no checkpoint
+ * for a check with no checkpoint: with RUNS above 2 runs 3 to RUNS are plain runs on the same cache
  */
 const [kernel = '', dir = '', ...arms] = process.argv.slice(2);
 const wants = new Map<string, string>(
@@ -138,7 +138,8 @@ for (const arm of arms) {
 		const base = i * 10;
 		row('1 (cold)', base + 1, await go(base + 1));
 		row('2 (cache)', base + 2, await go(base + 2));
-		if (runs > 2 && i === 0) await checkpointRuns(base);
+		if (runs > 2 && i === 0 && process.env.NORESUME) for (let n = 3; n <= runs; n++) row(`${n} (cache)`, base + n, await go(base + n));
+		else if (runs > 2 && i === 0) await checkpointRuns(base);
 	}
 	async function checkpointRuns(base: number) {
 	// run 3: checkpointed in the middle, finished in a fresh machine of the same modules

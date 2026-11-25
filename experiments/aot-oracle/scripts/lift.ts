@@ -287,6 +287,7 @@ const regionSizes: number[] = [];
 const regionSlotted: boolean[] = [];
 let irIns = 0;
 let windowCount = 0;
+let windowsDone = 0;
 
 // each region's blocks, chosen before any is lifted so a call can name the region it enters
 const selected = specs.map(({ path, ranges }) => selectBlocks(path, ranges, coverage));
@@ -346,7 +347,9 @@ order.forEach((region) => {
 	const R = `r${region}`;
 	regionNames[region] = `${R}_run`;
 	regionSizes[region] = chosen.length;
-	const index = new Map(chosen.map((b, j) => [b.pc, j]));
+	windowsDone += windowCount;
+	windowCount = 0;
+	const index =new Map(chosen.map((b, j) => [b.pc, j]));
 	const dead = flagsMode === 'all' ? new Set<string>() : deadFlags(chosen, index, calls, new Map(all.map((b) => [b.pc, b])), { mode: flagsMode, mutate, identity: opt.identity });
 	if (flagsMode !== 'all') console.error(`${dump}: --flags=${flagsMode} drops ${dead.size} of ${chosen.reduce((n, b) => n + b.ins.filter((x) => opName(x.op) === 'FLAGS').length, 0)} flag writes`);
 	const arch =/^arch (\d+)$/m.exec(readFileSync(dump, 'utf8'));
@@ -1156,7 +1159,7 @@ order.forEach((region) => {
 			const two = ld.wins.filter((w) => w.two).length;
 			console.error(`${R}: ${nest.loops.length} loops, ${ld.byLoop.size} with windows, ${ld.wins.length} loop windows${two ? ` (${two} of two pieces)` : ''}, ${through} loads and stores through them${s ? ' (slots form)' : ''}`);
 		}
-	console.error(`${R}: ${regList.length} region registers, ${twins.size} blocks with windows, ${windowCount} windows so far`);
+	console.error(`${R}: ${regList.length} region registers, ${twins.size} blocks with windows, ${windowCount} windows`);
 });
 
 table.sort((a, b) => (a.pc < b.pc ? -1 : a.pc > b.pc ? 1 : 0));
@@ -1211,4 +1214,4 @@ lines.push(
 	'}'
 );
 writeFileSync(out, `${lines.join('\n')}\n`);
-console.error(`wrote ${out}: ${table.length} blocks in ${regionNames.length} regions, ${irIns} IR ops (${irIns * 16} bytes), ${windowCount} windows`);
+console.error(`wrote ${out}: ${table.length} blocks in ${regionNames.length} regions, ${irIns} IR ops (${irIns * 16} bytes), ${windowsDone + windowCount} windows`);

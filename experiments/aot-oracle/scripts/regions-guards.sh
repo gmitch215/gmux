@@ -16,6 +16,11 @@
 # LIFT_FLAGS adds lift.ts flags and CC_EXTRA the host flags of the lifted build (--epochs needs -DKB_EPOCH=1).
 #   x86-pcs.c: one load between two-byte nops, either side of it in turn at the same address: equal IR and end, other instruction
 #     boundaries, so the pc a fault reports is the guard's to tell apart
+#   x86-cache.c: a loop whose head is a block of its own, run 40 times a process: the head's profile crosses the trace
+#     threshold in the second process on one KATYBUG_CACHE dir, and a trace from the head must not keep the promoted body's loop
+#     in the interpreter (the cache row runs it three times on one dir: lifted share and entries equal run 1's)
+#   x86-fork.c (the last row, which sets KATYBUG_FORK=exec): every executed block lifted, the parent forks by exec from inside
+#     its regions and the child enters its own, starting with the blocks the parent's table gave it
 #   x86-flat.c: checked accesses (an index read from memory) on a buffer that is cut up, protected, remapped, grown and
 #     forked under the loop, and read at addresses that share its low 32 bits
 # FLAT=1 (with LIFT_FLAGS="--epochs ..." and CC_EXTRA="-DKB_EPOCH=1 -DKB_FLAT=1048576") lifts each guest twice: with --classes, to count
@@ -42,7 +47,7 @@ echo "guest,regs,result,entries,lifted,flat hits"
 # guest name, source, expected output, region function ('' lifts every executed block), compiler flags, 1 when regions
 # must be entered, 0 when none may be
 check() {
-	local g=$1 src=$2 want=$3 fn=$4 cflags=$5 entered=$6 warm=${7:-} flatmin=${8:-0} ranges=() got rc=0 big regs flat=()
+	local g=$1 src=$2 want=$3 fn=$4 cflags=$5 entered=$6 warm=${7:-} flatmin=${8:-0} cover=${9:-1} cached=${10:-} ranges=() got rc=0 big regs flat=()
 	[ -z "${GUEST:-}" ] || [ "$GUEST" = "$g" ] || return 0
 	"$llvm/clang" "${flags[@]}" $cflags -o "$out/$g" "$T/$src"
 	got=$("$out/plain" "$out/$g" 2> /dev/null) || rc=$?
@@ -59,7 +64,7 @@ check() {
 		ranges=(--ranges="0x$addr-$(printf '0x%x' $((0x$addr + 0x$size)))")
 	fi
 	if [ -n "${FLAT:-}" ]; then
-		"$node" --no-warnings --experimental-strip-types "$here/lift.ts" --temps --windows --regs --slots ${LIFT_FLAGS:-} --classes ${ranges[@]+"${ranges[@]}"} "$out/aotc-$g.c" 1 "$big" 2> "$out/aotc-$g.log"
+		"$node" --no-warnings --experimental-strip-types "$here/lift.ts" --temps --windows --regs --slots ${LIFT_FLAGS:-} --classes ${ranges[@]+"${ranges[@]}"} "$out/aotc-$g.c" "$cover" "$big" 2> "$out/aotc-$g.log"
 		$cc ${CC_EXTRA:-} -DKB_AOT -DKB_COUNT -DAOT_CLASS -I"$K" -I"$here/../src" -o "$out/aotc-$g" "$K"/*.c "$out/aotc-$g.c" -lm
 		: > "$out/$g.census"
 		for regs in 0 1 2; do
@@ -67,7 +72,7 @@ check() {
 		done
 		flat=(--flat="$out/$g.census")
 	fi
-	"$node" --no-warnings --experimental-strip-types "$here/lift.ts" --temps --windows --regs --slots ${LIFT_FLAGS:-} ${flat[@]+"${flat[@]}"} ${ranges[@]+"${ranges[@]}"} "$out/aot-$g.c" 1 "$big" 2> "$out/aot-$g.log"
+	"$node" --no-warnings --experimental-strip-types "$here/lift.ts" --temps --windows --regs --slots ${LIFT_FLAGS:-} ${flat[@]+"${flat[@]}"} ${ranges[@]+"${ranges[@]}"} "$out/aot-$g.c" "$cover" "$big" 2> "$out/aot-$g.log"
 	$cc ${CC_EXTRA:-} -DKB_AOT -DKB_COUNT -I"$K" -I"$here/../src" -o "$out/aot-$g" "$K"/*.c "$out/aot-$g.c" -lm
 	for regs in 0 1 2; do
 		rc=0
@@ -86,6 +91,24 @@ check() {
 			echo "$g,$regs,FAIL (exit $rc; output $([ "$got" = "$want" ] && echo equal || echo differs); entries $([ "$ok" = 1 ] && echo as wanted || echo not as wanted)),$entries,$lifted,$hits"
 			failed=1
 		fi
+		if [ -n "$cached" ]; then
+			# three runs on one cache dir: the lifted share and the entries of runs 2 and 3 must equal run 1's
+			local dir n share=() ent=() verdict=PASS
+			dir=$(mktemp -d "$out/cache-$g-$regs.XXXXXX")
+			for n in 1 2 3; do
+				rc=0
+				: > "$out/$g-$regs-c$n.count"
+				got=$(KATYBUG_REGS=$regs KATYBUG_CACHE="$dir" KATYBUG_COUNT="$out/$g-$regs-c$n.count" "$out/aot-$g" "$out/$g" 2> /dev/null) || rc=$?
+				[ "$got" = "$want" ] && [ "$rc" = 0 ] || verdict="FAIL (run $n exit $rc; output $([ "$got" = "$want" ] && echo equal || echo differs))"
+				ent[n]=$(awk '/^katybug count:/ { for (i = 3; i < NF; i += 2) if ($i == "entries") n += $(i + 1) } END { print n + 0 }' "$out/$g-$regs-c$n.count")
+				share[n]=$(awk '/^katybug count:/ { for (i = 3; i < NF; i += 2) { if ($i == "lifted") l += $(i + 1); if ($i == "insns") t += $(i + 1) } } END { printf "%.2f", t ? 100 * l / t : 0 }' "$out/$g-$regs-c$n.count")
+			done
+			for n in 2 3; do
+				awk -v a="${share[1]}" -v b="${share[n]}" -v x="${ent[1]}" -v y="${ent[n]}" 'BEGIN { d = a - b; e = x - y; exit !((d < 0 ? -d : d) <= 0.1 && (e < 0 ? -e : e) <= x / 1000 && x > 0) }' || verdict="FAIL (run $n lifted ${share[n]}% entries ${ent[n]}, run 1 ${share[1]}% ${ent[1]})"
+			done
+			echo "$g-cache,$regs,$verdict,${ent[1]}/${ent[2]}/${ent[3]},${share[1]}%/${share[2]}%/${share[3]}%,-"
+			[ "$verdict" = PASS ] || failed=1
+		fi
 	done
 }
 check region-smc x86-region-smc.c "region-smc ok" region_fn "-Wl,-N -mno-sse -mno-mmx" 0
@@ -94,6 +117,9 @@ check rights rights.c "$(grep -v '^smc-self ' "$T/rights-x86.expected")" "" "-mn
 check loops x86-loops.c "$(cat "$T/x86-loops.expected")" "" "-mno-sse -mno-mmx -mno-red-zone" 1
 check flat x86-flat.c "$(cat "$T/x86-flat.expected")" "" "-mno-sse -mno-mmx -mno-red-zone" 1 warm 1000
 check pcs x86-pcs.c "pcs 2 0 2 0" "" "-mno-sse -mno-mmx -mno-red-zone" 1
+check cache x86-cache.c "cache ok" "" "-mno-sse -mno-mmx -mno-red-zone" 1 "" 0 0.999 1
+export KATYBUG_FORK=exec
+check fork x86-fork.c $'c 029\nd 107\ne 107\nc 029\nd 107\ne 107\np 107\nq 107' "" "-mno-sse -mno-mmx -mno-red-zone" 1
 if [ -n "${EXPECT_FAIL:-}" ]; then
 	[ "$failed" = 1 ]
 	exit

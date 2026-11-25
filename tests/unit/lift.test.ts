@@ -980,3 +980,51 @@ describe('lift --lines', () => {
 		expect(lines).toMatch(/#line \d+ "dispatch"\n[^\n]*goto/);
 	});
 });
+
+describe('lift --windows over several regions', () => {
+	const load = (n: number) => [
+		`${op.LD} 8 8 7 0 ${n}`,
+		`${op.LD} 8 9 6 0 ${n + 8}`,
+		`${op.JMP} 8 0 37 0 0`
+	];
+	const text = [
+		'arch 0',
+		'block 1000 2000 0 3 5',
+		...load(16),
+		'block 2000 3000 0 3 5',
+		...load(32),
+		'block 3000 3001 0 3 5',
+		...load(48),
+		''
+	].join('\n');
+
+	it('sizes each region window array by its own windows, not by the windows lifted before it', () => {
+		const dir = mkdtempSync(join(tmpdir(), 'lift-'));
+		const hot = join(dir, 'd.hot');
+		writeFileSync(hot, text);
+		const out = join(dir, 'out.c');
+		const run = spawnSync(
+			process.execPath,
+			[
+				'--no-warnings',
+				'--experimental-strip-types',
+				'experiments/aot-oracle/scripts/lift.ts',
+				'--temps',
+				'--windows',
+				'--regs',
+				out,
+				'1',
+				`${hot}@0x1000-0x2000`,
+				`${hot}@0x2000-0x3000`,
+				`${hot}@0x3000-0x3001`
+			],
+			{ encoding: 'utf8' }
+		);
+		expect(run.status).toBe(0);
+		const c = readFileSync(out, 'utf8');
+		expect(c).toContain('static struct kb_ic r0_win[2];');
+		expect(c).toContain('static struct kb_ic r1_win[2];');
+		expect(c).toContain('static struct kb_ic r2_win[2];');
+		expect(run.stderr).toContain('6 windows');
+	});
+});

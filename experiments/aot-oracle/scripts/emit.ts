@@ -63,10 +63,10 @@ export const L = {
 	cpuDf: 592,
 	cpuExited: 600,
 	cpuMapgen: 35928,
-	cpuFault: 52368,
-	cpuIpc: 52528,
-	cpuFaultSig: 55316,
-	cpuSigreturned: 55324,
+	cpuFault: 52408,
+	cpuIpc: 52568,
+	cpuFaultSig: 55356,
+	cpuSigreturned: 55364,
 	blkIns: 28,
 	blkIc: 32
 };
@@ -96,6 +96,20 @@ export interface RegionIn {
 	all: Block[];
 	chosen: Block[];
 }
+// one wasm `if` of an emitted function, by its place among the function's `if`s in the order written. A guest branch (`br`, the
+// final BR or BRZ of a block) or an interior side exit (`exit`) names its block and op; a `guard` of 0 or 1 is the static
+// expectation for the other classes (1: the then arm is the usual one); an untagged `if` has none
+export interface HintRow {
+	fn: string;
+	ordinal: number;
+	cls: string;
+	pc?: bigint;
+	op?: number;
+	guard?: 0 | 1;
+}
+export const HINT_COLUMNS = 'fn\tordinal\tclass\tpc\top\tguard';
+export const hintsTsv = (rows: HintRow[]) =>
+	`${HINT_COLUMNS}\n${rows.map((h) => `${h.fn}\t${h.ordinal}\t${h.cls}\t${h.pc === undefined ? '' : h.pc.toString(16)}\t${h.op ?? ''}\t${h.guard ?? ''}`).join('\n')}\n`;
 export interface RegionReport {
 	name: string;
 	chosen: number;
@@ -262,7 +276,7 @@ export function layoutChecks(): string[] {
 	];
 }
 
-export function emitRegions(regions: RegionIn[], cfg: EmitConfig): { asm: string; tables: string; reports: RegionReport[] } {
+export function emitRegions(regions: RegionIn[], cfg: EmitConfig): { asm: string; tables: string; reports: RegionReport[]; hints: HintRow[] } {
 	const asm: string[] = [
 		'\t.globaltype\t__memory_base, i32, immutable',
 		...HELPERS.map((h) => `\t.functype\t${h.replace(' ', '\t')}`),
@@ -373,7 +387,7 @@ export function emitRegions(regions: RegionIn[], cfg: EmitConfig): { asm: string
 		'\t}',
 		'}'
 	);
-	return { asm: `${asm.join('\n')}\n`, tables: `${tab.join('\n')}\n`, reports };
+	return { asm: `${asm.join('\n')}\n`, tables: `${tab.join('\n')}\n`, reports, hints: live.flatMap((_, rn) => doneBy[rn]!.hints) };
 }
 
 // what a caller needs of a region it calls: the registers it takes and the ones it hands back
@@ -634,6 +648,11 @@ function emitRegion(region: RegionIn, rn: number, cfg: EmitConfig, calls: Map<bi
 	// #endregion
 
 	const out: string[] = [];
+	const ifs: Omit<HintRow, 'fn'>[] = [];
+	let ifTag: Omit<HintRow, 'fn' | 'ordinal'> | undefined;
+	const tag = (cls: string, rest: { pc?: bigint; op?: number; guard?: 0 | 1 } = {}) => {
+		ifTag = { cls, ...rest };
+	};
 	// each operator (not a constant, a local move or a frame marker) is counted under the category being emitted, weighted by the block's runs
 	let cat = 'arith';
 	let runsNow = 0n;
@@ -666,6 +685,10 @@ function emitRegion(region: RegionIn, rn: number, cfg: EmitConfig, calls: Map<bi
 				}
 			}
 			out.push(`\t${l}`);
+			if (l === 'if' || l.startsWith('if\t')) {
+				ifs.push({ ordinal: ifs.length, ...(ifTag ?? { cls: 'other' }) });
+				ifTag = undefined;
+			}
 			if (!counted) return;
 			const e = catStat.get(c) ?? catStat.set(c, { static: 0, weighted: 0n }).get(c)!;
 			e.static++;
@@ -1349,6 +1372,7 @@ function emitRegion(region: RegionIn, rn: number, cfg: EmitConfig, calls: Map<bi
 		// a fault leaves with the callee's fault set: if (cpu->fault) leave
 		const ifFault = (then: () => void) => {
 			cpuLoad32(L.cpuFault);
+			tag('fault', { guard: 0 });
 			open('if', '#if');
 			then();
 			close('end_if');
@@ -1396,6 +1420,7 @@ function emitRegion(region: RegionIn, rn: number, cfg: EmitConfig, calls: Map<bi
 				lget(okb);
 				o(`i32.load8_u\t${k}:p2align=0`);
 				o('i32.and');
+				tag('ok', { guard: 1 });
 				open('if', '#if');
 				if (edgeOn) as('flags', () => carryOver(k));
 				edge(j, k);
@@ -1744,6 +1769,7 @@ function emitRegion(region: RegionIn, rn: number, cfg: EmitConfig, calls: Map<bi
 			if (hit) {
 				fastPtr(hit, W);
 				lget(swp);
+				tag('window', { guard: 1 });
 				open('if', '#if');
 			}
 			if (hit) {
@@ -1776,6 +1802,7 @@ function emitRegion(region: RegionIn, rn: number, cfg: EmitConfig, calls: Map<bi
 			o('i64.sub');
 			o('i64.gt_u');
 			o('i32.or');
+			tag('slow', { guard: 0 });
 			open('if', '#if');
 			if (isLoad) {
 				lget(CPU);
@@ -2155,6 +2182,7 @@ function emitRegion(region: RegionIn, rn: number, cfg: EmitConfig, calls: Map<bi
 					break;
 				case 'BR':
 					cond(Number(x.imm));
+					tag('br', { pc: b.pc, op: i });
 					open('if', '#if');
 					leave(b.target);
 					close('end_if');
@@ -2164,6 +2192,7 @@ function emitRegion(region: RegionIn, rn: number, cfg: EmitConfig, calls: Map<bi
 					o('i64.eqz');
 					if (x.imm !== 0n) o('i32.eqz');
 					// leave when (A != 0) == (imm != 0): imm 0 leaves on A == 0 (eqz), nonzero imm on A != 0
+					tag('br', { pc: b.pc, op: i });
 					open('if', '#if');
 					leave(b.target);
 					close('end_if');
@@ -2175,6 +2204,7 @@ function emitRegion(region: RegionIn, rn: number, cfg: EmitConfig, calls: Map<bi
 						o('i64.eqz');
 						if (x.imm & 1n) o('i32.eqz');
 					} else cond(Number(x.imm & 0xffn));
+					tag('exit', { pc: b.pc, op: i });
 					open('if', '#if');
 					leave(to);
 					close('end_if');
@@ -2440,11 +2470,13 @@ function emitRegion(region: RegionIn, rn: number, cfg: EmitConfig, calls: Map<bi
 					lget(CPU);
 					as('helpers', () => o('call\tkb_syscall'));
 					cpuLoad32(L.cpuExited);
+					tag('fault', { guard: 0 });
 					o('if');
 					i64c(0n);
 					o('return');
 					o('end_if');
 					cpuLoad32(L.cpuSigreturned);
+					tag('fault', { guard: 0 });
 					o('if');
 					cpuStore32(L.cpuSigreturned, () => i32c(0));
 					lget(CPU);
@@ -2452,6 +2484,7 @@ function emitRegion(region: RegionIn, rn: number, cfg: EmitConfig, calls: Map<bi
 					o('return');
 					o('end_if');
 					cpuLoad32(L.cpuFault);
+					tag('fault', { guard: 0 });
 					o('if');
 					cpuStore64(L.cpuIpc, () => i64c(ipc));
 					i64c(b.pc);
@@ -2702,7 +2735,7 @@ function emitRegion(region: RegionIn, rn: number, cfg: EmitConfig, calls: Map<bi
 		cats: Object.fromEntries(catStat)
 	};
 	void ownWindows;
-	return { asm, report, blocks: chosen.map((b) => original.get(b) ?? b), windows: windowCount };
+	return { asm, report, blocks: chosen.map((b) => original.get(b) ?? b), windows: windowCount, hints: ifs.map((h): HintRow => ({ fn, ...h })) };
 }
 
 if (import.meta.main) {
@@ -2729,6 +2762,7 @@ if (import.meta.main) {
 	mkdirSync(outDir, { recursive: true });
 	writeFileSync(`${outDir}/regions.s`, done.asm);
 	writeFileSync(`${outDir}/tables.c`, done.tables);
+	writeFileSync(`${outDir}/hints.tsv`, hintsTsv(done.hints));
 	for (const r of done.reports) {
 		const pct = (a: bigint | number, c: bigint | number) => (Number(c) ? ((100 * Number(a)) / Number(c)).toFixed(1) : '0.0');
 		console.error(
