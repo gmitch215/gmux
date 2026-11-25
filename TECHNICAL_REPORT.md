@@ -1920,6 +1920,79 @@ before the kernel's out-of-memory killer runs; the `taskcap` probe passes at 800
 three C-suite modes, but on the deployed boot rig it stops after "the 61 running tasks stay alive" (3 of 6
 expected lines) and is not explained. The `SHORT` cell is 0 in 100 on both arms on all three hosts.
 
+### Host Tree, Region Module and Control Matrix (Nov. 25)
+
+Timed on paisley-park under Node v26.10.0 [30] (V8 14.6.202.34 [13]) against the same program natively
+on the same box, unless an instrument says otherwise. The box never read quiet: one core outside the
+pinned set was busy in every sample (`quiet.sh` 1.00 to 1.17 at best), so every sample keeps its reading
+and none was dropped; a sample above 0.5 is labelled noisy, and most tables below say how many were.
+Kernel base is mainline Linux 7.3 [1] with patches 0001-0045 (0044 and 0045 are new).
+
+| measurement | figure | instrument |
+| --- | --- | --- |
+| Process start recycled on the checkpointing site (the asyncified and evacuable BusyBox builds) | busy samples **-58.5%** on a configure-shaped run (N=900) and **-67.5%** on fork+exec (N=3000), against the share build's -59.1% and -64.5%; 27 of 30 samples kept, 0 failed checks | V8 profile busy samples, `experiments/syscall-cost` |
+| The spawn chain's host side | **16.0%** (14.2 to 17.4) of configure wall and **20.8%** (20.1 to 21.4) of a fork loop's; a memo of the exec stub's facts plus three shared control-flow objects cut configure N=900 wall **16.3%** and fork N=300 wall **16.8%** (5 samples a cell, ranges apart), exact (0 mismatches over 10,830, 6,030 and 630 execs) | wall and busy samples, `experiments/syscall-cost` |
+| A fork in a machine | **3.737 ms** with the parent's learned table carried to the child against **4.745 ms** without (median of 9 rounds, -21.2%, ranges 3.728 to 3.825 and 4.710 to 4.829) | wall per fork, `experiments/aot-oracle` |
+| The relay's lend, 6.9 MB request | mean CPU **-26.6%** (httpd, 9.365 to 6.875 ms) and **-32.7%** (lighttpd, 9.466 to 6.375 ms) against the copy, 5 of 5 paired runs below it; against the shipped lend -16.8% and -15.9%; `sendfile` 1.34 to 2.21 times native CPU per call; 62 of 62 cells, 0 noisy | mean CPU per request, `experiments/serving` |
+| The C scheduler against the TypeScript one | **2.2% to 3.1%** fewer ns per step at rings 4 to 64, a tie at ring 256 and at 54 sleepers; crossings 1.85 to 2.29 per step on every arm; the copy module is 1.7 to 26 times faster than the views; 22 cells, 197 samples, all noisy | ns per step, `experiments/core-sched` |
+| An exec's data mapping zeroed by the host | `execve` samples **-11% to -14%** on both host arms; the plain host's busy samples **+4% to 5%** (its own zeroing, 589 samples, against the 51 `do_mmap` samples the kernel stopped spending); wall unresolved; `memory.fill` did not lower it (1.057 [1.038, 1.076] of the old path on configure) | V8 profile, 70 samples |
+| `cksum`'s fold | **1.39** (1.35 to 1.40) of native on native Katybug against 4.44 before; the machine **4.83** against 5.53 (the interval includes 1 at 64 MiB); 1,142 samples, 1,128 noisy | `experiments/string-kernels`, `experiments/aot-oracle` |
+| lighttpd 1.4.76 [26] as the image's server | startup **14 ms** with the 1.30 MB asyncified module against 15 ms without; the six replies equal its native build's masked hashes with the lend on and off; a parked keep-alive stream rides a checkpoint, an eviction of 200 s and a request-driven restore on Free with no new open | `wrangler deploy` startup time, `experiments/serving`, Free |
+| The post-restore OOM kill | **0 of 24** runs killed with each `ksoftirqd` at `SCHED_FIFO` priority 1, against 9 of 24 without (Fisher p 0.0016); raising `rcu_divisor` or `rcu_resched_ns` does not remove it (13 of 24 and 4 of 24 against 10 of 24) | `experiments/staged-init`, a 3 s clock step per checkpoint |
+
+Lifted code (Katybug's whole-program regions) under V8 against the native binary: the opt-in region
+module reads **6.2** (gzip), **12.3** (bzip2), **21 to 22** (sqlite) and **32.8** (bash), within 3% of
+one table per workload, on 624 samples, all noisy, every output equal to the native binary's. The shipped
+default build carries **no region module**: with it every Katybug process asks the guest for 2,207,744
+contiguous bytes and coreutils passes 0 of 516 at 1,200 and 800 pages, against 327 on the default
+build. The module's node RSS over the interpreter is +29 (gzip), +52 (bzip2), +96 (sqlite) and +82
+(bash) MiB and a per-workload table +15, +26, +10 and +85; these are `node` process RSS, not the
+isolate charge. Where the lifted time goes for bash on the clang route: 1,733 ms of 2,607 ms is lifted
+execution, of which dispatch is 808, spill stores 271, spill loads 221, guards 80 and instrumentation
+53 (shares of V8 samples times a timed median, not per-category timings). The source-built `wasm32`
+Bash reads **1.58** (1.55 to 1.65, 14 rounds) of the x86 binary, so 21.7 of the lift's 34.16 sits in the
+representation step. The flat table with the epoch form takes the unproved accesses per 1,000
+instructions to gzip 115.72, fnc 98.83, sqlite 73.43, bash 31.95 and sha256 11.53, and recovers 4.8%
+(gzip) and 2.7% to 4.5% (fnc); on bash it reads 16 to 36 ms slower (a tie).
+
+SHA-256 against optimized native builds, eight 64 MiB files, five paired rounds, `r` against the pinned
+static coreutils 9.5 [9] (0.774 s; `--version` reads 9.5 and `ldd` reads "not a dynamic executable"):
+
+| arm | `r` |
+| --- | --- |
+| the box's `sha256sum` (coreutils 9.4 with `libcrypto.so.3`, OpenSSL 3.0.13 [20]) | 0.28 |
+| coreutils 9.11 built with OpenSSL | 0.28 |
+| `openssl dgst -sha256`, and the same with the SHA extension masked | 0.29, 0.75 |
+| Node's `createHash` (Node's own OpenSSL 3.5.8), 32 KiB reads, 1 MiB reads, masked | 0.30, 0.28, 0.75 |
+| gmux's host arm, and the same with the SHA extension masked in the host process | 0.40, 0.88 |
+| gmux's host arm without hashing the bytes | 0.15 |
+
+Against an equally optimized native program the host path is 1.43 times slower (0.40 over 0.28, bridged
+through the control; 217 ms for the best native arm against 313 ms). Across the digest family, `r` of
+the kernel arm and the host arm: md5sum 1.38 and 1.10, sha1sum 1.61 and 0.76, sha224sum 1.35 and 0.41,
+sha256sum 1.34 and 0.40, sha384sum 1.37 and 0.85, sha512sum 1.37 and 0.86; b2sum host 1.31.
+
+The first fixture measurement: GNU coreutils `make check` [9] on gmux passes 339 of 516 tests against
+native's 361 (three samples per arm, status not passing), whole-suite wall ratio 7.85 median (7.31 to
+11.49, n = 3, no interval), on a build before the region module; the sum of per-test wall times is a
+different quantity and the 505 s figure of the previous run (340 PASS, 1.486 s per PASS against 0.276 s)
+is replaced by this record. vim 9.1.0800 builds in the census and its ex-mode output and exit codes equal
+native vim's byte for byte.
+
+Deployed on Free [3] (run 5's build, not the final tree): `survive` at N 24,000,000 passed 2 of 3 (READY
+356 to 442 s; the third try died of a guest `oom-kill` of `sh` after 16 checkpoints and a restore); the
+sha256sum cell reads `r_product` 0.76 (64 MiB) and 0.81 (112 MiB) against a 0.84 to 0.86 earlier control;
+the `taskcap` probe never sees its END-2 marker in 45 polls; the inflate probe finds `createInflateRaw`,
+`_handle.writeSync` and `_writeState`, returns the right bytes on every complete stream up to 64 MiB and
+no error on a truncated or bit-flipped one (Node's own `inflateRawSync` returns the same wrong bytes on
+the flipped input); the big-reply check returns the six replies with VER-4's hashes on the three
+compared ones and a slow reader (`--limit-rate 64k`, 6,888,896 bytes) finishes 3 of 3 at 103.8, 100.4 and
+103.4 s; the two-memory layout does not reproduce the earlier +26% to +38% (multi over single 0.97
+median). The host also carries a machine-wide inflate bound, `maximumInflateBytes` (default 64 MiB,
+counted in 1 MiB pieces). The CI toolchain gate (Katybug's `run.sh` with clang 18.1.3 [16] in the Ubuntu
+24.04 image) reads 718 PASS 0 FAIL on the final tree, equal to the Mac; the digest and inflate gates read
+98 ok and 692 cases equal, 334 taken, on Debian and Alpine.
+
 ### Idle Machine, 24 Hours
 
 On Free (STUDENT account, 37 hours read, 24 hours tabulated) the idle machine used 47 requests,
