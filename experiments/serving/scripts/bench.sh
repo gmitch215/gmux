@@ -10,6 +10,7 @@
 #     LIGHTTPD_PLAIN, LIGHTTPD and WORK as for shapes
 #   lend: per SERVER the small and big files (and httpd's catcgi) on the kernel without patch 0041 against GMUX_BUILD_NEW's, which
 #     borrows; EXPECT_<server>_<small|big|catcgi>, LIGHTTPD_PLAIN, LIGHTTPD and WORK as for shapes
+#   arms: lend's cells for any number of kernel arms: ARMS (names, ctl does not borrow), STAGES (the directory of <name>/build), LEND_WORKLOADS
 #   sendfile: the tests/c/sendfile probe's CPU per transfer, natively and in the machine, for each kind and size
 #   shapes: per SERVER (httpd lighttpd) the small file in rounds of PER_ROUND (100) requests: seq (a new stream each, one after
 #     another), keepalive (all down one stream; httpd closes after a reply, so it has no timed cell) and conc<k> (k at a
@@ -147,6 +148,28 @@ for part in "${parts[@]}"; do
 						sample lend "$server-$w-$kind" "\"server\":\"$server\",\"workload\":\"$w\",\"kind\":\"$kind\",\"run\":$run" "${!expect_var:?$expect_var}" \
 							env SERVER="$server" MODE=bench WORKLOAD="$w" BORROW="$borrow" ROUNDS="$rounds" GMUX_BUILD="$gb" "${pin[@]}" \
 							node --no-warnings --experimental-strip-types "$here/serve.ts" "$dir"
+					done
+				done
+			done
+		done
+		;;
+	arms)
+		# per server and workload, each kernel arm of ARMS (a list of names) once per run, the order rotating with the run;
+		# an arm's build is $STAGES/<name>/build. The arm named ctl does not borrow, every other arm's streams do.
+		# EXPECT_<server>_<workload> is the reply hash every arm must give
+		for run in $(seq "$runs"); do
+			for server in ${SERVERS:-httpd lighttpd}; do
+				for w in ${LEND_WORKLOADS:-small big catcgi}; do
+					[ "$server $w" != "lighttpd catcgi" ] || continue
+					expect_var=EXPECT_${server}_${w}
+					names=(${ARMS:?})
+					for i in $(seq 0 $((${#names[@]} - 1))); do
+						arm=${names[$(((i + run - 1) % ${#names[@]}))]}
+						borrow=1
+						[ "$arm" != ctl ] || borrow=0
+						sample arms "$server-$w-$arm" "\"server\":\"$server\",\"workload\":\"$w\",\"kind\":\"$arm\",\"run\":$run" "${!expect_var:?$expect_var}" \
+							env SERVER="$server" MODE=bench WORKLOAD="$w" BORROW="$borrow" ROUNDS="$rounds" GMUX_BUILD="${STAGES:?}/$arm/build" "${pin[@]}" \
+							node --no-warnings --experimental-strip-types "$here/serve.ts" "$STAGES/$arm/build/kernel"
 					done
 				done
 			done

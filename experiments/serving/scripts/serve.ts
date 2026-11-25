@@ -58,7 +58,14 @@ const lighttpdConf = 'server.document-root = "/www"\nserver.port = 80\nserver.bi
 // the program's hash is of the file the guest reads; the machine runs the instrumented build in its place
 const extraPrograms: [string, WebAssembly.Module][] = [];
 let initramfs = new Uint8Array(kernelFile('initramfs.bin'));
-if (lighttpd) {
+// no LIGHTTPD override: the staged image's own lighttpd, which rcS starts from the kernel command line
+const imageServer = lighttpd && !process.env.LIGHTTPD && !!manifest.lighttpd;
+const siteMode = process.env.SITE === '1' || mode === 'streams';
+if (imageServer) {
+	// the site's options register the asyncified build themselves
+	if (!siteMode)
+		extraPrograms.push([manifest.lighttpd, new WebAssembly.Module(kernelFile('lighttpd.wasm'))]);
+} else if (lighttpd) {
 	const plain = process.env.LIGHTTPD_PLAIN;
 	const run = process.env.LIGHTTPD;
 	if (!plain || !run) throw new Error('SERVER=lighttpd needs LIGHTTPD_PLAIN and LIGHTTPD');
@@ -74,6 +81,17 @@ if (lighttpd) {
 		appendCpio(join(dir, 'initramfs.bin'), cpio, [`/bin/lighttpd=${plain}`, `/etc/lighttpd.conf=${conf}`]);
 	initramfs = new Uint8Array(readFileSync(cpio));
 	extraPrograms.push([sha256(readFileSync(plain)), new WebAssembly.Module(readFileSync(run))]);
+}
+// DSYNC_OPEN=1: /bin/osync (DSYNC_PROGRAM: experiments/write-back/programs/osync.wat with O_SYNC) for one open
+if (process.env.DSYNC_OPEN === '1') {
+	const program = process.env.DSYNC_PROGRAM;
+	if (!program) throw new Error('DSYNC_OPEN=1 needs DSYNC_PROGRAM');
+	const work = process.env.WORK ?? join(tmpdir(), 'gmux-serve');
+	mkdirSync(work, { recursive: true });
+	const cpio = join(work, 'initramfs-dsync.cpio');
+	appendCpio(join(dir, 'initramfs.bin'), cpio, [`/bin/osync=${program}`]);
+	initramfs = new Uint8Array(readFileSync(cpio));
+	extraPrograms.push([sha256(readFileSync(program)), new WebAssembly.Module(readFileSync(program))]);
 }
 // SITE=1 (bench) and streams mode boot the machine the site runs, with a file sync handler over a SQLite
 // stand-in as the keeper's; the others keep their own, smaller options
@@ -91,6 +109,7 @@ const siteMachine = () => {
 					? new WebAssembly.Module(kernelFile('busybox.share.wasm'))
 					: undefined,
 			katybug: new WebAssembly.Module(kernelFile('katybug.wasm')),
+			lighttpd: imageServer ? new WebAssembly.Module(kernelFile('lighttpd.async.wasm')) : undefined,
 			runtime: hostRuntime(),
 			initrd: initramfs,
 			manifest
@@ -131,7 +150,9 @@ const machine = new Machine(siteOpts ?? {
 		: {}),
 	vmlinux: new WebAssembly.Module(readFileSync(join(dir, 'vmlinux.wasm'))),
 	initrd: initramfs,
-	cmdline: 'maxcpus=3 root=/dev/ram0 rootfstype=ramfs init=/init console=hvc console=ttyS0',
+	cmdline:
+		'maxcpus=3 root=/dev/ram0 rootfstype=ramfs init=/init console=hvc console=ttyS0' +
+		(imageServer ? ' gmux.http=lighttpd' : ''),
 	registry: new Map([
 		[manifest.busybox, new WebAssembly.Module(readFileSync(join(dir, 'busybox.wasm')))],
 		...extraPrograms
@@ -159,7 +180,7 @@ async function drive<T>(work: Promise<T>, limitMs = 900_000): Promise<T> {
 	const trace = process.env.TRACE
 		? setInterval(() => console.log('trace', steps, JSON.stringify(pickStats())), 2000)
 		: undefined;
-	await machine.run(() => (steps++, finished || Date.now() - started > limitMs), sleep);
+	await machine.run(() => (steps++, stepTick(), finished || Date.now() - started > limitMs), sleep);
 	clearInterval(trace);
 	if (!finished) throw new Error('the work did not finish in time');
 	return result;
@@ -419,8 +440,150 @@ net.lend = (memory: WebAssembly.Memory, id: number, buf: number, n: number) => {
 	else if (result === 0) cross.sendZero++;
 	return result;
 };
+// DETAIL=1: where the relay's calls go, counted at the host's table without touching the product (the timed
+// sweeps leave it off): next calls by event, lends by outcome, release sizes, hand-outs per read, steps by import signature
+const detailOn = process.env.DETAIL === '1';
+const detail = {
+	nextData: 0,
+	nextRelease: 0,
+	nextOpen: 0,
+	nextShut: 0,
+	nextAbort: 0,
+	nextEmpty: 0,
+	releaseTokens: 0,
+	lendKept: 0,
+	lendCopied: 0,
+	lendRefused: 0,
+	lendGone: 0,
+	lendBytes: 0,
+	lendSmall: 0,
+	lendFull: 0,
+	giveDirect: 0,
+	giveQueued: 0,
+	handQueued: 0,
+	handWaits: 0,
+	recycleCalls: 0,
+	recycleEmpty: 0,
+	recycleTokens: 0,
+	reclaimNow: 0
+};
+const stepBins: Record<string, number> = {};
+const stepSig = { next: 0, lend: 0, send: 0, end: 0, release: 0, sleeps: 0, idles: 0, runner: '' };
+let stepOpen = false;
+const stepTick = () => {
+	if (!detailOn) return;
+	if (stepOpen) {
+		const sleeps = machine.stats.hostSleeps - stepSig.sleeps;
+		const imports = `${stepSig.next ? 'next' : ''}${stepSig.release ? '(rel)' : ''}${stepSig.lend ? '+lend' : ''}${stepSig.send ? '+send' : ''}${stepSig.end ? '+end' : ''}`;
+		// the runner that parked last in the step, and whether the step ended in an idle wait
+		const key = sleeps
+			? 'hostsleep'
+			: `${stepSig.runner.replace(/:\d+$/, '')} ${machine.stats.idles > stepSig.idles ? 'idle' : 'switch'} ${imports || '-'}`;
+		stepBins[key] = (stepBins[key] ?? 0) + 1;
+	}
+	stepOpen = true;
+	stepSig.next = stepSig.lend = stepSig.send = stepSig.end = stepSig.release = 0;
+	stepSig.sleeps = machine.stats.hostSleeps;
+	stepSig.idles = machine.stats.idles;
+	stepSig.runner = '';
+};
+if (detailOn) {
+	const parkRaw = (machine as any).park.bind(machine);
+	(machine as any).park = (runner: { name: string }, where?: string) => {
+		stepSig.runner = runner.name;
+		return parkRaw(runner, where);
+	};
+	const nextRaw = net.next!.bind(net);
+	net.next = (memory: WebAssembly.Memory, event: number, buf: number, cap: number) => {
+		const r = nextRaw(memory, event, buf, cap);
+		stepSig.next++;
+		if (!r) detail.nextEmpty++;
+		else {
+			const view = new DataView(memory.buffer);
+			const op = view.getUint32(event, true);
+			if (op === 1) detail.nextOpen++;
+			else if (op === 2) detail.nextData++;
+			else if (op === 3) detail.nextShut++;
+			else if (op === 4) detail.nextAbort++;
+			else if (op === 5) {
+				detail.nextRelease++;
+				stepSig.release++;
+				detail.releaseTokens += view.getUint32(event + 8, true);
+			}
+		}
+		return r;
+	};
+	const lendRaw = net.lend!.bind(net);
+	net.lend = (memory: WebAssembly.Memory, id: number, buf: number, n: number) => {
+		const r = lendRaw(memory, id, buf, n);
+		stepSig.lend++;
+		if (r < 0) detail.lendGone++;
+		else if (r === 0) detail.lendRefused++;
+		else {
+			if (r & 0x4000_0000) detail.lendCopied++;
+			else detail.lendKept++;
+			detail.lendBytes += n;
+			if (n < 4096) detail.lendSmall++;
+			else if (n >= 16_000) detail.lendFull++;
+		}
+		return r;
+	};
+	const sendRaw = net.send!.bind(net);
+	net.send = (id: number, bytes: Uint8Array) => {
+		stepSig.send++;
+		return sendRaw(id, bytes);
+	};
+	const endRaw = net.end!.bind(net);
+	net.end = (id: number, how: number) => {
+		stepSig.end++;
+		return endRaw(id, how);
+	};
+	const reclaimRaw = net.reclaim!.bind(net);
+	net.reclaim = (tokens: number[], now: boolean) => {
+		if (now) detail.reclaimNow++;
+		return reclaimRaw(tokens, now);
+	};
+	const connectRaw = net.connect!.bind(net);
+	net.connect = (port: number, borrows?: boolean) => {
+		const stream = connectRaw(port, borrows);
+		const s = stream as any;
+		if (!s.borrows) return stream;
+		const giveRaw = s.give.bind(s);
+		s.give = (view: Uint8Array, token?: number) => {
+			if (s.wanting) detail.giveDirect++;
+			else detail.giveQueued++;
+			return giveRaw(view, token);
+		};
+		const handRaw = s.hand.bind(s);
+		s.hand = (view?: Uint8Array, token?: number) => {
+			if (!view) {
+				if (s.queue.length) detail.handQueued++;
+				else detail.handWaits++;
+			}
+			return handRaw(view, token);
+		};
+		const recycleRaw = stream.recycle.bind(stream);
+		stream.recycle = () => {
+			detail.recycleCalls++;
+			if (!s.taken.length) detail.recycleEmpty++;
+			else detail.recycleTokens += s.taken.length;
+			return recycleRaw();
+		};
+		return stream;
+	};
+}
+// MODE=forge: the addresses the host gave back to the kernel, which the mode releases again
+const released: number[] = [];
+if (mode === 'forge') {
+	const reclaimRaw = net.reclaim!.bind(net);
+	net.reclaim = (tokens: number[], now: boolean) => {
+		released.push(...tokens);
+		return reclaimRaw(tokens, now);
+	};
+}
+const detailNow = () => ({ ...detail });
 const crossNow = () => ({ ...cross });
-const crossDiff = (a: typeof cross, b: typeof cross) =>
+const crossDiff =(a: typeof cross, b: typeof cross) =>
 	Object.fromEntries(Object.keys(cross).map((k) => [k, (b as any)[k] - (a as any)[k]]));
 // syscalls by number (mode count): calls, and the bytes the calls that returned a count moved
 const sysNow = () => ({ calls: { ...machine.stats.syscalls }, bytes: { ...syscallBytes } });
@@ -515,9 +678,13 @@ await sh(
 );
 const listeningBefore = machine.listening(80);
 // lighttpd stays in the foreground (a daemonizing fork needs resumable frames); the shell backgrounds it
-const started = await sh(
-	lighttpd ? 'lighttpd -D -f /etc/lighttpd.conf & echo httpd=$?' : 'httpd -p 80 -h /www; echo httpd=$?'
-);
+const started = imageServer
+	? 'httpd=0'
+	: await sh(
+			lighttpd
+				? 'lighttpd -D -f /etc/lighttpd.conf & echo httpd=$?'
+				: 'httpd -p 80 -h /www; echo httpd=$?'
+		);
 await sh('sleep 1');
 const free0 = await memFree();
 console.log(
@@ -544,6 +711,47 @@ if (mode === 'raw') {
 			})
 		);
 	}
+} else if (mode === 'forge') {
+	// releases the host never owed the kernel: addresses it released already, addresses it never lent, one inside
+	// a buffer and some outside memory. The machine must keep running, keep its memory and give exact replies, with
+	// two streams open at once so a buffer handed out twice would show as one stream's bytes in the other's reply
+	const request = REQUESTS.big!;
+	const settle = () => drive(new Promise<void>((r) => setTimeout(r, 100)));
+	const pair = async () => {
+		const both = await drive(Promise.all([rawWork(request), rawWork(request)]));
+		return both.map((r) => r.sha256);
+	};
+	const warm = await raw(request);
+	await settle();
+	const mem0 = await memFree();
+	const control = await pair();
+	await settle();
+	const mem1 = await memFree();
+	const gone = released.slice(-8);
+	const last = gone.at(-1)!;
+	const size = machine.memory.buffer.byteLength;
+	// FORGE_FAR=0 leaves out the addresses past the end of memory, which a kernel that does not check the range traps on
+	const far = process.env.FORGE_FAR === '0' ? [] : [size + 4096, 0xffff_f000];
+	const forged = [...gone, ...gone, last + 4, last + 8192, last + 16_384, 1, 4096, 1 << 20, size - 4096, ...far];
+	for (let i = 0; i < 8; i++) net.reclaim!(forged, true);
+	await settle();
+	const mem2 = await memFree();
+	const forgedPair = await pair();
+	await settle();
+	const mem3 = await memFree();
+	console.log(
+		JSON.stringify({
+			mode,
+			forgedTokens: forged.length * 8,
+			released: released.length,
+			warm: warm.sha256,
+			control,
+			forgedPair,
+			equal: [...control, ...forgedPair].every((h) => h === warm.sha256),
+			memFreeKb: { start: mem0, afterControl: mem1, afterForge: mem2, afterForgedPair: mem3 },
+			crashed: String(machine.crashed)
+		})
+	);
 } else if (mode === 'http') {
 	// each request through the site's own request and response framing, printed as native.sh prints curl's view
 	const cases: [string, string, string, Record<string, string>][] = [
@@ -563,7 +771,8 @@ if (mode === 'raw') {
 			? undefined
 			: new Server(
 					{
-						open: async () => machine,
+						open: async () => ({ machine, from: 'running' as const }),
+						current: () => machine,
 						pumping: () => false,
 						pump: async (budgetMs, wake) => void (await machine.run(wake, sleep, budgetMs)),
 						rest: async () => {},
@@ -636,6 +845,9 @@ if (mode === 'raw') {
 	// the warm-up request is hashed (the sample's exactness check); the rounds are not unless HASH=1,
 	// which is what the first table's rig did (a sha256 over the reply inside the timed region)
 	const hashRounds = process.env.HASH === '1';
+	// DSYNC_OPEN=1: one unrelated O_SYNC open and close first, so the write route is on for the rounds
+	if (process.env.DSYNC_OPEN === '1')
+		console.error(await sh('mkdir -p /data; /bin/osync; echo osync=$?; rm -f /data/osync'));
 	let sinkText = '';
 	const warm = await raw(
 		request,
@@ -655,6 +867,8 @@ if (mode === 'raw') {
 	let sys: ReturnType<typeof sysDiff> | undefined;
 	const importsBefore = { us: { ...importUs }, calls: { ...importCalls } };
 	const statsBefore = { ...machine.stats };
+	const detailBefore = detailNow();
+	const binsBefore = { ...stepBins };
 	// PROFILE=<file> writes a V8 CPU profile of the rounds alone
 	const profiler = process.env.PROFILE ? new Session() : undefined;
 	if (profiler) {
@@ -782,6 +996,22 @@ if (mode === 'raw') {
 								.filter(([, v]) => v.calls > 0)
 								.sort((a, b) => b[1].us - a[1].us)
 								.slice(0, 14)
+						)
+					}
+				: {}),
+			...(detailOn
+				? {
+						detailPerRequest: Object.fromEntries(
+							Object.entries(detailNow()).map(([k, v]) => [
+								k,
+								+((v - (detailBefore as any)[k]) / rounds).toFixed(2)
+							])
+						),
+						stepsByImports: Object.fromEntries(
+							Object.entries(stepBins).map(([k, v]) => [
+								k,
+								+((v - (binsBefore[k] ?? 0)) / rounds).toFixed(2)
+							])
 						)
 					}
 				: {}),

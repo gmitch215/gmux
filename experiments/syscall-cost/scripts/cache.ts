@@ -10,7 +10,7 @@ import { Machine } from '../../../src/worker/machine/machine.ts';
  * (statx of 50 system paths while a conftest file is made and removed in /tmp), retention cases (what
  * a change must and must not end, read from the hit counter) and a mutation script whose output must
  * be byte for byte the same with the cache as without, while every hit is checked against the kernel
- * in verify mode. GMUX_BUILD names the kernel (build/kernel by default); a kernel with patch 0022 only
+ * in verify mode, once through the hook and once with the direct fill (MachineOptions.directFill). GMUX_BUILD names the kernel (build/kernel by default); a kernel with patch 0022 only
  * holds answers on its whole generation, one with patch 0029 on the inodes a path crossed.
  * TIMEOUT_MS bounds a command (300000 by default): a cache that answers wrongly can leave the shell
  * waiting on output that never comes. RELATIME=1 remounts / with relatime before the loops.
@@ -113,7 +113,7 @@ const RETAIN = [
 const CHURN_PATHS =
 	'P="$(ls -d /usr/bin/* | head -20) $(ls -d /usr/sbin/* | head -15) $(ls -d /sbin/* | head -15)"';
 
-async function session(syscallCache: boolean | 'verify') {
+async function session(syscallCache: boolean | 'verify', directFill = false) {
 	let output = '';
 	const machine = new Machine({
 		vmlinux,
@@ -124,6 +124,7 @@ async function session(syscallCache: boolean | 'verify') {
 		sha256,
 		sharedKernel: true,
 		syscallCache,
+		directFill,
 		runtime: hostRuntime(),
 		write: (text) => (output += text)
 	});
@@ -211,28 +212,43 @@ async function session(syscallCache: boolean | 'verify') {
 	};
 }
 
-const arm = (mode: boolean | 'verify') =>
-	session(mode).catch((error: Error) => {
-		console.log(JSON.stringify({ arm: String(mode), error: error.message.slice(0, 300) }));
+const arm = (mode: boolean | 'verify', direct = false) =>
+	session(mode, direct).catch((error: Error) => {
+		console.log(
+			JSON.stringify({ arm: `${direct ? 'direct ' : ''}${mode}`, error: error.message.slice(0, 300) })
+		);
 		console.log('FAIL statx cache exact');
 		process.exit(1);
 	});
+// the hook form and the direct form (no unwinding) of the cache, each plain and verified
 const off = await arm(false);
 const on = await arm(true);
 const verify = await arm('verify');
+const onDirect = await arm(true, true);
+const verifyDirect = await arm('verify', true);
 const row = (name: string, s: Awaited<ReturnType<typeof session>>) =>
 	console.log(JSON.stringify({ arm: name, loop: s.loop, churn: s.churn, stats: s.stats }));
 row('off', off);
 row('cache', on);
 row('verify', verify);
-const exact = on.transcript === off.transcript && verify.transcript === off.transcript;
-console.log(JSON.stringify({ transcriptsEqual: exact, mismatches: verify.stats.mismatches }));
+row('direct', onDirect);
+row('direct verify', verifyDirect);
+const exact = [on, verify, onDirect, verifyDirect].every((s) => s.transcript === off.transcript);
+const mismatches = verify.stats.mismatches + verifyDirect.stats.mismatches;
+console.log(
+	JSON.stringify({
+		transcriptsEqual: exact,
+		mismatches: { hook: verify.stats.mismatches, direct: verifyDirect.stats.mismatches }
+	})
+);
 if (!exact) {
 	// the first line a cache arm answered differently from the cache-off arm
 	const want = off.transcript.split('\n');
 	for (const [name, s] of [
 		['cache', on],
-		['verify', verify]
+		['verify', verify],
+		['direct', onDirect],
+		['direct verify', verifyDirect]
 	] as const) {
 		const got = s.transcript.split('\n');
 		const at = want.findIndex((line, i) => line !== got[i]);
@@ -250,6 +266,12 @@ const retention = on.retained.map((r) => ({
 }));
 console.log(JSON.stringify({ fineGuard: fine, retention }));
 const retentionOk = retention.every((r) => r.ok !== false && r.endedOk !== false);
-const pass = exact && verify.stats.mismatches === 0 && on.stats.hits > 0 && retentionOk;
+const pass =
+	exact &&
+	mismatches === 0 &&
+	on.stats.hits > 0 &&
+	onDirect.stats.hits > 0 &&
+	retentionOk &&
+	onDirect.retained.every((r, i) => r.hits === on.retained[i]!.hits);
 console.log(pass ? 'PASS statx cache exact' : 'FAIL statx cache exact');
 process.exit(pass ? 0 : 1);

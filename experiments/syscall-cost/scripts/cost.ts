@@ -28,7 +28,14 @@ const manifest = JSON.parse(readFileSync(join(kernel, 'manifest.json'), 'utf8'))
 // INSTRUMENTED names an instrument.sh output made elsewhere, for a host without wabt
 if (process.env.INSTRUMENTED) copyFileSync(process.env.INSTRUMENTED, join(work, 'cost.fuel.wasm'));
 else execFileSync(join(root, 'scripts/wasm/instrument.sh'), [plain, join(work, 'cost.fuel.wasm')]);
-appendCpio(join(kernel, 'initramfs.bin'), join(work, 'initramfs.cpio'), [`/bin/cost=${plain}`]);
+// DSYNC_OPEN=1: /bin/osync (DSYNC_PROGRAM, programs/osync.wat with O_SYNC) runs before cost, so writes take the hook
+const dsyncProgram = process.env.DSYNC_OPEN === '1' ? process.env.DSYNC_PROGRAM : undefined;
+if (process.env.DSYNC_OPEN === '1' && !dsyncProgram) throw new Error('DSYNC_OPEN=1 needs DSYNC_PROGRAM');
+appendCpio(join(kernel, 'initramfs.bin'), join(work, 'initramfs.cpio'), [
+	`/bin/cost=${plain}`,
+	...(dsyncProgram ? [`/bin/osync=${dsyncProgram}`] : [])
+]);
+const prefix = dsyncProgram ? 'mkdir -p /data; /bin/osync; rm -f /data/osync; ' : '';
 
 let output = '';
 let pending = '';
@@ -40,11 +47,14 @@ const machine = new Machine({
 		'maxcpus=3 root=/dev/ram0 rootfstype=ramfs init=/init console=hvc console=ttyS0',
 	registry: new Map([
 		[manifest.busybox, new WebAssembly.Module(readFileSync(join(kernel, 'busybox.wasm')))],
-		[sha256(new Uint8Array(readFileSync(plain))), new WebAssembly.Module(readFileSync(join(work, 'cost.fuel.wasm')))]
+		[sha256(new Uint8Array(readFileSync(plain))), new WebAssembly.Module(readFileSync(join(work, 'cost.fuel.wasm')))],
+		...(dsyncProgram ? [[sha256(readFileSync(dsyncProgram)), new WebAssembly.Module(readFileSync(dsyncProgram))] as const] : [])
 	]),
 	maximumPages: 4096,
 	sha256,
 	sharedKernel: true,
+	// the O_SYNC open changes nothing without a file sync handler (the site's machine has one)
+	...(dsyncProgram ? { fileSync: async () => {} } : {}),
 	runtime: hostRuntime(undefined, { core: process.env.CORE !== '0' }),
 	syscallCache: process.env.CACHE === "verify" ? "verify" : process.env.CACHE === "1",
 	write: (text) => {
@@ -100,7 +110,7 @@ let redo = 0;
 for (let r = 0; r < Number(rounds); r++) {
 	marks.length = 0;
 	const start = output.length;
-	machine.type(`cost ${n}${process.env.SPAWN ? ' spawn' : ''}\n`);
+	machine.type(`${prefix}cost ${n}${process.env.SPAWN ? ' spawn' : ''}\n`);
 	await run(() => output.slice(start).includes('cost done'));
 	// a start where the guest reads its count as 0 times nothing: run the round again
 	if (marks.some(([name, count]) => name !== 'end' && count === 0)) {
@@ -122,5 +132,5 @@ console.log(
 );
 if (process.env.SPAWN) console.log(JSON.stringify({ rounds: Object.fromEntries(perCall) }));
 console.log(JSON.stringify({ unit: 'host ns per call, median of rounds', crashed: String(machine.crashed) }));
-const { statxHits, statxMisses, statxFills, statxMismatches } = machine.stats;
-console.log(JSON.stringify({ statxHits, statxMisses, statxFills, statxMismatches }));
+const { statxHits, statxMisses, statxFills, statxMismatches, writeHooks, flagReads } = machine.stats;
+console.log(JSON.stringify({ statxHits, statxMisses, statxFills, statxMismatches, writeHooks, flagReads }));

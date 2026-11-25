@@ -32,8 +32,8 @@ import { sqlite } from '../../write-back/scripts/sqlite.ts';
  */
 const root = new URL('../../../', import.meta.url).pathname;
 const [workload] = process.argv.slice(2);
-if (!['configure', 'fork', 'lsl', 'userland', 'gap'].includes(workload ?? ''))
-	throw new Error('usage: census.ts <configure|fork|lsl|userland|gap>');
+if (!['configure', 'fork', 'lsl', 'userland', 'gap', 'guest'].includes(workload ?? ''))
+	throw new Error('usage: census.ts <configure|fork|lsl|userland|gap|guest>');
 const mode = process.env.MODE ?? 'count';
 const build = process.env.GMUX_BUILD ?? join(root, 'build');
 const kernel = join(build, 'kernel');
@@ -41,7 +41,8 @@ const work = mkdtempSync(join(tmpdir(), 'gmux-census-'));
 const sha256 = (bytes: Uint8Array) => createHash('sha256').update(bytes).digest('hex');
 const manifest = JSON.parse(readFileSync(join(kernel, 'manifest.json'), 'utf8'));
 const n = Number(
-	process.env.N ?? { configure: 300, fork: 300, lsl: 1000, userland: 40, gap: 200 }[workload!]
+	process.env.N ??
+		{ configure: 300, fork: 300, lsl: 1000, userland: 40, gap: 200, guest: 2048 }[workload!]
 );
 
 const names = new Map<number, string>();
@@ -87,6 +88,10 @@ while [ $i -lt ${n} ]; do
 	/bin/true
 done
 `,
+	// one BusyBox process doing user-side work: N KiB of generated text through gzip
+	guest: `
+gzip -c /work/guest.txt > /dev/null
+`,
 	lsl: `
 i=0
 while [ $i -lt ${n} ]; do
@@ -119,6 +124,15 @@ for (let k = 0; k < 20; k++) {
 	const text = Array.from({ length: 60 }, (_, l) => `#define G${k}_L${l} ${k * l}\n`).join('');
 	writeFileSync(join(work, `g${k}.h`), text);
 	files.push(`/usr/include/g${k}.h=${join(work, `g${k}.h`)}`);
+}
+if (workload === 'guest') {
+	// 49 bytes a line, 21 to the KiB, each told apart by its counter so the deflate has matches to find and to miss
+	const lines = Array.from({ length: n * 21 }, (_, l) => {
+		const h = (Math.imul(l, 2654435761) >>> 0).toString(16).padStart(8, '0');
+		return `line ${String(l).padStart(8, '0')} ${h} ${h.split('').reverse().join('')} ${h}${h}\n`;
+	});
+	writeFileSync(join(work, 'guest.txt'), lines.join(''));
+	files.push(`/work/guest.txt=${join(work, 'guest.txt')}`);
 }
 if (workload === 'userland') {
 	const ubin = join(root, 'build/katybug/transcript/ubin');
@@ -178,7 +192,16 @@ const siteModules = site
 
 let bootInfo = { wallMs: 0, cpuMs: 0 };
 const numbers = (s: Machine['stats']) =>
-	Object.fromEntries(Object.entries(s).filter(([, v]) => typeof v === 'number'));
+	Object.fromEntries([
+		...Object.entries(s).filter(([, v]) => typeof v === 'number'),
+		...Object.entries(s.recycleRefused).map(([k, v]) => [`recycleRefused.${k}`, v]),
+		...Object.entries(s.execRefused).map(([k, v]) => [`execRefused.${k}`, v])
+	]);
+// EXEC_CACHE=0, 1 or verify sets MachineOptions.execCache; absent leaves the machine's own setting
+const execCache =
+	process.env.EXEC_CACHE === undefined
+		? {}
+		: { execCache: process.env.EXEC_CACHE === 'verify' ? ('verify' as const) : process.env.EXEC_CACHE === '1' };
 const importMark = (machine: Machine) => ({
 	us: { ...imports.us },
 	calls: { ...imports.calls },
@@ -253,7 +276,8 @@ async function boot(count: boolean | ((call: SyscallCall) => void)) {
 					syncs.calls++;
 					syncs.ms += performance.now() - t0;
 				},
-				...(count ? { countSyscalls: count } : {})
+				...(count ? { countSyscalls: count } : {}),
+				...execCache
 			}
 		: {
 				vmlinux,
@@ -272,6 +296,7 @@ async function boot(count: boolean | ((call: SyscallCall) => void)) {
 				...(process.env.PREFILL === undefined
 					? {}
 					: { prefillInstances: Number(process.env.PREFILL) }),
+				...execCache,
 				...(count ? { runtime, countSyscalls: count } : {}),
 				write: (text) => (output += text)
 			};
@@ -510,7 +535,7 @@ if (mode === 'wall') {
 			...siteReport(m.machine, before),
 			persist: await persist(m.machine),
 			programs: started(s),
-			execs: { userExecs: s.userExecs, recycledStarts: s.recycledStarts, recycleReturns: s.recycleReturns, prefilled: s.prefilled },
+			execs: { userExecs: s.userExecs, guardedExecs: s.guardedExecs, dataUnzeroedExecs: s.dataUnzeroedExecs, dataZeroedBytes: s.dataZeroedBytes, recycledStarts: s.recycledStarts, recycleReturns: s.recycleReturns, recycleRefused: s.recycleRefused, prefilled: s.prefilled, execHits: s.execHits, execMisses: s.execMisses, execRefused: s.execRefused, execMismatches: s.execMismatches },
 			arm: { busybox: busyboxArm, recycle: process.env.RECYCLE ?? 'default', prefill: process.env.PREFILL ?? '0', shareInstances: process.env.SHARE_INSTANCES === '1' },
 			outputEnd: printed.replace(/\r/g, '').slice(-40),
 			crashed: String(m.machine.crashed)
@@ -620,10 +645,16 @@ console.log(
 		programs: started(m.machine.stats),
 		execs: {
 			userExecs: m.machine.stats.userExecs,
+			guardedExecs: m.machine.stats.guardedExecs,
 			recycledStarts: m.machine.stats.recycledStarts,
 			recycleReturns: m.machine.stats.recycleReturns,
+			recycleRefused: m.machine.stats.recycleRefused,
 			prefilled: m.machine.stats.prefilled,
-			sharedEntries: m.machine.stats.sharedEntries
+			sharedEntries: m.machine.stats.sharedEntries,
+			execHits: m.machine.stats.execHits,
+			execMisses: m.machine.stats.execMisses,
+			execRefused: m.machine.stats.execRefused,
+			execMismatches: m.machine.stats.execMismatches
 		},
 		...siteReport(m.machine, before),
 		persist: await persist(m.machine),

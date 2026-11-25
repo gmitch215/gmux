@@ -27,7 +27,7 @@ const memory = new WebAssembly.Memory({ initial: 256, maximum: 4096, shared: tru
 const dataStart = 0x400000;
 const programs = {
 	busybox: new WebAssembly.Module(readFileSync(join(kernel, 'busybox.share.wasm'))),
-	// the asyncified build the site registers: no gmux.share section, so no reset row
+	// the asyncified build the site registers; it carries the gmux.share note since asyncify.sh reads the share build
 	busyboxAsync: new WebAssembly.Module(readFileSync(join(kernel, 'busybox.async.wasm'))),
 	katybug: new WebAssembly.Module(readFileSync(join(kernel, 'katybug.wasm')))
 };
@@ -83,6 +83,8 @@ function router() {
 		k: k as WebAssembly.ModuleImports,
 		h: h as WebAssembly.ModuleImports,
 		c: { 5: () => -1 },
+		q: { 5: () => -1 },
+		f: { 5: () => {} },
 		env: {
 			memory,
 			route: new WebAssembly.Global({ value: 'i32', mutable: true }, 0),

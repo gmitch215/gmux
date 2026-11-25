@@ -114,6 +114,13 @@ const probes = [
 			const asleep = [...o.matchAll(/^SLEEPING (.*)$/gm)].map((m) => cpu(m[1]));
 			return !!busy && (o.match(/^SLEEP \d+ /gm) ?? []).length === 8 && asleep.length > 0 && asleep.every((c) => c === cpu(busy[1]));
 		}
+	],
+	[
+		'softirq',
+		'n=0; f=0; for d in /proc/[0-9]*; do { read -r c < $d/comm; } 2> /dev/null; ' +
+			'case $c in ksoftirqd/*) n=$((n+1)); chrt -p ${d#/proc/} | grep -q SCHED_FIFO && f=$((f+1));; esac; done; ' +
+			'[ $n -gt 0 ] && [ $f -eq $n ] && echo "PASS all $n ksoftirqd threads are SCHED_FIFO" || echo "FAIL $f of $n ksoftirqd threads are SCHED_FIFO"',
+		passes(1)
 	]
 ];
 // fork needs resumable frames; PROT_NONE mappings take real memory without an MMU
@@ -123,6 +130,8 @@ const pages = { userland: 2400, taskcap: 800, ...(process.env.PAGES ? { tasks: N
 const libcTests = (process.env.LIBC_TESTS ?? '').split(' ').filter(Boolean);
 // ONLY="posix dl" runs just those
 const only = (process.env.ONLY ?? '').split(' ').filter(Boolean);
+// TRACE_PROBE=1 logs each request of a probe and, past the suite's own polls, keeps polling as a diagnostic
+const trace = process.env.TRACE_PROBE === '1';
 const cases = [
 	...probes.filter(([label]) => !only.length || only.includes(label)),
 	...libcTests.map((t) => [t, `mkdir -p /dev/shm; ${t}; echo "RC $?"`, (o) => /^RC 0\r?$/m.test(o)])
@@ -148,13 +157,33 @@ for (const [label, cmd, check] of cases) {
 			continue;
 		}
 		let lost = false;
+		let calls = 0;
+		let last: Record<string, any> = {};
 		const step = async (path) => {
+			const t0 = performance.now();
 			const r = await get(path);
 			if (r.instance !== boot.instance) lost = true;
-			return r.out ?? '';
+			last = r;
+			const o = r.out ?? '';
+			if (trace)
+				console.log(
+					`trace ${label} call ${calls} ${path.split('?')[0]} client ${Math.round(performance.now() - t0)} ms outcome ${r.outcome} wallMs ${r.wallMs} instance ${r.instance === boot.instance ? 'match' : 'differs'} output ${o.length}`
+				);
+			calls++;
+			return o;
 		};
 		out = await step(`/exec?cmd=${encodeURIComponent(`${cmd}; echo END-$((1+1))`)}&wall=6000`);
 		for (let i = 0; i < 12 && !lost && !out.includes('END-2'); i++) out += await step('/run?until=END-2&wall=5000');
+		if (trace && !lost && !out.includes('END-2')) {
+			let arrived = -1;
+			for (let i = 0; i < 60 && !lost && arrived < 0; i++) {
+				out += await step('/run?until=END-2&wall=5000');
+				if (out.includes('END-2')) arrived = i;
+			}
+			console.log(
+				`diagnostic ${label}: END-2 ${arrived < 0 ? 'never arrived in 60 extension polls' : `arrived at extension poll ${arrived}`}; lost ${lost}; last stats ${JSON.stringify(last.stats ?? null).slice(0, 400)}`
+			);
+		}
 		await get('/abort');
 		if (!lost) break;
 		replaced++;

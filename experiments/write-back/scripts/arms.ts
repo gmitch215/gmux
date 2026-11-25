@@ -1,6 +1,8 @@
 import { createHash } from 'node:crypto';
-import { readFileSync } from 'node:fs';
+import { mkdtempSync, readFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { appendCpio } from '../../../scripts/wasm/cpio-append.ts';
 import { hostRuntime } from '../../../scripts/wasm/router-modules.ts';
 import { decodeSnapshot, DurableStore, encodeSnapshot } from '../../../src/worker/durable.ts';
 import { Machine, type MachineOptions } from '../../../src/worker/machine/machine.ts';
@@ -14,7 +16,8 @@ import { sqlite } from './sqlite.ts';
  * `node --experimental-strip-types experiments/write-back/scripts/arms.ts <write|cpu> <quantum|writeback> [quanta]`
  */
 const root = new URL('../../../', import.meta.url).pathname;
-const vendor = join(root, 'experiments/boot/vendor');
+// GUEST_DIR=build/kernel reads the staged guest files the manifest describes (default: the vendor copies)
+const vendor = join(root, process.env.GUEST_DIR ?? 'experiments/boot/vendor');
 const read = (name: string) => new Uint8Array(readFileSync(join(vendor, name)));
 const manifest = JSON.parse(readFileSync(join(root, 'build/kernel/manifest.json'), 'utf8'));
 const [job = 'write', arm = 'writeback', quantaArg = '24'] = process.argv.slice(2);
@@ -27,6 +30,17 @@ const JOBS: Record<string, string> = {
 const ROW = 2_000_000;
 const vmlinux = new WebAssembly.Module(read('vmlinux.async.wasm'));
 const busybox = new WebAssembly.Module(read('busybox.async.wasm'));
+// DSYNC_OPEN=1: /bin/osync (DSYNC_PROGRAM: programs/osync.wat assembled with O_SYNC) in the initramfs and registry
+const dsyncProgram = process.env.DSYNC_OPEN === '1' ? process.env.DSYNC_PROGRAM : undefined;
+if (process.env.DSYNC_OPEN === '1' && !dsyncProgram) throw new Error('DSYNC_OPEN=1 needs DSYNC_PROGRAM');
+const dsyncBytes = dsyncProgram ? readFileSync(dsyncProgram) : undefined;
+const initrd = dsyncProgram
+	? (() => {
+			const out = join(mkdtempSync(join(tmpdir(), 'arms-dsync-')), 'initramfs.bin');
+			appendCpio(join(vendor, 'initramfs.bin'), out, [`/bin/osync=${dsyncProgram}`]);
+			return new Uint8Array(readFileSync(out));
+		})()
+	: read('initramfs.bin');
 
 const sql = sqlite();
 sql.exec('CREATE TABLE IF NOT EXISTS image (k INTEGER PRIMARY KEY, v BLOB)');
@@ -37,9 +51,14 @@ let output = '';
 let fsyncs = 0;
 const options = (): MachineOptions => ({
 	vmlinux,
-	initrd: read('initramfs.bin'),
+	initrd,
 	cmdline: 'maxcpus=3 root=/dev/ram0 rootfstype=ramfs init=/init console=hvc console=ttyS0',
-	registry: new Map([[manifest.busybox, busybox]]),
+	registry: new Map<string, WebAssembly.Module>([
+		[manifest.busybox, busybox],
+		...(dsyncBytes
+			? [[createHash('sha256').update(dsyncBytes).digest('hex'), new WebAssembly.Module(dsyncBytes)] as const]
+			: [])
+	]),
 	maximumPages: Number(process.env.PAGES ?? 2048),
 	sha256: (bytes) => createHash('sha256').update(bytes).digest('hex'),
 	sharedKernel: true,
@@ -68,7 +87,9 @@ const progress = () => {
 
 let machine = new Machine(options());
 await run(machine, 60_000, () => output.includes('# '));
-machine.type(`${JOBS[job]}\n`);
+// DSYNC_OPEN=1: one unrelated O_SYNC open and close in the same boot, before the job
+const dsync = process.env.DSYNC_OPEN === '1' ? 'mkdir -p /data; /bin/osync; rm -f /data/osync; ' : '';
+machine.type(`${dsync}${JOBS[job]}\n`);
 await run(machine, 2000);
 const cpu0 = process.cpuUsage();
 const t0 = Date.now();
@@ -166,6 +187,8 @@ console.log(
 		losses,
 		lossMs,
 		progress: progress(),
+		writeHooks: machine.stats.writeHooks,
+		flagReads: machine.stats.flagReads,
 		rowsPerHour: Math.round(((sql.written - rows0) * 3_600_000) / (Number(quantaArg) * 5000)),
 		tail: process.env.FULL ? output : output.slice(-200)
 	})

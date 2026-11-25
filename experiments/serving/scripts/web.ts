@@ -87,7 +87,8 @@ await sh(
 		`printf '#!/bin/sh\\necho "Content-Type: text/plain"\\necho\\nseq 1 3000000\\n' > /www/cgi-bin/stream.cgi; ` +
 		'chmod +x /www/cgi-bin/*.cgi'
 );
-await sh('httpd -p 80 -h /www');
+// SERVER=lighttpd: the image already runs it
+if (process.env.SERVER !== 'lighttpd') await sh('httpd -p 80 -h /www');
 await sh('sleep 1');
 
 const requests: [string, string, RequestInit][] = [

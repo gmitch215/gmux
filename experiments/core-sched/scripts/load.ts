@@ -14,8 +14,15 @@ import { join } from 'node:path';
 const root = new URL('../../../', import.meta.url).pathname;
 const kernel = join(process.env.GMUX_BUILD ?? join(root, 'build'), 'kernel');
 const read = (path: string) => new Uint8Array(readFileSync(path));
-// a baseline machine.ts takes `core`, the current one `runtime.core`
-const withCore = (core: WebAssembly.Module) => ({ core, runtime: { core } });
+// a baseline machine.ts takes `core`, the current one `runtime.core`; COPY names copy.wasm, which a
+// machine with a runtime hands its fork children's memories (a baseline ignores it)
+const withCore = (core: WebAssembly.Module) => ({
+	core,
+	runtime: {
+		core,
+		...(process.env.COPY ? { copy: new WebAssembly.Module(read(process.env.COPY)) } : {})
+	}
+});
 const sha256 = (bytes: Uint8Array) => createHash('sha256').update(bytes).digest('hex');
 const manifest = JSON.parse(readFileSync(join(kernel, 'manifest.json'), 'utf8'));
 if (process.env.FROZEN) {
@@ -33,6 +40,10 @@ if (process.env.FROZEN) {
 		}
 	});
 }
+// COUNT=1 counts the calls into the kernel's imports over the window (the timing is then not a result)
+const counter = process.env.COUNT ? await import('../../syscall-cost/scripts/imports.ts') : null;
+counter?.watchKernel(true);
+const watched = counter?.imports;
 const { Machine } = await import(
 	process.env.MACHINE ?? join(root, 'src/worker/machine/machine.ts')
 );
@@ -74,6 +85,14 @@ const machine = new Machine({
 	sharedKernel: true,
 	...(process.env.FROZEN ? { now: () => 0n } : {}),
 	...(process.env.CORE ? withCore(new WebAssembly.Module(read(process.env.CORE))) : {}),
+	...(!process.env.CORE && process.env.COPY
+		? {
+				runtime: {
+					core: undefined,
+					copy: new WebAssembly.Module(read(process.env.COPY))
+				}
+			}
+		: {}),
 	trace: Boolean(process.env.TRACE),
 	log: (line: string) => process.env.TRACE && lines.push(line),
 	write: (text: string) => {
@@ -109,6 +128,7 @@ phase('warm');
 if (process.env.TRACE) lines.length = 0;
 
 const before = { ...machine.stats };
+const callsBefore = { ...watched?.calls };
 const session = process.env.PROF ? new (await import('node:inspector')).Session() : null;
 let profile: unknown = null;
 if (session) {
@@ -131,6 +151,12 @@ const table = (machine as any).runners as Map<number, { idle: unknown }>;
 let idling = 0;
 for (const r of table.values()) if (r.idle) idling++;
 const switches = after.switches - before.switches;
+const importCalls = Object.fromEntries(
+	Object.entries(watched?.calls ?? {})
+		.map(([name, n]) => [name, n - (callsBefore[name] ?? 0)] as const)
+		.filter(([, n]) => n > 0)
+);
+const importTotal = Object.values(importCalls).reduce((a, b) => a + b, 0);
 console.log(
 	JSON.stringify({
 		kind,
@@ -147,7 +173,10 @@ console.log(
 		windowMs: +wall.toFixed(1),
 		slept: +slept.toFixed(1),
 		nsPerStep: Math.round((wall * 1e6) / steps),
-		nsPerSwitch: switches ? Math.round((wall * 1e6) / switches) : null
+		nsPerSwitch: switches ? Math.round((wall * 1e6) / switches) : null,
+		...(watched
+			? { importCalls: importTotal, importsPerStep: +(importTotal / steps).toFixed(4), imports: importCalls }
+			: {})
 	})
 );
 if (process.env.PROBE) {

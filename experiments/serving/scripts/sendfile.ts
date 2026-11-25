@@ -1,6 +1,7 @@
 import { execFileSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { appendCpio } from '../../../scripts/wasm/cpio-append.ts';
 import { Machine } from '../../../src/worker/machine/machine.ts';
@@ -13,14 +14,15 @@ import { Machine } from '../../../src/worker/machine/machine.ts';
  *   MODE=prep (needs wasm2wat and wat2wasm): writes WORK/sendfile.run.wasm, the probe with fuel checks
  *     and resumable frames, which fork needs
  *   default: KIND=sendfile|splice|rw SIZE=<bytes> CALLS=<n>; one JSON line
- * PROBE is the probe as the pipeline built it (build/probes/sendfile.wasm); WORK keeps the prep
- * output and the generated initramfs.
+ * PROBE is the probe as the pipeline built it (build/probes/sendfile.wasm). WORK (default: a
+ * gmux-sendfile directory under os.tmpdir()) gets the prep output, sendfile.run.wasm and
+ * sendfile.fueled.wasm, and the generated initramfs-sendfile.cpio.
  * `node --no-warnings --experimental-strip-types experiments/serving/scripts/sendfile.ts <kernel dir>`
  */
 const root = new URL('../../../', import.meta.url).pathname;
 const dir = process.argv[2] ?? join(root, 'build/kernel');
 const probe = process.env.PROBE ?? join(root, 'build/probes/sendfile.wasm');
-const work = process.env.WORK ?? join(root, 'build/batch/run4/P1-b/work');
+const work = process.env.WORK ?? join(tmpdir(), 'gmux-sendfile');
 const run = join(work, 'sendfile.run.wasm');
 const sha256 = (bytes: Uint8Array) => createHash('sha256').update(bytes).digest('hex');
 mkdirSync(work, { recursive: true });

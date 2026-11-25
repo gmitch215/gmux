@@ -19,7 +19,7 @@ import { sqlite } from '../../write-back/scripts/sqlite.ts';
  * kernel panic, an rcu stall line, an OOM kill, a crash, a wrong count or no READY.
  * `GMUX_BUILD=<dir with kernel/ and router/> node --no-warnings --experimental-strip-types
  * restore-chain.ts` (N=9000000, TURNS=24, GAP_S=120, REOPEN=both|reuse|fresh, CAP_S=900,
- * CLOCK=frozen|live, RESUME=place|restore, CORE=0 for the TypeScript scheduler)
+ * STEP_S=0, CLOCK=frozen|live, RESUME=place|restore, CORE=0 for the TypeScript scheduler)
  */
 const root = new URL('../../../', import.meta.url).pathname;
 const build = process.env.GMUX_BUILD ?? join(root, 'build');
@@ -27,6 +27,8 @@ const N = Number(process.env.N ?? 9_000_000);
 const TURNS = Number(process.env.TURNS ?? 24);
 const GAP_S = Number(process.env.GAP_S ?? 120);
 const CAP_S = Number(process.env.CAP_S ?? 900);
+// guest seconds added at every checkpoint's storage sync, as a host whose turns run longer adds
+const STEP_S = Number(process.env.STEP_S ?? 0);
 const REOPEN = process.env.REOPEN ?? 'both';
 const FROZEN = (process.env.CLOCK ?? 'frozen') === 'frozen';
 // the keeper continues a checkpointed machine in its own memory; `restore` has it restore the
@@ -78,6 +80,7 @@ function hostOver(db: ReturnType<typeof sqlite>, memory?: WebAssembly.Memory): K
 		sync: async () => {
 			if (db.written > seen) {
 				seen = db.written;
+				gapNs += BigInt(Math.round(STEP_S * 1000)) * 1_000_000n;
 				moveClock();
 			}
 		},

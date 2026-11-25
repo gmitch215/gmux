@@ -10,16 +10,18 @@ import program7 from '../vendor/programs/fork.wasm';
 import program8 from '../vendor/programs/gens.wasm';
 import program9 from '../vendor/programs/isolation.wasm';
 import program10 from '../vendor/programs/maps.wasm';
-import program11 from '../vendor/programs/posix.wasm';
-import program12 from '../vendor/programs/sendfile.wasm';
-import program13 from '../vendor/programs/sig.wasm';
-import program14 from '../vendor/programs/spin.wasm';
-import program15 from '../vendor/programs/stack.wasm';
-import program16 from '../vendor/programs/thr.wasm';
-import program17 from '../vendor/programs/time.wasm';
-import program18 from '../vendor/programs/vf.wasm';
-import program19 from '../vendor/programs/libcallback.so.wasm';
-import program20 from '../vendor/programs/libz.so.wasm';
+import program11 from '../vendor/programs/mmleak.wasm';
+import program12 from '../vendor/programs/posix.wasm';
+import program13 from '../vendor/programs/sendfile.wasm';
+import program14 from '../vendor/programs/sig.wasm';
+import program15 from '../vendor/programs/spin.wasm';
+import program16 from '../vendor/programs/stack.wasm';
+import program17 from '../vendor/programs/thr.wasm';
+import program18 from '../vendor/programs/time.wasm';
+import program19 from '../vendor/programs/vf.wasm';
+import program20 from '../vendor/programs/zerodata.wasm';
+import program21 from '../vendor/programs/libcallback.so.wasm';
+import program22 from '../vendor/programs/libz.so.wasm';
 import katybug from '../vendor/programs/katybug.build.wasm';
 import guarded0 from '../vendor/programs/abi-old.guard.wasm';
 import guarded1 from '../vendor/programs/abi.guard.wasm';
@@ -32,15 +34,17 @@ import guarded7 from '../vendor/programs/fork.guard.wasm';
 import guarded8 from '../vendor/programs/gens.guard.wasm';
 import guarded9 from '../vendor/programs/isolation.guard.wasm';
 import guarded10 from '../vendor/programs/maps.guard.wasm';
-import guarded11 from '../vendor/programs/posix.guard.wasm';
-import guarded12 from '../vendor/programs/sendfile.guard.wasm';
-import guarded13 from '../vendor/programs/sig.guard.wasm';
-import guarded14 from '../vendor/programs/spin.guard.wasm';
-import guarded15 from '../vendor/programs/stack.guard.wasm';
-import guarded16 from '../vendor/programs/thr.guard.wasm';
-import guarded17 from '../vendor/programs/time.guard.wasm';
-import guarded18 from '../vendor/programs/vf.guard.wasm';
-export const BUSYBOX_SHA256 = '78f113a5a6723ae2d497f57618af65f07280431764e885e9d1cf0adb2c4e1580';
+import guarded11 from '../vendor/programs/mmleak.guard.wasm';
+import guarded12 from '../vendor/programs/posix.guard.wasm';
+import guarded13 from '../vendor/programs/sendfile.guard.wasm';
+import guarded14 from '../vendor/programs/sig.guard.wasm';
+import guarded15 from '../vendor/programs/spin.guard.wasm';
+import guarded16 from '../vendor/programs/stack.guard.wasm';
+import guarded17 from '../vendor/programs/thr.guard.wasm';
+import guarded18 from '../vendor/programs/time.guard.wasm';
+import guarded19 from '../vendor/programs/vf.guard.wasm';
+import guarded20 from '../vendor/programs/zerodata.guard.wasm';
+export const BUSYBOX_SHA256 = '10bae2df4fef8447780635cc1278d8af65601a71775892c625ff548a68b30ec9';
 export const PROGRAMS: [string, WebAssembly.Module][] = [
 	['ee6f4c2817b36625e19934ee8bacd21a8c653952d850907c5e9ef81659a012da', program0],
 	['db899ee086c9e69b6939049cb3970e885ac41fe7e9144889da61a0b413292a17', program1],
@@ -51,19 +55,21 @@ export const PROGRAMS: [string, WebAssembly.Module][] = [
 	['aa20d14cb16bc974a2848fa6e0b4d97bd610aa76b945afedb0050ee6ab0d13b5', program6],
 	['afa0c4c21f7a6d81cc52607d6eb6c6d308df9a7bdaac7139d72563ab670ea373', program7],
 	['a9aaa027ce572c59520fb7e6721b0b280e8b01fff018d6687526822b6dbf1e50', program8],
-	['3f8051f8715b2659926755fb828d1054f717d2370265f093ce62190ba92a991d', program9],
+	['035f4bf66d56599d85389a6477cb446c9dc8deda0006cf00d9a110a4bf551f98', program9],
 	['2b3f2fb601736e6db3c66678c03ce69622fab884f2d7ef1585314676858a9399', program10],
-	['d79bf4a4dc702bf1c7c52a23083c638fb466c295a4b09a6a1dd149e7693bcb7f', program11],
-	['7b4e40b260d4788642583b574e61905684c76e3104aeec2c65496a52a8abea55', program12],
-	['1292d9140bcbda1994496b6531a55f715df8d79621e13bd38cbebebf46e368b0', program13],
-	['689738469318734b28208a3921debffb126a90967dbf2702b616570c9ba83e63', program14],
-	['9d752e2e48e414477266b11ff082667492737850e8cad51ad091ae2d55876482', program15],
-	['6a6a8b5fbe4f96cb8e5f5fc71e860a35ed41c8dc54cfdd1b64ff1e9c9151bea5', program16],
-	['19f7b56f40e961bcc2fae7c41af4a5362aa04394dd3ae57737c13518e8d057fb', program17],
-	['c4cd091d72ad4c1da645dd145012fbddbdda3a90a9fcad6f6ee335030493f84e', program18],
-	['4dda0b934734a3b0c2106687adb00a7a438e07bb422e65ec4538005c38c83b15', program19],
-	['2e32baa636fb6b3125d8bacb8ea887d97222d3cfe85aeb8ede499efe93d3f0e6', program20],
-	['ccc1452ef031226249be93d74d037cae24c80d98ab8bf185942f4a5010ce61ae', katybug],
+	['00f425d49918ca28bd8d75ec7449fb3f51652ab129e92c1e9d3416d812e66fc1', program11],
+	['b209aa08e4d4e640afc5f64e6c005ca69f3ef24f06cc834aa1f6cca6e826e47d', program12],
+	['7b4e40b260d4788642583b574e61905684c76e3104aeec2c65496a52a8abea55', program13],
+	['1292d9140bcbda1994496b6531a55f715df8d79621e13bd38cbebebf46e368b0', program14],
+	['689738469318734b28208a3921debffb126a90967dbf2702b616570c9ba83e63', program15],
+	['9d752e2e48e414477266b11ff082667492737850e8cad51ad091ae2d55876482', program16],
+	['6a6a8b5fbe4f96cb8e5f5fc71e860a35ed41c8dc54cfdd1b64ff1e9c9151bea5', program17],
+	['19f7b56f40e961bcc2fae7c41af4a5362aa04394dd3ae57737c13518e8d057fb', program18],
+	['c4cd091d72ad4c1da645dd145012fbddbdda3a90a9fcad6f6ee335030493f84e', program19],
+	['3927e9d0f92c71d868760a0ad957b9fca6f9cb65cc990064ff0e9303fcab5a0b', program20],
+	['4dda0b934734a3b0c2106687adb00a7a438e07bb422e65ec4538005c38c83b15', program21],
+	['2e32baa636fb6b3125d8bacb8ea887d97222d3cfe85aeb8ede499efe93d3f0e6', program22],
+	['1b4a5473f67b84e4d73dffb035e12ced1fffde0d0a2b5c2a90cbc1c14cbef071', katybug],
 ];
 export const GUARDED: [string, WebAssembly.Module][] = [
 	['ee6f4c2817b36625e19934ee8bacd21a8c653952d850907c5e9ef81659a012da', guarded0],
@@ -75,14 +81,16 @@ export const GUARDED: [string, WebAssembly.Module][] = [
 	['aa20d14cb16bc974a2848fa6e0b4d97bd610aa76b945afedb0050ee6ab0d13b5', guarded6],
 	['afa0c4c21f7a6d81cc52607d6eb6c6d308df9a7bdaac7139d72563ab670ea373', guarded7],
 	['a9aaa027ce572c59520fb7e6721b0b280e8b01fff018d6687526822b6dbf1e50', guarded8],
-	['3f8051f8715b2659926755fb828d1054f717d2370265f093ce62190ba92a991d', guarded9],
+	['035f4bf66d56599d85389a6477cb446c9dc8deda0006cf00d9a110a4bf551f98', guarded9],
 	['2b3f2fb601736e6db3c66678c03ce69622fab884f2d7ef1585314676858a9399', guarded10],
-	['d79bf4a4dc702bf1c7c52a23083c638fb466c295a4b09a6a1dd149e7693bcb7f', guarded11],
-	['7b4e40b260d4788642583b574e61905684c76e3104aeec2c65496a52a8abea55', guarded12],
-	['1292d9140bcbda1994496b6531a55f715df8d79621e13bd38cbebebf46e368b0', guarded13],
-	['689738469318734b28208a3921debffb126a90967dbf2702b616570c9ba83e63', guarded14],
-	['9d752e2e48e414477266b11ff082667492737850e8cad51ad091ae2d55876482', guarded15],
-	['6a6a8b5fbe4f96cb8e5f5fc71e860a35ed41c8dc54cfdd1b64ff1e9c9151bea5', guarded16],
-	['19f7b56f40e961bcc2fae7c41af4a5362aa04394dd3ae57737c13518e8d057fb', guarded17],
-	['c4cd091d72ad4c1da645dd145012fbddbdda3a90a9fcad6f6ee335030493f84e', guarded18],
+	['00f425d49918ca28bd8d75ec7449fb3f51652ab129e92c1e9d3416d812e66fc1', guarded11],
+	['b209aa08e4d4e640afc5f64e6c005ca69f3ef24f06cc834aa1f6cca6e826e47d', guarded12],
+	['7b4e40b260d4788642583b574e61905684c76e3104aeec2c65496a52a8abea55', guarded13],
+	['1292d9140bcbda1994496b6531a55f715df8d79621e13bd38cbebebf46e368b0', guarded14],
+	['689738469318734b28208a3921debffb126a90967dbf2702b616570c9ba83e63', guarded15],
+	['9d752e2e48e414477266b11ff082667492737850e8cad51ad091ae2d55876482', guarded16],
+	['6a6a8b5fbe4f96cb8e5f5fc71e860a35ed41c8dc54cfdd1b64ff1e9c9151bea5', guarded17],
+	['19f7b56f40e961bcc2fae7c41af4a5362aa04394dd3ae57737c13518e8d057fb', guarded18],
+	['c4cd091d72ad4c1da645dd145012fbddbdda3a90a9fcad6f6ee335030493f84e', guarded19],
+	['3927e9d0f92c71d868760a0ad957b9fca6f9cb65cc990064ff0e9303fcab5a0b', guarded20],
 ];

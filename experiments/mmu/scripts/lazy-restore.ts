@@ -15,10 +15,20 @@ import { Machine, type MachineOptions } from '../../../src/worker/machine/machin
  * `node --experimental-strip-types experiments/mmu/scripts/lazy-restore.ts` (after boot stage.sh)
  */
 const root = new URL('../../../', import.meta.url).pathname;
-const vendor = join(root, 'experiments/boot/vendor');
+// GMUX_BUILD names a staged build whose kernel directory holds the same files (and the manifest they match)
+const vendor = process.env.GMUX_BUILD
+	? join(process.env.GMUX_BUILD, 'kernel')
+	: join(root, 'experiments/boot/vendor');
 const read = (name: string) => new Uint8Array(readFileSync(join(vendor, name)));
 const sha256 = (bytes: Uint8Array) => createHash('sha256').update(bytes).digest('hex');
-const manifest = JSON.parse(readFileSync(join(root, 'build/kernel/manifest.json'), 'utf8'));
+const manifest = JSON.parse(
+	readFileSync(
+		process.env.GMUX_BUILD
+			? join(vendor, 'manifest.json')
+			: join(root, 'build/kernel/manifest.json'),
+		'utf8'
+	)
+);
 
 let output = '';
 const options: MachineOptions = {
