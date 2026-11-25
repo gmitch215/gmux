@@ -175,7 +175,7 @@ prog file https://astron.com/pub/file/file-5.45.tar.gz file.tgz src/file --disab
 prog tmux https://github.com/tmux/tmux/releases/download/3.5a/tmux-3.5a.tar.gz tmux.tgz tmux --disable-utf8proc
 prog htop https://github.com/htop-dev/htop/releases/download/3.3.0/htop-3.3.0.tar.xz htop.txz htop --disable-unicode
 (unpack vim https://github.com/vim/vim/archive/refs/tags/v9.1.0800.tar.gz vim.tgz && conf vim --with-features=normal --disable-gui \
-	--without-x --with-tlib=tinfow --disable-nls && mk vim && checkwasm vim src/vim)
+	--without-x --with-tlib=tinfow --disable-nls "LDFLAGS=$LDFLAGS -Wl,-Bsymbolic" && mk vim && checkwasm vim src/vim)
 prog git https://www.kernel.org/pub/software/scm/git/git-2.47.0.tar.xz git.txz git --without-tcltk --without-python --without-openssl \
 	--without-curl --without-expat --without-iconv --with-zlib=$P
 (unpack redis https://download.redis.io/releases/redis-7.4.1.tar.gz redis.tgz \
