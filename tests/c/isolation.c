@@ -53,14 +53,42 @@ static const unsigned char stored[16] = {0x1d, 0x17, 0x0f, 0x02, 0x15, 0x0d,
                                          0x14, 0x09, 0x0e, 0x15, 0x08, 0x1f,
                                          0x17, 0x1b, 0x08, 0x11};
 
-/* as a process in a memory of its own: an address that is another owner's reads
- * zeros, and a store and the syscalls that name it reach only this process's
- * bytes */
+/* whether 16 bytes at addr are inside this process's memory: a memory of its
+ * own ends at its highest mapping, so an address root got from a page the
+ * allocator placed higher is past it */
+static int inside(const char* addr) {
+#ifdef __wasm__
+    unsigned long end = (unsigned long) __builtin_wasm_memory_size(0) << 16;
+    return (unsigned long) addr + 16 <= end;
+#else
+    (void) addr;
+    return 1;
+#endif
+}
+
+/* past the end of the memory a load or store traps (SIGSEGV) and a syscall
+ * buffer is refused with EFAULT (SECURITY.md); no byte there is reachable */
+static int beyond(char* addr) {
+    int fds[2], bad = 0;
+    if (pipe(fds)) return 100;
+    if (write(fds[1], addr, 16) != -1 || errno != EFAULT) bad |= 2;
+    write(fds[1], "abcdefghijklmnop", 16);
+    if (read(fds[0], addr, 16) != -1 || errno != EFAULT) bad |= 8;
+    close(fds[0]);
+    close(fds[1]);
+    if (bad) printf("reach %p beyond the memory: %d\n", (void*) addr, bad);
+    return bad;
+}
+
+/* as a process in a memory of its own: an address that is another owner's and
+ * inside the memory reads zeros, and a store and the syscalls that name it
+ * reach only this process's bytes; past the memory's end nothing is there */
 static int reach(char* addr) {
     volatile unsigned char* p = (volatile unsigned char*) addr;
     volatile unsigned char key = 0x5a;
     unsigned char got[16];
     int fds[2], bad = 0, i;
+    if (!inside(addr)) return beyond(addr);
     if (pipe(fds)) return 100;
     for (i = 0; i < 16; i++)
         if (p[i]) bad |= 1;
@@ -839,10 +867,26 @@ static void regions(void) {
 static char* kern;
 static unsigned char kbefore[16];
 
-/* a window of the kernel's static data (the first 192 KiB from 0x10000, below
- * the pages processes are given) that is not all zero and does not change over
- * 150 ms: what a process in the machine's memory reads, and one in its own does
- * not */
+/* the kernel's version banner, a constant the kernel never writes, where it
+ * sits in the first 192 KiB from 0x10000 (below the pages processes are
+ * given): /proc/version reads the same text */
+static char* banner_window(void) {
+    char text[16];
+    int fd = open("/proc/version", O_RDONLY);
+    if (fd < 0) return NULL;
+    int got = read(fd, text, sizeof text);
+    close(fd);
+    if (got != (int) sizeof text) return NULL;
+    for (char* p = (char*) 0x10000; p < (char*) 0x40000 - sizeof text; p++)
+        if (!memcmp(p, text, sizeof text)) return p;
+    return NULL;
+}
+
+/* a window of the kernel's static data that is not all zero and is the same
+ * from one read to the next: what a process in the machine's memory reads, and
+ * one in its own does not. The banner when it is in range; else a window that
+ * does not change over 150 ms, which a counter or the random pool can still
+ * leave changing later */
 static void find_kernel(void) {
     enum
     {
@@ -851,6 +895,14 @@ static void find_kernel(void) {
     char* at[WANT];
     unsigned char first[WANT][16];
     int n = 0;
+    kern = banner_window();
+    if (kern) {
+        printf(
+            "kernel window at 0x10000 + %lu (version banner)\n",
+            (unsigned long) (kern - (char*) 0x10000)
+        );
+        return;
+    }
     for (char* p = (char*) 0x10000; p < (char*) 0x40000 && n < WANT; p += 16) {
         int set = 0;
         for (int i = 0; i < 16; i++) set += p[i] != 0;

@@ -19,9 +19,9 @@ import { hostOnly, leaks, SURFACE, watch } from './authority.ts';
 
 /**
  * Boots build/kernel with the tests/c probes from build/probes and checks each one's output;
- * GMUX_BUILD points at another build, FROZEN=1 stops the host clock. The scheduler core from
- * build/router runs the scheduler's tables in C; CORE=0 runs them in TypeScript and
- * CORE=<gmux-core.wasm> runs another core build.
+ * GMUX_BUILD points at another build, which needs its router/ beside kernel/; FROZEN=1 stops the
+ * host clock. The scheduler core from router/ runs the scheduler's tables in C; CORE=0 runs them
+ * in TypeScript and CORE=<gmux-core.wasm> runs another core build.
  * `node --experimental-strip-types tests/c/run.ts [probe...]`
  */
 interface Probe {
@@ -115,6 +115,38 @@ function taskcapCheck(section: string): string[] {
 }
 
 /**
+ * tests/c/mmleak.c reads free memory, percpu memory and the mm_struct and vm_area_struct slabs every
+ * 100 rounds of exec, exit, fork and a failed exec; after the warm-up (the slab counts of the
+ * control kernel reach their level by round 300) none of them may drift past what the control's
+ * own readings range over (rounds 300 to 1,000, 35 runs on the control kernel: memfree and buddy
+ * within 71 pages either way, percpu 0, mm_struct 0 to 135 in steps of 27, a slab page,
+ * vm_area_struct 0 to 123 on a kernel with one of the patches; the bounds are the next round
+ * numbers up, a leak of a page or an object per round is 700 or more)
+ */
+const MMLEAK_BOUNDS = { memfree: 128, percpu: 64, buddy: 128, mm: 162, vma: 162 };
+const MMLEAK_WARMUP = 2;
+function mmleakCheck(section: string): string[] {
+	const rows = [
+		...section.matchAll(
+			/SAMPLE (\d+) memfree (-?\d+) percpu (-?\d+) buddy (-?\d+) mm (-?\d+) vma (-?\d+)/g
+		)
+	].map((m) => m.slice(1).map(Number));
+	if (rows.length < 10) return [`mmleak: ${rows.length} samples, not 10`];
+	const [first, last] = [rows[MMLEAK_WARMUP]!, rows.at(-1)!];
+	const drift = (i: number) => last[i]! - first[i]!;
+	console.log(
+		`mmleak: rounds ${first[0]} to ${last[0]}: memfree ${drift(1)} pages, percpu ${drift(2)} kB, buddy ${drift(3)} pages, mm_struct ${drift(4)}, vm_area_struct ${drift(5)}`
+	);
+	const found: string[] = [];
+	if (-drift(1) > MMLEAK_BOUNDS.memfree) found.push(`memfree fell ${-drift(1)} pages`);
+	if (drift(2) > MMLEAK_BOUNDS.percpu) found.push(`percpu grew ${drift(2)} kB`);
+	if (-drift(3) > MMLEAK_BOUNDS.buddy) found.push(`free pages in the buddy fell ${-drift(3)}`);
+	if (drift(4) > MMLEAK_BOUNDS.mm) found.push(`mm_struct grew ${drift(4)}`);
+	if (drift(5) > MMLEAK_BOUNDS.vma) found.push(`vm_area_struct grew ${drift(5)}`);
+	return found;
+}
+
+/**
  * what tests/c/isolation.c's own-memory pass stores at kernel, peer and segment addresses (the
  * program holds it xor 0x5a): a process in a memory of its own writes it nowhere in the machine's
  * memory, so a scan of that memory after the run must not find it
@@ -193,6 +225,16 @@ const probes: Record<string, Probe> = {
 			'signals same',
 			'load after repair 42'
 		]
+	},
+	// loads and stores at an index read from memory on a buffer that is cut up, protected, remapped, grown and forked under
+	// the loop, as native Linux ran them (x86-flat.expected)
+	flat: {
+		program: null,
+		files: { '/bin/flat-x86': 'katybug/flat-x86' },
+		cmd: '/bin/flat-x86',
+		lines: readFileSync(new URL('./katybug/x86-flat.expected', import.meta.url), 'utf8')
+			.split('\n')
+			.filter(Boolean)
 	},
 	// static amd64 coreutils, bash, sqlite3 and curl (tests/c/katybug/transcript.sh stages them),
 	// expected lines from their native x86-64 run
@@ -462,6 +504,20 @@ const probes: Record<string, Probe> = {
 		],
 		passes: 5
 	},
+	// a program fills its whole data mapping and a mapping of its own with a pattern and exits;
+	// 40 times over, the next exec gets those pages back and must find no word of it in its data,
+	// its bss, the tail of its last page, or a mapping asked for with the uninitialized flag
+	zerodata: { lines: ['40 cycles, 0 failed to run, 0 unreadable'], passes: 7 },
+	// 1,000 rounds of vfork and exec on an 800-page machine, with a fork that never execs, an exec
+	// that fails after the mm swap and a program that holds its mm to its exit mixed in: free pages,
+	// percpu memory and the mm_struct and vm_area_struct slabs stay level after a warm-up
+	mmleak: {
+		evacuate: true,
+		pages: 800,
+		lines: ['SAMPLE 1000 '],
+		passes: 2,
+		check: mmleakCheck
+	},
 	// user tasks share the cpus (patch 0032): 256 tasks each blocked opening a fifo are all alive at
 	// once, as /proc counts them, and exit when it is written
 	tasks: {
@@ -501,6 +557,17 @@ const probes: Record<string, Probe> = {
 		lines: [],
 		passes: 6,
 		check: taskcapCheck
+	},
+	// rcS sets every ksoftirqd to SCHED_FIFO; a busy task on its cpu otherwise starves it and the
+	// RCU callbacks it would run pile up until the OOM killer runs (after a checkpoint's clock step)
+	softirq: {
+		program: null,
+		cmd:
+			'n=0; f=0; for d in /proc/[0-9]*; do { read -r c < $d/comm; } 2> /dev/null; ' +
+			'case $c in ksoftirqd/*) n=$((n+1)); chrt -p ${d#/proc/} | grep -q SCHED_FIFO && f=$((f+1));; esac; done; ' +
+			'[ $n -gt 0 ] && [ $f -eq $n ] && echo "PASS all $n ksoftirqd threads are SCHED_FIFO" || echo "FAIL $f of $n ksoftirqd threads are SCHED_FIFO"',
+		lines: [],
+		passes: 1
 	},
 	// a thread cannot change its affinity; a program may set a mask of several cpus and exit (the
 	// kernel once panicked in release_thread)
@@ -556,7 +623,18 @@ const share = !!process.env.SHARE;
 // PREFILL=1: RECYCLE=1 with idle instances made ahead while the pump has nothing to run
 const prefill = !!process.env.PREFILL;
 const recycle = !!process.env.RECYCLE || prefill;
-const busybox = read(share || recycle ? 'kernel/busybox.share.wasm' : 'kernel/busybox.wasm');
+// ASYNC=1: the site's kinds, the asyncified kernel and BusyBox with `asyncify: true`, recycled at the default
+const asynced = !!process.env.ASYNC;
+// EXEC_CACHE=1: the exec memo on; EXEC_CACHE=verify also checks every answer and fails the run on a mismatch
+const execCache =
+	process.env.EXEC_CACHE === 'verify' ? ('verify' as const) : !!process.env.EXEC_CACHE;
+const busybox = read(
+	asynced
+		? 'kernel/busybox.async.wasm'
+		: share || recycle
+			? 'kernel/busybox.share.wasm'
+			: 'kernel/busybox.wasm'
+);
 const manifest = JSON.parse(readFileSync(join(build, 'kernel/manifest.json'), 'utf8'));
 // a kernel staged from other patches than this tree's fails probes for reasons the tree does not have
 if (!manifest.inputs)
@@ -602,13 +680,29 @@ for (const [to, path, name] of added) {
 	const forks = probes[name]!.evacuate;
 	const evacuated = Array.isArray(forks) ? forks.includes(to) : !!forks;
 	if (evacuated) {
-		execFileSync(
-			join(root, 'scripts/ts'),
-			[join(root, 'scripts/wasm/export-globals.ts'), fueled, `${fueled}.g`, '--all-mutable'],
-			{
-				stdio: 'ignore'
-			}
-		);
+		// a program that can be shared carries the note recycling reads; SHARE=1 would run a forking
+		// program's frames on one instance, so it keeps the plain export
+		let marked = false;
+		if (!share)
+			try {
+				execFileSync(
+					join(root, 'scripts/ts'),
+					[join(root, 'scripts/wasm/share.ts'), join(build, path), fueled, `${fueled}.g`],
+					{ stdio: 'ignore' }
+				);
+				marked = true;
+			} catch {}
+		if (!marked)
+			execFileSync(
+				join(root, 'scripts/ts'),
+				[
+					join(root, 'scripts/wasm/export-globals.ts'),
+					fueled,
+					`${fueled}.g`,
+					'--all-mutable'
+				],
+				{ stdio: 'ignore' }
+			);
 		execFileSync(
 			process.execPath,
 			[
@@ -696,7 +790,10 @@ async function boot(group: string[], maximumPages: number, maxcpus = 3) {
 	const hostLog: string[] = [];
 	let typed = false;
 	const machine = new Machine({
-		vmlinux: new WebAssembly.Module(read('kernel/vmlinux.wasm')),
+		vmlinux: new WebAssembly.Module(
+			read(asynced ? 'kernel/vmlinux.async.wasm' : 'kernel/vmlinux.wasm')
+		),
+		asyncify: asynced,
 		initrd: new Uint8Array(readFileSync(initrd)),
 		cmdline: `maxcpus=${maxcpus} root=/dev/ram0 rootfstype=ramfs init=/init console=hvc console=ttyS0`,
 		registry,
@@ -704,12 +801,13 @@ async function boot(group: string[], maximumPages: number, maxcpus = 3) {
 		sha256,
 		sharedKernel: true,
 		shareInstances: share,
+		...(execCache ? { execCache } : {}),
 		...(prefill ? { prefillInstances: 4 } : {}),
 		guarded,
 		// FROZEN=1: a host clock that never moves, as a deployed Worker's while code runs
 		...(process.env.FROZEN ? { now: () => 0n } : {}),
 		runtime: {
-			...hostRuntime(join(root, 'build/router'), { core: !process.env.CORE }),
+			...hostRuntime(join(build, 'router'), { core: !process.env.CORE }),
 			...(process.env.CORE && process.env.CORE !== '0'
 				? { core: new WebAssembly.Module(readFileSync(process.env.CORE)) }
 				: {})
@@ -788,6 +886,15 @@ for (const name of names) {
 	if (problems.length) console.log(section.slice(-1200).replace(/\r/g, ''));
 	if (process.env.SHOW) console.log(section.replace(/\r/g, ''));
 	if (problems.length && process.env.HOSTLOG) console.log(hostLog.slice(-20).join('\n'));
+}
+if (execCache) {
+	const all = [...boots.values()].map((b) => b.machine.stats);
+	const sum = (key: 'execHits' | 'execMisses' | 'execMismatches') =>
+		all.reduce((n, s) => n + s[key], 0);
+	console.log(
+		`exec memo: ${sum('execHits')} hits, ${sum('execMisses')} misses, ${sum('execMismatches')} mismatches`
+	);
+	if (sum('execMismatches') || !sum('execHits')) failed++;
 }
 if (process.env.STATS) console.log(JSON.stringify(machine.stats));
 process.exit(failed ? 1 : 0);
