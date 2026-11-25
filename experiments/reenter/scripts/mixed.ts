@@ -45,8 +45,7 @@ if (mode === 'assemble') {
 	const [dir = ''] = args;
 	const m = JSON.parse(readFileSync(join(dir, 'rungs.json'), 'utf8')) as Manifest;
 	for (const r of m.rungs) {
-		// host_direct carries eight arguments, so a rung with a wider thunk runs over JavaScript
-		if (!Object.keys(r.imports).length || entriesOf(r).some((e) => e.arity > 8)) continue;
+		if (!Object.keys(r.imports).length) continue;
 		writeFileSync(join(dir, `rung${r.rung}.dispatch.wasm`), execFileSync('wasm-tools', ['parse', '-o', '/dev/stdout'], { input: dispatchWat(entriesOf(r), true), maxBuffer: 1 << 28 }));
 	}
 }

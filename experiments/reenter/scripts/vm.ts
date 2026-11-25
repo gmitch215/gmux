@@ -37,6 +37,8 @@ export interface Vm {
 export interface VmOptions {
 	/** answers the interpreter's host_direct import; defaults to one that returns 0 */
 	hostDirect?: (...args: number[]) => number;
+	/** answers host_wide (the arities past eight) the same way */
+	hostWide?: (...args: number[]) => number;
 	stackBytes?: number;
 	/** burrow's maxMemoryBytes (0 or absent: none) */
 	memoryLimit?: number;
@@ -114,6 +116,7 @@ export async function createVm(wasm3: WebAssembly.Module | string, options: VmOp
 		}
 	};
 	if (WebAssembly.Module.imports(module).some((i) => i.module === 'burrow' && i.name === 'host_direct')) burrow.host_direct = options.hostDirect ?? (() => 0);
+	if (WebAssembly.Module.imports(module).some((i) => i.module === 'burrow' && i.name === 'host_wide')) burrow.host_wide = options.hostWide ?? (() => 0);
 	const wanted = WebAssembly.Module.imports(module);
 	const env: Record<string, WebAssembly.ImportValue> = { emscripten_notify_memory_growth: () => {} };
 	// the guest memory build imports both its own memory and the guest's (see tools/interp/guest-memory.mjs)

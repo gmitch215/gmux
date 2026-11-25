@@ -1,34 +1,43 @@
 #!/usr/bin/env bash
 # the timed sweep for the re-entry item: whole-workload tax of the rebased module (part0.ts), the crossing per direction
 # without JavaScript (rt.ts), and the ladder's open and closed rungs on zlib (mixed.ts); lock and quiet reading per sample
-# usage: sweep.sh <out dir>   (run from the repo root or a rig copy of it that holds build/batch/run4/B22)
-# env: HOST (paisley-park | mac, default paisley-park), CPUS (taskset list, default 18,19), LOCK (default per host),
-#      QUIET (quiet.sh path), P0_SAMPLES (9), RT_SAMPLES (12), C_SAMPLES (3), WAITS (2), LOCK_WAIT (seconds, 3600),
-#      SMOKE=1 (one sample per cell, rounds 1, no lock), CELLS (default "p0 rt c")
+# usage: sweep.sh <out dir>   (run from the repo root or a rig copy of it; node 22.6.0 or later on PATH)
+# env, required: HOST (paisley-park | mac), LOCK (timing lock path, not read with SMOKE=1), QUIET (quiet.sh, paisley-park only)
+# env, required by cell: REENTER_BASE and REENTER_PRIOR (p0 rt c e i m o x), NATIVE_DIR (en), PL_DIR, PL_RE_WASM3, PL_GM_WASM3 (pl)
+# env, optional: CPUS (taskset list, default 18,19), WASM3_RE, WASM3_GM (default under the inputs), P0_SAMPLES (9),
+#      RT_SAMPLES (12), C_SAMPLES (3), WAITS (2), LOCK_WAIT (seconds, 3600), SMOKE=1 (one sample per cell, rounds 1, no lock),
+#      CELLS (default "p0 rt c")
 # the done marker is <out dir>/done, written whatever the exit status
 set -u
 root=$(cd "$(dirname "$0")/../../.." && pwd)
 cd "$root"
 out=${1:?usage: sweep.sh <out dir>}
 mkdir -p "$out"
-host=${HOST:-paisley-park}
+host=${HOST:?set HOST to paisley-park or mac}
 cpus=${CPUS:-18,19}
 smoke=${SMOKE:-0}
-if [ "$host" = mac ]; then lock=${LOCK:-$root/build/batch/mac-bench.lock}; else lock=${LOCK:-/tmp/paisley-timing.lock}; fi
-quiet=${QUIET:-$root/build/batch/quiet.sh}
+[ "$smoke" = 1 ] || lock=${LOCK:?set LOCK to the timing lock path}
+[ "$host" = mac ] || quiet=${QUIET:?set QUIET to the quiet.sh path}
 waits=${WAITS:-2}
 lock_wait=${LOCK_WAIT:-3600}
 cells=${CELLS:-"p0 rt c"}
-b=${B22:-build/batch/run4/B22}
-r5=${R5:-build/batch/run5/B22-2-a}
-re=${WASM3_RE:-$b/out-reenter/wasm3.wasm}
-gm=${WASM3_GM:-$r5/out-gm-reenter/wasm3.wasm}
-native=${NATIVE_DIR:-$r5/native}
+inputs=0
+for c in $cells; do
+	case $c in
+		pl) ;;
+		en) native=${NATIVE_DIR:?set NATIVE_DIR to the native control binaries} ;;
+		*) inputs=1 ;;
+	esac
+done
+if [ "$inputs" = 1 ]; then
+	b=${REENTER_BASE:?set REENTER_BASE to the run4 re-entry tree}
+	r5=${REENTER_PRIOR:?set REENTER_PRIOR to the run5 re-entry tree}
+	re=${WASM3_RE:-$b/out-reenter/wasm3.wasm}
+	gm=${WASM3_GM:-$r5/out-gm-reenter/wasm3.wasm}
+fi
 node="node --no-warnings --experimental-strip-types"
+node -e 'const [a, b] = process.versions.node.split(".").map(Number); process.exitCode = a > 22 || (a === 22 && b >= 6) ? 0 : 1' || { echo "sweep.sh: node $(node -p process.version) is below 22.6.0" >&2; exit 2; }
 if [ "$host" != mac ]; then
-	export NVM_DIR=$HOME/.nvm
-	. "$NVM_DIR/nvm.sh" > /dev/null
-	nvm use 26.10.0 > /dev/null
 	pin="taskset -c $cpus"
 else
 	pin=
@@ -94,8 +103,9 @@ en=${E_SAMPLES:-9}
 on=${O_SAMPLES:-3}
 isn=${I_SAMPLES:-3}
 mn=${M_SAMPLES:-3}
+pln=${PL_SAMPLES:-5}
 rounds=5
-[ "$smoke" = 1 ] && { p0n=1; rtn=1; cn=1; en=1; on=1; isn=1; mn=1; rounds=1; }
+[ "$smoke" = 1 ] && { p0n=1; rtn=1; cn=1; en=1; on=1; isn=1; mn=1; pln=1; rounds=1; }
 echo "# sweep start $(date -u +%FT%TZ) host $host cpus $cpus node $(node --version) cells $cells" >> "$out/log"
 # the guest memory item's cells: e (endpoint arms over the guest memory build, with mem0 and mem0-shared), en (native controls),
 # o (open zlib rungs, old base form on the re-entry build against mem0 on the guest memory build), i (the all-interpreted rung,
@@ -154,14 +164,31 @@ cells_r5() {
 		done
 	fi
 }
+# the ladder cells: each dir under PL_DIR holds one guest's rungs (zlib-open, zstd-open: base form, run on
+# PL_RE_WASM3; zlib-open-m0, zstd-open-m0: mem0, run on PL_GM_WASM3); a row is a rung, the interpreted and native ends included.
+cells_pl() {
+	local i=$1 g dir wasm rows
+	wantx pl && [ "$i" -le "$pln" ] || return 0
+	for g in zlib zstd; do
+		rows=$([ "$g" = zlib ] && echo 6 || echo 10)
+		dir=${PL_DIR:?set PL_DIR to the ladder root}/$g-open
+		wasm=${PL_RE_WASM3:?set PL_RE_WASM3 to the re-entry build}
+		cell "pl-$g-base-$i" "pl-$g-base" "$rows" '"rung"' $pin $node $scripts/mixed.ts run "$dir" "$wasm" $rounds direct "$out/pl-$g-base-$i.json"
+		dir=${PL_DIR:?set PL_DIR to the ladder root}/$g-open-m0
+		wasm=${PL_GM_WASM3:?set PL_GM_WASM3 to the guest memory build}
+		cell "pl-$g-mem0-$i" "pl-$g-mem0" "$rows" '"rung"' $pin $node $scripts/mixed.ts run "$dir" "$wasm" $rounds direct "$out/pl-$g-mem0-$i.json"
+	done
+}
 (
 	max=$p0n
+	[ "$pln" -gt "$max" ] && max=$pln
 	[ "$rtn" -gt "$max" ] && max=$rtn
 	[ "$cn" -gt "$max" ] && max=$cn
 	[ "$en" -gt "$max" ] && max=$en
 	[ "$on" -gt "$max" ] && max=$on
 	for i in $(seq "$max"); do
 		cells_r5 "$i"
+		cells_pl "$i"
 		if [[ " $cells " == *" p0 "* ]] && [ "$i" -le "$p0n" ]; then
 			for g in zlib zstd; do
 				cell "p0-$g-$i" "p0-$g" 7 '"variant"' $pin $node $scripts/part0.ts sample $b/p0/$g/asm $rounds "$out/p0-$g-$i.json"

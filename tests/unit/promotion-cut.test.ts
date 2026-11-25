@@ -13,14 +13,18 @@ import {
 } from '../../experiments/promotion-cut/scripts/calibration.ts';
 import {
 	bruteForce,
+	bruteForceOpen,
 	callees,
 	choose,
 	deps,
 	minCut,
+	openFeasible,
+	openMinCut,
 	policies,
 	reach,
 	sccs,
 	split,
+	uncarriable,
 	type Graph,
 	type Params
 } from '../../experiments/promotion-cut/scripts/plan.ts';
@@ -230,6 +234,119 @@ describe('promotion cut planner', () => {
 				free.objective,
 				6
 			);
+		}
+	});
+});
+
+describe('open policy (no closure)', () => {
+	const random = (seed: number) => () =>
+		(seed = (seed * 1103515245 + 12345) % 2147483648) / 2147483648;
+	const randomGraph = (next: () => number, n: number, maxParams: number): Graph => {
+		const nodes = Array.from({ length: n }, (_, i) => ({
+			...node(`f${i}`, Math.floor(next() * 1000), 50 + Math.floor(next() * 100)),
+			params: 1 + Math.floor(next() * maxParams),
+			wide: next() < 0.15,
+			pinned: next() < 0.1
+		}));
+		const edges: Graph['edges'] = [];
+		for (let e = 0; e < n * 2; e++) {
+			const from = Math.floor(next() * n);
+			const to = Math.floor(next() * n);
+			if (from !== to)
+				edges.push({ from: `f${from}`, to: `f${to}`, count: Math.floor(next() * 300) });
+		}
+		return { nodes, edges };
+	};
+	const randomParams = (next: () => number): Params => ({
+		sI: 1,
+		sN: 0.05 + next() * 0.5,
+		tau: next() * 8,
+		lambda: next() * 0.5,
+		tauDown: next() * 8,
+		tauUp: next() * 8,
+		maxParams: 7
+	});
+
+	it('prices each crossing direction on its own', () => {
+		const at = (...n: string[]) =>
+			new Set(n.map((x) => hand.nodes.findIndex((y) => y.name === x)));
+		const q = { ...p, tauDown: 10, tauUp: 1 };
+		expect(split(hand, at('A'), q)).toMatchObject({ crossings: 2, upCrossings: 520 });
+		expect(split(hand, at('A'), q).boundary).toBeCloseTo(2 * 10 + 520 * 1);
+		// closed sets have no up crossings, so the closed policies price as before
+		expect(split(hand, at('A', 'B', 'C'), q)).toMatchObject({ crossings: 2, upCrossings: 0 });
+	});
+
+	it('matches enumeration over every set on random graphs with asymmetric prices, wide and pinned functions', () => {
+		for (let k = 0; k < 200; k++) {
+			const next = random(9000 + k);
+			const g = randomGraph(next, 3 + Math.floor(next() * 5), 9);
+			const q = randomParams(next);
+			const best = bruteForceOpen(g, q);
+			const set = openMinCut(g, q);
+			expect(openFeasible(g, q, set)).toBe(true);
+			expect(split(g, set, q).objective).toBeCloseTo(best.objective, 6);
+		}
+	});
+
+	it('keeps a wide function on the side of its callers, however cheap the crossing; its own calls may cross', () => {
+		const wide = { ...node('W', 1500), wide: true };
+		const g: Graph = {
+			nodes: [node('main', 10), node('A', 1000), wide, node('Z', 1000)],
+			edges: [
+				{ from: 'main', to: 'A', count: 2 },
+				{ from: 'A', to: 'W', count: 500 },
+				{ from: 'W', to: 'Z', count: 500 }
+			]
+		};
+		const q = { ...p, tauUp: 0.0001, tauDown: 0.0001 };
+		expect(uncarriable(g, q)).toEqual([false, false, true, false]);
+		// W may call a native Z across the bridge: only the calls into W are fenced
+		expect(openFeasible(g, q, new Set([3]))).toBe(true);
+		expect(openFeasible(g, q, new Set([2]))).toBe(false);
+		for (const budget of [Infinity, 0, 100]) {
+			const set = choose('open', g, q, budget);
+			expect(openFeasible(g, q, set)).toBe(true);
+			expect(set.has(1)).toBe(set.has(2));
+		}
+	});
+
+	it('treats a function with more parameters than the bridge carries as uncarriable', () => {
+		const wide8 = { ...node('W', 1500), params: 8 };
+		const g: Graph = {
+			nodes: [node('main', 10), node('A', 1000), wide8],
+			edges: [{ from: 'A', to: 'W', count: 500 }]
+		};
+		expect(uncarriable(g, { ...p, maxParams: 7 })).toEqual([false, false, true]);
+		expect(uncarriable(g, { ...p, maxParams: 8 })).toEqual([false, false, false]);
+	});
+
+	it('never makes a pinned function native', () => {
+		const pinned = { ...node('P', 1500), pinned: true };
+		const g: Graph = {
+			nodes: [node('main', 10), pinned],
+			edges: [{ from: 'main', to: 'P', count: 1 }]
+		};
+		const q = { ...p, sN: 0 };
+		expect(openMinCut(g, q).has(1)).toBe(false);
+		expect(openFeasible(g, q, new Set([1]))).toBe(false);
+	});
+
+	it('stays inside a byte budget, feasible, and above the enumerated optimum on random graphs', () => {
+		for (let k = 0; k < 120; k++) {
+			const next = random(31000 + k);
+			const g = randomGraph(next, 3 + Math.floor(next() * 5), 9);
+			const q = randomParams(next);
+			const total = g.nodes.reduce((s, x) => s + x.bytes, 0);
+			for (const fraction of [0.2, 0.5]) {
+				const budget = fraction * total;
+				const set = choose('open', g, q, budget);
+				expect(split(g, set, q).bytes).toBeLessThanOrEqual(budget);
+				expect(openFeasible(g, q, set)).toBe(true);
+				expect(split(g, set, q).objective).toBeGreaterThanOrEqual(
+					bruteForceOpen(g, q, budget).objective - 1e-9
+				);
+			}
 		}
 	});
 });

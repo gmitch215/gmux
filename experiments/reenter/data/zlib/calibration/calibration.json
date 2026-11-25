@@ -1,0 +1,11 @@
+{
+	"tau_ns": 386.3983477168452,
+	"crossings": 91105,
+	"spread": 0.047103388262586574,
+	"rung": "longest_match",
+	"rounds": 3,
+	"host": "local-26.8",
+	"node": "v26.8.2",
+	"module": "4278be622aa921e9543044ef757a39a959a332b72bf8bbd3c7bd129c5b89e316",
+	"seconds": 15.900566000000001
+}

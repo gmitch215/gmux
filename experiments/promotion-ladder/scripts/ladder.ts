@@ -123,7 +123,9 @@ if (mode === 'prepare') {
 	if (given) {
 		for (const [label, names] of Object.entries(given)) rungs.push({ target: 0, set: new Set(names), share: shareOf(new Set(names)), label });
 		// LADDER_NATIVE_END=0 leaves out the all-native rung, which cannot be built from a function that grows memory
-		if (process.env.LADDER_NATIVE_END !== '0') rungs.push({ target: 1, set: new Set(fns.filter((fn) => !fn.wide).map((fn) => fn.name)), share: 1, label: 'native' });
+		// LADDER_NATIVE_WIDE=1 puts the wide functions in the all-native rung too: native code then never reaches an interpreted one
+		const wideNative = process.env.LADDER_NATIVE_WIDE === '1';
+		if (process.env.LADDER_NATIVE_END !== '0') rungs.push({ target: 1, set: new Set(fns.filter((fn) => wideNative || !fn.wide).map((fn) => fn.name)), share: 1, label: 'native' });
 		for (const r of rungs) r.target = r.share;
 	}
 	for (; !given; ) {
@@ -179,7 +181,7 @@ if (mode === 'prepare') {
 		// an entry stub per interpreted function native code reaches: it sets the stack pointer to native's and puts it back
 		const stubs = cold.flatMap((n) => {
 			const fn = byName.get(n)!;
-			if (fn.params > 7) throw new Error(`${n}: ${fn.params} parameters, call_at takes eight arguments with the stack pointer`);
+			if (fn.params > 18) throw new Error(`${n}: ${fn.params} parameters, call_at_wide takes nineteen slots with the stack pointer`);
 			const params = ['i32', ...Array.from({ length: fn.params }, () => 'i32')].join(' ');
 			return [
 				`  (func $ie_${n} (export "ie_${n}") (param ${params})${fn.result ? ' (result i32)' : ''}`,
@@ -201,8 +203,13 @@ if (mode === 'prepare') {
 
 		// the native side: wasm3's memory, every access at base + address, entries that set the stack pointer
 		const own = (l: string) => !/^ {2}\((memory|export|data) /.test(l);
+		const wideCold = cold.some((n) => byName.get(n)!.params > 7);
 		const coldImports = cold.length
-			? ['  (import "interp" "call_at" (func $call_at (param i32 i32 i32 i32 i32 i32 i32 i32 i32) (result i32)))', ...cold.map((n) => `  (import "interp" "h_${n}" (global $h_${n} i32))`)]
+			? [
+					'  (import "interp" "call_at" (func $call_at (param i32 i32 i32 i32 i32 i32 i32 i32 i32) (result i32)))',
+					...(wideCold ? [`  (import "interp" "call_at_wide" (func $call_at_wide (param ${Array.from({ length: 20 }, () => 'i32').join(' ')}) (result i32)))`] : []),
+					...cold.map((n) => `  (import "interp" "h_${n}" (global $h_${n} i32))`)
+				]
 			: [];
 		const nativeHead = [...head.slice(0, importAt), '  (import "env" "memory" (memory 1))', ...(mem0 ? [] : ['  (import "env" "base" (global $gbase i32))']), ...coldImports, ...head.slice(importAt).filter(own)];
 		// an interpreted function the native side calls is a wrapper that enters wasm3 at the live frame's top
@@ -213,8 +220,8 @@ if (mode === 'prepare') {
 				`    global.get $h_${fn.name}`,
 				'    global.get $__stack_pointer',
 				...paramList(fn),
-				...Array.from({ length: 7 - fn.params }, () => '    i32.const 0'),
-				'    call $call_at',
+				...Array.from({ length: (fn.params > 7 ? 18 : 7) - fn.params }, () => '    i32.const 0'),
+				fn.params > 7 ? '    call $call_at_wide' : '    call $call_at',
 				...(fn.result ? [] : ['    drop'])
 			]
 		});

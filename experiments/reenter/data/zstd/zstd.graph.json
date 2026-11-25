@@ -1,0 +1,4745 @@
+{
+	"guest": "guests/zstd.wasm",
+	"checksum": 2657366272,
+	"total": 129958980,
+	"bytes": 394154,
+	"nodes": [
+		{
+			"name": "FSE_readNCount_bmi2",
+			"count": 13067,
+			"bytes": 784,
+			"params": 6,
+			"result": true,
+			"wide": false
+		},
+		{
+			"name": "FSE_readNCount",
+			"count": 54,
+			"bytes": 20,
+			"params": 5,
+			"result": true,
+			"wide": false
+		},
+		{
+			"name": "HUF_readStats",
+			"count": 0,
+			"bytes": 65,
+			"params": 7,
+			"result": true,
+			"wide": false
+		},
+		{
+			"name": "HUF_readStats_wksp",
+			"count": 4657,
+			"bytes": 517,
+			"params": 10,
+			"result": true,
+			"wide": false
+		},
+		{
+			"name": "FSE_buildDTable_internal",
+			"count": 2693,
+			"bytes": 1325,
+			"params": 6,
+			"result": true,
+			"wide": false
+		},
+		{
+			"name": "FSE_decompress_wksp_bmi2",
+			"count": 6416,
+			"bytes": 3095,
+			"params": 8,
+			"result": true,
+			"wide": false
+		},
+		{
+			"name": "FSE_initDState",
+			"count": 120,
+			"bytes": 212,
+			"params": 3,
+			"result": false,
+			"wide": false
+		},
+		{
+			"name": "BIT_initDStream",
+			"count": 48,
+			"bytes": 252,
+			"params": 3,
+			"result": true,
+			"wide": false
+		},
+		{
+			"name": "ZSTD_XXH64",
+			"count": 0,
+			"bytes": 2181,
+			"params": 3,
+			"result": true,
+			"wide": true
+		},
+		{
+			"name": "ZSTD_XXH64_reset",
+			"count": 26,
+			"bytes": 81,
+			"params": 2,
+			"result": true,
+			"wide": true
+		},
+		{
+			"name": "ZSTD_XXH64_update",
+			"count": 0,
+			"bytes": 583,
+			"params": 3,
+			"result": true,
+			"wide": false
+		},
+		{
+			"name": "ZSTD_XXH64_digest",
+			"count": 0,
+			"bytes": 885,
+			"params": 1,
+			"result": true,
+			"wide": true
+		},
+		{
+			"name": "ZSTD_isError",
+			"count": 6,
+			"bytes": 8,
+			"params": 1,
+			"result": true,
+			"wide": false
+		},
+		{
+			"name": "ZSTD_getErrorCode",
+			"count": 8,
+			"bytes": 16,
+			"params": 1,
+			"result": true,
+			"wide": false
+		},
+		{
+			"name": "FSE_buildCTable_wksp",
+			"count": 144161,
+			"bytes": 1312,
+			"params": 6,
+			"result": true,
+			"wide": false
+		},
+		{
+			"name": "FSE_writeNCount",
+			"count": 476,
+			"bytes": 70,
+			"params": 5,
+			"result": true,
+			"wide": false
+		},
+		{
+			"name": "FSE_writeNCount_generic",
+			"count": 26595,
+			"bytes": 698,
+			"params": 6,
+			"result": true,
+			"wide": false
+		},
+		{
+			"name": "FSE_optimalTableLog_internal",
+			"count": 100,
+			"bytes": 85,
+			"params": 4,
+			"result": true,
+			"wide": false
+		},
+		{
+			"name": "FSE_optimalTableLog",
+			"count": 672,
+			"bytes": 82,
+			"params": 3,
+			"result": true,
+			"wide": false
+		},
+		{
+			"name": "FSE_normalizeCount",
+			"count": 16085,
+			"bytes": 1331,
+			"params": 6,
+			"result": true,
+			"wide": false
+		},
+		{
+			"name": "FSE_buildCTable_rle",
+			"count": 0,
+			"bytes": 38,
+			"params": 2,
+			"result": true,
+			"wide": false
+		},
+		{
+			"name": "FSE_compress_usingCTable",
+			"count": 34,
+			"bytes": 32,
+			"params": 5,
+			"result": true,
+			"wide": false
+		},
+		{
+			"name": "FSE_compress_usingCTable_generic",
+			"count": 15010,
+			"bytes": 889,
+			"params": 6,
+			"result": true,
+			"wide": false
+		},
+		{
+			"name": "HIST_count_simple",
+			"count": 5244,
+			"bytes": 367,
+			"params": 4,
+			"result": true,
+			"wide": false
+		},
+		{
+			"name": "HIST_countFast_wksp",
+			"count": 192,
+			"bytes": 406,
+			"params": 6,
+			"result": true,
+			"wide": false
+		},
+		{
+			"name": "HIST_count_parallel_wksp",
+			"count": 1278085,
+			"bytes": 990,
+			"params": 6,
+			"result": true,
+			"wide": false
+		},
+		{
+			"name": "HIST_count_wksp",
+			"count": 34207,
+			"bytes": 430,
+			"params": 6,
+			"result": true,
+			"wide": false
+		},
+		{
+			"name": "HUF_writeCTable_wksp",
+			"count": 4846,
+			"bytes": 1035,
+			"params": 7,
+			"result": true,
+			"wide": false
+		},
+		{
+			"name": "HUF_readCTable",
+			"count": 0,
+			"bytes": 1319,
+			"params": 5,
+			"result": true,
+			"wide": false
+		},
+		{
+			"name": "HUF_getNbBitsFromCTable",
+			"count": 0,
+			"bytes": 36,
+			"params": 2,
+			"result": true,
+			"wide": false
+		},
+		{
+			"name": "HUF_buildCTable_wksp",
+			"count": 56961,
+			"bytes": 4023,
+			"params": 6,
+			"result": true,
+			"wide": false
+		},
+		{
+			"name": "HUF_simpleQuickSort",
+			"count": 0,
+			"bytes": 1492,
+			"params": 3,
+			"result": false,
+			"wide": false
+		},
+		{
+			"name": "HUF_estimateCompressedSize",
+			"count": 0,
+			"bytes": 179,
+			"params": 3,
+			"result": true,
+			"wide": false
+		},
+		{
+			"name": "HUF_validateCTable",
+			"count": 2445,
+			"bytes": 188,
+			"params": 3,
+			"result": true,
+			"wide": false
+		},
+		{
+			"name": "HUF_compress1X_usingCTable",
+			"count": 0,
+			"bytes": 18,
+			"params": 6,
+			"result": true,
+			"wide": false
+		},
+		{
+			"name": "HUF_compress1X_usingCTable_internal",
+			"count": 43832,
+			"bytes": 2311,
+			"params": 5,
+			"result": true,
+			"wide": false
+		},
+		{
+			"name": "HUF_compress4X_usingCTable",
+			"count": 0,
+			"bytes": 18,
+			"params": 6,
+			"result": true,
+			"wide": false
+		},
+		{
+			"name": "HUF_compress4X_usingCTable_internal",
+			"count": 292,
+			"bytes": 301,
+			"params": 5,
+			"result": true,
+			"wide": false
+		},
+		{
+			"name": "HUF_optimalTableLog",
+			"count": 28,
+			"bytes": 579,
+			"params": 8,
+			"result": true,
+			"wide": false
+		},
+		{
+			"name": "HUF_compress1X_repeat",
+			"count": 0,
+			"bytes": 32,
+			"params": 11,
+			"result": true,
+			"wide": false
+		},
+		{
+			"name": "HUF_compress_internal",
+			"count": 4476,
+			"bytes": 1131,
+			"params": 12,
+			"result": true,
+			"wide": false
+		},
+		{
+			"name": "HUF_compressCTable_internal",
+			"count": 84,
+			"bytes": 103,
+			"params": 7,
+			"result": true,
+			"wide": false
+		},
+		{
+			"name": "HUF_compress4X_repeat",
+			"count": 30,
+			"bytes": 32,
+			"params": 11,
+			"result": true,
+			"wide": false
+		},
+		{
+			"name": "ZSTD_clearAllDicts",
+			"count": 62,
+			"bytes": 300,
+			"params": 1,
+			"result": false,
+			"wide": false
+		},
+		{
+			"name": "ZSTD_getCParams_internal",
+			"count": 236,
+			"bytes": 617,
+			"params": 5,
+			"result": false,
+			"wide": true
+		},
+		{
+			"name": "ZSTD_estimateCCtxSize_usingCCtxParams_internal",
+			"count": 222,
+			"bytes": 433,
+			"params": 9,
+			"result": true,
+			"wide": true
+		},
+		{
+			"name": "ZSTD_resetCCtx_internal",
+			"count": 714,
+			"bytes": 3889,
+			"params": 6,
+			"result": true,
+			"wide": true
+		},
+		{
+			"name": "ZSTD_selectBlockCompressor",
+			"count": 0,
+			"bytes": 65,
+			"params": 3,
+			"result": true,
+			"wide": false
+		},
+		{
+			"name": "ZSTD_resetSeqStore",
+			"count": 0,
+			"bytes": 29,
+			"params": 1,
+			"result": false,
+			"wide": false
+		},
+		{
+			"name": "ZSTD_buildBlockEntropyStats",
+			"count": 0,
+			"bytes": 853,
+			"params": 7,
+			"result": true,
+			"wide": false
+		},
+		{
+			"name": "ZSTD_buildSequencesStatistics",
+			"count": 1897628,
+			"bytes": 929,
+			"params": 11,
+			"result": false,
+			"wide": false
+		},
+		{
+			"name": "ZSTD_compressContinue_internal",
+			"count": 568,
+			"bytes": 3184,
+			"params": 7,
+			"result": true,
+			"wide": false
+		},
+		{
+			"name": "ZSTD_writeFrameHeader",
+			"count": 124,
+			"bytes": 396,
+			"params": 5,
+			"result": true,
+			"wide": true
+		},
+		{
+			"name": "ZSTD_overflowCorrectIfNeeded",
+			"count": 18,
+			"bytes": 1009,
+			"params": 5,
+			"result": false,
+			"wide": false
+		},
+		{
+			"name": "ZSTD_compressBlock_internal",
+			"count": 158,
+			"bytes": 279,
+			"params": 6,
+			"result": true,
+			"wide": false
+		},
+		{
+			"name": "ZSTD_buildSeqStore",
+			"count": 350,
+			"bytes": 1314,
+			"params": 3,
+			"result": true,
+			"wide": false
+		},
+		{
+			"name": "ZSTD_isRLE",
+			"count": 0,
+			"bytes": 390,
+			"params": 2,
+			"result": true,
+			"wide": false
+		},
+		{
+			"name": "ZSTD_deriveBlockSplitsHelper",
+			"count": 0,
+			"bytes": 244,
+			"params": 5,
+			"result": false,
+			"wide": false
+		},
+		{
+			"name": "ZSTD_compressSeqStore_singleBlock",
+			"count": 0,
+			"bytes": 974,
+			"params": 10,
+			"result": true,
+			"wide": false
+		},
+		{
+			"name": "ZSTD_deriveSeqStoreChunk",
+			"count": 0,
+			"bytes": 764,
+			"params": 4,
+			"result": false,
+			"wide": false
+		},
+		{
+			"name": "ZSTD_loadCEntropy",
+			"count": 0,
+			"bytes": 843,
+			"params": 4,
+			"result": true,
+			"wide": false
+		},
+		{
+			"name": "ZSTD_loadDictionaryContent",
+			"count": 0,
+			"bytes": 829,
+			"params": 8,
+			"result": false,
+			"wide": false
+		},
+		{
+			"name": "ZSTD_compressEnd_public",
+			"count": 67,
+			"bytes": 389,
+			"params": 5,
+			"result": true,
+			"wide": false
+		},
+		{
+			"name": "ZSTD_compress_advanced_internal",
+			"count": 38,
+			"bytes": 301,
+			"params": 8,
+			"result": true,
+			"wide": false
+		},
+		{
+			"name": "ZSTD_compress_usingDict",
+			"count": 122,
+			"bytes": 347,
+			"params": 8,
+			"result": true,
+			"wide": false
+		},
+		{
+			"name": "ZSTD_compress",
+			"count": 87,
+			"bytes": 229,
+			"params": 5,
+			"result": true,
+			"wide": false
+		},
+		{
+			"name": "ZSTD_reset_matchState",
+			"count": 434,
+			"bytes": 2577,
+			"params": 7,
+			"result": true,
+			"wide": false
+		},
+		{
+			"name": "ZSTD_copySequencesToSeqStoreExplicitBlockDelim",
+			"count": 0,
+			"bytes": 1628,
+			"params": 7,
+			"result": true,
+			"wide": false
+		},
+		{
+			"name": "ZSTD_entropyCompressSeqStore",
+			"count": 546,
+			"bytes": 674,
+			"params": 9,
+			"result": true,
+			"wide": false
+		},
+		{
+			"name": "ZSTD_reduceTable",
+			"count": 0,
+			"bytes": 491,
+			"params": 3,
+			"result": false,
+			"wide": false
+		},
+		{
+			"name": "ZSTD_copyBlockSequences",
+			"count": 0,
+			"bytes": 591,
+			"params": 3,
+			"result": true,
+			"wide": false
+		},
+		{
+			"name": "ZSTD_buildEntropyStatisticsAndEstimateSubBlockSize",
+			"count": 0,
+			"bytes": 954,
+			"params": 2,
+			"result": true,
+			"wide": false
+		},
+		{
+			"name": "ZSTD_noCompressLiterals",
+			"count": 0,
+			"bytes": 126,
+			"params": 4,
+			"result": true,
+			"wide": false
+		},
+		{
+			"name": "ZSTD_compressRleLiteralsBlock",
+			"count": 0,
+			"bytes": 105,
+			"params": 4,
+			"result": true,
+			"wide": false
+		},
+		{
+			"name": "ZSTD_compressLiterals",
+			"count": 410,
+			"bytes": 935,
+			"params": 12,
+			"result": true,
+			"wide": false
+		},
+		{
+			"name": "ZSTD_fseBitCost",
+			"count": 0,
+			"bytes": 186,
+			"params": 3,
+			"result": true,
+			"wide": false
+		},
+		{
+			"name": "ZSTD_crossEntropyCost",
+			"count": 0,
+			"bytes": 256,
+			"params": 4,
+			"result": true,
+			"wide": false
+		},
+		{
+			"name": "ZSTD_selectEncodingType",
+			"count": 9229,
+			"bytes": 832,
+			"params": 11,
+			"result": true,
+			"wide": false
+		},
+		{
+			"name": "ZSTD_buildCTable",
+			"count": 540,
+			"bytes": 279,
+			"params": 16,
+			"result": true,
+			"wide": false
+		},
+		{
+			"name": "ZSTD_encodeSequences",
+			"count": 8115186,
+			"bytes": 1812,
+			"params": 12,
+			"result": true,
+			"wide": false
+		},
+		{
+			"name": "ZSTD_compressSuperBlock",
+			"count": 0,
+			"bytes": 2960,
+			"params": 6,
+			"result": true,
+			"wide": false
+		},
+		{
+			"name": "ZSTD_compressSubBlock",
+			"count": 0,
+			"bytes": 972,
+			"params": 18,
+			"result": true,
+			"wide": false
+		},
+		{
+			"name": "ZSTD_fillDoubleHashTable",
+			"count": 0,
+			"bytes": 889,
+			"params": 4,
+			"result": false,
+			"wide": false
+		},
+		{
+			"name": "ZSTD_compressBlock_doubleFast",
+			"count": 0,
+			"bytes": 15479,
+			"params": 5,
+			"result": true,
+			"wide": false
+		},
+		{
+			"name": "ZSTD_compressBlock_doubleFast_dictMatchState",
+			"count": 0,
+			"bytes": 16927,
+			"params": 5,
+			"result": true,
+			"wide": false
+		},
+		{
+			"name": "ZSTD_count_2segments",
+			"count": 0,
+			"bytes": 498,
+			"params": 5,
+			"result": true,
+			"wide": false
+		},
+		{
+			"name": "ZSTD_compressBlock_doubleFast_extDict",
+			"count": 0,
+			"bytes": 39,
+			"params": 5,
+			"result": true,
+			"wide": false
+		},
+		{
+			"name": "ZSTD_compressBlock_doubleFast_extDict_generic",
+			"count": 0,
+			"bytes": 4166,
+			"params": 6,
+			"result": true,
+			"wide": false
+		},
+		{
+			"name": "ZSTD_fillHashTable",
+			"count": 0,
+			"bytes": 1286,
+			"params": 4,
+			"result": false,
+			"wide": false
+		},
+		{
+			"name": "ZSTD_compressBlock_fast",
+			"count": 0,
+			"bytes": 18587,
+			"params": 5,
+			"result": true,
+			"wide": false
+		},
+		{
+			"name": "ZSTD_compressBlock_fast_dictMatchState",
+			"count": 0,
+			"bytes": 14326,
+			"params": 5,
+			"result": true,
+			"wide": false
+		},
+		{
+			"name": "_func91_ZSTD_count_2segments",
+			"count": 0,
+			"bytes": 498,
+			"params": 5,
+			"result": true,
+			"wide": false
+		},
+		{
+			"name": "ZSTD_compressBlock_fast_extDict",
+			"count": 0,
+			"bytes": 39,
+			"params": 5,
+			"result": true,
+			"wide": false
+		},
+		{
+			"name": "ZSTD_compressBlock_fast_extDict_generic",
+			"count": 0,
+			"bytes": 2858,
+			"params": 6,
+			"result": true,
+			"wide": false
+		},
+		{
+			"name": "ZSTD_dedicatedDictSearch_lazy_loadDictionary",
+			"count": 0,
+			"bytes": 1190,
+			"params": 2,
+			"result": false,
+			"wide": false
+		},
+		{
+			"name": "ZSTD_insertAndFindFirstIndex",
+			"count": 0,
+			"bytes": 480,
+			"params": 2,
+			"result": true,
+			"wide": false
+		},
+		{
+			"name": "ZSTD_row_update",
+			"count": 0,
+			"bytes": 328,
+			"params": 2,
+			"result": false,
+			"wide": false
+		},
+		{
+			"name": "ZSTD_compressBlock_greedy",
+			"count": 0,
+			"bytes": 2048,
+			"params": 5,
+			"result": true,
+			"wide": false
+		},
+		{
+			"name": "ZSTD_HcFindBestMatch_noDict_4",
+			"count": 0,
+			"bytes": 665,
+			"params": 4,
+			"result": true,
+			"wide": false
+		},
+		{
+			"name": "ZSTD_HcFindBestMatch_noDict_5",
+			"count": 0,
+			"bytes": 681,
+			"params": 4,
+			"result": true,
+			"wide": false
+		},
+		{
+			"name": "ZSTD_HcFindBestMatch_noDict_6",
+			"count": 0,
+			"bytes": 681,
+			"params": 4,
+			"result": true,
+			"wide": false
+		},
+		{
+			"name": "ZSTD_compressBlock_greedy_dictMatchState",
+			"count": 0,
+			"bytes": 1687,
+			"params": 5,
+			"result": true,
+			"wide": false
+		},
+		{
+			"name": "_func102_ZSTD_count_2segments",
+			"count": 0,
+			"bytes": 498,
+			"params": 5,
+			"result": true,
+			"wide": false
+		},
+		{
+			"name": "ZSTD_HcFindBestMatch_dictMatchState_4",
+			"count": 0,
+			"bytes": 948,
+			"params": 4,
+			"result": true,
+			"wide": false
+		},
+		{
+			"name": "ZSTD_HcFindBestMatch_dictMatchState_5",
+			"count": 0,
+			"bytes": 976,
+			"params": 4,
+			"result": true,
+			"wide": false
+		},
+		{
+			"name": "ZSTD_HcFindBestMatch_dictMatchState_6",
+			"count": 0,
+			"bytes": 976,
+			"params": 4,
+			"result": true,
+			"wide": false
+		},
+		{
+			"name": "ZSTD_compressBlock_greedy_dedicatedDictSearch",
+			"count": 0,
+			"bytes": 1703,
+			"params": 5,
+			"result": true,
+			"wide": false
+		},
+		{
+			"name": "ZSTD_HcFindBestMatch_dedicatedDictSearch_4",
+			"count": 0,
+			"bytes": 1191,
+			"params": 4,
+			"result": true,
+			"wide": false
+		},
+		{
+			"name": "ZSTD_HcFindBestMatch_dedicatedDictSearch_5",
+			"count": 0,
+			"bytes": 1214,
+			"params": 4,
+			"result": true,
+			"wide": false
+		},
+		{
+			"name": "ZSTD_HcFindBestMatch_dedicatedDictSearch_6",
+			"count": 0,
+			"bytes": 1214,
+			"params": 4,
+			"result": true,
+			"wide": false
+		},
+		{
+			"name": "ZSTD_compressBlock_greedy_row",
+			"count": 0,
+			"bytes": 2742,
+			"params": 5,
+			"result": true,
+			"wide": false
+		},
+		{
+			"name": "ZSTD_RowFindBestMatch_noDict_4_4",
+			"count": 0,
+			"bytes": 1585,
+			"params": 4,
+			"result": true,
+			"wide": false
+		},
+		{
+			"name": "ZSTD_RowFindBestMatch_noDict_4_5",
+			"count": 0,
+			"bytes": 1738,
+			"params": 4,
+			"result": true,
+			"wide": false
+		},
+		{
+			"name": "ZSTD_RowFindBestMatch_noDict_4_6",
+			"count": 0,
+			"bytes": 1512,
+			"params": 4,
+			"result": true,
+			"wide": false
+		},
+		{
+			"name": "ZSTD_RowFindBestMatch_noDict_5_4",
+			"count": 77704377,
+			"bytes": 1611,
+			"params": 4,
+			"result": true,
+			"wide": false
+		},
+		{
+			"name": "ZSTD_RowFindBestMatch_noDict_5_5",
+			"count": 0,
+			"bytes": 1764,
+			"params": 4,
+			"result": true,
+			"wide": false
+		},
+		{
+			"name": "ZSTD_RowFindBestMatch_noDict_5_6",
+			"count": 0,
+			"bytes": 1538,
+			"params": 4,
+			"result": true,
+			"wide": false
+		},
+		{
+			"name": "ZSTD_RowFindBestMatch_noDict_6_4",
+			"count": 0,
+			"bytes": 1611,
+			"params": 4,
+			"result": true,
+			"wide": false
+		},
+		{
+			"name": "ZSTD_RowFindBestMatch_noDict_6_5",
+			"count": 0,
+			"bytes": 1764,
+			"params": 4,
+			"result": true,
+			"wide": false
+		},
+		{
+			"name": "ZSTD_RowFindBestMatch_noDict_6_6",
+			"count": 0,
+			"bytes": 1538,
+			"params": 4,
+			"result": true,
+			"wide": false
+		},
+		{
+			"name": "ZSTD_compressBlock_greedy_dictMatchState_row",
+			"count": 0,
+			"bytes": 2379,
+			"params": 5,
+			"result": true,
+			"wide": false
+		},
+		{
+			"name": "ZSTD_RowFindBestMatch_dictMatchState_4_4",
+			"count": 0,
+			"bytes": 2173,
+			"params": 4,
+			"result": true,
+			"wide": false
+		},
+		{
+			"name": "ZSTD_RowFindBestMatch_dictMatchState_4_5",
+			"count": 0,
+			"bytes": 2483,
+			"params": 4,
+			"result": true,
+			"wide": false
+		},
+		{
+			"name": "ZSTD_RowFindBestMatch_dictMatchState_4_6",
+			"count": 0,
+			"bytes": 2038,
+			"params": 4,
+			"result": true,
+			"wide": false
+		},
+		{
+			"name": "ZSTD_RowFindBestMatch_dictMatchState_5_4",
+			"count": 0,
+			"bytes": 2207,
+			"params": 4,
+			"result": true,
+			"wide": false
+		},
+		{
+			"name": "ZSTD_RowFindBestMatch_dictMatchState_5_5",
+			"count": 0,
+			"bytes": 2517,
+			"params": 4,
+			"result": true,
+			"wide": false
+		},
+		{
+			"name": "ZSTD_RowFindBestMatch_dictMatchState_5_6",
+			"count": 0,
+			"bytes": 2070,
+			"params": 4,
+			"result": true,
+			"wide": false
+		},
+		{
+			"name": "ZSTD_RowFindBestMatch_dictMatchState_6_4",
+			"count": 0,
+			"bytes": 2207,
+			"params": 4,
+			"result": true,
+			"wide": false
+		},
+		{
+			"name": "ZSTD_RowFindBestMatch_dictMatchState_6_5",
+			"count": 0,
+			"bytes": 2517,
+			"params": 4,
+			"result": true,
+			"wide": false
+		},
+		{
+			"name": "ZSTD_RowFindBestMatch_dictMatchState_6_6",
+			"count": 0,
+			"bytes": 2070,
+			"params": 4,
+			"result": true,
+			"wide": false
+		},
+		{
+			"name": "ZSTD_compressBlock_greedy_dedicatedDictSearch_row",
+			"count": 0,
+			"bytes": 2395,
+			"params": 5,
+			"result": true,
+			"wide": false
+		},
+		{
+			"name": "ZSTD_RowFindBestMatch_dedicatedDictSearch_4_4",
+			"count": 0,
+			"bytes": 2152,
+			"params": 4,
+			"result": true,
+			"wide": false
+		},
+		{
+			"name": "ZSTD_RowFindBestMatch_dedicatedDictSearch_4_5",
+			"count": 0,
+			"bytes": 2309,
+			"params": 4,
+			"result": true,
+			"wide": false
+		},
+		{
+			"name": "ZSTD_RowFindBestMatch_dedicatedDictSearch_4_6",
+			"count": 0,
+			"bytes": 2067,
+			"params": 4,
+			"result": true,
+			"wide": false
+		},
+		{
+			"name": "ZSTD_RowFindBestMatch_dedicatedDictSearch_5_4",
+			"count": 0,
+			"bytes": 2187,
+			"params": 4,
+			"result": true,
+			"wide": false
+		},
+		{
+			"name": "ZSTD_RowFindBestMatch_dedicatedDictSearch_5_5",
+			"count": 0,
+			"bytes": 2344,
+			"params": 4,
+			"result": true,
+			"wide": false
+		},
+		{
+			"name": "ZSTD_RowFindBestMatch_dedicatedDictSearch_5_6",
+			"count": 0,
+			"bytes": 2100,
+			"params": 4,
+			"result": true,
+			"wide": false
+		},
+		{
+			"name": "ZSTD_RowFindBestMatch_dedicatedDictSearch_6_4",
+			"count": 0,
+			"bytes": 2187,
+			"params": 4,
+			"result": true,
+			"wide": false
+		},
+		{
+			"name": "ZSTD_RowFindBestMatch_dedicatedDictSearch_6_5",
+			"count": 0,
+			"bytes": 2344,
+			"params": 4,
+			"result": true,
+			"wide": false
+		},
+		{
+			"name": "ZSTD_RowFindBestMatch_dedicatedDictSearch_6_6",
+			"count": 0,
+			"bytes": 2100,
+			"params": 4,
+			"result": true,
+			"wide": false
+		},
+		{
+			"name": "ZSTD_compressBlock_lazy",
+			"count": 0,
+			"bytes": 2563,
+			"params": 5,
+			"result": true,
+			"wide": false
+		},
+		{
+			"name": "ZSTD_compressBlock_lazy_dictMatchState",
+			"count": 0,
+			"bytes": 2022,
+			"params": 5,
+			"result": true,
+			"wide": false
+		},
+		{
+			"name": "ZSTD_compressBlock_lazy_dedicatedDictSearch",
+			"count": 0,
+			"bytes": 2022,
+			"params": 5,
+			"result": true,
+			"wide": false
+		},
+		{
+			"name": "ZSTD_compressBlock_lazy_row",
+			"count": 8581437,
+			"bytes": 3440,
+			"params": 5,
+			"result": true,
+			"wide": false
+		},
+		{
+			"name": "ZSTD_compressBlock_lazy_dictMatchState_row",
+			"count": 0,
+			"bytes": 2904,
+			"params": 5,
+			"result": true,
+			"wide": false
+		},
+		{
+			"name": "ZSTD_compressBlock_lazy_dedicatedDictSearch_row",
+			"count": 0,
+			"bytes": 2904,
+			"params": 5,
+			"result": true,
+			"wide": false
+		},
+		{
+			"name": "ZSTD_compressBlock_lazy2",
+			"count": 0,
+			"bytes": 2991,
+			"params": 5,
+			"result": true,
+			"wide": false
+		},
+		{
+			"name": "ZSTD_compressBlock_lazy2_dictMatchState",
+			"count": 0,
+			"bytes": 2281,
+			"params": 5,
+			"result": true,
+			"wide": false
+		},
+		{
+			"name": "ZSTD_compressBlock_lazy2_dedicatedDictSearch",
+			"count": 0,
+			"bytes": 2281,
+			"params": 5,
+			"result": true,
+			"wide": false
+		},
+		{
+			"name": "ZSTD_compressBlock_lazy2_row",
+			"count": 0,
+			"bytes": 4051,
+			"params": 5,
+			"result": true,
+			"wide": false
+		},
+		{
+			"name": "ZSTD_compressBlock_lazy2_dictMatchState_row",
+			"count": 0,
+			"bytes": 3339,
+			"params": 5,
+			"result": true,
+			"wide": false
+		},
+		{
+			"name": "ZSTD_compressBlock_lazy2_dedicatedDictSearch_row",
+			"count": 0,
+			"bytes": 3339,
+			"params": 5,
+			"result": true,
+			"wide": false
+		},
+		{
+			"name": "ZSTD_compressBlock_btlazy2",
+			"count": 0,
+			"bytes": 2991,
+			"params": 5,
+			"result": true,
+			"wide": false
+		},
+		{
+			"name": "ZSTD_BtFindBestMatch_noDict_4",
+			"count": 0,
+			"bytes": 365,
+			"params": 4,
+			"result": true,
+			"wide": false
+		},
+		{
+			"name": "ZSTD_BtFindBestMatch_noDict_5",
+			"count": 0,
+			"bytes": 386,
+			"params": 4,
+			"result": true,
+			"wide": false
+		},
+		{
+			"name": "ZSTD_BtFindBestMatch_noDict_6",
+			"count": 0,
+			"bytes": 386,
+			"params": 4,
+			"result": true,
+			"wide": false
+		},
+		{
+			"name": "ZSTD_compressBlock_btlazy2_dictMatchState",
+			"count": 0,
+			"bytes": 2281,
+			"params": 5,
+			"result": true,
+			"wide": false
+		},
+		{
+			"name": "ZSTD_BtFindBestMatch_dictMatchState_4",
+			"count": 0,
+			"bytes": 365,
+			"params": 4,
+			"result": true,
+			"wide": false
+		},
+		{
+			"name": "ZSTD_BtFindBestMatch_dictMatchState_5",
+			"count": 0,
+			"bytes": 386,
+			"params": 4,
+			"result": true,
+			"wide": false
+		},
+		{
+			"name": "ZSTD_BtFindBestMatch_dictMatchState_6",
+			"count": 0,
+			"bytes": 386,
+			"params": 4,
+			"result": true,
+			"wide": false
+		},
+		{
+			"name": "ZSTD_compressBlock_greedy_extDict",
+			"count": 0,
+			"bytes": 1758,
+			"params": 5,
+			"result": true,
+			"wide": false
+		},
+		{
+			"name": "ZSTD_HcFindBestMatch_extDict_4",
+			"count": 0,
+			"bytes": 746,
+			"params": 4,
+			"result": true,
+			"wide": false
+		},
+		{
+			"name": "ZSTD_HcFindBestMatch_extDict_5",
+			"count": 0,
+			"bytes": 763,
+			"params": 4,
+			"result": true,
+			"wide": false
+		},
+		{
+			"name": "ZSTD_HcFindBestMatch_extDict_6",
+			"count": 0,
+			"bytes": 763,
+			"params": 4,
+			"result": true,
+			"wide": false
+		},
+		{
+			"name": "ZSTD_compressBlock_greedy_extDict_row",
+			"count": 0,
+			"bytes": 2454,
+			"params": 5,
+			"result": true,
+			"wide": false
+		},
+		{
+			"name": "ZSTD_RowFindBestMatch_extDict_4_4",
+			"count": 0,
+			"bytes": 1667,
+			"params": 4,
+			"result": true,
+			"wide": false
+		},
+		{
+			"name": "ZSTD_RowFindBestMatch_extDict_4_5",
+			"count": 0,
+			"bytes": 1820,
+			"params": 4,
+			"result": true,
+			"wide": false
+		},
+		{
+			"name": "ZSTD_RowFindBestMatch_extDict_4_6",
+			"count": 0,
+			"bytes": 1594,
+			"params": 4,
+			"result": true,
+			"wide": false
+		},
+		{
+			"name": "ZSTD_RowFindBestMatch_extDict_5_4",
+			"count": 0,
+			"bytes": 1693,
+			"params": 4,
+			"result": true,
+			"wide": false
+		},
+		{
+			"name": "ZSTD_RowFindBestMatch_extDict_5_5",
+			"count": 0,
+			"bytes": 1846,
+			"params": 4,
+			"result": true,
+			"wide": false
+		},
+		{
+			"name": "ZSTD_RowFindBestMatch_extDict_5_6",
+			"count": 0,
+			"bytes": 1618,
+			"params": 4,
+			"result": true,
+			"wide": false
+		},
+		{
+			"name": "ZSTD_RowFindBestMatch_extDict_6_4",
+			"count": 0,
+			"bytes": 1693,
+			"params": 4,
+			"result": true,
+			"wide": false
+		},
+		{
+			"name": "ZSTD_RowFindBestMatch_extDict_6_5",
+			"count": 0,
+			"bytes": 1846,
+			"params": 4,
+			"result": true,
+			"wide": false
+		},
+		{
+			"name": "ZSTD_RowFindBestMatch_extDict_6_6",
+			"count": 0,
+			"bytes": 1618,
+			"params": 4,
+			"result": true,
+			"wide": false
+		},
+		{
+			"name": "ZSTD_compressBlock_lazy_extDict",
+			"count": 0,
+			"bytes": 2210,
+			"params": 5,
+			"result": true,
+			"wide": false
+		},
+		{
+			"name": "ZSTD_compressBlock_lazy_extDict_row",
+			"count": 0,
+			"bytes": 3093,
+			"params": 5,
+			"result": true,
+			"wide": false
+		},
+		{
+			"name": "ZSTD_compressBlock_lazy2_extDict",
+			"count": 0,
+			"bytes": 2456,
+			"params": 5,
+			"result": true,
+			"wide": false
+		},
+		{
+			"name": "ZSTD_compressBlock_lazy2_extDict_row",
+			"count": 0,
+			"bytes": 3522,
+			"params": 5,
+			"result": true,
+			"wide": false
+		},
+		{
+			"name": "ZSTD_compressBlock_btlazy2_extDict",
+			"count": 0,
+			"bytes": 2456,
+			"params": 5,
+			"result": true,
+			"wide": false
+		},
+		{
+			"name": "ZSTD_BtFindBestMatch_extDict_4",
+			"count": 0,
+			"bytes": 365,
+			"params": 4,
+			"result": true,
+			"wide": false
+		},
+		{
+			"name": "ZSTD_BtFindBestMatch_extDict_5",
+			"count": 0,
+			"bytes": 386,
+			"params": 4,
+			"result": true,
+			"wide": false
+		},
+		{
+			"name": "ZSTD_BtFindBestMatch_extDict_6",
+			"count": 0,
+			"bytes": 386,
+			"params": 4,
+			"result": true,
+			"wide": false
+		},
+		{
+			"name": "ZSTD_DUBT_findBestMatch",
+			"count": 0,
+			"bytes": 2288,
+			"params": 6,
+			"result": true,
+			"wide": false
+		},
+		{
+			"name": "ZSTD_ldm_adjustParameters",
+			"count": 0,
+			"bytes": 127,
+			"params": 2,
+			"result": false,
+			"wide": false
+		},
+		{
+			"name": "ZSTD_ldm_getTableSize",
+			"count": 24,
+			"bytes": 47,
+			"params": 1,
+			"result": true,
+			"wide": false
+		},
+		{
+			"name": "ZSTD_ldm_getMaxNbSeq",
+			"count": 18,
+			"bytes": 33,
+			"params": 2,
+			"result": true,
+			"wide": false
+		},
+		{
+			"name": "ZSTD_ldm_fillHashTable",
+			"count": 0,
+			"bytes": 370,
+			"params": 4,
+			"result": false,
+			"wide": false
+		},
+		{
+			"name": "ZSTD_ldm_gear_feed",
+			"count": 0,
+			"bytes": 576,
+			"params": 5,
+			"result": true,
+			"wide": false
+		},
+		{
+			"name": "ZSTD_ldm_generateSequences",
+			"count": 0,
+			"bytes": 2674,
+			"params": 5,
+			"result": true,
+			"wide": false
+		},
+		{
+			"name": "ZSTD_ldm_skipSequences",
+			"count": 0,
+			"bytes": 223,
+			"params": 3,
+			"result": false,
+			"wide": false
+		},
+		{
+			"name": "ZSTD_ldm_skipRawSeqStoreBytes",
+			"count": 0,
+			"bytes": 157,
+			"params": 2,
+			"result": false,
+			"wide": false
+		},
+		{
+			"name": "ZSTD_ldm_blockCompress",
+			"count": 0,
+			"bytes": 1729,
+			"params": 7,
+			"result": true,
+			"wide": false
+		},
+		{
+			"name": "ZSTD_updateTree",
+			"count": 0,
+			"bytes": 78,
+			"params": 3,
+			"result": false,
+			"wide": false
+		},
+		{
+			"name": "ZSTD_insertBt1",
+			"count": 0,
+			"bytes": 1029,
+			"params": 6,
+			"result": true,
+			"wide": false
+		},
+		{
+			"name": "ZSTD_compressBlock_btopt",
+			"count": 0,
+			"bytes": 20,
+			"params": 5,
+			"result": true,
+			"wide": false
+		},
+		{
+			"name": "ZSTD_compressBlock_opt0",
+			"count": 0,
+			"bytes": 4616,
+			"params": 6,
+			"result": true,
+			"wide": false
+		},
+		{
+			"name": "ZSTD_opt_getNextMatchAndUpdateSeqStore",
+			"count": 0,
+			"bytes": 556,
+			"params": 3,
+			"result": false,
+			"wide": false
+		},
+		{
+			"name": "ZSTD_rescaleFreqs",
+			"count": 0,
+			"bytes": 2304,
+			"params": 4,
+			"result": false,
+			"wide": false
+		},
+		{
+			"name": "ZSTD_optLdm_processMatchCandidate",
+			"count": 0,
+			"bytes": 325,
+			"params": 5,
+			"result": false,
+			"wide": false
+		},
+		{
+			"name": "ZSTD_updateStats",
+			"count": 0,
+			"bytes": 451,
+			"params": 5,
+			"result": false,
+			"wide": false
+		},
+		{
+			"name": "ZSTD_compressBlock_btultra",
+			"count": 0,
+			"bytes": 20,
+			"params": 5,
+			"result": true,
+			"wide": false
+		},
+		{
+			"name": "ZSTD_compressBlock_opt2",
+			"count": 0,
+			"bytes": 5811,
+			"params": 6,
+			"result": true,
+			"wide": false
+		},
+		{
+			"name": "ZSTD_compressBlock_btultra2",
+			"count": 0,
+			"bytes": 202,
+			"params": 5,
+			"result": true,
+			"wide": false
+		},
+		{
+			"name": "ZSTD_compressBlock_btopt_dictMatchState",
+			"count": 0,
+			"bytes": 20,
+			"params": 5,
+			"result": true,
+			"wide": false
+		},
+		{
+			"name": "ZSTD_compressBlock_btopt_extDict",
+			"count": 0,
+			"bytes": 20,
+			"params": 5,
+			"result": true,
+			"wide": false
+		},
+		{
+			"name": "ZSTD_compressBlock_btultra_dictMatchState",
+			"count": 0,
+			"bytes": 20,
+			"params": 5,
+			"result": true,
+			"wide": false
+		},
+		{
+			"name": "ZSTD_compressBlock_btultra_extDict",
+			"count": 0,
+			"bytes": 20,
+			"params": 5,
+			"result": true,
+			"wide": false
+		},
+		{
+			"name": "_func207_ZSTD_count_2segments",
+			"count": 0,
+			"bytes": 498,
+			"params": 5,
+			"result": true,
+			"wide": false
+		},
+		{
+			"name": "ZSTD_setBasePrices",
+			"count": 0,
+			"bytes": 257,
+			"params": 2,
+			"result": false,
+			"wide": false
+		},
+		{
+			"name": "ZSTD_btGetAllMatches_noDict_3",
+			"count": 0,
+			"bytes": 1950,
+			"params": 8,
+			"result": true,
+			"wide": false
+		},
+		{
+			"name": "ZSTD_btGetAllMatches_noDict_4",
+			"count": 0,
+			"bytes": 1327,
+			"params": 8,
+			"result": true,
+			"wide": false
+		},
+		{
+			"name": "ZSTD_btGetAllMatches_noDict_5",
+			"count": 0,
+			"bytes": 1343,
+			"params": 8,
+			"result": true,
+			"wide": false
+		},
+		{
+			"name": "ZSTD_btGetAllMatches_noDict_6",
+			"count": 0,
+			"bytes": 1343,
+			"params": 8,
+			"result": true,
+			"wide": false
+		},
+		{
+			"name": "ZSTD_btGetAllMatches_extDict_3",
+			"count": 0,
+			"bytes": 2157,
+			"params": 8,
+			"result": true,
+			"wide": false
+		},
+		{
+			"name": "ZSTD_btGetAllMatches_extDict_4",
+			"count": 0,
+			"bytes": 1495,
+			"params": 8,
+			"result": true,
+			"wide": false
+		},
+		{
+			"name": "ZSTD_btGetAllMatches_extDict_5",
+			"count": 0,
+			"bytes": 1511,
+			"params": 8,
+			"result": true,
+			"wide": false
+		},
+		{
+			"name": "ZSTD_btGetAllMatches_extDict_6",
+			"count": 0,
+			"bytes": 1511,
+			"params": 8,
+			"result": true,
+			"wide": false
+		},
+		{
+			"name": "ZSTD_btGetAllMatches_dictMatchState_3",
+			"count": 0,
+			"bytes": 2471,
+			"params": 8,
+			"result": true,
+			"wide": false
+		},
+		{
+			"name": "ZSTD_btGetAllMatches_dictMatchState_4",
+			"count": 0,
+			"bytes": 1842,
+			"params": 8,
+			"result": true,
+			"wide": false
+		},
+		{
+			"name": "ZSTD_btGetAllMatches_dictMatchState_5",
+			"count": 0,
+			"bytes": 1853,
+			"params": 8,
+			"result": true,
+			"wide": false
+		},
+		{
+			"name": "ZSTD_btGetAllMatches_dictMatchState_6",
+			"count": 0,
+			"bytes": 1853,
+			"params": 8,
+			"result": true,
+			"wide": false
+		},
+		{
+			"name": "HUF_readDTableX1_wksp",
+			"count": 10190,
+			"bytes": 2937,
+			"params": 6,
+			"result": true,
+			"wide": false
+		},
+		{
+			"name": "HUF_readDTableX2_wksp",
+			"count": 0,
+			"bytes": 2112,
+			"params": 6,
+			"result": true,
+			"wide": false
+		},
+		{
+			"name": "HUF_fillDTableX2ForWeight",
+			"count": 0,
+			"bytes": 1537,
+			"params": 7,
+			"result": false,
+			"wide": false
+		},
+		{
+			"name": "HUF_decompress1X2_usingDTable_internal",
+			"count": 0,
+			"bytes": 957,
+			"params": 5,
+			"result": true,
+			"wide": false
+		},
+		{
+			"name": "HUF_decompress1X1_usingDTable_internal",
+			"count": 0,
+			"bytes": 874,
+			"params": 5,
+			"result": true,
+			"wide": false
+		},
+		{
+			"name": "HUF_decompress1X1_DCtx_wksp",
+			"count": 0,
+			"bytes": 75,
+			"params": 8,
+			"result": true,
+			"wide": false
+		},
+		{
+			"name": "HUF_decompress1X_usingDTable",
+			"count": 0,
+			"bytes": 46,
+			"params": 6,
+			"result": true,
+			"wide": false
+		},
+		{
+			"name": "HUF_decompress4X_usingDTable",
+			"count": 13,
+			"bytes": 46,
+			"params": 6,
+			"result": true,
+			"wide": false
+		},
+		{
+			"name": "HUF_decompress4X2_usingDTable_internal",
+			"count": 0,
+			"bytes": 4828,
+			"params": 5,
+			"result": true,
+			"wide": false
+		},
+		{
+			"name": "HUF_decompress4X1_usingDTable_internal",
+			"count": 51443,
+			"bytes": 4201,
+			"params": 5,
+			"result": true,
+			"wide": false
+		},
+		{
+			"name": "_func231_BIT_initDStream",
+			"count": 96,
+			"bytes": 252,
+			"params": 3,
+			"result": true,
+			"wide": false
+		},
+		{
+			"name": "HUF_decompress4X_hufOnly_wksp",
+			"count": 82,
+			"bytes": 249,
+			"params": 8,
+			"result": true,
+			"wide": false
+		},
+		{
+			"name": "ZSTD_DDict_dictContent",
+			"count": 0,
+			"bytes": 7,
+			"params": 1,
+			"result": true,
+			"wide": false
+		},
+		{
+			"name": "ZSTD_DDict_dictSize",
+			"count": 0,
+			"bytes": 7,
+			"params": 1,
+			"result": true,
+			"wide": false
+		},
+		{
+			"name": "ZSTD_copyDDictParameters",
+			"count": 0,
+			"bytes": 189,
+			"params": 2,
+			"result": false,
+			"wide": false
+		},
+		{
+			"name": "ZSTD_freeDDict",
+			"count": 10,
+			"bytes": 134,
+			"params": 1,
+			"result": true,
+			"wide": false
+		},
+		{
+			"name": "ZSTD_getDictID_fromDDict",
+			"count": 0,
+			"bytes": 19,
+			"params": 1,
+			"result": true,
+			"wide": false
+		},
+		{
+			"name": "ZSTD_freeDCtx",
+			"count": 52,
+			"bytes": 302,
+			"params": 1,
+			"result": true,
+			"wide": false
+		},
+		{
+			"name": "ZSTD_getFrameHeader_advanced",
+			"count": 179,
+			"bytes": 748,
+			"params": 4,
+			"result": true,
+			"wide": false
+		},
+		{
+			"name": "ZSTD_decompressMultiFrame",
+			"count": 453,
+			"bytes": 1366,
+			"params": 8,
+			"result": true,
+			"wide": false
+		},
+		{
+			"name": "ZSTD_decompressBegin_usingDict",
+			"count": 70,
+			"bytes": 375,
+			"params": 3,
+			"result": true,
+			"wide": false
+		},
+		{
+			"name": "ZSTD_decodeFrameHeader",
+			"count": 52,
+			"bytes": 200,
+			"params": 3,
+			"result": true,
+			"wide": false
+		},
+		{
+			"name": "ZSTD_decompress",
+			"count": 87,
+			"bytes": 243,
+			"params": 4,
+			"result": true,
+			"wide": false
+		},
+		{
+			"name": "ZSTD_DCtx_selectFrameDDict",
+			"count": 0,
+			"bytes": 220,
+			"params": 1,
+			"result": false,
+			"wide": false
+		},
+		{
+			"name": "ZSTD_loadDEntropy",
+			"count": 0,
+			"bytes": 532,
+			"params": 3,
+			"result": true,
+			"wide": false
+		},
+		{
+			"name": "ZSTD_getcBlockSize",
+			"count": 90,
+			"bytes": 100,
+			"params": 3,
+			"result": true,
+			"wide": false
+		},
+		{
+			"name": "ZSTD_decodeLiteralsBlock",
+			"count": 390,
+			"bytes": 1429,
+			"params": 6,
+			"result": true,
+			"wide": false
+		},
+		{
+			"name": "ZSTD_allocateLiteralsBuffer",
+			"count": 89,
+			"bytes": 201,
+			"params": 7,
+			"result": false,
+			"wide": false
+		},
+		{
+			"name": "ZSTD_buildFSETable",
+			"count": 213084,
+			"bytes": 1171,
+			"params": 9,
+			"result": false,
+			"wide": false
+		},
+		{
+			"name": "ZSTD_decodeSeqHeaders",
+			"count": 350,
+			"bytes": 446,
+			"params": 4,
+			"result": true,
+			"wide": false
+		},
+		{
+			"name": "ZSTD_buildSeqTable",
+			"count": 378,
+			"bytes": 365,
+			"params": 14,
+			"result": true,
+			"wide": false
+		},
+		{
+			"name": "ZSTD_decompressBlock_internal",
+			"count": 310,
+			"bytes": 11673,
+			"params": 6,
+			"result": true,
+			"wide": false
+		},
+		{
+			"name": "ZSTD_decompressSequencesSplitLitBuffer",
+			"count": 0,
+			"bytes": 7644,
+			"params": 7,
+			"result": true,
+			"wide": false
+		},
+		{
+			"name": "ZSTD_decompressSequences",
+			"count": 11294241,
+			"bytes": 3669,
+			"params": 7,
+			"result": true,
+			"wide": false
+		},
+		{
+			"name": "ZSTD_execSequenceEnd",
+			"count": 258,
+			"bytes": 611,
+			"params": 8,
+			"result": true,
+			"wide": false
+		},
+		{
+			"name": "ZSTD_execSequenceEndSplitLitBuffer",
+			"count": 0,
+			"bytes": 725,
+			"params": 9,
+			"result": true,
+			"wide": false
+		},
+		{
+			"name": "ZSTD_checkContinuity",
+			"count": 30,
+			"bytes": 77,
+			"params": 3,
+			"result": false,
+			"wide": false
+		},
+		{
+			"name": "ZSTD_safecopy",
+			"count": 323,
+			"bytes": 661,
+			"params": 5,
+			"result": false,
+			"wide": false
+		},
+		{
+			"name": "memcpy",
+			"count": 30597,
+			"bytes": 241,
+			"params": 3,
+			"result": true,
+			"wide": false
+		},
+		{
+			"name": "memmove",
+			"count": 9082,
+			"bytes": 429,
+			"params": 3,
+			"result": true,
+			"wide": false
+		},
+		{
+			"name": "memset",
+			"count": 15646537,
+			"bytes": 175,
+			"params": 3,
+			"result": true,
+			"wide": false
+		},
+		{
+			"name": "malloc",
+			"count": 50,
+			"bytes": 65,
+			"params": 1,
+			"result": true,
+			"wide": false
+		},
+		{
+			"name": "free",
+			"count": 0,
+			"bytes": 2,
+			"params": 1,
+			"result": false,
+			"wide": false
+		},
+		{
+			"name": "run",
+			"count": 4726899,
+			"bytes": 594,
+			"params": 1,
+			"result": true,
+			"wide": false
+		}
+	],
+	"edges": [
+		{
+			"from": "FSE_readNCount_bmi2",
+			"to": "FSE_readNCount_bmi2",
+			"count": 0
+		},
+		{
+			"from": "FSE_readNCount_bmi2",
+			"to": "memcpy",
+			"count": 0
+		},
+		{
+			"from": "FSE_readNCount_bmi2",
+			"to": "memset",
+			"count": 7
+		},
+		{
+			"from": "FSE_readNCount",
+			"to": "FSE_readNCount_bmi2",
+			"count": 6
+		},
+		{
+			"from": "HUF_readStats",
+			"to": "HUF_readStats_wksp",
+			"count": 0
+		},
+		{
+			"from": "HUF_readStats_wksp",
+			"to": "FSE_decompress_wksp_bmi2",
+			"count": 1
+		},
+		{
+			"from": "FSE_decompress_wksp_bmi2",
+			"to": "FSE_readNCount_bmi2",
+			"count": 1
+		},
+		{
+			"from": "FSE_decompress_wksp_bmi2",
+			"to": "FSE_buildDTable_internal",
+			"count": 1
+		},
+		{
+			"from": "FSE_decompress_wksp_bmi2",
+			"to": "FSE_initDState",
+			"count": 2
+		},
+		{
+			"from": "FSE_decompress_wksp_bmi2",
+			"to": "BIT_initDStream",
+			"count": 1
+		},
+		{
+			"from": "ZSTD_XXH64_reset",
+			"to": "memset",
+			"count": 1
+		},
+		{
+			"from": "ZSTD_XXH64_update",
+			"to": "memcpy",
+			"count": 0
+		},
+		{
+			"from": "FSE_writeNCount",
+			"to": "FSE_writeNCount_generic",
+			"count": 14
+		},
+		{
+			"from": "FSE_compress_usingCTable",
+			"to": "FSE_compress_usingCTable_generic",
+			"count": 2
+		},
+		{
+			"from": "HIST_count_simple",
+			"to": "memset",
+			"count": 2
+		},
+		{
+			"from": "HIST_countFast_wksp",
+			"to": "HIST_count_parallel_wksp",
+			"count": 6
+		},
+		{
+			"from": "HIST_countFast_wksp",
+			"to": "memset",
+			"count": 0
+		},
+		{
+			"from": "HIST_count_parallel_wksp",
+			"to": "memmove",
+			"count": 6
+		},
+		{
+			"from": "HIST_count_parallel_wksp",
+			"to": "memset",
+			"count": 6
+		},
+		{
+			"from": "HIST_count_wksp",
+			"to": "HIST_count_parallel_wksp",
+			"count": 0
+		},
+		{
+			"from": "HIST_count_wksp",
+			"to": "memset",
+			"count": 2
+		},
+		{
+			"from": "HUF_writeCTable_wksp",
+			"to": "FSE_buildCTable_wksp",
+			"count": 2
+		},
+		{
+			"from": "HUF_writeCTable_wksp",
+			"to": "FSE_writeNCount",
+			"count": 2
+		},
+		{
+			"from": "HUF_writeCTable_wksp",
+			"to": "FSE_optimalTableLog",
+			"count": 2
+		},
+		{
+			"from": "HUF_writeCTable_wksp",
+			"to": "FSE_normalizeCount",
+			"count": 2
+		},
+		{
+			"from": "HUF_writeCTable_wksp",
+			"to": "FSE_compress_usingCTable",
+			"count": 2
+		},
+		{
+			"from": "HUF_writeCTable_wksp",
+			"to": "HIST_count_simple",
+			"count": 2
+		},
+		{
+			"from": "HUF_readCTable",
+			"to": "HUF_readStats",
+			"count": 0
+		},
+		{
+			"from": "HUF_buildCTable_wksp",
+			"to": "HUF_simpleQuickSort",
+			"count": 0
+		},
+		{
+			"from": "HUF_buildCTable_wksp",
+			"to": "memset",
+			"count": 4
+		},
+		{
+			"from": "HUF_simpleQuickSort",
+			"to": "HUF_simpleQuickSort",
+			"count": 0
+		},
+		{
+			"from": "HUF_compress1X_usingCTable",
+			"to": "HUF_compress1X_usingCTable_internal",
+			"count": 0
+		},
+		{
+			"from": "HUF_compress4X_usingCTable",
+			"to": "HUF_compress4X_usingCTable_internal",
+			"count": 0
+		},
+		{
+			"from": "HUF_compress4X_usingCTable_internal",
+			"to": "HUF_compress1X_usingCTable_internal",
+			"count": 8
+		},
+		{
+			"from": "HUF_optimalTableLog",
+			"to": "FSE_optimalTableLog_internal",
+			"count": 2
+		},
+		{
+			"from": "HUF_optimalTableLog",
+			"to": "HUF_writeCTable_wksp",
+			"count": 0
+		},
+		{
+			"from": "HUF_optimalTableLog",
+			"to": "HUF_buildCTable_wksp",
+			"count": 0
+		},
+		{
+			"from": "HUF_compress1X_repeat",
+			"to": "HUF_compress_internal",
+			"count": 0
+		},
+		{
+			"from": "HUF_compress_internal",
+			"to": "HIST_count_simple",
+			"count": 0
+		},
+		{
+			"from": "HUF_compress_internal",
+			"to": "HIST_count_wksp",
+			"count": 2
+		},
+		{
+			"from": "HUF_compress_internal",
+			"to": "HUF_writeCTable_wksp",
+			"count": 2
+		},
+		{
+			"from": "HUF_compress_internal",
+			"to": "HUF_buildCTable_wksp",
+			"count": 2
+		},
+		{
+			"from": "HUF_compress_internal",
+			"to": "HUF_validateCTable",
+			"count": 1
+		},
+		{
+			"from": "HUF_compress_internal",
+			"to": "HUF_optimalTableLog",
+			"count": 2
+		},
+		{
+			"from": "HUF_compress_internal",
+			"to": "HUF_compressCTable_internal",
+			"count": 2
+		},
+		{
+			"from": "HUF_compress_internal",
+			"to": "memcpy",
+			"count": 1
+		},
+		{
+			"from": "HUF_compressCTable_internal",
+			"to": "HUF_compress1X_usingCTable_internal",
+			"count": 0
+		},
+		{
+			"from": "HUF_compressCTable_internal",
+			"to": "HUF_compress4X_usingCTable_internal",
+			"count": 2
+		},
+		{
+			"from": "HUF_compress4X_repeat",
+			"to": "HUF_compress_internal",
+			"count": 2
+		},
+		{
+			"from": "ZSTD_clearAllDicts",
+			"to": "free",
+			"count": 0
+		},
+		{
+			"from": "ZSTD_estimateCCtxSize_usingCCtxParams_internal",
+			"to": "ZSTD_ldm_getTableSize",
+			"count": 1
+		},
+		{
+			"from": "ZSTD_estimateCCtxSize_usingCCtxParams_internal",
+			"to": "ZSTD_ldm_getMaxNbSeq",
+			"count": 1
+		},
+		{
+			"from": "ZSTD_resetCCtx_internal",
+			"to": "ZSTD_XXH64_reset",
+			"count": 1
+		},
+		{
+			"from": "ZSTD_resetCCtx_internal",
+			"to": "ZSTD_estimateCCtxSize_usingCCtxParams_internal",
+			"count": 1
+		},
+		{
+			"from": "ZSTD_resetCCtx_internal",
+			"to": "ZSTD_reset_matchState",
+			"count": 1
+		},
+		{
+			"from": "ZSTD_resetCCtx_internal",
+			"to": "ZSTD_ldm_adjustParameters",
+			"count": 0
+		},
+		{
+			"from": "ZSTD_resetCCtx_internal",
+			"to": "ZSTD_ldm_getMaxNbSeq",
+			"count": 1
+		},
+		{
+			"from": "ZSTD_resetCCtx_internal",
+			"to": "memcpy",
+			"count": 1
+		},
+		{
+			"from": "ZSTD_resetCCtx_internal",
+			"to": "memset",
+			"count": 0
+		},
+		{
+			"from": "ZSTD_resetCCtx_internal",
+			"to": "malloc",
+			"count": 1
+		},
+		{
+			"from": "ZSTD_resetCCtx_internal",
+			"to": "free",
+			"count": 0
+		},
+		{
+			"from": "ZSTD_buildBlockEntropyStats",
+			"to": "HIST_count_wksp",
+			"count": 0
+		},
+		{
+			"from": "ZSTD_buildBlockEntropyStats",
+			"to": "HUF_writeCTable_wksp",
+			"count": 0
+		},
+		{
+			"from": "ZSTD_buildBlockEntropyStats",
+			"to": "HUF_buildCTable_wksp",
+			"count": 0
+		},
+		{
+			"from": "ZSTD_buildBlockEntropyStats",
+			"to": "HUF_estimateCompressedSize",
+			"count": 0
+		},
+		{
+			"from": "ZSTD_buildBlockEntropyStats",
+			"to": "HUF_validateCTable",
+			"count": 0
+		},
+		{
+			"from": "ZSTD_buildBlockEntropyStats",
+			"to": "HUF_optimalTableLog",
+			"count": 0
+		},
+		{
+			"from": "ZSTD_buildBlockEntropyStats",
+			"to": "ZSTD_buildSequencesStatistics",
+			"count": 0
+		},
+		{
+			"from": "ZSTD_buildBlockEntropyStats",
+			"to": "memcpy",
+			"count": 0
+		},
+		{
+			"from": "ZSTD_buildBlockEntropyStats",
+			"to": "memset",
+			"count": 0
+		},
+		{
+			"from": "ZSTD_buildSequencesStatistics",
+			"to": "HIST_countFast_wksp",
+			"count": 6
+		},
+		{
+			"from": "ZSTD_buildSequencesStatistics",
+			"to": "ZSTD_selectEncodingType",
+			"count": 6
+		},
+		{
+			"from": "ZSTD_buildSequencesStatistics",
+			"to": "ZSTD_buildCTable",
+			"count": 6
+		},
+		{
+			"from": "ZSTD_compressContinue_internal",
+			"to": "ZSTD_XXH64_update",
+			"count": 0
+		},
+		{
+			"from": "ZSTD_compressContinue_internal",
+			"to": "ZSTD_writeFrameHeader",
+			"count": 1
+		},
+		{
+			"from": "ZSTD_compressContinue_internal",
+			"to": "ZSTD_overflowCorrectIfNeeded",
+			"count": 2
+		},
+		{
+			"from": "ZSTD_compressContinue_internal",
+			"to": "ZSTD_compressBlock_internal",
+			"count": 2
+		},
+		{
+			"from": "ZSTD_compressContinue_internal",
+			"to": "ZSTD_buildSeqStore",
+			"count": 0
+		},
+		{
+			"from": "ZSTD_compressContinue_internal",
+			"to": "ZSTD_isRLE",
+			"count": 0
+		},
+		{
+			"from": "ZSTD_compressContinue_internal",
+			"to": "ZSTD_deriveBlockSplitsHelper",
+			"count": 0
+		},
+		{
+			"from": "ZSTD_compressContinue_internal",
+			"to": "ZSTD_compressSeqStore_singleBlock",
+			"count": 0
+		},
+		{
+			"from": "ZSTD_compressContinue_internal",
+			"to": "ZSTD_deriveSeqStoreChunk",
+			"count": 0
+		},
+		{
+			"from": "ZSTD_compressContinue_internal",
+			"to": "ZSTD_compressSuperBlock",
+			"count": 0
+		},
+		{
+			"from": "ZSTD_compressContinue_internal",
+			"to": "memcpy",
+			"count": 0
+		},
+		{
+			"from": "ZSTD_overflowCorrectIfNeeded",
+			"to": "ZSTD_reduceTable",
+			"count": 0
+		},
+		{
+			"from": "ZSTD_compressBlock_internal",
+			"to": "ZSTD_buildSeqStore",
+			"count": 2
+		},
+		{
+			"from": "ZSTD_compressBlock_internal",
+			"to": "ZSTD_isRLE",
+			"count": 0
+		},
+		{
+			"from": "ZSTD_compressBlock_internal",
+			"to": "ZSTD_entropyCompressSeqStore",
+			"count": 2
+		},
+		{
+			"from": "ZSTD_compressBlock_internal",
+			"to": "ZSTD_copyBlockSequences",
+			"count": 0
+		},
+		{
+			"from": "ZSTD_buildSeqStore",
+			"to": "ZSTD_copySequencesToSeqStoreExplicitBlockDelim",
+			"count": 0
+		},
+		{
+			"from": "ZSTD_buildSeqStore",
+			"to": "ZSTD_compressBlock_lazy_row",
+			"count": 2
+		},
+		{
+			"from": "ZSTD_buildSeqStore",
+			"to": "ZSTD_ldm_generateSequences",
+			"count": 0
+		},
+		{
+			"from": "ZSTD_buildSeqStore",
+			"to": "ZSTD_ldm_skipSequences",
+			"count": 0
+		},
+		{
+			"from": "ZSTD_buildSeqStore",
+			"to": "ZSTD_ldm_skipRawSeqStoreBytes",
+			"count": 0
+		},
+		{
+			"from": "ZSTD_buildSeqStore",
+			"to": "ZSTD_ldm_blockCompress",
+			"count": 0
+		},
+		{
+			"from": "ZSTD_buildSeqStore",
+			"to": "memcpy",
+			"count": 2
+		},
+		{
+			"from": "ZSTD_deriveBlockSplitsHelper",
+			"to": "ZSTD_deriveBlockSplitsHelper",
+			"count": 0
+		},
+		{
+			"from": "ZSTD_deriveBlockSplitsHelper",
+			"to": "ZSTD_deriveSeqStoreChunk",
+			"count": 0
+		},
+		{
+			"from": "ZSTD_deriveBlockSplitsHelper",
+			"to": "ZSTD_buildEntropyStatisticsAndEstimateSubBlockSize",
+			"count": 0
+		},
+		{
+			"from": "ZSTD_compressSeqStore_singleBlock",
+			"to": "ZSTD_isRLE",
+			"count": 0
+		},
+		{
+			"from": "ZSTD_compressSeqStore_singleBlock",
+			"to": "ZSTD_entropyCompressSeqStore",
+			"count": 0
+		},
+		{
+			"from": "ZSTD_compressSeqStore_singleBlock",
+			"to": "ZSTD_copyBlockSequences",
+			"count": 0
+		},
+		{
+			"from": "ZSTD_compressSeqStore_singleBlock",
+			"to": "memcpy",
+			"count": 0
+		},
+		{
+			"from": "ZSTD_loadCEntropy",
+			"to": "FSE_readNCount",
+			"count": 0
+		},
+		{
+			"from": "ZSTD_loadCEntropy",
+			"to": "FSE_buildCTable_wksp",
+			"count": 0
+		},
+		{
+			"from": "ZSTD_loadCEntropy",
+			"to": "HUF_readCTable",
+			"count": 0
+		},
+		{
+			"from": "ZSTD_loadDictionaryContent",
+			"to": "ZSTD_overflowCorrectIfNeeded",
+			"count": 0
+		},
+		{
+			"from": "ZSTD_loadDictionaryContent",
+			"to": "ZSTD_fillDoubleHashTable",
+			"count": 0
+		},
+		{
+			"from": "ZSTD_loadDictionaryContent",
+			"to": "ZSTD_fillHashTable",
+			"count": 0
+		},
+		{
+			"from": "ZSTD_loadDictionaryContent",
+			"to": "ZSTD_dedicatedDictSearch_lazy_loadDictionary",
+			"count": 0
+		},
+		{
+			"from": "ZSTD_loadDictionaryContent",
+			"to": "ZSTD_insertAndFindFirstIndex",
+			"count": 0
+		},
+		{
+			"from": "ZSTD_loadDictionaryContent",
+			"to": "ZSTD_row_update",
+			"count": 0
+		},
+		{
+			"from": "ZSTD_loadDictionaryContent",
+			"to": "ZSTD_ldm_fillHashTable",
+			"count": 0
+		},
+		{
+			"from": "ZSTD_loadDictionaryContent",
+			"to": "ZSTD_updateTree",
+			"count": 0
+		},
+		{
+			"from": "ZSTD_loadDictionaryContent",
+			"to": "memset",
+			"count": 0
+		},
+		{
+			"from": "ZSTD_compressEnd_public",
+			"to": "ZSTD_XXH64_digest",
+			"count": 0
+		},
+		{
+			"from": "ZSTD_compressEnd_public",
+			"to": "ZSTD_compressContinue_internal",
+			"count": 1
+		},
+		{
+			"from": "ZSTD_compress_advanced_internal",
+			"to": "ZSTD_resetCCtx_internal",
+			"count": 1
+		},
+		{
+			"from": "ZSTD_compress_advanced_internal",
+			"to": "ZSTD_loadCEntropy",
+			"count": 0
+		},
+		{
+			"from": "ZSTD_compress_advanced_internal",
+			"to": "ZSTD_loadDictionaryContent",
+			"count": 0
+		},
+		{
+			"from": "ZSTD_compress_advanced_internal",
+			"to": "ZSTD_compressEnd_public",
+			"count": 1
+		},
+		{
+			"from": "ZSTD_compress_usingDict",
+			"to": "ZSTD_getCParams_internal",
+			"count": 1
+		},
+		{
+			"from": "ZSTD_compress_usingDict",
+			"to": "ZSTD_compress_advanced_internal",
+			"count": 1
+		},
+		{
+			"from": "ZSTD_compress_usingDict",
+			"to": "memset",
+			"count": 1
+		},
+		{
+			"from": "ZSTD_compress",
+			"to": "ZSTD_clearAllDicts",
+			"count": 2
+		},
+		{
+			"from": "ZSTD_compress",
+			"to": "ZSTD_compress_usingDict",
+			"count": 1
+		},
+		{
+			"from": "ZSTD_compress",
+			"to": "memset",
+			"count": 2
+		},
+		{
+			"from": "ZSTD_compress",
+			"to": "free",
+			"count": 1
+		},
+		{
+			"from": "ZSTD_reset_matchState",
+			"to": "memset",
+			"count": 2
+		},
+		{
+			"from": "ZSTD_copySequencesToSeqStoreExplicitBlockDelim",
+			"to": "memcpy",
+			"count": 0
+		},
+		{
+			"from": "ZSTD_entropyCompressSeqStore",
+			"to": "ZSTD_buildSequencesStatistics",
+			"count": 2
+		},
+		{
+			"from": "ZSTD_entropyCompressSeqStore",
+			"to": "ZSTD_compressLiterals",
+			"count": 2
+		},
+		{
+			"from": "ZSTD_entropyCompressSeqStore",
+			"to": "ZSTD_encodeSequences",
+			"count": 2
+		},
+		{
+			"from": "ZSTD_entropyCompressSeqStore",
+			"to": "memcpy",
+			"count": 0
+		},
+		{
+			"from": "ZSTD_buildEntropyStatisticsAndEstimateSubBlockSize",
+			"to": "HIST_countFast_wksp",
+			"count": 0
+		},
+		{
+			"from": "ZSTD_buildEntropyStatisticsAndEstimateSubBlockSize",
+			"to": "HIST_count_wksp",
+			"count": 0
+		},
+		{
+			"from": "ZSTD_buildEntropyStatisticsAndEstimateSubBlockSize",
+			"to": "HUF_estimateCompressedSize",
+			"count": 0
+		},
+		{
+			"from": "ZSTD_buildEntropyStatisticsAndEstimateSubBlockSize",
+			"to": "ZSTD_buildBlockEntropyStats",
+			"count": 0
+		},
+		{
+			"from": "ZSTD_buildEntropyStatisticsAndEstimateSubBlockSize",
+			"to": "ZSTD_fseBitCost",
+			"count": 0
+		},
+		{
+			"from": "ZSTD_buildEntropyStatisticsAndEstimateSubBlockSize",
+			"to": "ZSTD_crossEntropyCost",
+			"count": 0
+		},
+		{
+			"from": "ZSTD_noCompressLiterals",
+			"to": "memcpy",
+			"count": 0
+		},
+		{
+			"from": "ZSTD_compressLiterals",
+			"to": "HUF_compress4X_repeat",
+			"count": 2
+		},
+		{
+			"from": "ZSTD_compressLiterals",
+			"to": "ZSTD_compressRleLiteralsBlock",
+			"count": 0
+		},
+		{
+			"from": "ZSTD_compressLiterals",
+			"to": "memcpy",
+			"count": 2
+		},
+		{
+			"from": "ZSTD_selectEncodingType",
+			"to": "FSE_writeNCount",
+			"count": 6
+		},
+		{
+			"from": "ZSTD_selectEncodingType",
+			"to": "FSE_optimalTableLog",
+			"count": 6
+		},
+		{
+			"from": "ZSTD_selectEncodingType",
+			"to": "FSE_normalizeCount",
+			"count": 6
+		},
+		{
+			"from": "ZSTD_buildCTable",
+			"to": "FSE_buildCTable_wksp",
+			"count": 6
+		},
+		{
+			"from": "ZSTD_buildCTable",
+			"to": "FSE_writeNCount",
+			"count": 6
+		},
+		{
+			"from": "ZSTD_buildCTable",
+			"to": "FSE_optimalTableLog",
+			"count": 6
+		},
+		{
+			"from": "ZSTD_buildCTable",
+			"to": "FSE_normalizeCount",
+			"count": 6
+		},
+		{
+			"from": "ZSTD_buildCTable",
+			"to": "FSE_buildCTable_rle",
+			"count": 0
+		},
+		{
+			"from": "ZSTD_buildCTable",
+			"to": "memcpy",
+			"count": 0
+		},
+		{
+			"from": "ZSTD_compressSuperBlock",
+			"to": "HIST_countFast_wksp",
+			"count": 0
+		},
+		{
+			"from": "ZSTD_compressSuperBlock",
+			"to": "HIST_count_wksp",
+			"count": 0
+		},
+		{
+			"from": "ZSTD_compressSuperBlock",
+			"to": "HUF_estimateCompressedSize",
+			"count": 0
+		},
+		{
+			"from": "ZSTD_compressSuperBlock",
+			"to": "ZSTD_buildBlockEntropyStats",
+			"count": 0
+		},
+		{
+			"from": "ZSTD_compressSuperBlock",
+			"to": "ZSTD_fseBitCost",
+			"count": 0
+		},
+		{
+			"from": "ZSTD_compressSuperBlock",
+			"to": "ZSTD_crossEntropyCost",
+			"count": 0
+		},
+		{
+			"from": "ZSTD_compressSuperBlock",
+			"to": "ZSTD_compressSubBlock",
+			"count": 0
+		},
+		{
+			"from": "ZSTD_compressSuperBlock",
+			"to": "memcpy",
+			"count": 0
+		},
+		{
+			"from": "ZSTD_compressSubBlock",
+			"to": "HUF_compress1X_usingCTable",
+			"count": 0
+		},
+		{
+			"from": "ZSTD_compressSubBlock",
+			"to": "HUF_compress4X_usingCTable",
+			"count": 0
+		},
+		{
+			"from": "ZSTD_compressSubBlock",
+			"to": "ZSTD_noCompressLiterals",
+			"count": 0
+		},
+		{
+			"from": "ZSTD_compressSubBlock",
+			"to": "ZSTD_compressRleLiteralsBlock",
+			"count": 0
+		},
+		{
+			"from": "ZSTD_compressSubBlock",
+			"to": "ZSTD_encodeSequences",
+			"count": 0
+		},
+		{
+			"from": "ZSTD_compressSubBlock",
+			"to": "memcpy",
+			"count": 0
+		},
+		{
+			"from": "ZSTD_compressBlock_doubleFast_dictMatchState",
+			"to": "ZSTD_count_2segments",
+			"count": 0
+		},
+		{
+			"from": "ZSTD_compressBlock_doubleFast_extDict",
+			"to": "ZSTD_compressBlock_doubleFast_extDict_generic",
+			"count": 0
+		},
+		{
+			"from": "ZSTD_compressBlock_doubleFast_extDict_generic",
+			"to": "ZSTD_compressBlock_doubleFast",
+			"count": 0
+		},
+		{
+			"from": "ZSTD_compressBlock_doubleFast_extDict_generic",
+			"to": "ZSTD_count_2segments",
+			"count": 0
+		},
+		{
+			"from": "ZSTD_compressBlock_fast_dictMatchState",
+			"to": "_func91_ZSTD_count_2segments",
+			"count": 0
+		},
+		{
+			"from": "ZSTD_compressBlock_fast_extDict",
+			"to": "ZSTD_compressBlock_fast_extDict_generic",
+			"count": 0
+		},
+		{
+			"from": "ZSTD_compressBlock_fast_extDict_generic",
+			"to": "ZSTD_compressBlock_fast",
+			"count": 0
+		},
+		{
+			"from": "ZSTD_compressBlock_fast_extDict_generic",
+			"to": "_func91_ZSTD_count_2segments",
+			"count": 0
+		},
+		{
+			"from": "ZSTD_compressBlock_greedy",
+			"to": "ZSTD_HcFindBestMatch_noDict_4",
+			"count": 0
+		},
+		{
+			"from": "ZSTD_compressBlock_greedy",
+			"to": "ZSTD_HcFindBestMatch_noDict_5",
+			"count": 0
+		},
+		{
+			"from": "ZSTD_compressBlock_greedy",
+			"to": "ZSTD_HcFindBestMatch_noDict_6",
+			"count": 0
+		},
+		{
+			"from": "ZSTD_compressBlock_greedy_dictMatchState",
+			"to": "_func102_ZSTD_count_2segments",
+			"count": 0
+		},
+		{
+			"from": "ZSTD_compressBlock_greedy_dictMatchState",
+			"to": "ZSTD_HcFindBestMatch_dictMatchState_4",
+			"count": 0
+		},
+		{
+			"from": "ZSTD_compressBlock_greedy_dictMatchState",
+			"to": "ZSTD_HcFindBestMatch_dictMatchState_5",
+			"count": 0
+		},
+		{
+			"from": "ZSTD_compressBlock_greedy_dictMatchState",
+			"to": "ZSTD_HcFindBestMatch_dictMatchState_6",
+			"count": 0
+		},
+		{
+			"from": "ZSTD_HcFindBestMatch_dictMatchState_4",
+			"to": "_func102_ZSTD_count_2segments",
+			"count": 0
+		},
+		{
+			"from": "ZSTD_HcFindBestMatch_dictMatchState_5",
+			"to": "_func102_ZSTD_count_2segments",
+			"count": 0
+		},
+		{
+			"from": "ZSTD_HcFindBestMatch_dictMatchState_6",
+			"to": "_func102_ZSTD_count_2segments",
+			"count": 0
+		},
+		{
+			"from": "ZSTD_compressBlock_greedy_dedicatedDictSearch",
+			"to": "_func102_ZSTD_count_2segments",
+			"count": 0
+		},
+		{
+			"from": "ZSTD_compressBlock_greedy_dedicatedDictSearch",
+			"to": "ZSTD_HcFindBestMatch_dedicatedDictSearch_4",
+			"count": 0
+		},
+		{
+			"from": "ZSTD_compressBlock_greedy_dedicatedDictSearch",
+			"to": "ZSTD_HcFindBestMatch_dedicatedDictSearch_5",
+			"count": 0
+		},
+		{
+			"from": "ZSTD_compressBlock_greedy_dedicatedDictSearch",
+			"to": "ZSTD_HcFindBestMatch_dedicatedDictSearch_6",
+			"count": 0
+		},
+		{
+			"from": "ZSTD_HcFindBestMatch_dedicatedDictSearch_4",
+			"to": "_func102_ZSTD_count_2segments",
+			"count": 0
+		},
+		{
+			"from": "ZSTD_HcFindBestMatch_dedicatedDictSearch_5",
+			"to": "_func102_ZSTD_count_2segments",
+			"count": 0
+		},
+		{
+			"from": "ZSTD_HcFindBestMatch_dedicatedDictSearch_6",
+			"to": "_func102_ZSTD_count_2segments",
+			"count": 0
+		},
+		{
+			"from": "ZSTD_compressBlock_greedy_row",
+			"to": "ZSTD_RowFindBestMatch_noDict_4_4",
+			"count": 0
+		},
+		{
+			"from": "ZSTD_compressBlock_greedy_row",
+			"to": "ZSTD_RowFindBestMatch_noDict_4_5",
+			"count": 0
+		},
+		{
+			"from": "ZSTD_compressBlock_greedy_row",
+			"to": "ZSTD_RowFindBestMatch_noDict_4_6",
+			"count": 0
+		},
+		{
+			"from": "ZSTD_compressBlock_greedy_row",
+			"to": "ZSTD_RowFindBestMatch_noDict_5_4",
+			"count": 0
+		},
+		{
+			"from": "ZSTD_compressBlock_greedy_row",
+			"to": "ZSTD_RowFindBestMatch_noDict_5_5",
+			"count": 0
+		},
+		{
+			"from": "ZSTD_compressBlock_greedy_row",
+			"to": "ZSTD_RowFindBestMatch_noDict_5_6",
+			"count": 0
+		},
+		{
+			"from": "ZSTD_compressBlock_greedy_row",
+			"to": "ZSTD_RowFindBestMatch_noDict_6_4",
+			"count": 0
+		},
+		{
+			"from": "ZSTD_compressBlock_greedy_row",
+			"to": "ZSTD_RowFindBestMatch_noDict_6_5",
+			"count": 0
+		},
+		{
+			"from": "ZSTD_compressBlock_greedy_row",
+			"to": "ZSTD_RowFindBestMatch_noDict_6_6",
+			"count": 0
+		},
+		{
+			"from": "ZSTD_compressBlock_greedy_dictMatchState_row",
+			"to": "_func102_ZSTD_count_2segments",
+			"count": 0
+		},
+		{
+			"from": "ZSTD_compressBlock_greedy_dictMatchState_row",
+			"to": "ZSTD_RowFindBestMatch_dictMatchState_4_4",
+			"count": 0
+		},
+		{
+			"from": "ZSTD_compressBlock_greedy_dictMatchState_row",
+			"to": "ZSTD_RowFindBestMatch_dictMatchState_4_5",
+			"count": 0
+		},
+		{
+			"from": "ZSTD_compressBlock_greedy_dictMatchState_row",
+			"to": "ZSTD_RowFindBestMatch_dictMatchState_4_6",
+			"count": 0
+		},
+		{
+			"from": "ZSTD_compressBlock_greedy_dictMatchState_row",
+			"to": "ZSTD_RowFindBestMatch_dictMatchState_5_4",
+			"count": 0
+		},
+		{
+			"from": "ZSTD_compressBlock_greedy_dictMatchState_row",
+			"to": "ZSTD_RowFindBestMatch_dictMatchState_5_5",
+			"count": 0
+		},
+		{
+			"from": "ZSTD_compressBlock_greedy_dictMatchState_row",
+			"to": "ZSTD_RowFindBestMatch_dictMatchState_5_6",
+			"count": 0
+		},
+		{
+			"from": "ZSTD_compressBlock_greedy_dictMatchState_row",
+			"to": "ZSTD_RowFindBestMatch_dictMatchState_6_4",
+			"count": 0
+		},
+		{
+			"from": "ZSTD_compressBlock_greedy_dictMatchState_row",
+			"to": "ZSTD_RowFindBestMatch_dictMatchState_6_5",
+			"count": 0
+		},
+		{
+			"from": "ZSTD_compressBlock_greedy_dictMatchState_row",
+			"to": "ZSTD_RowFindBestMatch_dictMatchState_6_6",
+			"count": 0
+		},
+		{
+			"from": "ZSTD_RowFindBestMatch_dictMatchState_4_4",
+			"to": "_func102_ZSTD_count_2segments",
+			"count": 0
+		},
+		{
+			"from": "ZSTD_RowFindBestMatch_dictMatchState_4_5",
+			"to": "_func102_ZSTD_count_2segments",
+			"count": 0
+		},
+		{
+			"from": "ZSTD_RowFindBestMatch_dictMatchState_4_6",
+			"to": "_func102_ZSTD_count_2segments",
+			"count": 0
+		},
+		{
+			"from": "ZSTD_RowFindBestMatch_dictMatchState_5_4",
+			"to": "_func102_ZSTD_count_2segments",
+			"count": 0
+		},
+		{
+			"from": "ZSTD_RowFindBestMatch_dictMatchState_5_5",
+			"to": "_func102_ZSTD_count_2segments",
+			"count": 0
+		},
+		{
+			"from": "ZSTD_RowFindBestMatch_dictMatchState_5_6",
+			"to": "_func102_ZSTD_count_2segments",
+			"count": 0
+		},
+		{
+			"from": "ZSTD_RowFindBestMatch_dictMatchState_6_4",
+			"to": "_func102_ZSTD_count_2segments",
+			"count": 0
+		},
+		{
+			"from": "ZSTD_RowFindBestMatch_dictMatchState_6_5",
+			"to": "_func102_ZSTD_count_2segments",
+			"count": 0
+		},
+		{
+			"from": "ZSTD_RowFindBestMatch_dictMatchState_6_6",
+			"to": "_func102_ZSTD_count_2segments",
+			"count": 0
+		},
+		{
+			"from": "ZSTD_compressBlock_greedy_dedicatedDictSearch_row",
+			"to": "_func102_ZSTD_count_2segments",
+			"count": 0
+		},
+		{
+			"from": "ZSTD_compressBlock_greedy_dedicatedDictSearch_row",
+			"to": "ZSTD_RowFindBestMatch_dedicatedDictSearch_4_4",
+			"count": 0
+		},
+		{
+			"from": "ZSTD_compressBlock_greedy_dedicatedDictSearch_row",
+			"to": "ZSTD_RowFindBestMatch_dedicatedDictSearch_4_5",
+			"count": 0
+		},
+		{
+			"from": "ZSTD_compressBlock_greedy_dedicatedDictSearch_row",
+			"to": "ZSTD_RowFindBestMatch_dedicatedDictSearch_4_6",
+			"count": 0
+		},
+		{
+			"from": "ZSTD_compressBlock_greedy_dedicatedDictSearch_row",
+			"to": "ZSTD_RowFindBestMatch_dedicatedDictSearch_5_4",
+			"count": 0
+		},
+		{
+			"from": "ZSTD_compressBlock_greedy_dedicatedDictSearch_row",
+			"to": "ZSTD_RowFindBestMatch_dedicatedDictSearch_5_5",
+			"count": 0
+		},
+		{
+			"from": "ZSTD_compressBlock_greedy_dedicatedDictSearch_row",
+			"to": "ZSTD_RowFindBestMatch_dedicatedDictSearch_5_6",
+			"count": 0
+		},
+		{
+			"from": "ZSTD_compressBlock_greedy_dedicatedDictSearch_row",
+			"to": "ZSTD_RowFindBestMatch_dedicatedDictSearch_6_4",
+			"count": 0
+		},
+		{
+			"from": "ZSTD_compressBlock_greedy_dedicatedDictSearch_row",
+			"to": "ZSTD_RowFindBestMatch_dedicatedDictSearch_6_5",
+			"count": 0
+		},
+		{
+			"from": "ZSTD_compressBlock_greedy_dedicatedDictSearch_row",
+			"to": "ZSTD_RowFindBestMatch_dedicatedDictSearch_6_6",
+			"count": 0
+		},
+		{
+			"from": "ZSTD_RowFindBestMatch_dedicatedDictSearch_4_4",
+			"to": "_func102_ZSTD_count_2segments",
+			"count": 0
+		},
+		{
+			"from": "ZSTD_RowFindBestMatch_dedicatedDictSearch_4_5",
+			"to": "_func102_ZSTD_count_2segments",
+			"count": 0
+		},
+		{
+			"from": "ZSTD_RowFindBestMatch_dedicatedDictSearch_4_6",
+			"to": "_func102_ZSTD_count_2segments",
+			"count": 0
+		},
+		{
+			"from": "ZSTD_RowFindBestMatch_dedicatedDictSearch_5_4",
+			"to": "_func102_ZSTD_count_2segments",
+			"count": 0
+		},
+		{
+			"from": "ZSTD_RowFindBestMatch_dedicatedDictSearch_5_5",
+			"to": "_func102_ZSTD_count_2segments",
+			"count": 0
+		},
+		{
+			"from": "ZSTD_RowFindBestMatch_dedicatedDictSearch_5_6",
+			"to": "_func102_ZSTD_count_2segments",
+			"count": 0
+		},
+		{
+			"from": "ZSTD_RowFindBestMatch_dedicatedDictSearch_6_4",
+			"to": "_func102_ZSTD_count_2segments",
+			"count": 0
+		},
+		{
+			"from": "ZSTD_RowFindBestMatch_dedicatedDictSearch_6_5",
+			"to": "_func102_ZSTD_count_2segments",
+			"count": 0
+		},
+		{
+			"from": "ZSTD_RowFindBestMatch_dedicatedDictSearch_6_6",
+			"to": "_func102_ZSTD_count_2segments",
+			"count": 0
+		},
+		{
+			"from": "ZSTD_compressBlock_lazy",
+			"to": "ZSTD_HcFindBestMatch_noDict_4",
+			"count": 0
+		},
+		{
+			"from": "ZSTD_compressBlock_lazy",
+			"to": "ZSTD_HcFindBestMatch_noDict_5",
+			"count": 0
+		},
+		{
+			"from": "ZSTD_compressBlock_lazy",
+			"to": "ZSTD_HcFindBestMatch_noDict_6",
+			"count": 0
+		},
+		{
+			"from": "ZSTD_compressBlock_lazy_dictMatchState",
+			"to": "_func102_ZSTD_count_2segments",
+			"count": 0
+		},
+		{
+			"from": "ZSTD_compressBlock_lazy_dictMatchState",
+			"to": "ZSTD_HcFindBestMatch_dictMatchState_4",
+			"count": 0
+		},
+		{
+			"from": "ZSTD_compressBlock_lazy_dictMatchState",
+			"to": "ZSTD_HcFindBestMatch_dictMatchState_5",
+			"count": 0
+		},
+		{
+			"from": "ZSTD_compressBlock_lazy_dictMatchState",
+			"to": "ZSTD_HcFindBestMatch_dictMatchState_6",
+			"count": 0
+		},
+		{
+			"from": "ZSTD_compressBlock_lazy_dedicatedDictSearch",
+			"to": "_func102_ZSTD_count_2segments",
+			"count": 0
+		},
+		{
+			"from": "ZSTD_compressBlock_lazy_dedicatedDictSearch",
+			"to": "ZSTD_HcFindBestMatch_dedicatedDictSearch_4",
+			"count": 0
+		},
+		{
+			"from": "ZSTD_compressBlock_lazy_dedicatedDictSearch",
+			"to": "ZSTD_HcFindBestMatch_dedicatedDictSearch_5",
+			"count": 0
+		},
+		{
+			"from": "ZSTD_compressBlock_lazy_dedicatedDictSearch",
+			"to": "ZSTD_HcFindBestMatch_dedicatedDictSearch_6",
+			"count": 0
+		},
+		{
+			"from": "ZSTD_compressBlock_lazy_row",
+			"to": "ZSTD_RowFindBestMatch_noDict_4_4",
+			"count": 0
+		},
+		{
+			"from": "ZSTD_compressBlock_lazy_row",
+			"to": "ZSTD_RowFindBestMatch_noDict_4_5",
+			"count": 0
+		},
+		{
+			"from": "ZSTD_compressBlock_lazy_row",
+			"to": "ZSTD_RowFindBestMatch_noDict_4_6",
+			"count": 0
+		},
+		{
+			"from": "ZSTD_compressBlock_lazy_row",
+			"to": "ZSTD_RowFindBestMatch_noDict_5_4",
+			"count": 58875
+		},
+		{
+			"from": "ZSTD_compressBlock_lazy_row",
+			"to": "ZSTD_RowFindBestMatch_noDict_5_5",
+			"count": 0
+		},
+		{
+			"from": "ZSTD_compressBlock_lazy_row",
+			"to": "ZSTD_RowFindBestMatch_noDict_5_6",
+			"count": 0
+		},
+		{
+			"from": "ZSTD_compressBlock_lazy_row",
+			"to": "ZSTD_RowFindBestMatch_noDict_6_4",
+			"count": 0
+		},
+		{
+			"from": "ZSTD_compressBlock_lazy_row",
+			"to": "ZSTD_RowFindBestMatch_noDict_6_5",
+			"count": 0
+		},
+		{
+			"from": "ZSTD_compressBlock_lazy_row",
+			"to": "ZSTD_RowFindBestMatch_noDict_6_6",
+			"count": 0
+		},
+		{
+			"from": "ZSTD_compressBlock_lazy_dictMatchState_row",
+			"to": "_func102_ZSTD_count_2segments",
+			"count": 0
+		},
+		{
+			"from": "ZSTD_compressBlock_lazy_dictMatchState_row",
+			"to": "ZSTD_RowFindBestMatch_dictMatchState_4_4",
+			"count": 0
+		},
+		{
+			"from": "ZSTD_compressBlock_lazy_dictMatchState_row",
+			"to": "ZSTD_RowFindBestMatch_dictMatchState_4_5",
+			"count": 0
+		},
+		{
+			"from": "ZSTD_compressBlock_lazy_dictMatchState_row",
+			"to": "ZSTD_RowFindBestMatch_dictMatchState_4_6",
+			"count": 0
+		},
+		{
+			"from": "ZSTD_compressBlock_lazy_dictMatchState_row",
+			"to": "ZSTD_RowFindBestMatch_dictMatchState_5_4",
+			"count": 0
+		},
+		{
+			"from": "ZSTD_compressBlock_lazy_dictMatchState_row",
+			"to": "ZSTD_RowFindBestMatch_dictMatchState_5_5",
+			"count": 0
+		},
+		{
+			"from": "ZSTD_compressBlock_lazy_dictMatchState_row",
+			"to": "ZSTD_RowFindBestMatch_dictMatchState_5_6",
+			"count": 0
+		},
+		{
+			"from": "ZSTD_compressBlock_lazy_dictMatchState_row",
+			"to": "ZSTD_RowFindBestMatch_dictMatchState_6_4",
+			"count": 0
+		},
+		{
+			"from": "ZSTD_compressBlock_lazy_dictMatchState_row",
+			"to": "ZSTD_RowFindBestMatch_dictMatchState_6_5",
+			"count": 0
+		},
+		{
+			"from": "ZSTD_compressBlock_lazy_dictMatchState_row",
+			"to": "ZSTD_RowFindBestMatch_dictMatchState_6_6",
+			"count": 0
+		},
+		{
+			"from": "ZSTD_compressBlock_lazy_dedicatedDictSearch_row",
+			"to": "_func102_ZSTD_count_2segments",
+			"count": 0
+		},
+		{
+			"from": "ZSTD_compressBlock_lazy_dedicatedDictSearch_row",
+			"to": "ZSTD_RowFindBestMatch_dedicatedDictSearch_4_4",
+			"count": 0
+		},
+		{
+			"from": "ZSTD_compressBlock_lazy_dedicatedDictSearch_row",
+			"to": "ZSTD_RowFindBestMatch_dedicatedDictSearch_4_5",
+			"count": 0
+		},
+		{
+			"from": "ZSTD_compressBlock_lazy_dedicatedDictSearch_row",
+			"to": "ZSTD_RowFindBestMatch_dedicatedDictSearch_4_6",
+			"count": 0
+		},
+		{
+			"from": "ZSTD_compressBlock_lazy_dedicatedDictSearch_row",
+			"to": "ZSTD_RowFindBestMatch_dedicatedDictSearch_5_4",
+			"count": 0
+		},
+		{
+			"from": "ZSTD_compressBlock_lazy_dedicatedDictSearch_row",
+			"to": "ZSTD_RowFindBestMatch_dedicatedDictSearch_5_5",
+			"count": 0
+		},
+		{
+			"from": "ZSTD_compressBlock_lazy_dedicatedDictSearch_row",
+			"to": "ZSTD_RowFindBestMatch_dedicatedDictSearch_5_6",
+			"count": 0
+		},
+		{
+			"from": "ZSTD_compressBlock_lazy_dedicatedDictSearch_row",
+			"to": "ZSTD_RowFindBestMatch_dedicatedDictSearch_6_4",
+			"count": 0
+		},
+		{
+			"from": "ZSTD_compressBlock_lazy_dedicatedDictSearch_row",
+			"to": "ZSTD_RowFindBestMatch_dedicatedDictSearch_6_5",
+			"count": 0
+		},
+		{
+			"from": "ZSTD_compressBlock_lazy_dedicatedDictSearch_row",
+			"to": "ZSTD_RowFindBestMatch_dedicatedDictSearch_6_6",
+			"count": 0
+		},
+		{
+			"from": "ZSTD_compressBlock_lazy2",
+			"to": "ZSTD_HcFindBestMatch_noDict_4",
+			"count": 0
+		},
+		{
+			"from": "ZSTD_compressBlock_lazy2",
+			"to": "ZSTD_HcFindBestMatch_noDict_5",
+			"count": 0
+		},
+		{
+			"from": "ZSTD_compressBlock_lazy2",
+			"to": "ZSTD_HcFindBestMatch_noDict_6",
+			"count": 0
+		},
+		{
+			"from": "ZSTD_compressBlock_lazy2_dictMatchState",
+			"to": "_func102_ZSTD_count_2segments",
+			"count": 0
+		},
+		{
+			"from": "ZSTD_compressBlock_lazy2_dictMatchState",
+			"to": "ZSTD_HcFindBestMatch_dictMatchState_4",
+			"count": 0
+		},
+		{
+			"from": "ZSTD_compressBlock_lazy2_dictMatchState",
+			"to": "ZSTD_HcFindBestMatch_dictMatchState_5",
+			"count": 0
+		},
+		{
+			"from": "ZSTD_compressBlock_lazy2_dictMatchState",
+			"to": "ZSTD_HcFindBestMatch_dictMatchState_6",
+			"count": 0
+		},
+		{
+			"from": "ZSTD_compressBlock_lazy2_dedicatedDictSearch",
+			"to": "_func102_ZSTD_count_2segments",
+			"count": 0
+		},
+		{
+			"from": "ZSTD_compressBlock_lazy2_dedicatedDictSearch",
+			"to": "ZSTD_HcFindBestMatch_dedicatedDictSearch_4",
+			"count": 0
+		},
+		{
+			"from": "ZSTD_compressBlock_lazy2_dedicatedDictSearch",
+			"to": "ZSTD_HcFindBestMatch_dedicatedDictSearch_5",
+			"count": 0
+		},
+		{
+			"from": "ZSTD_compressBlock_lazy2_dedicatedDictSearch",
+			"to": "ZSTD_HcFindBestMatch_dedicatedDictSearch_6",
+			"count": 0
+		},
+		{
+			"from": "ZSTD_compressBlock_lazy2_row",
+			"to": "ZSTD_RowFindBestMatch_noDict_4_4",
+			"count": 0
+		},
+		{
+			"from": "ZSTD_compressBlock_lazy2_row",
+			"to": "ZSTD_RowFindBestMatch_noDict_4_5",
+			"count": 0
+		},
+		{
+			"from": "ZSTD_compressBlock_lazy2_row",
+			"to": "ZSTD_RowFindBestMatch_noDict_4_6",
+			"count": 0
+		},
+		{
+			"from": "ZSTD_compressBlock_lazy2_row",
+			"to": "ZSTD_RowFindBestMatch_noDict_5_4",
+			"count": 0
+		},
+		{
+			"from": "ZSTD_compressBlock_lazy2_row",
+			"to": "ZSTD_RowFindBestMatch_noDict_5_5",
+			"count": 0
+		},
+		{
+			"from": "ZSTD_compressBlock_lazy2_row",
+			"to": "ZSTD_RowFindBestMatch_noDict_5_6",
+			"count": 0
+		},
+		{
+			"from": "ZSTD_compressBlock_lazy2_row",
+			"to": "ZSTD_RowFindBestMatch_noDict_6_4",
+			"count": 0
+		},
+		{
+			"from": "ZSTD_compressBlock_lazy2_row",
+			"to": "ZSTD_RowFindBestMatch_noDict_6_5",
+			"count": 0
+		},
+		{
+			"from": "ZSTD_compressBlock_lazy2_row",
+			"to": "ZSTD_RowFindBestMatch_noDict_6_6",
+			"count": 0
+		},
+		{
+			"from": "ZSTD_compressBlock_lazy2_dictMatchState_row",
+			"to": "_func102_ZSTD_count_2segments",
+			"count": 0
+		},
+		{
+			"from": "ZSTD_compressBlock_lazy2_dictMatchState_row",
+			"to": "ZSTD_RowFindBestMatch_dictMatchState_4_4",
+			"count": 0
+		},
+		{
+			"from": "ZSTD_compressBlock_lazy2_dictMatchState_row",
+			"to": "ZSTD_RowFindBestMatch_dictMatchState_4_5",
+			"count": 0
+		},
+		{
+			"from": "ZSTD_compressBlock_lazy2_dictMatchState_row",
+			"to": "ZSTD_RowFindBestMatch_dictMatchState_4_6",
+			"count": 0
+		},
+		{
+			"from": "ZSTD_compressBlock_lazy2_dictMatchState_row",
+			"to": "ZSTD_RowFindBestMatch_dictMatchState_5_4",
+			"count": 0
+		},
+		{
+			"from": "ZSTD_compressBlock_lazy2_dictMatchState_row",
+			"to": "ZSTD_RowFindBestMatch_dictMatchState_5_5",
+			"count": 0
+		},
+		{
+			"from": "ZSTD_compressBlock_lazy2_dictMatchState_row",
+			"to": "ZSTD_RowFindBestMatch_dictMatchState_5_6",
+			"count": 0
+		},
+		{
+			"from": "ZSTD_compressBlock_lazy2_dictMatchState_row",
+			"to": "ZSTD_RowFindBestMatch_dictMatchState_6_4",
+			"count": 0
+		},
+		{
+			"from": "ZSTD_compressBlock_lazy2_dictMatchState_row",
+			"to": "ZSTD_RowFindBestMatch_dictMatchState_6_5",
+			"count": 0
+		},
+		{
+			"from": "ZSTD_compressBlock_lazy2_dictMatchState_row",
+			"to": "ZSTD_RowFindBestMatch_dictMatchState_6_6",
+			"count": 0
+		},
+		{
+			"from": "ZSTD_compressBlock_lazy2_dedicatedDictSearch_row",
+			"to": "_func102_ZSTD_count_2segments",
+			"count": 0
+		},
+		{
+			"from": "ZSTD_compressBlock_lazy2_dedicatedDictSearch_row",
+			"to": "ZSTD_RowFindBestMatch_dedicatedDictSearch_4_4",
+			"count": 0
+		},
+		{
+			"from": "ZSTD_compressBlock_lazy2_dedicatedDictSearch_row",
+			"to": "ZSTD_RowFindBestMatch_dedicatedDictSearch_4_5",
+			"count": 0
+		},
+		{
+			"from": "ZSTD_compressBlock_lazy2_dedicatedDictSearch_row",
+			"to": "ZSTD_RowFindBestMatch_dedicatedDictSearch_4_6",
+			"count": 0
+		},
+		{
+			"from": "ZSTD_compressBlock_lazy2_dedicatedDictSearch_row",
+			"to": "ZSTD_RowFindBestMatch_dedicatedDictSearch_5_4",
+			"count": 0
+		},
+		{
+			"from": "ZSTD_compressBlock_lazy2_dedicatedDictSearch_row",
+			"to": "ZSTD_RowFindBestMatch_dedicatedDictSearch_5_5",
+			"count": 0
+		},
+		{
+			"from": "ZSTD_compressBlock_lazy2_dedicatedDictSearch_row",
+			"to": "ZSTD_RowFindBestMatch_dedicatedDictSearch_5_6",
+			"count": 0
+		},
+		{
+			"from": "ZSTD_compressBlock_lazy2_dedicatedDictSearch_row",
+			"to": "ZSTD_RowFindBestMatch_dedicatedDictSearch_6_4",
+			"count": 0
+		},
+		{
+			"from": "ZSTD_compressBlock_lazy2_dedicatedDictSearch_row",
+			"to": "ZSTD_RowFindBestMatch_dedicatedDictSearch_6_5",
+			"count": 0
+		},
+		{
+			"from": "ZSTD_compressBlock_lazy2_dedicatedDictSearch_row",
+			"to": "ZSTD_RowFindBestMatch_dedicatedDictSearch_6_6",
+			"count": 0
+		},
+		{
+			"from": "ZSTD_compressBlock_btlazy2",
+			"to": "ZSTD_BtFindBestMatch_noDict_4",
+			"count": 0
+		},
+		{
+			"from": "ZSTD_compressBlock_btlazy2",
+			"to": "ZSTD_BtFindBestMatch_noDict_5",
+			"count": 0
+		},
+		{
+			"from": "ZSTD_compressBlock_btlazy2",
+			"to": "ZSTD_BtFindBestMatch_noDict_6",
+			"count": 0
+		},
+		{
+			"from": "ZSTD_BtFindBestMatch_noDict_4",
+			"to": "ZSTD_DUBT_findBestMatch",
+			"count": 0
+		},
+		{
+			"from": "ZSTD_BtFindBestMatch_noDict_5",
+			"to": "ZSTD_DUBT_findBestMatch",
+			"count": 0
+		},
+		{
+			"from": "ZSTD_BtFindBestMatch_noDict_6",
+			"to": "ZSTD_DUBT_findBestMatch",
+			"count": 0
+		},
+		{
+			"from": "ZSTD_compressBlock_btlazy2_dictMatchState",
+			"to": "_func102_ZSTD_count_2segments",
+			"count": 0
+		},
+		{
+			"from": "ZSTD_compressBlock_btlazy2_dictMatchState",
+			"to": "ZSTD_BtFindBestMatch_dictMatchState_4",
+			"count": 0
+		},
+		{
+			"from": "ZSTD_compressBlock_btlazy2_dictMatchState",
+			"to": "ZSTD_BtFindBestMatch_dictMatchState_5",
+			"count": 0
+		},
+		{
+			"from": "ZSTD_compressBlock_btlazy2_dictMatchState",
+			"to": "ZSTD_BtFindBestMatch_dictMatchState_6",
+			"count": 0
+		},
+		{
+			"from": "ZSTD_BtFindBestMatch_dictMatchState_4",
+			"to": "ZSTD_DUBT_findBestMatch",
+			"count": 0
+		},
+		{
+			"from": "ZSTD_BtFindBestMatch_dictMatchState_5",
+			"to": "ZSTD_DUBT_findBestMatch",
+			"count": 0
+		},
+		{
+			"from": "ZSTD_BtFindBestMatch_dictMatchState_6",
+			"to": "ZSTD_DUBT_findBestMatch",
+			"count": 0
+		},
+		{
+			"from": "ZSTD_compressBlock_greedy_extDict",
+			"to": "_func102_ZSTD_count_2segments",
+			"count": 0
+		},
+		{
+			"from": "ZSTD_compressBlock_greedy_extDict",
+			"to": "ZSTD_HcFindBestMatch_extDict_4",
+			"count": 0
+		},
+		{
+			"from": "ZSTD_compressBlock_greedy_extDict",
+			"to": "ZSTD_HcFindBestMatch_extDict_5",
+			"count": 0
+		},
+		{
+			"from": "ZSTD_compressBlock_greedy_extDict",
+			"to": "ZSTD_HcFindBestMatch_extDict_6",
+			"count": 0
+		},
+		{
+			"from": "ZSTD_HcFindBestMatch_extDict_4",
+			"to": "_func102_ZSTD_count_2segments",
+			"count": 0
+		},
+		{
+			"from": "ZSTD_HcFindBestMatch_extDict_5",
+			"to": "_func102_ZSTD_count_2segments",
+			"count": 0
+		},
+		{
+			"from": "ZSTD_HcFindBestMatch_extDict_6",
+			"to": "_func102_ZSTD_count_2segments",
+			"count": 0
+		},
+		{
+			"from": "ZSTD_compressBlock_greedy_extDict_row",
+			"to": "_func102_ZSTD_count_2segments",
+			"count": 0
+		},
+		{
+			"from": "ZSTD_compressBlock_greedy_extDict_row",
+			"to": "ZSTD_RowFindBestMatch_extDict_4_4",
+			"count": 0
+		},
+		{
+			"from": "ZSTD_compressBlock_greedy_extDict_row",
+			"to": "ZSTD_RowFindBestMatch_extDict_4_5",
+			"count": 0
+		},
+		{
+			"from": "ZSTD_compressBlock_greedy_extDict_row",
+			"to": "ZSTD_RowFindBestMatch_extDict_4_6",
+			"count": 0
+		},
+		{
+			"from": "ZSTD_compressBlock_greedy_extDict_row",
+			"to": "ZSTD_RowFindBestMatch_extDict_5_4",
+			"count": 0
+		},
+		{
+			"from": "ZSTD_compressBlock_greedy_extDict_row",
+			"to": "ZSTD_RowFindBestMatch_extDict_5_5",
+			"count": 0
+		},
+		{
+			"from": "ZSTD_compressBlock_greedy_extDict_row",
+			"to": "ZSTD_RowFindBestMatch_extDict_5_6",
+			"count": 0
+		},
+		{
+			"from": "ZSTD_compressBlock_greedy_extDict_row",
+			"to": "ZSTD_RowFindBestMatch_extDict_6_4",
+			"count": 0
+		},
+		{
+			"from": "ZSTD_compressBlock_greedy_extDict_row",
+			"to": "ZSTD_RowFindBestMatch_extDict_6_5",
+			"count": 0
+		},
+		{
+			"from": "ZSTD_compressBlock_greedy_extDict_row",
+			"to": "ZSTD_RowFindBestMatch_extDict_6_6",
+			"count": 0
+		},
+		{
+			"from": "ZSTD_RowFindBestMatch_extDict_4_4",
+			"to": "_func102_ZSTD_count_2segments",
+			"count": 0
+		},
+		{
+			"from": "ZSTD_RowFindBestMatch_extDict_4_5",
+			"to": "_func102_ZSTD_count_2segments",
+			"count": 0
+		},
+		{
+			"from": "ZSTD_RowFindBestMatch_extDict_4_6",
+			"to": "_func102_ZSTD_count_2segments",
+			"count": 0
+		},
+		{
+			"from": "ZSTD_RowFindBestMatch_extDict_5_4",
+			"to": "_func102_ZSTD_count_2segments",
+			"count": 0
+		},
+		{
+			"from": "ZSTD_RowFindBestMatch_extDict_5_5",
+			"to": "_func102_ZSTD_count_2segments",
+			"count": 0
+		},
+		{
+			"from": "ZSTD_RowFindBestMatch_extDict_5_6",
+			"to": "_func102_ZSTD_count_2segments",
+			"count": 0
+		},
+		{
+			"from": "ZSTD_RowFindBestMatch_extDict_6_4",
+			"to": "_func102_ZSTD_count_2segments",
+			"count": 0
+		},
+		{
+			"from": "ZSTD_RowFindBestMatch_extDict_6_5",
+			"to": "_func102_ZSTD_count_2segments",
+			"count": 0
+		},
+		{
+			"from": "ZSTD_RowFindBestMatch_extDict_6_6",
+			"to": "_func102_ZSTD_count_2segments",
+			"count": 0
+		},
+		{
+			"from": "ZSTD_compressBlock_lazy_extDict",
+			"to": "_func102_ZSTD_count_2segments",
+			"count": 0
+		},
+		{
+			"from": "ZSTD_compressBlock_lazy_extDict",
+			"to": "ZSTD_HcFindBestMatch_extDict_4",
+			"count": 0
+		},
+		{
+			"from": "ZSTD_compressBlock_lazy_extDict",
+			"to": "ZSTD_HcFindBestMatch_extDict_5",
+			"count": 0
+		},
+		{
+			"from": "ZSTD_compressBlock_lazy_extDict",
+			"to": "ZSTD_HcFindBestMatch_extDict_6",
+			"count": 0
+		},
+		{
+			"from": "ZSTD_compressBlock_lazy_extDict_row",
+			"to": "_func102_ZSTD_count_2segments",
+			"count": 0
+		},
+		{
+			"from": "ZSTD_compressBlock_lazy_extDict_row",
+			"to": "ZSTD_RowFindBestMatch_extDict_4_4",
+			"count": 0
+		},
+		{
+			"from": "ZSTD_compressBlock_lazy_extDict_row",
+			"to": "ZSTD_RowFindBestMatch_extDict_4_5",
+			"count": 0
+		},
+		{
+			"from": "ZSTD_compressBlock_lazy_extDict_row",
+			"to": "ZSTD_RowFindBestMatch_extDict_4_6",
+			"count": 0
+		},
+		{
+			"from": "ZSTD_compressBlock_lazy_extDict_row",
+			"to": "ZSTD_RowFindBestMatch_extDict_5_4",
+			"count": 0
+		},
+		{
+			"from": "ZSTD_compressBlock_lazy_extDict_row",
+			"to": "ZSTD_RowFindBestMatch_extDict_5_5",
+			"count": 0
+		},
+		{
+			"from": "ZSTD_compressBlock_lazy_extDict_row",
+			"to": "ZSTD_RowFindBestMatch_extDict_5_6",
+			"count": 0
+		},
+		{
+			"from": "ZSTD_compressBlock_lazy_extDict_row",
+			"to": "ZSTD_RowFindBestMatch_extDict_6_4",
+			"count": 0
+		},
+		{
+			"from": "ZSTD_compressBlock_lazy_extDict_row",
+			"to": "ZSTD_RowFindBestMatch_extDict_6_5",
+			"count": 0
+		},
+		{
+			"from": "ZSTD_compressBlock_lazy_extDict_row",
+			"to": "ZSTD_RowFindBestMatch_extDict_6_6",
+			"count": 0
+		},
+		{
+			"from": "ZSTD_compressBlock_lazy2_extDict",
+			"to": "_func102_ZSTD_count_2segments",
+			"count": 0
+		},
+		{
+			"from": "ZSTD_compressBlock_lazy2_extDict",
+			"to": "ZSTD_HcFindBestMatch_extDict_4",
+			"count": 0
+		},
+		{
+			"from": "ZSTD_compressBlock_lazy2_extDict",
+			"to": "ZSTD_HcFindBestMatch_extDict_5",
+			"count": 0
+		},
+		{
+			"from": "ZSTD_compressBlock_lazy2_extDict",
+			"to": "ZSTD_HcFindBestMatch_extDict_6",
+			"count": 0
+		},
+		{
+			"from": "ZSTD_compressBlock_lazy2_extDict_row",
+			"to": "_func102_ZSTD_count_2segments",
+			"count": 0
+		},
+		{
+			"from": "ZSTD_compressBlock_lazy2_extDict_row",
+			"to": "ZSTD_RowFindBestMatch_extDict_4_4",
+			"count": 0
+		},
+		{
+			"from": "ZSTD_compressBlock_lazy2_extDict_row",
+			"to": "ZSTD_RowFindBestMatch_extDict_4_5",
+			"count": 0
+		},
+		{
+			"from": "ZSTD_compressBlock_lazy2_extDict_row",
+			"to": "ZSTD_RowFindBestMatch_extDict_4_6",
+			"count": 0
+		},
+		{
+			"from": "ZSTD_compressBlock_lazy2_extDict_row",
+			"to": "ZSTD_RowFindBestMatch_extDict_5_4",
+			"count": 0
+		},
+		{
+			"from": "ZSTD_compressBlock_lazy2_extDict_row",
+			"to": "ZSTD_RowFindBestMatch_extDict_5_5",
+			"count": 0
+		},
+		{
+			"from": "ZSTD_compressBlock_lazy2_extDict_row",
+			"to": "ZSTD_RowFindBestMatch_extDict_5_6",
+			"count": 0
+		},
+		{
+			"from": "ZSTD_compressBlock_lazy2_extDict_row",
+			"to": "ZSTD_RowFindBestMatch_extDict_6_4",
+			"count": 0
+		},
+		{
+			"from": "ZSTD_compressBlock_lazy2_extDict_row",
+			"to": "ZSTD_RowFindBestMatch_extDict_6_5",
+			"count": 0
+		},
+		{
+			"from": "ZSTD_compressBlock_lazy2_extDict_row",
+			"to": "ZSTD_RowFindBestMatch_extDict_6_6",
+			"count": 0
+		},
+		{
+			"from": "ZSTD_compressBlock_btlazy2_extDict",
+			"to": "_func102_ZSTD_count_2segments",
+			"count": 0
+		},
+		{
+			"from": "ZSTD_compressBlock_btlazy2_extDict",
+			"to": "ZSTD_BtFindBestMatch_extDict_4",
+			"count": 0
+		},
+		{
+			"from": "ZSTD_compressBlock_btlazy2_extDict",
+			"to": "ZSTD_BtFindBestMatch_extDict_5",
+			"count": 0
+		},
+		{
+			"from": "ZSTD_compressBlock_btlazy2_extDict",
+			"to": "ZSTD_BtFindBestMatch_extDict_6",
+			"count": 0
+		},
+		{
+			"from": "ZSTD_BtFindBestMatch_extDict_4",
+			"to": "ZSTD_DUBT_findBestMatch",
+			"count": 0
+		},
+		{
+			"from": "ZSTD_BtFindBestMatch_extDict_5",
+			"to": "ZSTD_DUBT_findBestMatch",
+			"count": 0
+		},
+		{
+			"from": "ZSTD_BtFindBestMatch_extDict_6",
+			"to": "ZSTD_DUBT_findBestMatch",
+			"count": 0
+		},
+		{
+			"from": "ZSTD_DUBT_findBestMatch",
+			"to": "_func102_ZSTD_count_2segments",
+			"count": 0
+		},
+		{
+			"from": "ZSTD_ldm_fillHashTable",
+			"to": "ZSTD_XXH64",
+			"count": 0
+		},
+		{
+			"from": "ZSTD_ldm_fillHashTable",
+			"to": "ZSTD_ldm_gear_feed",
+			"count": 0
+		},
+		{
+			"from": "ZSTD_ldm_generateSequences",
+			"to": "ZSTD_XXH64",
+			"count": 0
+		},
+		{
+			"from": "ZSTD_ldm_generateSequences",
+			"to": "ZSTD_ldm_gear_feed",
+			"count": 0
+		},
+		{
+			"from": "ZSTD_ldm_blockCompress",
+			"to": "ZSTD_selectBlockCompressor",
+			"count": 0
+		},
+		{
+			"from": "ZSTD_ldm_blockCompress",
+			"to": "ZSTD_fillDoubleHashTable",
+			"count": 0
+		},
+		{
+			"from": "ZSTD_ldm_blockCompress",
+			"to": "ZSTD_fillHashTable",
+			"count": 0
+		},
+		{
+			"from": "ZSTD_updateTree",
+			"to": "ZSTD_insertBt1",
+			"count": 0
+		},
+		{
+			"from": "ZSTD_insertBt1",
+			"to": "_func207_ZSTD_count_2segments",
+			"count": 0
+		},
+		{
+			"from": "ZSTD_compressBlock_btopt",
+			"to": "ZSTD_compressBlock_opt0",
+			"count": 0
+		},
+		{
+			"from": "ZSTD_compressBlock_opt0",
+			"to": "ZSTD_opt_getNextMatchAndUpdateSeqStore",
+			"count": 0
+		},
+		{
+			"from": "ZSTD_compressBlock_opt0",
+			"to": "ZSTD_rescaleFreqs",
+			"count": 0
+		},
+		{
+			"from": "ZSTD_compressBlock_opt0",
+			"to": "ZSTD_optLdm_processMatchCandidate",
+			"count": 0
+		},
+		{
+			"from": "ZSTD_compressBlock_opt0",
+			"to": "ZSTD_updateStats",
+			"count": 0
+		},
+		{
+			"from": "ZSTD_rescaleFreqs",
+			"to": "HIST_count_simple",
+			"count": 0
+		},
+		{
+			"from": "ZSTD_rescaleFreqs",
+			"to": "HUF_getNbBitsFromCTable",
+			"count": 0
+		},
+		{
+			"from": "ZSTD_rescaleFreqs",
+			"to": "ZSTD_setBasePrices",
+			"count": 0
+		},
+		{
+			"from": "ZSTD_rescaleFreqs",
+			"to": "memcpy",
+			"count": 0
+		},
+		{
+			"from": "ZSTD_optLdm_processMatchCandidate",
+			"to": "ZSTD_opt_getNextMatchAndUpdateSeqStore",
+			"count": 0
+		},
+		{
+			"from": "ZSTD_compressBlock_btultra",
+			"to": "ZSTD_compressBlock_opt2",
+			"count": 0
+		},
+		{
+			"from": "ZSTD_compressBlock_opt2",
+			"to": "ZSTD_opt_getNextMatchAndUpdateSeqStore",
+			"count": 0
+		},
+		{
+			"from": "ZSTD_compressBlock_opt2",
+			"to": "ZSTD_rescaleFreqs",
+			"count": 0
+		},
+		{
+			"from": "ZSTD_compressBlock_opt2",
+			"to": "ZSTD_optLdm_processMatchCandidate",
+			"count": 0
+		},
+		{
+			"from": "ZSTD_compressBlock_opt2",
+			"to": "ZSTD_updateStats",
+			"count": 0
+		},
+		{
+			"from": "ZSTD_compressBlock_btultra2",
+			"to": "ZSTD_resetSeqStore",
+			"count": 0
+		},
+		{
+			"from": "ZSTD_compressBlock_btultra2",
+			"to": "ZSTD_compressBlock_opt2",
+			"count": 0
+		},
+		{
+			"from": "ZSTD_compressBlock_btopt_dictMatchState",
+			"to": "ZSTD_compressBlock_opt0",
+			"count": 0
+		},
+		{
+			"from": "ZSTD_compressBlock_btopt_extDict",
+			"to": "ZSTD_compressBlock_opt0",
+			"count": 0
+		},
+		{
+			"from": "ZSTD_compressBlock_btultra_dictMatchState",
+			"to": "ZSTD_compressBlock_opt2",
+			"count": 0
+		},
+		{
+			"from": "ZSTD_compressBlock_btultra_extDict",
+			"to": "ZSTD_compressBlock_opt2",
+			"count": 0
+		},
+		{
+			"from": "ZSTD_btGetAllMatches_noDict_3",
+			"to": "ZSTD_insertBt1",
+			"count": 0
+		},
+		{
+			"from": "ZSTD_btGetAllMatches_noDict_4",
+			"to": "ZSTD_insertBt1",
+			"count": 0
+		},
+		{
+			"from": "ZSTD_btGetAllMatches_noDict_5",
+			"to": "ZSTD_insertBt1",
+			"count": 0
+		},
+		{
+			"from": "ZSTD_btGetAllMatches_noDict_6",
+			"to": "ZSTD_insertBt1",
+			"count": 0
+		},
+		{
+			"from": "ZSTD_btGetAllMatches_extDict_3",
+			"to": "ZSTD_insertBt1",
+			"count": 0
+		},
+		{
+			"from": "ZSTD_btGetAllMatches_extDict_3",
+			"to": "_func207_ZSTD_count_2segments",
+			"count": 0
+		},
+		{
+			"from": "ZSTD_btGetAllMatches_extDict_4",
+			"to": "ZSTD_insertBt1",
+			"count": 0
+		},
+		{
+			"from": "ZSTD_btGetAllMatches_extDict_4",
+			"to": "_func207_ZSTD_count_2segments",
+			"count": 0
+		},
+		{
+			"from": "ZSTD_btGetAllMatches_extDict_5",
+			"to": "ZSTD_insertBt1",
+			"count": 0
+		},
+		{
+			"from": "ZSTD_btGetAllMatches_extDict_5",
+			"to": "_func207_ZSTD_count_2segments",
+			"count": 0
+		},
+		{
+			"from": "ZSTD_btGetAllMatches_extDict_6",
+			"to": "ZSTD_insertBt1",
+			"count": 0
+		},
+		{
+			"from": "ZSTD_btGetAllMatches_extDict_6",
+			"to": "_func207_ZSTD_count_2segments",
+			"count": 0
+		},
+		{
+			"from": "ZSTD_btGetAllMatches_dictMatchState_3",
+			"to": "ZSTD_insertBt1",
+			"count": 0
+		},
+		{
+			"from": "ZSTD_btGetAllMatches_dictMatchState_3",
+			"to": "_func207_ZSTD_count_2segments",
+			"count": 0
+		},
+		{
+			"from": "ZSTD_btGetAllMatches_dictMatchState_4",
+			"to": "ZSTD_insertBt1",
+			"count": 0
+		},
+		{
+			"from": "ZSTD_btGetAllMatches_dictMatchState_4",
+			"to": "_func207_ZSTD_count_2segments",
+			"count": 0
+		},
+		{
+			"from": "ZSTD_btGetAllMatches_dictMatchState_5",
+			"to": "ZSTD_insertBt1",
+			"count": 0
+		},
+		{
+			"from": "ZSTD_btGetAllMatches_dictMatchState_5",
+			"to": "_func207_ZSTD_count_2segments",
+			"count": 0
+		},
+		{
+			"from": "ZSTD_btGetAllMatches_dictMatchState_6",
+			"to": "ZSTD_insertBt1",
+			"count": 0
+		},
+		{
+			"from": "ZSTD_btGetAllMatches_dictMatchState_6",
+			"to": "_func207_ZSTD_count_2segments",
+			"count": 0
+		},
+		{
+			"from": "HUF_readDTableX1_wksp",
+			"to": "HUF_readStats_wksp",
+			"count": 1
+		},
+		{
+			"from": "HUF_readDTableX2_wksp",
+			"to": "HUF_readStats_wksp",
+			"count": 0
+		},
+		{
+			"from": "HUF_readDTableX2_wksp",
+			"to": "HUF_fillDTableX2ForWeight",
+			"count": 0
+		},
+		{
+			"from": "HUF_readDTableX2_wksp",
+			"to": "memset",
+			"count": 0
+		},
+		{
+			"from": "HUF_decompress1X1_DCtx_wksp",
+			"to": "HUF_readDTableX1_wksp",
+			"count": 0
+		},
+		{
+			"from": "HUF_decompress1X1_DCtx_wksp",
+			"to": "HUF_decompress1X1_usingDTable_internal",
+			"count": 0
+		},
+		{
+			"from": "HUF_decompress1X_usingDTable",
+			"to": "HUF_decompress1X2_usingDTable_internal",
+			"count": 0
+		},
+		{
+			"from": "HUF_decompress1X_usingDTable",
+			"to": "HUF_decompress1X1_usingDTable_internal",
+			"count": 0
+		},
+		{
+			"from": "HUF_decompress4X_usingDTable",
+			"to": "HUF_decompress4X2_usingDTable_internal",
+			"count": 0
+		},
+		{
+			"from": "HUF_decompress4X_usingDTable",
+			"to": "HUF_decompress4X1_usingDTable_internal",
+			"count": 1
+		},
+		{
+			"from": "HUF_decompress4X2_usingDTable_internal",
+			"to": "_func231_BIT_initDStream",
+			"count": 0
+		},
+		{
+			"from": "HUF_decompress4X1_usingDTable_internal",
+			"to": "_func231_BIT_initDStream",
+			"count": 2
+		},
+		{
+			"from": "HUF_decompress4X_hufOnly_wksp",
+			"to": "HUF_readDTableX1_wksp",
+			"count": 1
+		},
+		{
+			"from": "HUF_decompress4X_hufOnly_wksp",
+			"to": "HUF_readDTableX2_wksp",
+			"count": 0
+		},
+		{
+			"from": "HUF_decompress4X_hufOnly_wksp",
+			"to": "HUF_decompress4X2_usingDTable_internal",
+			"count": 0
+		},
+		{
+			"from": "HUF_decompress4X_hufOnly_wksp",
+			"to": "HUF_decompress4X1_usingDTable_internal",
+			"count": 1
+		},
+		{
+			"from": "ZSTD_freeDDict",
+			"to": "free",
+			"count": 0
+		},
+		{
+			"from": "ZSTD_freeDCtx",
+			"to": "ZSTD_freeDDict",
+			"count": 1
+		},
+		{
+			"from": "ZSTD_freeDCtx",
+			"to": "free",
+			"count": 1
+		},
+		{
+			"from": "ZSTD_getFrameHeader_advanced",
+			"to": "memcpy",
+			"count": 0
+		},
+		{
+			"from": "ZSTD_decompressMultiFrame",
+			"to": "ZSTD_XXH64_update",
+			"count": 0
+		},
+		{
+			"from": "ZSTD_decompressMultiFrame",
+			"to": "ZSTD_XXH64_digest",
+			"count": 0
+		},
+		{
+			"from": "ZSTD_decompressMultiFrame",
+			"to": "ZSTD_getErrorCode",
+			"count": 1
+		},
+		{
+			"from": "ZSTD_decompressMultiFrame",
+			"to": "ZSTD_DDict_dictContent",
+			"count": 0
+		},
+		{
+			"from": "ZSTD_decompressMultiFrame",
+			"to": "ZSTD_DDict_dictSize",
+			"count": 0
+		},
+		{
+			"from": "ZSTD_decompressMultiFrame",
+			"to": "ZSTD_copyDDictParameters",
+			"count": 0
+		},
+		{
+			"from": "ZSTD_decompressMultiFrame",
+			"to": "ZSTD_decompressBegin_usingDict",
+			"count": 1
+		},
+		{
+			"from": "ZSTD_decompressMultiFrame",
+			"to": "ZSTD_decodeFrameHeader",
+			"count": 1
+		},
+		{
+			"from": "ZSTD_decompressMultiFrame",
+			"to": "ZSTD_getcBlockSize",
+			"count": 2
+		},
+		{
+			"from": "ZSTD_decompressMultiFrame",
+			"to": "ZSTD_decompressBlock_internal",
+			"count": 2
+		},
+		{
+			"from": "ZSTD_decompressMultiFrame",
+			"to": "ZSTD_checkContinuity",
+			"count": 1
+		},
+		{
+			"from": "ZSTD_decompressMultiFrame",
+			"to": "memmove",
+			"count": 0
+		},
+		{
+			"from": "ZSTD_decompressMultiFrame",
+			"to": "memset",
+			"count": 0
+		},
+		{
+			"from": "ZSTD_decompressBegin_usingDict",
+			"to": "ZSTD_loadDEntropy",
+			"count": 0
+		},
+		{
+			"from": "ZSTD_decodeFrameHeader",
+			"to": "ZSTD_XXH64_reset",
+			"count": 0
+		},
+		{
+			"from": "ZSTD_decodeFrameHeader",
+			"to": "ZSTD_getFrameHeader_advanced",
+			"count": 1
+		},
+		{
+			"from": "ZSTD_decodeFrameHeader",
+			"to": "ZSTD_DCtx_selectFrameDDict",
+			"count": 0
+		},
+		{
+			"from": "ZSTD_decompress",
+			"to": "ZSTD_freeDDict",
+			"count": 1
+		},
+		{
+			"from": "ZSTD_decompress",
+			"to": "ZSTD_freeDCtx",
+			"count": 1
+		},
+		{
+			"from": "ZSTD_decompress",
+			"to": "ZSTD_decompressMultiFrame",
+			"count": 1
+		},
+		{
+			"from": "ZSTD_decompress",
+			"to": "malloc",
+			"count": 1
+		},
+		{
+			"from": "ZSTD_DCtx_selectFrameDDict",
+			"to": "ZSTD_XXH64",
+			"count": 0
+		},
+		{
+			"from": "ZSTD_DCtx_selectFrameDDict",
+			"to": "ZSTD_freeDDict",
+			"count": 0
+		},
+		{
+			"from": "ZSTD_DCtx_selectFrameDDict",
+			"to": "ZSTD_getDictID_fromDDict",
+			"count": 0
+		},
+		{
+			"from": "ZSTD_loadDEntropy",
+			"to": "FSE_readNCount",
+			"count": 0
+		},
+		{
+			"from": "ZSTD_loadDEntropy",
+			"to": "HUF_readDTableX2_wksp",
+			"count": 0
+		},
+		{
+			"from": "ZSTD_loadDEntropy",
+			"to": "ZSTD_buildFSETable",
+			"count": 0
+		},
+		{
+			"from": "ZSTD_decodeLiteralsBlock",
+			"to": "HUF_decompress1X1_DCtx_wksp",
+			"count": 0
+		},
+		{
+			"from": "ZSTD_decodeLiteralsBlock",
+			"to": "HUF_decompress1X_usingDTable",
+			"count": 0
+		},
+		{
+			"from": "ZSTD_decodeLiteralsBlock",
+			"to": "HUF_decompress4X_usingDTable",
+			"count": 1
+		},
+		{
+			"from": "ZSTD_decodeLiteralsBlock",
+			"to": "HUF_decompress4X_hufOnly_wksp",
+			"count": 1
+		},
+		{
+			"from": "ZSTD_decodeLiteralsBlock",
+			"to": "ZSTD_allocateLiteralsBuffer",
+			"count": 2
+		},
+		{
+			"from": "ZSTD_decodeLiteralsBlock",
+			"to": "memcpy",
+			"count": 0
+		},
+		{
+			"from": "ZSTD_decodeLiteralsBlock",
+			"to": "memmove",
+			"count": 0
+		},
+		{
+			"from": "ZSTD_decodeLiteralsBlock",
+			"to": "memset",
+			"count": 0
+		},
+		{
+			"from": "ZSTD_decodeSeqHeaders",
+			"to": "ZSTD_buildSeqTable",
+			"count": 6
+		},
+		{
+			"from": "ZSTD_buildSeqTable",
+			"to": "FSE_readNCount",
+			"count": 6
+		},
+		{
+			"from": "ZSTD_buildSeqTable",
+			"to": "ZSTD_buildFSETable",
+			"count": 6
+		},
+		{
+			"from": "ZSTD_decompressBlock_internal",
+			"to": "ZSTD_decodeLiteralsBlock",
+			"count": 2
+		},
+		{
+			"from": "ZSTD_decompressBlock_internal",
+			"to": "ZSTD_decodeSeqHeaders",
+			"count": 2
+		},
+		{
+			"from": "ZSTD_decompressBlock_internal",
+			"to": "ZSTD_decompressSequencesSplitLitBuffer",
+			"count": 0
+		},
+		{
+			"from": "ZSTD_decompressBlock_internal",
+			"to": "ZSTD_decompressSequences",
+			"count": 2
+		},
+		{
+			"from": "ZSTD_decompressBlock_internal",
+			"to": "ZSTD_execSequenceEnd",
+			"count": 0
+		},
+		{
+			"from": "ZSTD_decompressBlock_internal",
+			"to": "ZSTD_execSequenceEndSplitLitBuffer",
+			"count": 0
+		},
+		{
+			"from": "ZSTD_decompressBlock_internal",
+			"to": "memmove",
+			"count": 0
+		},
+		{
+			"from": "ZSTD_decompressSequencesSplitLitBuffer",
+			"to": "ZSTD_execSequenceEnd",
+			"count": 0
+		},
+		{
+			"from": "ZSTD_decompressSequencesSplitLitBuffer",
+			"to": "ZSTD_execSequenceEndSplitLitBuffer",
+			"count": 0
+		},
+		{
+			"from": "ZSTD_decompressSequencesSplitLitBuffer",
+			"to": "memcpy",
+			"count": 0
+		},
+		{
+			"from": "ZSTD_decompressSequencesSplitLitBuffer",
+			"to": "memmove",
+			"count": 0
+		},
+		{
+			"from": "ZSTD_decompressSequences",
+			"to": "ZSTD_execSequenceEnd",
+			"count": 3
+		},
+		{
+			"from": "ZSTD_decompressSequences",
+			"to": "memcpy",
+			"count": 2
+		},
+		{
+			"from": "ZSTD_decompressSequences",
+			"to": "memmove",
+			"count": 0
+		},
+		{
+			"from": "ZSTD_execSequenceEnd",
+			"to": "ZSTD_safecopy",
+			"count": 3
+		},
+		{
+			"from": "ZSTD_execSequenceEnd",
+			"to": "memmove",
+			"count": 0
+		},
+		{
+			"from": "ZSTD_execSequenceEndSplitLitBuffer",
+			"to": "ZSTD_safecopy",
+			"count": 0
+		},
+		{
+			"from": "ZSTD_execSequenceEndSplitLitBuffer",
+			"to": "memmove",
+			"count": 0
+		},
+		{
+			"from": "run",
+			"to": "ZSTD_isError",
+			"count": 2
+		},
+		{
+			"from": "run",
+			"to": "ZSTD_compress",
+			"count": 1
+		},
+		{
+			"from": "run",
+			"to": "ZSTD_decompress",
+			"count": 1
+		}
+	]
+}

@@ -1,0 +1,586 @@
+{
+	"guest": "zlib-out/guest.wasm",
+	"checksum": 1744705808,
+	"total": 343711057,
+	"bytes": 27924,
+	"nodes": [
+		{
+			"name": "deflateInit_",
+			"count": 11,
+			"bytes": 24,
+			"params": 4,
+			"result": true,
+			"wide": false
+		},
+		{
+			"name": "deflateInit2_",
+			"count": 270,
+			"bytes": 657,
+			"params": 8,
+			"result": true,
+			"wide": false
+		},
+		{
+			"name": "deflateEnd",
+			"count": 136,
+			"bytes": 375,
+			"params": 1,
+			"result": true,
+			"wide": false
+		},
+		{
+			"name": "deflateReset",
+			"count": 78,
+			"bytes": 199,
+			"params": 1,
+			"result": true,
+			"wide": false
+		},
+		{
+			"name": "deflateResetKeep",
+			"count": 100,
+			"bytes": 294,
+			"params": 1,
+			"result": true,
+			"wide": false
+		},
+		{
+			"name": "fill_window",
+			"count": 17209658,
+			"bytes": 1198,
+			"params": 1,
+			"result": false,
+			"wide": false
+		},
+		{
+			"name": "deflate",
+			"count": 380,
+			"bytes": 4381,
+			"params": 2,
+			"result": true,
+			"wide": false
+		},
+		{
+			"name": "flush_pending",
+			"count": 136,
+			"bytes": 147,
+			"params": 1,
+			"result": false,
+			"wide": false
+		},
+		{
+			"name": "deflate_stored",
+			"count": 0,
+			"bytes": 1825,
+			"params": 2,
+			"result": true,
+			"wide": false
+		},
+		{
+			"name": "deflate_huff",
+			"count": 0,
+			"bytes": 920,
+			"params": 2,
+			"result": true,
+			"wide": false
+		},
+		{
+			"name": "deflate_rle",
+			"count": 0,
+			"bytes": 1484,
+			"params": 2,
+			"result": true,
+			"wide": false
+		},
+		{
+			"name": "deflate_fast",
+			"count": 0,
+			"bytes": 1652,
+			"params": 2,
+			"result": true,
+			"wide": false
+		},
+		{
+			"name": "longest_match",
+			"count": 254132117,
+			"bytes": 549,
+			"params": 2,
+			"result": true,
+			"wide": false
+		},
+		{
+			"name": "deflate_slow",
+			"count": 45958778,
+			"bytes": 2150,
+			"params": 2,
+			"result": true,
+			"wide": false
+		},
+		{
+			"name": "_tr_init",
+			"count": 34,
+			"bytes": 98,
+			"params": 1,
+			"result": false,
+			"wide": false
+		},
+		{
+			"name": "init_block",
+			"count": 12092,
+			"bytes": 475,
+			"params": 1,
+			"result": false,
+			"wide": false
+		},
+		{
+			"name": "_tr_stored_block",
+			"count": 0,
+			"bytes": 459,
+			"params": 4,
+			"result": false,
+			"wide": false
+		},
+		{
+			"name": "_tr_flush_bits",
+			"count": 93,
+			"bytes": 174,
+			"params": 1,
+			"result": false,
+			"wide": false
+		},
+		{
+			"name": "_tr_align",
+			"count": 0,
+			"bytes": 418,
+			"params": 1,
+			"result": false,
+			"wide": false
+		},
+		{
+			"name": "_tr_flush_block",
+			"count": 37782,
+			"bytes": 2590,
+			"params": 4,
+			"result": false,
+			"wide": false
+		},
+		{
+			"name": "build_tree",
+			"count": 239918,
+			"bytes": 2752,
+			"params": 2,
+			"result": false,
+			"wide": false
+		},
+		{
+			"name": "compress_block",
+			"count": 10378970,
+			"bytes": 1172,
+			"params": 3,
+			"result": false,
+			"wide": false
+		},
+		{
+			"name": "send_tree",
+			"count": 45520,
+			"bytes": 1503,
+			"params": 3,
+			"result": false,
+			"wide": false
+		},
+		{
+			"name": "adler32_z",
+			"count": 5402810,
+			"bytes": 1054,
+			"params": 3,
+			"result": true,
+			"wide": false
+		},
+		{
+			"name": "adler32",
+			"count": 108,
+			"bytes": 14,
+			"params": 3,
+			"result": true,
+			"wide": false
+		},
+		{
+			"name": "crc32_z",
+			"count": 0,
+			"bytes": 463,
+			"params": 3,
+			"result": true,
+			"wide": false
+		},
+		{
+			"name": "crc32",
+			"count": 0,
+			"bytes": 14,
+			"params": 3,
+			"result": true,
+			"wide": false
+		},
+		{
+			"name": "zmemcpy",
+			"count": 10193448,
+			"bytes": 231,
+			"params": 3,
+			"result": false,
+			"wide": false
+		},
+		{
+			"name": "zmemzero",
+			"count": 98393,
+			"bytes": 99,
+			"params": 2,
+			"result": false,
+			"wide": false
+		},
+		{
+			"name": "run",
+			"count": 90,
+			"bytes": 483,
+			"params": 1,
+			"result": true,
+			"wide": false
+		},
+		{
+			"name": "zfree",
+			"count": 0,
+			"bytes": 2,
+			"params": 2,
+			"result": false,
+			"wide": false
+		},
+		{
+			"name": "zalloc",
+			"count": 135,
+			"bytes": 68,
+			"params": 3,
+			"result": true,
+			"wide": false
+		}
+	],
+	"edges": [
+		{
+			"from": "deflateInit_",
+			"to": "deflateInit2_",
+			"count": 1
+		},
+		{
+			"from": "deflateInit2_",
+			"to": "deflateEnd",
+			"count": 0
+		},
+		{
+			"from": "deflateInit2_",
+			"to": "deflateReset",
+			"count": 1
+		},
+		{
+			"from": "deflateInit2_",
+			"to": "zalloc",
+			"count": 5
+		},
+		{
+			"from": "deflateEnd",
+			"to": "zfree",
+			"count": 5
+		},
+		{
+			"from": "deflateReset",
+			"to": "deflateResetKeep",
+			"count": 1
+		},
+		{
+			"from": "deflateReset",
+			"to": "zmemzero",
+			"count": 1
+		},
+		{
+			"from": "deflateResetKeep",
+			"to": "_tr_init",
+			"count": 1
+		},
+		{
+			"from": "deflateResetKeep",
+			"to": "adler32",
+			"count": 1
+		},
+		{
+			"from": "deflateResetKeep",
+			"to": "crc32",
+			"count": 0
+		},
+		{
+			"from": "fill_window",
+			"to": "adler32",
+			"count": 15
+		},
+		{
+			"from": "fill_window",
+			"to": "crc32",
+			"count": 0
+		},
+		{
+			"from": "fill_window",
+			"to": "zmemcpy",
+			"count": 30
+		},
+		{
+			"from": "fill_window",
+			"to": "zmemzero",
+			"count": 1
+		},
+		{
+			"from": "deflate",
+			"to": "flush_pending",
+			"count": 2
+		},
+		{
+			"from": "deflate",
+			"to": "deflate_stored",
+			"count": 0
+		},
+		{
+			"from": "deflate",
+			"to": "deflate_huff",
+			"count": 0
+		},
+		{
+			"from": "deflate",
+			"to": "deflate_rle",
+			"count": 0
+		},
+		{
+			"from": "deflate",
+			"to": "deflate_slow",
+			"count": 1
+		},
+		{
+			"from": "deflate",
+			"to": "_tr_stored_block",
+			"count": 0
+		},
+		{
+			"from": "deflate",
+			"to": "_tr_flush_bits",
+			"count": 0
+		},
+		{
+			"from": "deflate",
+			"to": "_tr_align",
+			"count": 0
+		},
+		{
+			"from": "deflate",
+			"to": "adler32",
+			"count": 1
+		},
+		{
+			"from": "deflate",
+			"to": "crc32",
+			"count": 0
+		},
+		{
+			"from": "deflate",
+			"to": "zmemcpy",
+			"count": 0
+		},
+		{
+			"from": "deflate",
+			"to": "zmemzero",
+			"count": 0
+		},
+		{
+			"from": "flush_pending",
+			"to": "_tr_flush_bits",
+			"count": 2
+		},
+		{
+			"from": "flush_pending",
+			"to": "zmemcpy",
+			"count": 2
+		},
+		{
+			"from": "deflate_stored",
+			"to": "_tr_stored_block",
+			"count": 0
+		},
+		{
+			"from": "deflate_stored",
+			"to": "_tr_flush_bits",
+			"count": 0
+		},
+		{
+			"from": "deflate_stored",
+			"to": "adler32",
+			"count": 0
+		},
+		{
+			"from": "deflate_stored",
+			"to": "crc32",
+			"count": 0
+		},
+		{
+			"from": "deflate_stored",
+			"to": "zmemcpy",
+			"count": 0
+		},
+		{
+			"from": "deflate_huff",
+			"to": "fill_window",
+			"count": 0
+		},
+		{
+			"from": "deflate_huff",
+			"to": "_tr_flush_bits",
+			"count": 0
+		},
+		{
+			"from": "deflate_huff",
+			"to": "_tr_flush_block",
+			"count": 0
+		},
+		{
+			"from": "deflate_huff",
+			"to": "zmemcpy",
+			"count": 0
+		},
+		{
+			"from": "deflate_rle",
+			"to": "fill_window",
+			"count": 0
+		},
+		{
+			"from": "deflate_rle",
+			"to": "_tr_flush_bits",
+			"count": 0
+		},
+		{
+			"from": "deflate_rle",
+			"to": "_tr_flush_block",
+			"count": 0
+		},
+		{
+			"from": "deflate_rle",
+			"to": "zmemcpy",
+			"count": 0
+		},
+		{
+			"from": "deflate_fast",
+			"to": "fill_window",
+			"count": 0
+		},
+		{
+			"from": "deflate_fast",
+			"to": "longest_match",
+			"count": 0
+		},
+		{
+			"from": "deflate_fast",
+			"to": "_tr_flush_bits",
+			"count": 0
+		},
+		{
+			"from": "deflate_fast",
+			"to": "_tr_flush_block",
+			"count": 0
+		},
+		{
+			"from": "deflate_fast",
+			"to": "zmemcpy",
+			"count": 0
+		},
+		{
+			"from": "deflate_slow",
+			"to": "fill_window",
+			"count": 63
+		},
+		{
+			"from": "deflate_slow",
+			"to": "longest_match",
+			"count": 91105
+		},
+		{
+			"from": "deflate_slow",
+			"to": "_tr_flush_bits",
+			"count": 3
+		},
+		{
+			"from": "deflate_slow",
+			"to": "_tr_flush_block",
+			"count": 3
+		},
+		{
+			"from": "deflate_slow",
+			"to": "zmemcpy",
+			"count": 3
+		},
+		{
+			"from": "_tr_init",
+			"to": "init_block",
+			"count": 1
+		},
+		{
+			"from": "_tr_stored_block",
+			"to": "zmemcpy",
+			"count": 0
+		},
+		{
+			"from": "_tr_flush_block",
+			"to": "init_block",
+			"count": 3
+		},
+		{
+			"from": "_tr_flush_block",
+			"to": "_tr_stored_block",
+			"count": 0
+		},
+		{
+			"from": "_tr_flush_block",
+			"to": "build_tree",
+			"count": 9
+		},
+		{
+			"from": "_tr_flush_block",
+			"to": "compress_block",
+			"count": 3
+		},
+		{
+			"from": "_tr_flush_block",
+			"to": "send_tree",
+			"count": 6
+		},
+		{
+			"from": "adler32",
+			"to": "adler32_z",
+			"count": 18
+		},
+		{
+			"from": "crc32",
+			"to": "crc32_z",
+			"count": 0
+		},
+		{
+			"from": "run",
+			"to": "deflateInit_",
+			"count": 1
+		},
+		{
+			"from": "run",
+			"to": "deflateEnd",
+			"count": 1
+		},
+		{
+			"from": "run",
+			"to": "deflate",
+			"count": 1
+		},
+		{
+			"from": "run",
+			"to": "adler32",
+			"count": 1
+		}
+	]
+}

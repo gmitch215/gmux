@@ -16,26 +16,33 @@ export interface Linked {
 }
 
 /**
- * A dispatcher for the interpreter's host_direct import: a br_table on the id, each arm calling one native function with
- * its first `arity` arguments. `viaTable` calls through an imported table (call_indirect on the id's slot), which breaks
- * the cycle when the native module needs the interpreter's memory and so cannot exist before it; otherwise each arm
- * calls an imported function directly.
+ * A dispatcher for the interpreter's host imports: a br_table on the id, each arm calling one native function with its
+ * first `arity` arguments. `host_direct` answers arities up to eight, `host_wide` (exported when an entry needs it) up to
+ * nineteen; an entry is only reachable through the export its arity fits. `viaTable` calls through an imported table
+ * (call_indirect on the id's slot), which breaks the cycle when the native module needs the interpreter's memory and so
+ * cannot exist before it; otherwise each arm calls an imported function directly.
  */
 export function dispatchWat(entries: { arity: number; returns: boolean }[], viaTable: boolean) {
 	const sig = (e: { arity: number; returns: boolean }) => `(param ${'i32 '.repeat(e.arity)}) ${e.returns ? '(result i32)' : ''}`;
 	const types = entries.map((e, i) => `(type $s${i} (func ${sig(e)}))`);
-	const imports = viaTable ? ['(import "env" "table" (table 64 funcref))'] : entries.map((e, i) => `(import "native" "f${i}" (func $f${i} ${sig(e)}))`);
+	const imports = viaTable ? [`(import "env" "table" (table ${entries.length} funcref))`] :entries.map((e, i) => `(import "native" "f${i}" (func $f${i} ${sig(e)}))`);
 	const args = (e: { arity: number }) => Array.from({ length: e.arity }, (_, k) => `(local.get $a${k})`).join(' ');
-	const arms = entries.map((e, i) => {
-		const call = viaTable ? `(call_indirect (type $s${i}) ${args(e)} (i32.const ${i}))` : `(call $f${i} ${args(e)})`;
-		return e.returns ? `(return ${call})` : `${call} (return (i32.const 0))`;
-	});
-	// arm i sits right after block i closes, which is where br_table target i lands
-	const opens = entries.map((_, i) => `(block $b${entries.length - 1 - i}`).join(' ');
-	const body = `(block $d ${opens} (br_table ${entries.map((_, i) => `$b${i}`).join(' ')} $d (local.get $id)) ${arms.map((a) => `) ${a}`).join(' ')}) (unreachable)`;
+	const exported = (name: string, slots: number, wide: boolean) => {
+		const arms = entries.map((e, i) => {
+			if (e.arity > 8 !== wide) return '(unreachable)';
+			const call = viaTable ? `(call_indirect (type $s${i}) ${args(e)} (i32.const ${i}))` : `(call $f${i} ${args(e)})`;
+			return e.returns ? `(return ${call})` : `${call} (return (i32.const 0))`;
+		});
+		// arm i sits right after block i closes, which is where br_table target i lands
+		const opens = entries.map((_, i) => `(block $b${entries.length - 1 - i}`).join(' ');
+		const body = `(block $d ${opens} (br_table ${entries.map((_, i) => `$b${i}`).join(' ')} $d (local.get $id)) ${arms.map((a) => `) ${a}`).join(' ')}) (unreachable)`;
+		return `(func (export "${name}") (param $id i32) ${Array.from({ length: slots }, (_, k) => `(param $a${k} i32)`).join(' ')} (result i32)
+		${body})`;
+	};
+	const wide = entries.some((e) => e.arity > 8) ? exported('host_wide', 19, true) : '';
 	return `(module ${types.join(' ')} ${imports.join(' ')}
-	(func (export "host_direct") (param $id i32) ${Array.from({ length: 8 }, (_, k) => `(param $a${k} i32)`).join(' ')} (result i32)
-		${body}))`;
+	${exported('host_direct', 8, false)}
+	${wide})`;
 }
 
 /** the entries a rung's thunks need dispatched, in link order */
@@ -46,11 +53,12 @@ export const entriesOf = (rung: Rung) => Object.entries(rung.imports).map(([name
  * open rung, the native side's way back into the interpreter. `direct` answers the thunks through host_direct and a
  * dispatcher over `table` (which this fills); otherwise through JavaScript.
  */
-export function linkRung(vm: Vm, dir: string, rung: Rung, options: { direct?: { table: WebAssembly.Table }; jsUp?: boolean; beforeUp?: () => void } = {}): Linked {
+export function linkRung(vm: Vm, dir: string, rung: Rung, options: { direct?: { table: WebAssembly.Table }; jsUp?: boolean; beforeUp?: () => void; suffix?: string } = {}): Linked {
+	const tag = options.suffix ? `.${options.suffix}` : '';
 	const counts = { down: 0, up: 0 };
 	const native: Linked['native'] = {};
 	const entries = entriesOf(rung);
-	const interpBytes = new Uint8Array(readFileSync(join(dir, `rung${rung.rung}.interp.wasm`)));
+	const interpBytes = new Uint8Array(readFileSync(join(dir, `rung${rung.rung}.interp${tag}.wasm`)));
 	const guest = options.direct
 		? vm.load(interpBytes, { direct: entries.map((e) => ({ module: 'native', field: e.name, signature: rung.imports[e.name]! })) })
 		: vm.load(interpBytes, {
@@ -79,9 +87,16 @@ export function linkRung(vm: Vm, dir: string, rung: Rung, options: { direct?: { 
 				return (vm.shim.burrow_call_at as (...x: number[]) => number)(...a);
 			}
 		: (vm.shim.burrow_call_at as unknown as WebAssembly.ImportValue);
-	const interp: Record<string, WebAssembly.ImportValue> = { call_at: callAt };
+	const callAtWide = options.jsUp
+		? (...a: number[]) => {
+				options.beforeUp?.();
+				counts.up++;
+				return (vm.shim.burrow_call_at_wide as (...x: number[]) => number)(...a);
+			}
+		: (vm.shim.burrow_call_at_wide as unknown as WebAssembly.ImportValue);
+	const interp: Record<string, WebAssembly.ImportValue> = { call_at: callAt, call_at_wide: callAtWide };
 	for (const c of rung.cold ?? []) interp[`h_${c}`] = new WebAssembly.Global({ value: 'i32', mutable: false }, guest.handle(`ie_${c}`));
-	const nativeModule = new WebAssembly.Module(readFileSync(join(dir, `rung${rung.rung}.native.wasm`)));
+	const nativeModule = new WebAssembly.Module(readFileSync(join(dir, `rung${rung.rung}.native${tag}.wasm`)));
 	// a module made with LADDER_MEM0 has no base to import
 	const needsBase = WebAssembly.Module.imports(nativeModule).some((i) => i.name === 'base');
 	const instance = new WebAssembly.Instance(nativeModule, { env: needsBase ? { memory, base } : { memory }, interp });
@@ -103,8 +118,12 @@ export async function openRung(wasm3: string, dir: string, rung: Rung, mode: 'gl
 		return { vm, linked: linkRung(vm, dir, rung, { jsUp: true }) };
 	}
 	if (!dispatcher) throw new Error('direct needs the assembled dispatcher');
-	const table = new WebAssembly.Table({ element: 'anyfunc', initial: 64 });
+	const table = new WebAssembly.Table({ element: 'anyfunc', initial: entriesOf(rung).length });
 	const instance = new WebAssembly.Instance(new WebAssembly.Module(dispatcher as Uint8Array<ArrayBuffer>), { env: { table } });
-	const vm = await createVm(wasm3, { ...options, hostDirect: instance.exports.host_direct as (...a: number[]) => number });
+	const vm = await createVm(wasm3, {
+		...options,
+		hostDirect: instance.exports.host_direct as (...a: number[]) => number,
+		hostWide: instance.exports.host_wide as ((...a: number[]) => number) | undefined
+	});
 	return { vm, linked: linkRung(vm, dir, rung, { direct: { table } }) };
 }

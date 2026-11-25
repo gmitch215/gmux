@@ -110,6 +110,36 @@ export async function runGrow(wasm3: string, dir: string): Promise<Check[]> {
 	];
 }
 
+/**
+ * toy-wide.wat: twelve-parameter functions that call each other across the tiers, and a nineteen-slot leaf. Each crossing
+ * takes the wide bridge (host_wide down, call_at_wide up); every answer and the memory word are compared with V8.
+ */
+export async function runWide(wasm3: string, dir: string, mode: 'glued' | 'direct', depth = 1000): Promise<Check[]> {
+	const { rungs } = JSON.parse(readFileSync(join(dir, 'rungs', 'rungs.json'), 'utf8')) as { rungs: (Rung & { label: string })[] };
+	const mixed = rungs.find((r) => r.label === 'mixed')!;
+	const { vm, linked } = await openRung(wasm3, join(dir, 'rungs'), mixed, mode, mode === 'direct' ? dispatcherBytes(mixed) : undefined);
+	const g = linked.guest;
+	const ref = v8(join(dir, 'guest.wasm'));
+	const checks: Check[] = [];
+	const attempt = (name: string, f: () => Check) => {
+		try {
+			checks.push(f());
+		} catch (e) {
+			checks.push({ name, ok: false, detail: `threw ${String(e).slice(0, 120)}` });
+		}
+	};
+	const both = (name: string, fn: string, ...args: number[]) => attempt(name, () => same(name, g.call(fn, ...args), ref[fn]!(...args)));
+	both('nested entry: hot12 from the host', 'hot12Drive', 3);
+	both('nested entry: cold12 from the host', 'cold12Drive', 4);
+	both(`mixed recursion depth ${depth}`, 'hot12Drive', depth);
+	both(`mixed recursion depth ${depth + 1} from the interpreted side`, 'cold12Drive', depth + 1);
+	both('leaf18 with nineteen slots', 'leafDrive', 7);
+	both('run(40)', 'run', 40);
+	both(`run(${depth})`, 'run', depth);
+	attempt('guest memory word equals v8', () => same('word', new DataView((vm.guest ?? vm.shim.memory).buffer).getInt32(g.memory().base + 512, true), new DataView(ref.memory.buffer).getInt32(512, true)));
+	return checks;
+}
+
 export type Step = [fn: string, ...args: number[]];
 
 /** the promoted functions of toy-mem.wat: every n_* and the native caller of the interpreter */

@@ -1,0 +1,11 @@
+{
+	"tau_ns": 255.03652550841707,
+	"crossings": 58875,
+	"spread": 0.10155599314992016,
+	"rung": "ZSTD_RowFindBestMatch_noDict_5_4",
+	"rounds": 3,
+	"host": "local-26.8",
+	"node": "v26.8.2",
+	"module": "3866a01f986804d8f839d427ac923a07eaec8402bfd01c605b50f156e3c1e245",
+	"seconds": 8.346412042
+}

@@ -12,8 +12,8 @@ const pure = process.argv.slice(2).flatMap((a, i, all) => (all[i - 1] === '--pur
 const budgets = [1, 0.1, 0.03, 0.015];
 const policies: Policy[] = ['hottest', 'mincut'];
 const guests = {
-	zlib: { dir: 'build/batch/run3/B31/acc/zlib-auto', reports: ['build/batch/run3/B31/acc/zlib-auto/zlib.report.md'] },
-	zstd: { dir: 'build/batch/run3/B31/acc/zstd-auto', reports: ['build/batch/run2/B30/zstd-t292/zstd.report.md', 'build/batch/run3/B31/acc/zstd-auto/zstd.report.md'] }
+	zlib: { dir: 'experiments/reenter/data/zlib', reports: ['experiments/reenter/data/zlib/zlib.report.md'] },
+	zstd: { dir: 'experiments/reenter/data/zstd', reports: ['experiments/reenter/data/zstd/zstd.earlier.report.md', 'experiments/reenter/data/zstd/zstd.report.md'] }
 };
 
 const measured = (path: string) => {

@@ -12,7 +12,8 @@ import {
 	prepareToy,
 	runGrow,
 	runMemory,
-	runToy
+	runToy,
+	runWide
 } from '../../experiments/reenter/scripts/toy.ts';
 import { createVm, memoryLimits } from '../../experiments/reenter/scripts/vm.ts';
 
@@ -32,6 +33,8 @@ const assemble = (wat: string) =>
 	new Uint8Array(execFileSync('wasm-tools', ['parse', '-o', '/dev/stdout'], { input: wat }));
 const toy = new URL('../../experiments/reenter/toy.wat', import.meta.url).pathname;
 const toyGrow = new URL('../../experiments/reenter/toy-grow.wat', import.meta.url).pathname;
+const toyWide = new URL('../../experiments/reenter/toy-wide.wat', import.meta.url).pathname;
+const wideSets = { mixed: ['hot12', 'leaf18', 'hotV'] };
 
 describe('dispatcher', () => {
 	const entries = [
@@ -45,6 +48,13 @@ describe('dispatcher', () => {
 		expect(wat).toContain('(br_table $b0 $b1 $b2 $d (local.get $id))');
 		expect(wat).toContain('(unreachable)');
 		expect(dispatchWat(entries, true)).toContain('call_indirect (type $s1)');
+	});
+
+	it('exports host_wide only when an entry takes more than eight slots', () => {
+		expect(dispatchWat(entries, false)).not.toContain('host_wide');
+		const wide = [...entries, { arity: 12, returns: true }];
+		expect(dispatchWat(wide, false)).toContain('(func (export "host_wide")');
+		expect(dispatchWat(wide, true)).toContain('call_indirect (type $s3)');
 	});
 
 	it('reads the arity from a wasm3 signature', () => {
@@ -185,6 +195,18 @@ describe.skipIf(!hasTools || !wasm3)(
 			expect(failed(await runGrow(wasm3!, join(dir, 'grow')))).toEqual([]);
 		});
 
+		it('answers what V8 answers across the wide bridge, over JavaScript', async () => {
+			prepareToy(toyWide, join(dir, 'wide-glued'), wideSets);
+			expect(failed(await runWide(wasm3!, join(dir, 'wide-glued'), 'glued', 400))).toEqual(
+				[]
+			);
+		});
+
+		it('answers what V8 answers across the wide bridge, with no JavaScript in the loop', async () => {
+			prepareToy(toyWide, join(dir, 'wide-direct'), wideSets);
+			expect(failed(await runWide(wasm3!, join(dir, 'wide-direct'), 'direct'))).toEqual([]);
+		});
+
 		it.skipIf(!mutant)('fails when the nested entry starts at the stack origin', async () => {
 			prepareToy(toy, join(dir, 'mutant'), sets);
 			expect(
@@ -300,6 +322,14 @@ describe.skipIf(!hasTools || !guestMemory)(
 			const sets = { mixed: ['hotA', 'leafH', 'viaTab', 'callTrap'] };
 			prepareToy(toy, join(dir, 'toy'), sets, true, mem0);
 			expect(failed(await runToy(guestMemory!, join(dir, 'toy'), 'direct'))).toEqual([]);
+		});
+
+		it('passes the wide-bridge toy over the shared Memory', async () => {
+			prepareToy(toyWide, join(dir, 'wide'), wideSets, true, mem0);
+			// depth 1000 overflows V8's stack on this build (RangeError), so the shared-memory run stops at 400
+			expect(failed(await runWide(guestMemory!, join(dir, 'wide'), 'direct', 400))).toEqual(
+				[]
+			);
 		});
 	}
 );

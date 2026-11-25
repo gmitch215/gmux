@@ -1,0 +1,25 @@
+{
+	"node": "v26.8.2",
+	"v8": "14.6.202.34-node.28",
+	"n": 2,
+	"rounds": 5,
+	"v8ms": 9.508667000000003,
+	"rows": [
+		{
+			"rung": 0,
+			"label": "interpreted",
+			"target": 0,
+			"share": 0,
+			"ms": 217.80970899999966,
+			"crossings": 0
+		},
+		{
+			"rung": 1,
+			"label": "native",
+			"target": 1,
+			"share": 1,
+			"ms": 10.07425000000012,
+			"crossings": 0
+		}
+	]
+}

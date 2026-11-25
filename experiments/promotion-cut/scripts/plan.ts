@@ -32,12 +32,19 @@ export interface Params {
 	tau: number;
 	/** seconds per code byte */
 	lambda: number;
+	/** seconds per down crossing (interpreted caller, native callee); defaults to tau */
+	tauDown?: number;
+	/** seconds per up crossing (native caller, interpreted callee); defaults to tau */
+	tauUp?: number;
+	/** the most parameters the bridge carries, for the open policy; defaults to 7 */
+	maxParams?: number;
 }
 
 export interface Split {
 	interp: number;
 	native: number;
 	crossings: number;
+	upCrossings: number;
 	boundary: number;
 	crossingBytes: number;
 	bytes: number;
@@ -47,7 +54,7 @@ export interface Split {
 	objective: number;
 }
 
-export type Policy = 'hottest' | 'closure' | 'scc' | 'mincut';
+export type Policy = 'hottest' | 'closure' | 'scc' | 'mincut' | 'open';
 export const policies: Policy[] = ['hottest', 'closure', 'scc', 'mincut'];
 
 const index = (g: Graph) => new Map(g.nodes.map((n, i) => [n.name, i]));
@@ -96,17 +103,20 @@ export function split(g: Graph, set: Set<number>, p: Params): Split {
 		} else interp += n.count;
 	});
 	let crossings = 0;
+	let upCrossings = 0;
 	let crossingBytes = 0;
 	for (const e of g.edges) {
+		const from = at.get(e.from)!;
 		const to = at.get(e.to)!;
-		if (set.has(to) && !set.has(at.get(e.from)!)) {
+		if (set.has(to) && !set.has(from)) {
 			crossings += e.count;
 			crossingBytes += e.count * 4 * (g.nodes[to]!.params + 1 + (g.nodes[to]!.result ? 1 : 0));
 		}
+		if (set.has(from) && !set.has(to)) upCrossings += e.count;
 	}
-	const boundary = crossings * p.tau;
+	const boundary = crossings * (p.tauDown ?? p.tau) + upCrossings * (p.tauUp ?? p.tau);
 	const seconds = interp * p.sI + native * p.sN + boundary;
-	return { interp, native, crossings, boundary, crossingBytes, bytes, seconds, objective: seconds + bytes * p.lambda };
+	return { interp, native, crossings, upCrossings, boundary, crossingBytes, bytes, seconds, objective: seconds + bytes * p.lambda };
 }
 
 /** closed under calls, and no pinned function (one that has to stay interpreted) inside */
@@ -300,7 +310,121 @@ function mincut(g: Graph, p: Params, budget: number) {
 	return j(pruned) < j(grown) ? pruned : grown;
 }
 
+/** the functions the bridge cannot carry: wide, or more parameters than maxParams */
+export function uncarriable(g: Graph, p: Params): boolean[] {
+	const max = p.maxParams ?? 7;
+	return g.nodes.map((n) => !!n.wide || n.params > max);
+}
+
+/** no pinned function is native, and no edge into an uncarriable function crosses (its callers share its side) */
+export function openFeasible(g: Graph, p: Params, set: Set<number>): boolean {
+	const at = index(g);
+	const stuck = uncarriable(g, p);
+	if ([...set].some((v) => g.nodes[v]!.pinned)) return false;
+	return g.edges.every((e) => {
+		const u = at.get(e.from)!;
+		const v = at.get(e.to)!;
+		return !stuck[v] || set.has(u) === set.has(v);
+	});
+}
+
+/**
+ * The open policy's exact minimum over any set, with no closure: the same cut as minCut, with a
+ * down and an up arc per edge priced separately, and an infinite pair on every edge into an
+ * uncarriable function: a call into it cannot cross, so its callers share its side. Its own calls
+ * may cross, because the bridge carries the callee's signature, not the caller's.
+ */
+export function openMinCut(g: Graph, p: Params): Set<number> {
+	const at = index(g);
+	const n = g.nodes.length;
+	const S = n;
+	const T = n + 1;
+	const stuck = uncarriable(g, p);
+	const scale = 1e12;
+	const inf = Infinity;
+	const arcs: [number, number, number][] = [];
+	g.nodes.forEach((x, i) => {
+		arcs.push([S, i, x.count * p.sI * scale]);
+		arcs.push([i, T, x.pinned ? inf : (x.count * p.sN + x.bytes * p.lambda) * scale]);
+	});
+	for (const e of g.edges) {
+		const u = at.get(e.from)!;
+		const v = at.get(e.to)!;
+		if (u === v) continue;
+		if (stuck[v]) {
+			arcs.push([u, v, inf], [v, u, inf]);
+			continue;
+		}
+		arcs.push([v, u, e.count * (p.tauDown ?? p.tau) * scale]);
+		arcs.push([u, v, e.count * (p.tauUp ?? p.tau) * scale]);
+	}
+	const { reachable } = maxflow(n + 2, arcs, S, T);
+	return new Set(g.nodes.map((_, i) => i).filter((i) => reachable[i]));
+}
+
+/** the open policy under a byte budget: mincut's lambda search, then single-function repairs that stay feasible */
+function opencut(g: Graph, p: Params, budget: number) {
+	const cut = (l: number) => openMinCut(g, { ...p, lambda: l });
+	const bytes = (set: Set<number>) => split(g, set, p).bytes;
+	const j = (set: Set<number>) => split(g, set, p).objective;
+	const fits = (set: Set<number>) => bytes(set) <= budget && openFeasible(g, p, set);
+	if (bytes(cut(p.lambda)) <= budget) return cut(p.lambda);
+	let lo = p.lambda;
+	let hi = Math.max(p.sI, 1e-9);
+	while (bytes(cut(hi)) > budget) hi *= 2;
+	for (let k = 0; k < 60; k++) {
+		const mid = (lo + hi) / 2;
+		if (bytes(cut(mid)) <= budget) hi = mid;
+		else lo = mid;
+	}
+	let grown = cut(hi);
+	for (;;) {
+		let best: { set: Set<number>; j: number } | undefined;
+		for (let v = 0; v < g.nodes.length; v++) {
+			if (grown.has(v) || g.nodes[v]!.pinned) continue;
+			const next = new Set([...grown, v]);
+			if (!fits(next)) continue;
+			const nj = j(next);
+			if (nj < (best?.j ?? j(grown))) best = { set: next, j: nj };
+		}
+		if (!best) break;
+		grown = best.set;
+	}
+	let pruned = cut(lo);
+	while (bytes(pruned) > budget) {
+		let best: { set: Set<number>; rate: number } | undefined;
+		for (const v of pruned) {
+			const next = new Set([...pruned].filter((x) => x !== v));
+			const freed = bytes(pruned) - bytes(next);
+			if (freed <= 0 || !openFeasible(g, p, next)) continue;
+			const rate = (j(next) - j(pruned)) / freed;
+			if (!best || rate < best.rate) best = { set: next, rate };
+		}
+		if (!best) break;
+		pruned = best.set;
+	}
+	// the empty set always fits, so a repair that stalls still returns a feasible set
+	return [grown, pruned, new Set<number>()].filter(fits).reduce((a, b) => (j(b) < j(a) ? b : a));
+}
+
+/** the exact optimum over every set (no closure) by enumeration, for graphs small enough (tests) */
+export function bruteForceOpen(g: Graph, p: Params, budget = Infinity): { set: Set<number>; objective: number } {
+	let best = { set: new Set<number>(), objective: Infinity };
+	for (let mask = 0; mask < 1 << g.nodes.length; mask++) {
+		const set = new Set(g.nodes.map((_, i) => i).filter((i) => mask & (1 << i)));
+		if (!openFeasible(g, p, set)) continue;
+		const s = split(g, set, p);
+		if (s.bytes <= budget && s.objective < best.objective) best = { set, objective: s.objective };
+	}
+	return best;
+}
+
 export function choose(policy: Policy, g: Graph, p: Params, budget: number): Set<number> {
+	if (policy === 'open') {
+		const set = opencut(g, p, budget);
+		if (!openFeasible(g, p, set)) throw new Error('open returned a set that crosses an uncarriable function');
+		return set;
+	}
 	const set = { hottest, closure, scc, mincut }[policy](g, p, budget);
 	if (!closed(g, deps(g), set)) throw new Error(`${policy} returned a set that is not closed under calls`);
 	return set;
@@ -330,9 +454,21 @@ if (import.meta.main ?? process.argv[1]?.endsWith('plan.ts')) {
 	// ends.json is a `ladder.ts run` LADDER_JSON of the empty and the all-native rungs: ms per n units
 	const ends = JSON.parse(readFileSync(endsPath, 'utf8')) as { n: number; rows: { ms: number }[] };
 	const perUnit = (ms: number) => ms / 1e3 / ends.n;
-	const p: Params = { sI: perUnit(ends.rows[0]!.ms) / g.total, sN: perUnit(ends.rows.at(-1)!.ms) / g.total, tau: tau.ns * 1e-9, lambda: 0 };
+	// PLAN_OPEN=1 plans the open policy beside the closure mincut at each budget; PLAN_TAU_DOWN_NS and PLAN_TAU_UP_NS
+	// price the two crossing directions apart (default tau); PLAN_MAX_PARAMS is the bridge's parameter limit (default 7)
+	const ns = (name: string) => (process.env[name] ? Number(process.env[name]) * 1e-9 : undefined);
+	const p: Params = {
+		sI: perUnit(ends.rows[0]!.ms) / g.total,
+		sN: perUnit(ends.rows.at(-1)!.ms) / g.total,
+		tau: tau.ns * 1e-9,
+		lambda: 0,
+		tauDown: ns('PLAN_TAU_DOWN_NS'),
+		tauUp: ns('PLAN_TAU_UP_NS'),
+		maxParams: process.env.PLAN_MAX_PARAMS ? Number(process.env.PLAN_MAX_PARAMS) : undefined
+	};
+	const used: Policy[] = process.env.PLAN_OPEN === '1' ? ['open', 'mincut'] : policies;
 	const plans = fractions.flatMap((f) =>
-		policies.map((policy) => {
+		used.map((policy) => {
 			const budget = Number(f) * g.bytes;
 			const set = choose(policy, g, p, budget);
 			return { policy, budget: Number(f), set: [...set].map((i) => g.nodes[i]!.name).sort(), predicted: split(g, set, p) };
