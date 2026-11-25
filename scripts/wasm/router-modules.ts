@@ -5,7 +5,7 @@ import { compileRuntime, type HostRuntime } from '../../src/worker/machine/route
 
 const root = new URL('../../', import.meta.url).pathname;
 const sources = [join(root, 'src/gmux/core'), join(root, 'src/gmux/core/router')];
-const outputs = ['router.wasm', 'statx.wasm', 'gmux-core.wasm'];
+const outputs = ['router.wasm', 'statx.wasm', 'copy.wasm', 'gmux-core.wasm'];
 /** build/router, or GMUX_BUILD's, which is where the kernel rigs take their build from */
 export const RUNTIME_BUILD = join(process.env.GMUX_BUILD ?? join(root, 'build'), 'router');
 
@@ -32,10 +32,16 @@ export function buildRuntime(dir = RUNTIME_BUILD) {
  * scheduler core out, which runs the TypeScript scheduler
  */
 export function hostRuntime(dir = RUNTIME_BUILD, { core = true } = {}): HostRuntime {
-	const read = (name: string) => new Uint8Array(readFileSync(join(dir, name)));
+	const read = (name: string) => {
+		const path = join(dir, name);
+		if (!existsSync(path))
+			throw new Error(`${path} is missing: run scripts/build-router.sh ${dir}`);
+		return new Uint8Array(readFileSync(path));
+	};
 	return compileRuntime(
 		read('router.wasm'),
 		read('statx.wasm'),
-		core ? read('gmux-core.wasm') : undefined
+		core ? read('gmux-core.wasm') : undefined,
+		read('copy.wasm')
 	);
 }

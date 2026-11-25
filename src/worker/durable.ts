@@ -232,12 +232,17 @@ export class DurableStore {
 	 * a checkpoint: the pages of `memory` that changed since the last one, and `snapshot`, the host
 	 * state that goes with them. Zero pages cost nothing to store
 	 */
-	writeCheckpoint(memory: Uint8Array, snapshot: string): Written {
+	writeCheckpoint(
+		memory: Uint8Array,
+		snapshot: string,
+		mark?: (phase: string, entering: boolean) => void
+	): Written {
 		const cost: Written = { rows: 0, bytes: 0, changed: 0 };
 		const count = memory.byteLength / PAGE;
 		const changed: [number, Uint8Array][] = [];
 		const next: Place[] = [];
 		const old = this.pages;
+		mark?.('hash', true);
 		for (let p = 0; p < count; p++) {
 			const bytes = memory.subarray(p * PAGE, (p + 1) * PAGE);
 			const was = old[p];
@@ -255,18 +260,23 @@ export class DurableStore {
 			// a view: the memory holds still while it is written, and a copy of every page would not fit
 			changed.push([p, bytes]);
 		}
+		mark?.('hash', false);
 		cost.changed += changed.length;
+		mark?.('extents', true);
 		for (const [p, { extent, slot }] of this.pack(IMAGE, PAGE, changed, cost)) {
 			next[p] = { extent, slot, hash: next[p]!.hash };
 			this.hold(extent, 1);
 		}
 		for (let p = 0; p < Math.max(old.length, count); p++)
 			if (old[p] && old[p]!.extent && old[p] !== next[p]) this.release(old[p]!.extent, cost);
+		mark?.('extents', false);
 		this.pages = next;
 		this.gen++;
+		mark?.('root', true);
 		this.setMeta('pages', packPlaces(next), cost);
 		// the checkpoint's generation leads its snapshot, one row for both
 		this.setMeta('checkpoint', `${this.gen}\n${snapshot}`, cost);
+		mark?.('root', false);
 		return cost;
 	}
 

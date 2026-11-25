@@ -1,9 +1,12 @@
 import { readFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
 import { RUNTIME_BUILD, hostRuntime } from '../../scripts/wasm/router-modules.ts';
 import { statxHash } from '../../src/worker/machine/machine.ts';
 import {
+	CACHE_DIRECT,
+	CACHE_HOOK,
 	FS_COUNTERS,
 	FS_MOVES,
 	MISS,
@@ -27,6 +30,13 @@ const O_DSYNC = 0o10000;
 const SYS_OPENAT = 56;
 
 describe('syscall router', () => {
+	it('names the missing module and the script that stages it', () => {
+		const dir = join(tmpdir(), 'gmux-no-router');
+		expect(() => hostRuntime(dir)).toThrow(
+			`${join(dir, 'router.wasm')} is missing: run scripts/build-router.sh ${dir}`
+		);
+	});
+
 	it('places nothing in the task memory it imports', () => {
 		const bytes = readFileSync(join(RUNTIME_BUILD, 'router.wasm'));
 		const ids: number[] = [];
@@ -71,6 +81,8 @@ describe('syscall router', () => {
 				k: k as WebAssembly.ModuleImports,
 				h: h as WebAssembly.ModuleImports,
 				c: { 5: () => MISS },
+				q: { 5: () => -1 },
+				f: { 5: () => {} },
 				env: {
 					memory: new WebAssembly.Memory({ initial: 1, maximum: 1, shared: true }),
 					route: global,
@@ -90,6 +102,126 @@ describe('syscall router', () => {
 						expect(result).toBe((to === 'k' ? 100 : 200) + n);
 					}
 		}
+	});
+
+	describe('with the statx cache on', () => {
+		// what a statx at s5 does, from the rules router.ts documents: the hit path first, then on a
+		// miss the hook (CACHE_HOOK) or, at CACHE_DIRECT, the query, the kernel and the fill
+		const expected = (
+			cache: number,
+			route: number,
+			nr: number,
+			flags: number,
+			hit: number,
+			id: number,
+			args: number[]
+		): { seen: string[]; result: number } => {
+			const a = args.join(',');
+			if (route === ROUTE_KERNEL) return { seen: [`k5:${a}`], result: 105 };
+			const cached = cache !== 0 && nr === SYS_STATX && route !== ROUTE_HOOK;
+			if (!cached) {
+				const to = goes(route, nr, flags, 5);
+				return { seen: [`${to}5:${a}`], result: (to === 'k' ? 100 : 200) + 5 };
+			}
+			if (hit !== MISS) return { seen: [`c5:${a}`], result: hit };
+			if (cache === CACHE_HOOK) return { seen: [`c5:${a}`, `h5:${a}`], result: 205 };
+			if (id < 0) return { seen: [`c5:${a}`, `q5:${a}`, `k5:${a}`], result: 105 };
+			return { seen: [`c5:${a}`, `q5:${a}`, `k5:${a}`, `f5:${id},105`], result: 105 };
+		};
+
+		it('follows the model at every cache value, route, number and flag, with 0 mismatches', () => {
+			let calls = 0;
+			let mismatches = 0;
+			for (const cache of [0, CACHE_HOOK, CACHE_DIRECT])
+				for (const route of [ROUTE_WATCH, ROUTE_KERNEL, ROUTE_HOOK, ROUTE_WRITES])
+					for (const hit of [MISS, 0, -2])
+						for (const id of [-1, 3]) {
+							const seen: string[] = [];
+							const k: Record<string, unknown> = {};
+							const h: Record<string, unknown> = {};
+							for (let n = 0; n <= 6; n++) {
+								k[n] = (...a: number[]) => (
+									seen.push(`k${n}:${a.join(',')}`),
+									100 + n
+								);
+								h[n] = (...a: number[]) => (
+									seen.push(`h${n}:${a.join(',')}`),
+									200 + n
+								);
+							}
+							const s = new WebAssembly.Instance(modules.route, {
+								k: k as WebAssembly.ModuleImports,
+								h: h as WebAssembly.ModuleImports,
+								c: { 5: (...a: number[]) => (seen.push(`c5:${a.join(',')}`), hit) },
+								q: { 5: (...a: number[]) => (seen.push(`q5:${a.join(',')}`), id) },
+								f: { 5: (...a: number[]) => void seen.push(`f5:${a.join(',')}`) },
+								env: {
+									memory: new WebAssembly.Memory({
+										initial: 1,
+										maximum: 1,
+										shared: true
+									}),
+									route: new WebAssembly.Global(
+										{ value: 'i32', mutable: true },
+										route
+									),
+									cache: new WebAssembly.Global(
+										{ value: 'i32', mutable: true },
+										cache
+									)
+								}
+							}).exports as Record<string, (...a: number[]) => number>;
+							for (const nr of Array.from({ length: 420 }, (_, i) => i))
+								for (const flags of [0, O_DSYNC, 0o4010001]) {
+									const args = [1, 2, nr, 3, 4, flags, 5, 6];
+									seen.length = 0;
+									const result = s.s5!(...args);
+									const want = expected(cache, route, nr, flags, hit, id, args);
+									calls++;
+									if (
+										JSON.stringify(seen) !== JSON.stringify(want.seen) ||
+										result !== want.result
+									)
+										mismatches++;
+								}
+						}
+			expect(calls).toBe(3 * 4 * 3 * 2 * 420 * 3);
+			expect(mismatches).toBe(0);
+		});
+
+		it('is caught when a model rule is broken (a mutant router would differ)', () => {
+			// the same sequence with the fill dropped, or the query after the kernel call, is not the model's
+			const args = [1, 2, SYS_STATX, 3, 4, 0, 5, 6];
+			const want = expected(CACHE_DIRECT, ROUTE_WATCH, SYS_STATX, 0, MISS, 3, args);
+			const a = args.join(',');
+			expect(want.seen).toEqual([`c5:${a}`, `q5:${a}`, `k5:${a}`, 'f5:3,105']);
+			expect(want.seen).not.toEqual([`c5:${a}`, `q5:${a}`, `k5:${a}`]);
+			expect(want.seen).not.toEqual([`c5:${a}`, `k5:${a}`, `q5:${a}`, 'f5:3,105']);
+		});
+
+		it('calls the kernel once before it fills, and never fills a query it did not get', () => {
+			for (const id of [-1, 7]) {
+				const order: string[] = [];
+				const s = new WebAssembly.Instance(modules.route, {
+					k: Object.fromEntries(
+						[0, 1, 2, 3, 4, 5, 6].map((n) => [n, () => (order.push('k'), -2)])
+					) as WebAssembly.ModuleImports,
+					h: Object.fromEntries(
+						[0, 1, 2, 3, 4, 5, 6].map((n) => [n, () => (order.push('h'), 0)])
+					) as WebAssembly.ModuleImports,
+					c: { 5: () => (order.push('c'), MISS) },
+					q: { 5: () => (order.push('q'), id) },
+					f: { 5: (i: number, result: number) => void order.push(`f${i}:${result}`) },
+					env: {
+						memory: new WebAssembly.Memory({ initial: 1, maximum: 1, shared: true }),
+						route: new WebAssembly.Global({ value: 'i32', mutable: true }, ROUTE_WATCH),
+						cache: new WebAssembly.Global({ value: 'i32', mutable: true }, CACHE_DIRECT)
+					}
+				}).exports as Record<string, (...a: number[]) => number>;
+				expect(s.s5!(0, 0, SYS_STATX, -100, 0x100, 0, 0x7ff, 0x400)).toBe(-2);
+				expect(order).toEqual(id < 0 ? ['c', 'q', 'k'] : ['c', 'q', 'k', 'f7:-2']);
+			}
+		});
 	});
 
 	it('imports its memory and declares none of its own', () => {

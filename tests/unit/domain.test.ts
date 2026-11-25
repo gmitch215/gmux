@@ -1,4 +1,5 @@
 import { describe, expect, it } from 'vitest';
+import { hostRuntime } from '../../scripts/wasm/router-modules.ts';
 import {
 	Domain,
 	EFAULT,
@@ -19,7 +20,8 @@ import {
 	putSockaddr,
 	putStatx,
 	refused,
-	stringLength
+	stringLength,
+	type Copier
 } from '../../src/worker/machine/domain.ts';
 
 const PAGE = 0x10000;
@@ -27,10 +29,11 @@ const PAGE = 0x10000;
 const memory = () => new WebAssembly.Memory({ initial: 2, maximum: 4, shared: true });
 const kernelMemory = memory();
 const kernel = new Uint8Array(kernelMemory.buffer);
+const COPY = hostRuntime().copy!;
 
 /** a domain of two pages and a writer for little-endian words */
 function rig() {
-	const domain = new Domain(memory(), READ | WRITE, kernelMemory);
+	const domain = new Domain(memory(), READ | WRITE, kernelMemory, COPY);
 	const view = new DataView(domain.memory.buffer);
 	const put = (at: number, ...words: number[]) =>
 		words.forEach((w, i) => view.setUint32(at + 4 * i, w >>> 0, true));
@@ -116,7 +119,7 @@ describe('crossings', () => {
 	it('fall back to views when the copy module cannot link the memories', () => {
 		// the module imports shared memories; a plain one does not link
 		const plain = new WebAssembly.Memory({ initial: 2, maximum: 4 });
-		const domain = new Domain(plain, READ | WRITE, kernelMemory);
+		const domain = new Domain(plain, READ | WRITE, kernelMemory, COPY);
 		kernel.fill(7, 0x300, 0x310);
 		expect(copyOut(domain, 0x300, 100, 16)).toBe(0);
 		expect(new Uint8Array(plain.buffer, 100, 16).every((b) => b === 7)).toBe(true);
@@ -146,8 +149,127 @@ describe('crossings', () => {
 		expect(kernel.slice(0x900, 0xa2c)).toEqual(viaModule);
 	});
 
+	it('copy through views when given no module', () => {
+		const domain = new Domain(memory(), READ | WRITE, kernelMemory);
+		kernel.fill(5, 0x500, 0x520);
+		expect(copyOut(domain, 0x500, 40, 32)).toBe(0);
+		expect(
+			domain
+				.bytes()
+				.subarray(40, 72)
+				.every((b) => b === 5)
+		).toBe(true);
+		expect(clear(domain, 40, 32)).toBe(0);
+		expect(
+			domain
+				.bytes()
+				.subarray(40, 72)
+				.every((b) => b === 0)
+		).toBe(true);
+	});
+
+	describe('the copy module against the views', () => {
+		const size = 2 * PAGE;
+		const LENGTHS = [0, 1, 4095, 4096, 65537];
+		const pattern = (seed: number, n: number) =>
+			Uint8Array.from({ length: n }, (_, i) => (i * 7 + seed) & 0xff);
+
+		/**
+		 * runs every copy of a copier and of the views on equal memories and returns the cases where the
+		 * two memories end up different: each length at the start, the middle and the very end of the
+		 * domain (and of the kernel's memory), for in, out and zero
+		 */
+		function differ(copier: (k: WebAssembly.Memory, u: WebAssembly.Memory) => Copier) {
+			const found: string[] = [];
+			for (const n of LENGTHS) {
+				for (const [where, at] of [
+					['start', 0],
+					['middle', 1000],
+					['end', size - n]
+				] as const) {
+					for (const op of ['in', 'out', 'zero'] as const) {
+						const make = (use: typeof copier) => {
+							const k = memory();
+							const u = memory();
+							new Uint8Array(k.buffer).set(pattern(3, size));
+							new Uint8Array(u.buffer).set(pattern(11, size));
+							const c = use(k, u);
+							if (op === 'zero') c.zero(at, n);
+							else c[op](size - n - (at === 1000 ? 5 : 0), at, n);
+							return [
+								new Uint8Array(k.buffer).slice(),
+								new Uint8Array(u.buffer).slice()
+							];
+						};
+						const [ks, us] = make(jsCopier);
+						try {
+							const [km, um] = make(copier);
+							if (!Buffer.from(ks!).equals(km!) || !Buffer.from(us!).equals(um!))
+								found.push(`${op} ${n} at ${where}`);
+						} catch {
+							// a trap is a difference too
+							found.push(`${op} ${n} at ${where}`);
+						}
+					}
+				}
+			}
+			return found;
+		}
+
+		const module = (k: WebAssembly.Memory, u: WebAssembly.Memory) =>
+			new Domain(u, READ | WRITE, k, COPY).copier!;
+
+		it('leaves the same bytes on the spans of 0, 1, 4,095, 4,096 and 65,537 at the ends', () => {
+			expect(differ(module)).toEqual([]);
+		});
+
+		it('is caught when a copy is one byte long, one byte short or in the other direction', () => {
+			const long = (k: WebAssembly.Memory, u: WebAssembly.Memory): Copier => {
+				const c = module(k, u);
+				return {
+					...c,
+					in: (a, b, n) => c.in(a, b, n + 1),
+					out: (a, b, n) => c.out(a, b, n + 1)
+				};
+			};
+			const short = (k: WebAssembly.Memory, u: WebAssembly.Memory): Copier => {
+				const c = module(k, u);
+				return {
+					in: (a, b, n) => c.in(a, b, Math.max(0, n - 1)),
+					out: (a, b, n) => c.out(a, b, Math.max(0, n - 1)),
+					zero: (a, n) => c.zero(a, Math.max(0, n - 1))
+				};
+			};
+			const swapped = (k: WebAssembly.Memory, u: WebAssembly.Memory): Copier => {
+				const c = module(k, u);
+				return { ...c, in: c.out, out: c.in };
+			};
+			const filled = (k: WebAssembly.Memory, u: WebAssembly.Memory): Copier => {
+				const c = module(k, u);
+				return { ...c, zero: (a, n) => new Uint8Array(u.buffer).fill(1, a, a + n) };
+			};
+			for (const mutant of [long, short, swapped, filled])
+				expect(differ(mutant)).not.toEqual([]);
+		});
+
+		it('is not asked for a span that leaves the domain, by one byte or by a wrap', () => {
+			const { domain, bytes } = rig();
+			kernel.fill(9, 0, size);
+			for (const n of LENGTHS.slice(1)) {
+				expect(copyOut(domain, 0, size - n + 1, n)).toBe(n);
+				expect(copyIn(domain, 0, size - n + 1, n)).toBe(n);
+				expect(clear(domain, size - n + 1, n)).toBe(n);
+			}
+			expect(bytes.every((b) => b === 0)).toBe(true);
+			expect(kernel.subarray(0, size).every((b) => b === 9)).toBe(true);
+			// and the last span that fits copies
+			expect(copyOut(domain, 0, size - 4096, 4096)).toBe(0);
+			expect(bytes.subarray(size - 4096).every((b) => b === 9)).toBe(true);
+		});
+	});
+
 	it('refuse a write into a read-only domain', () => {
-		const domain = new Domain(memory(), READ, kernelMemory);
+		const domain = new Domain(memory(), READ, kernelMemory, COPY);
 		expect(copyOut(domain, 0, 0, 8)).toBe(8);
 		expect(clear(domain, 0, 8)).toBe(8);
 		expect(copyIn(domain, 0, 0, 8)).toBe(0);

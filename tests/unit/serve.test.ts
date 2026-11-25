@@ -1,4 +1,5 @@
 import { describe, expect, it, vi } from 'vitest';
+import type { Encounter, Opened } from '../../src/worker/encounter.ts';
 import type { IngressStream } from '../../src/worker/machine/ingress.ts';
 import {
 	Server,
@@ -21,6 +22,7 @@ class FakeStream implements IngressStream {
 	ended = false;
 	aborted = false;
 	closed = false;
+	parked = false;
 	/** called with the request's number each time a head arrives, so a guest can answer a kept stream */
 	onRequest: (n: number) => void = () => {};
 	heads = 0;
@@ -98,7 +100,9 @@ function rig(
 		rests: 0,
 		pumps: 0,
 		waits: 0,
-		stall: false
+		stall: false,
+		from: 'running' as Opened,
+		encounters: [] as Encounter[]
 	};
 	const fixed: number[] = [];
 	const machine: ServeMachine = {
@@ -112,10 +116,13 @@ function rig(
 		netPoll() {},
 		get netActivity() {
 			return state.activity;
-		}
+		},
+		restoredStreams: []
 	};
 	const host: ServeHost = {
-		open: async () => (state.opens++, machine),
+		open: async () => (state.opens++, { machine, from: state.from }),
+		current: () => machine,
+		encounter: (outcome) => void state.encounters.push(outcome),
 		pumping: () => state.pumping,
 		pump: async (budgetMs, wake) => {
 			state.pumps++;
@@ -133,7 +140,7 @@ function rig(
 		idleMs: 0,
 		...limits
 	});
-	return { server, streams, state, fixed };
+	return { server, streams, state, fixed, host, machine };
 }
 
 const get = (server: Server, path = '/') => server.serve(new Request(`http://site.test${path}`));
@@ -379,10 +386,11 @@ describe('Server.serve with borrowed buffers', () => {
 		const { server, streams } = rig((s) => s.send(reply('hello')));
 		const open = (server as unknown as { host: ServeHost }).host.open;
 		(server as unknown as { host: ServeHost }).host.open = async () => {
-			const machine = await open();
+			const opened = await open();
+			const machine = opened.machine;
 			const ingress = machine.ingress.bind(machine);
 			machine.ingress = (port, borrows) => (asked.push(borrows), ingress(port, borrows));
-			return machine;
+			return opened;
 		};
 		const res = await get(server);
 		expect(streams[0]!.releases).toBe(0);
@@ -441,6 +449,38 @@ describe('Server.serve with borrowed buffers', () => {
 		expect(server.idle).toBe(0);
 		await res.text();
 		expect(server.idle).toBe(1);
+	});
+});
+
+describe('Server.serve and the cold-encounter count', () => {
+	it('tells the host what the machine meant to each request that used it', async () => {
+		const { server, state } = rig((s) => s.send(reply('hello')));
+		for (const from of ['booted', 'running', 'restored', 'bootstrapped'] as const) {
+			state.from = from;
+			await (await get(server)).text();
+		}
+		expect(state.encounters).toEqual(['booted', 'warm', 'restored', 'bootstrapped']);
+	});
+
+	it('counts a request refused before the machine is woken as none, and does not wake it', async () => {
+		const { server, state } = rig();
+		const res = await server.serve(
+			new Request('http://site.test/', {
+				method: 'POST',
+				headers: { 'content-length': '999' }
+			})
+		);
+		expect(res.status).toBe(413);
+		expect(state.encounters).toEqual(['none']);
+		expect(state.opens).toBe(0);
+	});
+
+	it('counts a request the woken machine could not serve by how it was woken', async () => {
+		const { server, state } = rig();
+		state.listening = false;
+		state.from = 'booted';
+		expect((await get(server)).status).toBe(503);
+		expect(state.encounters).toEqual(['booted']);
 	});
 });
 
@@ -610,6 +650,89 @@ describe('Server.serve with idle streams', () => {
 		await get(server);
 		expect((await get(server)).status).toBe(503);
 		expect(server.idle).toBe(0);
+	});
+
+	describe('across a checkpoint', () => {
+		/** a machine as a restore makes it: a new object that hands back the streams its snapshot held */
+		function restoredWith(streams: FakeStream[]): ServeMachine {
+			return {
+				listening: () => true,
+				ingress: () => {
+					throw new Error('a new stream was opened');
+				},
+				netPoll() {},
+				netActivity: 0,
+				restoredStreams: streams
+			};
+		}
+
+		it('marks a finished stream parked and leaves it open when the machine rests', async () => {
+			const { server, streams, state } = rig(answers, { idleMs: 1000 });
+			await text(get(server));
+			await vi.waitFor(() => expect(state.rests).toBeGreaterThan(0));
+			// the checkpoint the keeper may take at this rest saves the stream, so it is still open and parked
+			expect(streams[0]!.parked).toBe(true);
+			expect(streams[0]!.ended).toBe(false);
+			expect(server.idle).toBe(1);
+			await text(get(server, '/b'));
+			expect(streams[0]!.parked).toBe(true);
+		});
+
+		it('clears the mark while a request holds the stream', async () => {
+			const { server, streams } = rig(
+				(s) =>
+					void (s.onRequest = (k) => {
+						if (k === 2) expect(s.parked).toBe(false);
+						s.send(reply(`r${k}`));
+					}),
+				{ idleMs: 1000 }
+			);
+			await text(get(server));
+			expect(streams[0]!.parked).toBe(true);
+			expect(await text(get(server))).toBe('r2');
+		});
+
+		it('takes the streams a restored machine hands back as its parked list and rides one', async () => {
+			const { server, streams, host } = rig(answers, { idleMs: 1000, maxStreams: 3 });
+			const held = new FakeStream();
+			held.parked = true;
+			held.onRequest = () => held.send(reply('again'));
+			const restored = restoredWith([held]);
+			host.open = async () => ({ machine: restored, from: 'restored' });
+			host.current = () => restored;
+			expect(await text(get(server))).toBe('again');
+			expect(held.heads).toBe(1);
+			expect(held.received).toContain('connection: keep-alive');
+			expect(streams).toHaveLength(0);
+			expect(held.ended).toBe(false);
+			expect(held.parked).toBe(true);
+			expect(server.idle).toBe(1);
+		});
+
+		it('drops the streams parked on the machine a checkpoint replaced, ending none of them', async () => {
+			const { server, streams, host } = rig(answers, { idleMs: 1000 });
+			await text(get(server));
+			expect(server.idle).toBe(1);
+			const replaced = restoredWith([]);
+			host.current = () => replaced;
+			await server.settle();
+			expect(server.idle).toBe(0);
+			expect(streams[0]!.ended).toBe(false);
+		});
+
+		it('gives a restored stream its own idle window, and ends it when nobody asks', async () => {
+			const { server, host } = rig(answers, { idleMs: 40 });
+			const held = new FakeStream();
+			held.parked = true;
+			const restored = restoredWith([held]);
+			host.open = async () => ({ machine: restored, from: 'restored' });
+			host.current = () => restored;
+			// a machine this server has not seen: adopted when the keeper's rest returns
+			await server.settle();
+			expect(server.idle).toBe(1);
+			await vi.waitFor(() => expect(held.ended).toBe(true));
+			expect(server.idle).toBe(0);
+		});
 	});
 });
 

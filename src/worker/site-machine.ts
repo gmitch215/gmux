@@ -6,6 +6,13 @@ import type { HostRuntime } from './machine/router.ts';
 export const CMDLINE =
 	'maxcpus=3 root=/dev/ram0 rootfstype=ramfs init=/init console=hvc console=ttyS0';
 export const MAXIMUM_PAGES = 800;
+/** the flag rcS reads to start lighttpd; it is on the command line only when the build carries the server */
+const HTTP_FLAG = 'gmux.http=lighttpd';
+
+/** the kernel command line of a site machine made of a build with or without lighttpd, which a bootstrap image must have been taken with */
+export function siteCmdline(lighttpd: boolean): string {
+	return lighttpd ? `${CMDLINE} ${HTTP_FLAG}` : CMDLINE;
+}
 
 /** the port the machine's site listens on, and how long a request may wait for the machine to speak, ms */
 export const PUBLIC_PORT = 80;
@@ -31,10 +38,15 @@ export interface SiteBuild {
 	 */
 	busyboxShare?: WebAssembly.Module;
 	katybug: WebAssembly.Module;
+	/**
+	 * the asyncified lighttpd (scripts/wasm/asyncify.sh), with `manifest.lighttpd` its hash: the machine
+	 * starts it at boot and a checkpoint can unwind it. A build without it has neither, and no server starts
+	 */
+	lighttpd?: WebAssembly.Module;
 	/** build/router: the router the keeper's file syncs go through, the statx hit path and the core */
 	runtime: HostRuntime;
 	initrd: Uint8Array;
-	manifest: { busybox: string; katybug: string; image?: string };
+	manifest: { busybox: string; katybug: string; lighttpd?: string; image?: string };
 }
 
 /**
@@ -45,13 +57,15 @@ export function siteOptions(
 	build: SiteBuild,
 	host: Pick<MachineOptions, 'sha256' | 'digest' | 'write' | 'memory'>
 ): MachineOptions {
+	const server = build.lighttpd && build.manifest.lighttpd;
 	return {
 		vmlinux: build.vmlinux,
 		initrd: build.initrd,
-		cmdline: CMDLINE,
+		cmdline: siteCmdline(!!server),
 		registry: new Map([
 			[build.manifest.busybox, build.busyboxShare ?? build.busybox],
-			[build.manifest.katybug, build.katybug]
+			[build.manifest.katybug, build.katybug],
+			...(server ? [[server, build.lighttpd!] as const] : [])
 		]),
 		// a non-root task's BusyBox checks every store against the kernel's page owner table
 		guarded: new Map([[build.manifest.busybox, build.busyboxGuard]]),
@@ -59,6 +73,7 @@ export function siteOptions(
 		maximumPages: MAXIMUM_PAGES,
 		sharedKernel: true,
 		asyncify: true,
+		execCache: true,
 		...host
 	};
 }

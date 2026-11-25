@@ -3,6 +3,8 @@ import { DlProcess, dylinkInfo, type DlMisses, type DlSaved, type DlView } from 
 import { clear, copyIn, copyOut, Domain, EFAULT, READ, stringLength, WRITE } from './domain.ts';
 import { Ingress, type IngressStream } from './ingress.ts';
 import {
+	CACHE_DIRECT,
+	CACHE_HOOK,
 	FS_CHAIN,
 	FS_COUNTERS,
 	FS_MOVES,
@@ -94,7 +96,8 @@ export interface MachineOptions {
 	 * the most idle instances kept for each share build (scripts/wasm/share.ts) that no process is
 	 * using: a finished process's instance goes back and is reset for the next exec of its program
 	 * (globals, relocations, TLS base, pristine data). 0 turns it off; the default is 8. Needs
-	 * `sharedKernel`; nothing pooled is saved by a checkpoint
+	 * `sharedKernel`; nothing pooled is saved by a checkpoint. An asyncified or evacuable share build
+	 * is pooled too, once its process has ended with no asyncify state or unwinding flag left
 	 */
 	recycleInstances?: number;
 	/**
@@ -113,6 +116,12 @@ export interface MachineOptions {
 	guarded?: Map<string, WebAssembly.Module>;
 	/** the most 64 KiB pages the machine's memory may grow to (default 2048); the kernel takes it all as RAM */
 	maximumPages?: number;
+	/**
+	 * the most host bytes all open inflate streams of every task may hold together (default 64 MiB,
+	 * a Free isolate's half). A stream holds whole 1 MiB pieces, so one that has decoded 40 bytes
+	 * counts 1 MiB; the decoded length is never more than what the streams hold
+	 */
+	maximumInflateBytes?: number;
 	/** the host clock in nanoseconds since the Unix epoch (default `Date.now()`) */
 	now?: () => bigint;
 	/** host diagnostics: faults, crashes, and with `trace` every switch */
@@ -137,12 +146,15 @@ export interface MachineOptions {
 	/**
 	 * a host decoder for the whole raw deflate stream of a program's gzip member (katybug's
 	 * inflate recognizer, `__gmux_digest` ops 8 to 13). Without it a program decodes with its own
-	 * code. The machine keeps the decoded bytes (at most `MAX_INFLATE_BYTES` a task) until the
-	 * program has taken them, and a machine with a stream open cannot checkpoint
+	 * code. The machine keeps the decoded bytes (at most `MAX_INFLATE_BYTES` a task, and
+	 * `maximumInflateBytes` in all) until the program has taken them, and a machine with a stream
+	 * open cannot checkpoint
 	 */
 	inflate?: () => HostInflater;
 	/** log every task switch and release through `log` */
 	trace?: boolean;
+	/** a phase's entry and exit (`interrupt`, `unwind`, `parked`), for a host that times them */
+	phase?: (name: string, entering: boolean) => void;
 	/**
 	 * called on a software-TLB miss for a page of a program built with scripts/wasm/mmu-pass.ts; a
 	 * promise parks the task until the page is in place (a lazy restore faulting pages in). With
@@ -198,6 +210,19 @@ export interface MachineOptions {
 	 * kernel. 'verify' asks the kernel every time and counts answers the cache would have got wrong
 	 */
 	syscallCache?: boolean | 'verify';
+	/**
+	 * with `syscallCache`, fills the cache from a plain import after the kernel's answer instead of
+	 * routing a miss through the Suspending hook. The router then calls the kernel without a tail
+	 * call, so a machine that unwinds its stacks cannot use it: combined with `asyncify` it throws
+	 */
+	directFill?: boolean;
+	/**
+	 * keeps what an exec's stub bytes alone decide, its registry key and the data size it maps, so a
+	 * repeat exec of the same stub neither hashes nor parses it again. The registry, the caller's euid
+	 * and the recorded dlopen misses are read on every exec. 'verify' also computes everything each
+	 * time and counts memo answers it contradicts in `stats.execMismatches`
+	 */
+	execCache?: boolean | 'verify';
 	/**
 	 * routes every syscall through the host hook, which counts it by number in `stats.syscalls`; a
 	 * function is also called for each (before it for the calls that may not return, else after). Exact
@@ -258,6 +283,8 @@ export interface SavedRunner {
 	where: 'kernel' | 'user' | null;
 	/** the program it runs: registry hash, data and table bases */
 	user: { hash: string; dataStart: number; tableStart: number } | null;
+	/** the bytes of its data mapping an exec in progress left to the host to zero */
+	unzeroed?: number;
 	/** the program instance's entry, stack pointer and exported mutable globals */
 	program: { entry: 'start' | 'clone'; stackPointer: number; globals: [string, number][] } | null;
 	/** the kernel frames of its park, as asyncify data */
@@ -321,6 +348,9 @@ export interface Snapshot {
 	syncWrites?: boolean;
 	/** the ports programs listened on (kernel patch 0031), once per listener */
 	ports?: number[];
+	/** the streams a client held parked between two requests (the kernel's side of each is in `memory`), and the id the next stream takes; absent when there were none */
+	streams?: { id: number; port: number; borrows: boolean }[];
+	streamNext?: number;
 }
 
 // asyncify buffers live in linear memory only while a stack unwinds or rewinds
@@ -341,6 +371,9 @@ const SYS_GETTID = 178;
 const SYS_CLONE = 220;
 const SYS_EXECVE = 221;
 const RECYCLE_DEFAULT = 8;
+/** the exec memo's limits: a stub is a header and a key, a few hundred bytes; a full file is never kept */
+const EXEC_MEMO_BYTES = 4096;
+const EXEC_MEMO_ENTRIES = 64;
 const SYS_MUNMAP = 215;
 const SYS_MMAP = 222;
 const SYS_PRLIMIT64 = 261;
@@ -427,6 +460,11 @@ class InflateStream {
 	constructor(owner: number, decoder: HostInflater) {
 		this.owner = owner;
 		this.decoder = decoder;
+	}
+
+	/** the bytes of the pieces allocated so far, the unit `maximumInflateBytes` counts */
+	get held(): number {
+		return this.pieces.length * INFLATE_PIECE;
 	}
 
 	/** 0 wants more input, 1 the stream ended, -1 failed, -2 would hold more than limit bytes */
@@ -522,6 +560,8 @@ interface Runner {
 		dataStart: number;
 		tableStart: number;
 	} | null;
+	/** bytes of the data mapping at `user.dataStart` the kernel left unzeroed for this exec, until the host writes them */
+	unzeroed?: number;
 	/** the shared instance its program runs on, and its values there while it is parked */
 	shared?: SharedProgram | null;
 	sharedSaved?: number[] | null;
@@ -656,6 +696,7 @@ function moduleFacts(module: WebAssembly.Module): ModuleFacts {
 	const share = word('gmux.share');
 	const tlb = has('tlb');
 	const guard = has('table');
+	const named = new Set(exports.map((e) => e.name));
 	facts = {
 		share,
 		data: word('gmux.data'),
@@ -667,8 +708,11 @@ function moduleFacts(module: WebAssembly.Module): ModuleFacts {
 			!tlb &&
 			!guard &&
 			imports.every((i) => i.module === 'env' && PLAIN_IMPORTS.has(i.name)) &&
-			// a program that forks, checkpoints or unwinds keeps frames an instance reset would drop
-			!exports.some((e) => e.name === 'gmux_ckpt' || e.name.startsWith('asyncify_'))
+			// an unwinding build keeps frames an instance reset would drop unless a retire can read that
+			// none are left: asyncify's state for one, gmux_fp and gmux_unwinding for the other
+			(!exports.some((e) => e.name.startsWith('asyncify_')) ||
+				named.has('asyncify_get_state')) &&
+			(!named.has('gmux_ckpt') || (named.has('gmux_fp') && named.has('gmux_unwinding')))
 	};
 	FACTS.set(module, facts);
 	return facts;
@@ -699,6 +743,23 @@ interface Pooled {
 	clone: boolean;
 	/** taken from the pool for this process: its start function will not write the data image */
 	reused: boolean;
+	/** an evacuable build's frame pointer and unwinding flag, and the pointer right after instantiation */
+	fp: WebAssembly.Global | null;
+	fpInitial: number;
+	unwinding: WebAssembly.Global | null;
+	/** an asyncified build's state: 0 when no unwind or rewind is under way */
+	asyncState: (() => number) | null;
+}
+
+/** the state a recycled unwinding build has beyond its gmux_g globals, read right after instantiation */
+function unwindState(exports: Record<string, any>) {
+	const fp = (exports.gmux_fp as WebAssembly.Global | undefined) ?? null;
+	return {
+		fp,
+		fpInitial: Number(fp?.value ?? 0),
+		unwinding: (exports.gmux_unwinding as WebAssembly.Global | undefined) ?? null,
+		asyncState: (exports.asyncify_get_state as (() => number) | undefined) ?? null
+	};
 }
 
 interface Template {
@@ -777,6 +838,11 @@ class Trap extends Error {
  */
 class Abandoned extends Error {}
 
+// thrown for every exec, signal return and released task; a fresh Error would capture a stack each time
+const RELOAD_PROGRAM = new Trap('reload_program');
+const SIGNAL_RETURN = new Trap('signal_return');
+const ABANDONED = new Abandoned();
+
 /** counters the host keeps while a machine runs */
 export interface MachineStats {
 	/** task switches the kernel asked for */
@@ -817,10 +883,31 @@ export interface MachineStats {
 	restoreHooks: number;
 	/** processes that joined a shared program instance instead of instantiating */
 	sharedEntries: number;
+	/** execs whose data mapping the kernel left unzeroed (kernel patch 0044), and the bytes the host zeroed in them */
+	dataUnzeroedExecs: number;
+	dataZeroedBytes: number;
 	/** execs that took a finished process's instance instead of instantiating */
 	recycledStarts: number;
 	/** finished processes' instances kept for the next exec of their program */
 	recycleReturns: number;
+	/** finished processes' instances left out of the pool, by reason */
+	recycleRefused: {
+		parked: number;
+		checkpointed: number;
+		asyncify: number;
+		unwinding: number;
+		clone: number;
+		full: number;
+	};
+	/** instances of the guarded build (a non-root exec), which are never pooled; part of userExecs */
+	guardedExecs: number;
+	/** with `execCache`: execs that took their stub's facts from the memo, and execs that had to compute them */
+	execHits: number;
+	execMisses: number;
+	/** misses left out of the memo, by reason: a full file, a stub over the length limit, the memo at its entry limit, an executable the registry refused */
+	execRefused: { file: number; long: number; full: number; unknown: number };
+	/** with `execCache: 'verify'`: memo answers the full computation contradicted */
+	execMismatches: number;
 	/** instances made ahead while the pump idled (`prefillInstances`) */
 	prefilled: number;
 	/** the console driver's reads from the host */
@@ -850,6 +937,9 @@ export interface MachineStats {
 	fileSyncs: number;
 	/** sync and syncfs calls, each a walk of the root filesystem */
 	syncWalks: number;
+	/** write-class calls the hook took, and the F_GETFL reads it made for them */
+	writeHooks: number;
+	flagReads: number;
 	/** parked stacks of released tasks, unwound so they can be collected */
 	abandonedStacks: number;
 	/** statx answered from the host's cache, asked of the kernel for want of an answer, and stored */
@@ -936,8 +1026,23 @@ export class Machine {
 		freePages: 0,
 		restoreHooks: 0,
 		sharedEntries: 0,
+		dataUnzeroedExecs: 0,
+		dataZeroedBytes: 0,
 		recycledStarts: 0,
 		recycleReturns: 0,
+		recycleRefused: {
+			parked: 0,
+			checkpointed: 0,
+			asyncify: 0,
+			unwinding: 0,
+			clone: 0,
+			full: 0
+		},
+		guardedExecs: 0,
+		execHits: 0,
+		execMisses: 0,
+		execRefused: { file: 0, long: 0, full: 0, unknown: 0 },
+		execMismatches: 0,
 		prefilled: 0,
 		consoleReads: 0,
 		consoleRaises: 0,
@@ -954,6 +1059,8 @@ export class Machine {
 		interpretedStarts: [],
 		fileSyncs: 0,
 		syncWalks: 0,
+		writeHooks: 0,
+		flagReads: 0,
 		abandonedStacks: 0,
 		statxHits: 0,
 		statxMisses: 0,
@@ -1038,6 +1145,12 @@ export class Machine {
 				shared: true
 			});
 		this.cpuZero = this.runner('cpu0', { kind: 'boot' });
+		if (options.directFill && !options.syscallCache)
+			throw new Error('directFill needs syscallCache');
+		if (options.directFill && options.asyncify)
+			throw new Error(
+				'directFill cannot be combined with asyncify: its kernel call is not a tail call, so a checkpoint would unwind through the router'
+			);
 		if (
 			options.fileSync ||
 			options.restoreFiles?.length ||
@@ -1096,16 +1209,26 @@ export class Machine {
 	}
 
 	/**
-	 * the kernel's cpu clock: host wall time where it moves, plus a fixed step per scheduling decision
-	 * where it stands still, as a deployed Worker's does while code runs; never goes backwards
+	 * the kernel's cpu clock: a step per scheduling decision, each syscall's charge, and the host time
+	 * across an idle sleep. Host time never reaches a running task, so a host stall is not cpu time;
+	 * it enters at a pump start and a restore (syncClock). Never goes backwards.
 	 */
 	private clock = 0n;
 
-	private now(): bigint {
-		const host =
+	private hostNs(): bigint {
+		return (
 			(this.options.now ? this.options.now() : BigInt(Date.now()) * 1000000n) +
-			this.clockOffset;
+			this.clockOffset
+		);
+	}
+
+	private syncClock(): bigint {
+		const host = this.hostNs();
 		if (host > this.clock) this.clock = host;
+		return this.clock;
+	}
+
+	private now(): bigint {
 		return this.clock;
 	}
 
@@ -1269,6 +1392,8 @@ export class Machine {
 				if (me.name === `cpu${IRQ_CPU}` && self.irqWord === null) {
 					self.irqWord = word;
 					self.raiseConsole();
+					// a stream written before this first idle (right after a restore) had no word to raise
+					if (self.net.owes()) self.raiseNet();
 				}
 				return self.park(me);
 			}),
@@ -1304,25 +1429,29 @@ export class Machine {
 				new Uint8Array(self.memory.buffer).set(text, buffer);
 				new Uint8Array(self.memory.buffer)[buffer + text.length] = 0;
 			},
+			// a refusal fails the exec (kernel patch 0018), which kills just that process; `unzeroed`
+			// bytes of the data mapping are the host's to write (patch 0044)
+			wasm_load_program: (
+				binStart: number,
+				binEnd: number,
+				dataStart: number,
+				tableStart: number,
+				unzeroed: number
+			) => self.loadProgram(owner(), binStart, binEnd, dataStart, tableStart, unzeroed),
+			// a kernel built before patch 0044, which zeroes the data mapping itself
 			wasm_load_executable: (
 				binStart: number,
 				binEnd: number,
 				dataStart: number,
 				tableStart: number
-			) => {
-				// a refusal fails the exec (kernel patch 0018), which kills just that process
-				const user = self.lookup(owner(), binStart, binEnd, dataStart, tableStart);
-				if (!user) return 1;
-				owner().user = user;
-				return 0;
-			},
+			) => self.loadProgram(owner(), binStart, binEnd, dataStart, tableStart, 0),
 			// the handler runs on a stack of its own, so a handler that blocks parks like any code
 			wasm_user_mode_tail: new WebAssembly.Suspending((flow: number) => {
 				const me = owner();
 				if (me.rewinding && me.signal) return self.rewindSignal(me);
-				if (flow === -1) throw new Trap('reload_program');
+				if (flow === -1) throw RELOAD_PROGRAM;
 				if (!(flow & 1)) {
-					if (flow & 2) throw new Trap('signal_return');
+					if (flow & 2) throw SIGNAL_RETURN;
 					return 0;
 				}
 				return self.handleSignal(me, flow);
@@ -1453,6 +1582,44 @@ export class Machine {
 		};
 	}
 
+	private loadProgram(
+		me: Runner,
+		binStart: number,
+		binEnd: number,
+		dataStart: number,
+		tableStart: number,
+		unzeroed: number
+	): number {
+		me.unzeroed = 0;
+		const user = this.lookup(me, binStart, binEnd, dataStart, tableStart);
+		if (!user) return 1;
+		me.user = user;
+		if (unzeroed) {
+			me.unzeroed = unzeroed >>> 0;
+			this.stats.dataUnzeroedExecs++;
+		}
+		return 0;
+	}
+
+	/**
+	 * writes zeros over the data mapping the kernel left unzeroed for this exec, from byte `from`, once.
+	 * An instance's start function writes only the bytes of its data segments, so a new instance gets
+	 * the whole mapping; a reused or shared one has the image copied over the first `share` bytes and
+	 * gets the rest
+	 */
+	private zeroData(runner: Runner, from: number) {
+		const bytes = runner.unzeroed ?? 0;
+		if (!bytes) return;
+		runner.unzeroed = 0;
+		if (from >= bytes) return;
+		// a wasm memory.fill: a typed array's fill on a shared buffer is far slower
+		this.domain(this.userMemory(runner)).copier!.zero(
+			runner.user!.dataStart + from,
+			bytes - from
+		);
+		this.stats.dataZeroedBytes += bytes - from;
+	}
+
 	/** the module for an executable the calling task runs: its guarded build when the task is not root and in the shared memory */
 	private lookup(
 		caller: Runner,
@@ -1462,9 +1629,26 @@ export class Machine {
 		tableStart: number,
 		forked = false
 	) {
-		const bytes = this.bytes(binStart, binEnd);
-		const hash = stubHash(bytes) ?? this.options.sha256(bytes);
+		const cache = this.options.execCache;
+		const length = binEnd - binStart;
+		const kept = cache ? this.execFind(binStart, length) : undefined;
+		// a memo hit leaves the stub where it is: no copy, no hash, no parse
+		const bytes = kept && cache !== 'verify' ? null : this.bytes(binStart, binEnd);
+		const key = bytes ? stubHash(bytes) : null;
+		const hash = bytes ? (key ?? this.options.sha256(bytes)) : kept!.hash;
+		// the data size the stub maps; with no memo it is read only for a module that has a data size
+		let mapped = kept && !bytes ? kept.mapped : undefined;
+		if (cache) {
+			if (kept) this.stats.execHits++;
+			else this.stats.execMisses++;
+			if (bytes) {
+				mapped = dylinkInfo(bytes)?.memorySize;
+				if (kept && (kept.hash !== hash || kept.mapped !== mapped))
+					this.stats.execMismatches++;
+			}
+		}
 		let module = this.options.registry.get(hash);
+		if (cache && !kept) this.execKeep(bytes!, key, hash, mapped, module !== undefined);
 		const guarded = this.options.guarded;
 		// a fork child and a non-root exec have a memory of their own and run the plain build; the
 		// guarded build is for a non-root task in the shared memory (kernel.gmux_own_exec = 0)
@@ -1477,10 +1661,8 @@ export class Machine {
 		) {
 			module = guarded.get(hash);
 			if (!module)
-				this.stats.unknownExecutables.push(
-					`${hash} (${bytes.length} bytes, no guarded build)`
-				);
-		} else if (!module) this.stats.unknownExecutables.push(`${hash} (${bytes.length} bytes)`);
+				this.stats.unknownExecutables.push(`${hash} (${length} bytes, no guarded build)`);
+		} else if (!module) this.stats.unknownExecutables.push(`${hash} (${length} bytes)`);
 		if (!module) return undefined;
 		const missed = this.dlMisses.get(hash);
 		if (missed?.size) {
@@ -1491,17 +1673,49 @@ export class Machine {
 			}
 		}
 		const size = moduleFacts(module).data;
-		const mapped = size === null ? undefined : dylinkInfo(bytes)?.memorySize;
-		if (size !== null && mapped !== undefined) {
+		const maps = size === null ? undefined : cache ? mapped : dylinkInfo(bytes!)?.memorySize;
+		if (size !== null && maps !== undefined) {
 			// the kernel maps the stub's size by whole pages (binfmt_wasm)
-			if (size > Math.ceil(mapped / 0x1000) * 0x1000) {
+			if (size > Math.ceil(maps / 0x1000) * 0x1000) {
 				this.stats.unknownExecutables.push(
-					`${hash} (needs ${size} bytes of data, stub maps ${mapped})`
+					`${hash} (needs ${size} bytes of data, stub maps ${maps})`
 				);
 				return undefined;
 			}
 		}
 		return { module, hash, dataStart, tableStart };
+	}
+
+	/** the memo's entry for the stub at `start`, compared in place from its key end */
+	private execFind(start: number, length: number) {
+		const list = this.execMemo.get(length);
+		if (!list || start < 0 || start + length > this.memory.buffer.byteLength) return undefined;
+		const view = new Uint8Array(this.memory.buffer, start, length);
+		for (const e of list) {
+			let i = length;
+			while (i > 0 && view[i - 1] === e.bytes[i - 1]) i--;
+			if (i === 0) return e;
+		}
+		return undefined;
+	}
+
+	/** keeps a stub's facts after a miss: only stubs of an executable the registry holds, up to the entry limit */
+	private execKeep(
+		bytes: Uint8Array,
+		key: string | null,
+		hash: string,
+		mapped: number | undefined,
+		known: boolean
+	) {
+		const refused = this.stats.execRefused;
+		if (key === null) return void refused.file++;
+		if (bytes.length > EXEC_MEMO_BYTES) return void refused.long++;
+		if (!known) return void refused.unknown++;
+		if (this.execMemoSize >= EXEC_MEMO_ENTRIES) return void refused.full++;
+		const list = this.execMemo.get(bytes.length) ?? [];
+		list.push({ bytes, hash, mapped });
+		this.execMemo.set(bytes.length, list);
+		this.execMemoSize++;
 	}
 
 	private release(dead: number) {
@@ -1526,7 +1740,7 @@ export class Machine {
 		runner.fail = null;
 		if (!fail) return;
 		this.stats.abandonedStacks++;
-		fail(new Abandoned());
+		fail(ABANDONED);
 	}
 
 	private shared: WebAssembly.Instance | null = null;
@@ -1771,6 +1985,7 @@ export class Machine {
 			p.memoryBase.value = user.dataStart;
 			p.stackPointer.value = stackPointer;
 			p.globals.forEach((g, i) => (g.value = p!.initial[i]!));
+			if (p.fp) p.fp.value = p.fpInitial;
 			this.hostCalling = true;
 			try {
 				p.exports.__wasm_apply_global_relocs();
@@ -1819,7 +2034,8 @@ export class Machine {
 				tlsOffset: (exports.__get_tls_base?.() ?? user.dataStart) - user.dataStart,
 				tableStart: user.tableStart,
 				clone,
-				reused: false
+				reused: false,
+				...unwindState(exports)
 			};
 			if (!clone && !this.templates.has(user.module))
 				this.templates.set(user.module, {
@@ -1900,7 +2116,8 @@ export class Machine {
 					tlsOffset: t.tlsOffset,
 					tableStart: t.tableStart,
 					clone: false,
-					reused: false
+					reused: false,
+					...unwindState(exports)
 				});
 				this.stats.prefilled++;
 			}
@@ -1908,17 +2125,32 @@ export class Machine {
 		ghost.user = null;
 	}
 
-	/** the program ended (an exec replaced it, or its task unwound): its instance goes back */
+	/**
+	 * the program ended (an exec replaced it, or its task unwound): its instance goes back when
+	 * nothing of the process is left on it. Both call sites run after the last frame is gone: an
+	 * exec's reload_program trap threw through the frames into userChain, and an abandoned stack
+	 * (`abandon` clears `resume` first) was failed with an exception that unwound them before
+	 * `finished` ran. What retire still checks is what those sites cannot promise: a parked runner
+	 * (its frames are live), a checkpoint that holds or is taking its frames, asyncify state in the
+	 * middle of an unwind or rewind, and an evacuable build's unwinding flag
+	 */
 	private retire(runner: Runner) {
 		const p = runner.recycled;
 		if (!p) return;
 		runner.recycled = null;
 		if (!p.clone) this.held.set(p.module, (this.held.get(p.module) ?? 1) - 1);
-		if (p.clone && !this.cloneChecked.get(p.module)) return;
+		const refused = this.stats.recycleRefused;
+		if (runner.resume) return void refused.parked++;
+		if (runner.checkpointed || runner.unwinding || runner.rewinding)
+			return void refused.checkpointed++;
+		if (p.asyncState && p.asyncState() !== 0) return void refused.asyncify++;
+		if (p.unwinding && Number(p.unwinding.value) !== 0) return void refused.unwinding++;
+		if (p.clone && !this.cloneChecked.get(p.module)) return void refused.clone++;
 		const pools = p.clone ? this.clonePool : this.pool;
 		let idle = pools.get(p.module);
 		if (!idle) pools.set(p.module, (idle = []));
-		if (idle.length >= (this.options.recycleInstances ?? RECYCLE_DEFAULT)) return;
+		if (idle.length >= (this.options.recycleInstances ?? RECYCLE_DEFAULT))
+			return void refused.full++;
 		idle.push(p);
 		this.stats.recycleReturns++;
 	}
@@ -1953,6 +2185,8 @@ export class Machine {
 				throw new WebAssembly.RuntimeError(`memory access denied at ${address >>> 0}`);
 			};
 		}
+		// the start function writes the data segments over what the kernel left in the mapping
+		this.zeroData(runner, 0);
 		this.hostCalling = true;
 		let instance: WebAssembly.Instance;
 		try {
@@ -1961,6 +2195,7 @@ export class Machine {
 			this.hostCalling = false;
 		}
 		this.stats.userExecs++;
+		if (facts.guard) this.stats.guardedExecs++;
 		if (this.options.trace)
 			this.log(`program for ${runner.name} data=${user.dataStart} table=${user.tableStart}`);
 		return instance;
@@ -1989,8 +2224,9 @@ export class Machine {
 				throw new WebAssembly.RuntimeError('abort');
 			},
 			// scripts/wasm/stack-pass.ts: a frame allocation left its stack segment
-			__gmux_stack_move: (sp: number) =>
-				this.stackMove(this.shared ? this.current! : runner, sp),
+			__gmux_stack_move: new WebAssembly.Suspending((sp: number) =>
+				this.stackMove(this.shared ? this.current! : runner, sp)
+			),
 			// fuel ran out in a user loop: give the other cpus the host thread, then refill
 			__gmux_fuel: new WebAssembly.Suspending(() => {
 				// a vfork child runs this instance as another task
@@ -2010,7 +2246,9 @@ export class Machine {
 			}),
 			__gmux_vfork: new WebAssembly.Suspending((env: number) => this.vforkStart(env)),
 			// musl's _Fork (musl patch 0008)
-			__gmux_fork: () => this.fork(this.shared ? this.current! : runner),
+			__gmux_fork: new WebAssembly.Suspending(() =>
+				this.fork(this.shared ? this.current! : runner)
+			),
 			__gmux_vfork_exec: new WebAssembly.Suspending(
 				(path: number, argv: number, envp: number) =>
 					this.vforkTerminal(SYS_EXECVE, [path, argv, envp])
@@ -2066,10 +2304,19 @@ export class Machine {
 			k: k as WebAssembly.ModuleImports,
 			h: h as WebAssembly.ModuleImports,
 			c: { 5: hit as WebAssembly.ImportValue },
+			// the direct form's two calls, around the kernel's answer; the others never reach them
+			q: {
+				5: (_sp: number, _tls: number, _nr: number, ...args: number[]) =>
+					this.statxPrepare(this.shared ? this.current! : runner, args)
+			},
+			f: { 5: (id: number, result: number) => this.statxFinish(id, result) },
 			env: {
 				memory: env.memory as WebAssembly.Memory,
 				route: this.route!,
-				cache: new WebAssembly.Global({ value: 'i32', mutable: true }, this.fsCache ? 1 : 0)
+				cache: new WebAssembly.Global(
+					{ value: 'i32', mutable: true },
+					this.fsCache ? (this.options.directFill ? CACHE_DIRECT : CACHE_HOOK) : 0
+				)
 			}
 		}).exports;
 		for (let n = 0; n <= 6; n++) env[`__wasm_syscall_${n}`] = router[`s${n}`];
@@ -2134,6 +2381,7 @@ export class Machine {
 			}
 			// -1 without fileSync: every call goes straight on
 			const sync = this.options.fileSync ? nr : -1;
+			if (WRITE_CALLS.includes(nr) || nr === SYS_PWRITEV2) this.stats.writeHooks++;
 			if (sync === SYS_FSYNC || sync === SYS_FDATASYNC || sync === SYS_SYNC_FILE_RANGE)
 				await this.syncFile(me, sp, tls, args[0]!);
 			else if (sync === SYS_MSYNC && args[2]! & MS_SYNC)
@@ -2168,10 +2416,11 @@ export class Machine {
 				// a synchronous write returns once its file is durable, as fsync after it would
 				const fd =
 					sync === SYS_SPLICE || sync === SYS_COPY_FILE_RANGE ? args[2]! : args[0]!;
-				const flags =
-					sync === SYS_PWRITEV2 && args[5]! & (RWF_DSYNC | RWF_SYNC)
-						? O_DSYNC
-						: await this.sys(me, sp, tls, SYS_FCNTL, fd, F_GETFL);
+				const flagged = sync === SYS_PWRITEV2 && args[5]! & (RWF_DSYNC | RWF_SYNC);
+				if (!flagged) this.stats.flagReads++;
+				const flags = flagged
+					? O_DSYNC
+					: await this.sys(me, sp, tls, SYS_FCNTL, fd, F_GETFL);
 				if (flags >= 0 && flags & O_DSYNC) await this.syncFile(me, sp, tls, fd);
 			}
 			return result;
@@ -2201,6 +2450,37 @@ export class Machine {
 			mask: args[3]!,
 			gen: this.fsGeneration()
 		};
+	}
+
+	/** the direct form's queries between the router's two imports, by id modulo the pool's size */
+	private readonly statxPending: ({
+		id: number;
+		me: Runner;
+		query: NonNullable<ReturnType<Machine['statxQuery']>>;
+		buf: number;
+	} | null)[] = Array.from({ length: 64 }, () => null);
+	private statxNext = 0;
+
+	/**
+	 * the direct form's first import: the query of a statx that missed (`args` are dirfd, path, flags,
+	 * mask, buf), kept under an id the router carries across the kernel's call, or -1 when no answer to
+	 * this one is kept. A task killed inside the call leaves its query behind, and the pool's next lap
+	 * over that slot drops it; its id then matches nothing
+	 */
+	private statxPrepare(me: Runner, args: number[]): number {
+		const query = this.statxQuery(me, args);
+		if (!query) return -1;
+		const id = (this.statxNext = (this.statxNext + 1) & 0x3fffffff);
+		this.statxPending[id & 63] = { id, me, query, buf: args[4]! >>> 0 };
+		return id;
+	}
+
+	/** the direct form's second import: fills the cache from the kernel's answer to query `id` */
+	private statxFinish(id: number, result: number) {
+		const held = this.statxPending[id & 63];
+		if (held?.id !== id) return;
+		this.statxPending[id & 63] = null;
+		this.statxFill(held.me, held.query, result, held.buf);
 	}
 
 	/** views over a memory's current buffer, made again only when the memory has grown */
@@ -2353,15 +2633,23 @@ export class Machine {
 	/** a synchronous-looking kernel call in the task's context, which may park it */
 	private async sys(me: Runner, sp: number, tls: number, nr: number, ...args: number[]) {
 		const call = this.exp(me)[`wasm_syscall_${args.length}`];
-		return Number(await WebAssembly.promising(call)(sp, tls, nr, ...args)) | 0;
+		// every 256th syscall hands the host thread over inside the call, so it can park: a checkpoint
+		// must not catch the task here, and the call goes through promising, never a plain export call
+		const was = me.syncing;
+		me.syncing = true;
+		try {
+			return Number(await WebAssembly.promising(call)(sp, tls, nr, ...args)) | 0;
+		} finally {
+			me.syncing = was;
+		}
 	}
 
 	/**
 	 * the hook's view of the task's scratch mapping: a path at 0, statx at 4608, reads from 8192.
 	 * Null when the task has no mapping to lend
 	 */
-	private hookScratch(me: Runner, sp: number, tls: number) {
-		const scratch = this.forkSpill(me);
+	private async hookScratch(me: Runner, sp: number, tls: number) {
+		const scratch = await this.forkSpill(me);
 		if (!scratch) return null;
 		const mem = () => new Uint8Array(this.userMemory(me).buffer);
 		const buffer = scratch + 8192;
@@ -2441,7 +2729,7 @@ export class Machine {
 
 	/** reads the file behind `fd` through the kernel and hands it to `fileSync` */
 	private async syncFile(me: Runner, sp: number, tls: number, fd: number) {
-		const s = this.hookScratch(me, sp, tls);
+		const s = await this.hookScratch(me, sp, tls);
 		if (!s) return void this.stats.fileSyncsSkipped++;
 		// /proc/self/fd/N names the open file; reopening it reads without moving the program's offset
 		const link = `/proc/self/fd/${fd}`;
@@ -2457,7 +2745,7 @@ export class Machine {
 
 	/** hands the regular file at `open` to `fileSync` under the name `path` */
 	private async flushPath(
-		s: NonNullable<ReturnType<Machine['hookScratch']>>,
+		s: NonNullable<Awaited<ReturnType<Machine['hookScratch']>>>,
 		open: string,
 		path: string
 	) {
@@ -2473,7 +2761,7 @@ export class Machine {
 
 	/** msync(MS_SYNC): every file mapped over [addr, addr + length), by /proc/self/maps */
 	private async syncMapped(me: Runner, sp: number, tls: number, addr: number, length: number) {
-		const s = this.hookScratch(me, sp, tls);
+		const s = await this.hookScratch(me, sp, tls);
 		if (!s) return void this.stats.fileSyncsSkipped++;
 		const maps = await s.read('/proc/self/maps');
 		const paths = new Set<string>();
@@ -2493,7 +2781,7 @@ export class Machine {
 	 * hook until the call returns. syncfs of another filesystem (proc, devtmpfs) has nothing to keep
 	 */
 	private async syncAll(me: Runner, sp: number, tls: number, fd?: number) {
-		const s = this.hookScratch(me, sp, tls);
+		const s = await this.hookScratch(me, sp, tls);
 		if (!s) return void this.stats.fileSyncsSkipped++;
 		const root = await s.stat('/');
 		if (!root) return;
@@ -2532,7 +2820,7 @@ export class Machine {
 
 	/** writes a restore's files back through the kernel, making any directory they need */
 	private async applyFiles(me: Runner, sp: number, tls: number, files: SyncedFile[]) {
-		const scratch = this.forkSpill(me);
+		const scratch = await this.forkSpill(me);
 		if (!scratch) {
 			this.stats.fileRestoreErrors.push('no scratch mapping');
 			return;
@@ -2735,7 +3023,7 @@ export class Machine {
 	 * of the next segment in the chain, mapped for the task on first use and reused after, until the
 	 * segments reach RLIMIT_STACK, past which it is a stack overflow (SIGSEGV), as with an MMU
 	 */
-	private stackMove(me: Runner, requested: number): number {
+	private async stackMove(me: Runner, requested: number): Promise<number> {
 		const program = me.program!;
 		const sp = requested >>> 0;
 		const current = program.stackPointer.value >>> 0;
@@ -2769,20 +3057,19 @@ export class Machine {
 			const size = Math.max(STACK_SEGMENT, (frame + 0x10fff) & ~0xfff);
 			const kernel = this.exp(me);
 			const tls = program.exports.__get_tls_base?.() ?? kernel.gmux_utls.value;
-			// synchronous: the program is mid-frame, and none of these sleeps
 			const syscall = (nr: number, ...args: number[]) =>
-				Number(kernel[`wasm_syscall_${args.length}`](current, tls, nr, ...args));
+				this.sys(me, current, tls, nr, ...args);
 			// a next segment too small for this frame, and any past it, hold no live frames
 			for (const old of segments.splice(at + 1))
-				syscall(SYS_MUNMAP, old.low, old.high - old.low);
-			const low = syscall(SYS_MMAP, 0, size, 3, 0x22, -1, 0) >>> 0;
+				await syscall(SYS_MUNMAP, old.low, old.high - old.low);
+			const low = (await syscall(SYS_MMAP, 0, size, 3, 0x22, -1, 0)) >>> 0;
 			if (low > 0xfffff000) throw new WebAssembly.RuntimeError('stack overflow');
 			// RLIMIT_STACK read into the new segment, the one place with room to spare
-			syscall(SYS_PRLIMIT64, 0, RLIMIT_STACK, 0, low);
+			await syscall(SYS_PRLIMIT64, 0, RLIMIT_STACK, 0, low);
 			const limit = Number(new DataView(this.userMemory(me).buffer).getBigUint64(low, true));
 			const total = segments.slice(0, at + 1).reduce((n, s) => n + s.high - s.low, 0) + size;
 			if (total > limit) {
-				syscall(SYS_MUNMAP, low, size);
+				await syscall(SYS_MUNMAP, low, size);
 				throw new WebAssembly.RuntimeError('stack overflow');
 			}
 			next = { low, high: low + size };
@@ -2845,6 +3132,8 @@ export class Machine {
 						);
 					else if (r.reused) new Uint8Array(this.memory.buffer).set(image, at);
 				}
+				// a reused or shared instance wrote no data: its image covers the first `share` bytes
+				this.zeroData(runner, moduleFacts(runner.user!.module).share ?? 0);
 				ux.__wasm_apply_data_relocs?.();
 				// the start function copies the main thread's TLS image but leaves its pointers to the loader
 				ux.__wasm_apply_tls_relocs?.();
@@ -2939,7 +3228,7 @@ export class Machine {
 		} finally {
 			me.handlers--;
 		}
-		if (flow & 2) throw new Trap('signal_return');
+		if (flow & 2) throw SIGNAL_RETURN;
 		return 0;
 	}
 
@@ -3011,7 +3300,7 @@ export class Machine {
 	 * experiments/evacuation/scripts/evacuate.ts --resume) and forkUnwound forks the task; the
 	 * frames resume in the parent and in the child, whose re-issued call gets the pid or 0
 	 */
-	private fork(me: Runner): number {
+	private async fork(me: Runner): Promise<number> {
 		if (me.forkResult !== undefined) {
 			const value = me.forkResult;
 			me.forkResult = undefined;
@@ -3020,7 +3309,7 @@ export class Machine {
 		const program = me.program!;
 		const ux = program.exports;
 		if (!evacuable(ux)) return -38;
-		const spill = this.forkSpill(me);
+		const spill = await this.forkSpill(me);
 		if (!spill) return -12;
 		me.forkSp = program.stackPointer.value;
 		ux.gmux_fp.value = spill;
@@ -3034,7 +3323,7 @@ export class Machine {
 	 * so its frames spill as for a fork and userChain resumes them in the same instance, where the
 	 * re-issued yield returns `value`
 	 */
-	private reenter(me: Runner, value: number): number {
+	private async reenter(me: Runner, value: number): Promise<number> {
 		if (me.reenterAt === undefined || me.unwinding || me.rewinding || this.now() < me.reenterAt)
 			return value;
 		const program = me.program;
@@ -3049,7 +3338,7 @@ export class Machine {
 		)
 			return value;
 		me.reenterAt = undefined;
-		const spill = this.forkSpill(me);
+		const spill = await this.forkSpill(me);
 		if (!spill) return value;
 		me.reenterSp = program.stackPointer.value;
 		program.exports.gmux_fp.value = spill;
@@ -3060,7 +3349,7 @@ export class Machine {
 	}
 
 	/** a mapping of the process's own for its spilled frames, made once and reused while it lasts */
-	private forkSpill(me: Runner): number {
+	private async forkSpill(me: Runner): Promise<number> {
 		const kernel = this.exp(me);
 		const mm = Number(kernel.wasm_current_mm()) >>> 0;
 		const known = this.forkSpills.get(mm);
@@ -3073,9 +3362,7 @@ export class Machine {
 		)
 			return known;
 		const [sp, tls] = this.userRegs(me);
-		// synchronous: the program is in its fork call, and an anonymous mapping does not sleep
-		const low =
-			Number(kernel.wasm_syscall_6(sp, tls, SYS_MMAP, 0, FORK_SPILL, 3, 0x22, -1, 0)) >>> 0;
+		const low = (await this.sys(me, sp, tls, SYS_MMAP, 0, FORK_SPILL, 3, 0x22, -1, 0)) >>> 0;
 		if (low > 0xfffff000) return 0;
 		this.forkSpills.set(mm, low);
 		return low;
@@ -3292,6 +3579,12 @@ export class Machine {
 	/** each process's side modules (dlopen), by the data start of its program */
 	private dls = new Map<number, DlProcess>();
 	private dlMisses: DlMisses;
+	/** `execCache`: the facts of stubs the registry holds, by stub length; never saved in a checkpoint */
+	private execMemo = new Map<
+		number,
+		{ bytes: Uint8Array; hash: string; mapped: number | undefined }[]
+	>();
+	private execMemoSize = 0;
 	/** shared instances, by program hash */
 	private sharedPrograms = new Map<string, SharedProgram>();
 	/** idle instances of share builds, by module, and each build's data image before relocation */
@@ -3378,7 +3671,10 @@ export class Machine {
 		if (this.lastDomain?.memory === memory) return this.lastDomain;
 		let domain = this.domains.get(memory);
 		if (!domain)
-			this.domains.set(memory, (domain = new Domain(memory, READ | WRITE, this.memory)));
+			this.domains.set(
+				memory,
+				(domain = new Domain(memory, READ | WRITE, this.memory, this.options.runtime?.copy))
+			);
 		return (this.lastDomain = domain);
 	}
 
@@ -3463,7 +3759,8 @@ export class Machine {
 	 * katybug's `__gmux_digest` ops 8 to 13, a program's gzip member decoded whole before its code
 	 * hands any of it on: 8 opens a decoder and returns its id, 9 decodes the c bytes at address b
 	 * (0 more input wanted, 1 the stream ended, -1 a data error or a bad request, -2 over the
-	 * bytes a task may hold), 10 writes four words at b (bytes decoded, bytes of input taken, whole
+	 * bytes a task or the machine may hold; input that ends inside the stream stays 0, so a caller
+	 * takes only a 1), 10 writes four words at b (bytes decoded, bytes of input taken, whole
 	 * windows decoded, whether it ended), 11 returns the bytes of input taken when window b was
 	 * done, 12 copies window c (32 KiB, the last may be short) to address b, 13 closes it. A
 	 * negative result is an error: no `inflate` option, an id the task did not open, or an address
@@ -3489,12 +3786,19 @@ export class Machine {
 			if (op === 9) {
 				if (c >>> 0 > MAX_INFLATE_FEED) return -1;
 				let others = 0;
-				for (const s of this.inflates.values())
-					if (s.owner === me.id && s !== stream) others += s.length;
+				let held = 0;
+				for (const s of this.inflates.values()) {
+					if (s === stream) continue;
+					held += s.held;
+					if (s.owner === me.id) others += s.length;
+				}
+				const pieces = Math.floor(
+					((this.options.maximumInflateBytes ?? 64 << 20) - held) / INFLATE_PIECE
+				);
 				const done = stream.ended;
 				const result = stream.feed(
 					new Uint8Array(buffer, b >>> 0, c >>> 0),
-					MAX_INFLATE_BYTES - others
+					Math.min(MAX_INFLATE_BYTES - others, pieces * INFLATE_PIECE)
 				);
 				if (result === 1 && !done) this.stats.inflates++;
 				return result;
@@ -3576,12 +3880,25 @@ export class Machine {
 		// resume past the call), which leaves the cpu in kernel mode: run on until it is out
 		const interrupted = () => [...this.runners.values()].some((r) => r.interrupting);
 		if (!this.running && interrupted()) {
+			this.options.phase?.('interrupt', true);
 			await this.run(
 				() => !interrupted(),
 				async () => {},
 				10_000
 			);
+			this.options.phase?.('interrupt', false);
 			if (interrupted()) throw new Error('checkpoint during a user-mode interrupt');
+		}
+		// the buffers a parked stream's reader gave back reach the kernel on its next event call: let the
+		// relay take them, or the snapshot would carry buffers nothing frees
+		if (!this.running && !this.net.blocker() && this.net.owes()) {
+			// the buffers were given back without a wake: the kernel calls for events only when told to
+			this.net.wake();
+			await this.run(
+				() => !this.net.owes(),
+				async () => {},
+				10_000
+			);
 		}
 		// the snapshot holds an empty console ring, so a restore neither loses nor repeats a byte
 		this.drainConsole();
@@ -3594,9 +3911,13 @@ export class Machine {
 		// ponytail: a fork child's own memory is not in the snapshot yet
 		if (this.privateMemories.size)
 			throw new Error('checkpoint: fork children with their own memory are not saved yet');
-		// ponytail: a stream is a socket in the kernel and queues here; closing them at a checkpoint is part 2
-		if (this.net.open)
-			throw new Error('checkpoint: streams are open to the machine and are not saved');
+		// a stream its owner holds between two requests is saved (its socket and the relay's connection are
+		// in the kernel's memory); one with a request in flight, or buffers still to give back, is not
+		const inFlight = this.net.blocker();
+		if (inFlight) throw new Error(`checkpoint: ${inFlight}`);
+		if (this.net.owes())
+			throw new Error('checkpoint: the relay still owes the kernel an event');
+		const streams = this.net.saved;
 		// a host digest cannot hand its state back, so a checkpoint waits for the stream to end
 		if (this.digests.size)
 			throw new Error('checkpoint: a host digest is open and is not saved');
@@ -3681,7 +4002,9 @@ export class Machine {
 			resume(0);
 			// wasm unwinds inside microtasks; workerd may never run the continuation of an entry started by an
 			// earlier request, so after one macrotask the checkpoint finishes the unwind itself
+			this.options.phase?.('unwind', true);
 			await Promise.race([done, new Promise<void>((r) => setTimeout(r, 0))]);
+			this.options.phase?.('unwind', false);
 			if (runner.unwinding) this.endUnwind(runner);
 			this.current = null;
 		}
@@ -3711,6 +4034,7 @@ export class Machine {
 			kernelStack: this.stacks.get(r)?.kernel ?? null,
 			userStack: this.stacks.get(r)?.user ?? null,
 			tag: r.user && owners ? owners[r.user.dataStart >>> 12] : undefined,
+			unzeroed: r.unzeroed || undefined,
 			signal: r.signal ?? null,
 			released: this.runners.get(r.id) !== r || undefined
 		}));
@@ -3748,6 +4072,8 @@ export class Machine {
 			runners,
 			stats: {
 				...this.stats,
+				recycleRefused: { ...this.stats.recycleRefused },
+				execRefused: { ...this.stats.execRefused },
 				unknownExecutables: [...this.stats.unknownExecutables],
 				dlMisses: [...this.stats.dlMisses],
 				interpretedStarts: [...this.stats.interpretedStarts]
@@ -3757,7 +4083,8 @@ export class Machine {
 				.map((d) => d.save()),
 			owners,
 			syncWrites: this.syncWrites || undefined,
-			ports: this.net.listeners
+			ports: this.net.listeners,
+			...(streams ? { streams: streams.streams, streamNext: streams.next } : {})
 		};
 	}
 
@@ -3842,16 +4169,22 @@ export class Machine {
 		} else if (lazy) into.set(await lazy.read(0, into.byteLength));
 		else if (image) image.write(into);
 		else if (!inPlace) into.set(snapshot.memory);
-		const behind = BigInt(snapshot.now) - machine.now();
+		const behind = BigInt(snapshot.now) - machine.hostNs();
 		if (behind > 0n) machine.clockOffset = behind;
 		Object.assign(machine.stats, snapshot.stats);
+		machine.stats.recycleRefused = { ...machine.stats.recycleRefused };
+		machine.stats.execRefused = { ...machine.stats.execRefused };
 		machine.stats.deferredPages = [...machine.deferred.values()].reduce(
 			(n, l) => n + l.length,
 			0
 		);
 		machine.stats.filledPages = 0;
 		machine.input = [...snapshot.input];
-		machine.net.restore(snapshot.ports);
+		machine.restoredStreams = machine.net.restore(
+			snapshot.ports,
+			snapshot.streams,
+			snapshot.streamNext
+		);
 		machine.scratch = snapshot.scratch;
 		// a snapshot with no region (taken before the core was bundled) keeps the TypeScript scheduler
 		if (snapshot.core !== undefined) {
@@ -3860,7 +4193,7 @@ export class Machine {
 		}
 		machine.instantiate(machine.cpuZero);
 		for (const saved of snapshot.dl ?? []) machine.dlProcess(saved.dataStart).load(saved);
-		const now = machine.now();
+		const now = machine.syncClock();
 		const made: Runner[] = [];
 		for (const saved of snapshot.runners) {
 			const runner =
@@ -3896,6 +4229,7 @@ export class Machine {
 				runner.user = { module, ...saved.user };
 			}
 			runner.tag = saved.tag;
+			runner.unzeroed = saved.unzeroed;
 			runner.signal = saved.signal ?? null;
 			if (!saved.released) machine.runners.set(saved.id, runner);
 		}
@@ -4000,6 +4334,9 @@ export class Machine {
 		Atomics.or(new BigInt64Array(this.memory.buffer), word / 8, 1n << BigInt(irq));
 		this.stats.consoleRaises++;
 	}
+
+	/** the streams of the snapshot this machine was restored from, parked as their owner left them */
+	restoredStreams: IngressStream[] = [];
 
 	/** changes whenever a stream gains something to read or its guest end closes, which a pump waiting on a stream can end its turn at */
 	get netActivity(): number {
@@ -4272,6 +4609,7 @@ export class Machine {
 			this.cpuZero.resume = () => void this.boot();
 			this.ready.push(this.cpuZero);
 		}
+		this.syncClock();
 		let steps = 0;
 		while (!until() && !this.halted && !this.crashed && steps++ < budget) {
 			// idle cpus with a raised interrupt or a due timer go first, or a spinner starves them
@@ -4291,8 +4629,11 @@ export class Machine {
 				// rounded up: a timer under a millisecond away is still time the machine skips, and a
 				// wait counted as 0 let a short-sleep loop hold an unattended turn open
 				const ms = Math.ceil(Number(deadline - this.now()) / 1e6);
+				const from = this.hostNs();
 				this.stats.hostSleeps++;
 				await sleep(Math.max(0, ms));
+				const slept = this.hostNs() - from;
+				if (slept > 0n) this.clock += slept;
 				// an idle machine that waited for its next timer has reached it, whether or not the host
 				// clock moved meanwhile (a deployed Worker's stands still while code runs)
 				if (this.clock < deadline) this.clock = deadline;
@@ -4322,8 +4663,10 @@ export class Machine {
 				next.sharedSaved = null;
 			}
 			const parked = new Promise<Runner>((r) => (this.suspended = r));
+			this.options.phase?.('parked', true);
 			resume(next.value);
 			await parked;
+			this.options.phase?.('parked', false);
 			this.current = null;
 		}
 		if (this.crashed) return 'crashed';

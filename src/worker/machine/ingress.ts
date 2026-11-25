@@ -40,6 +40,12 @@ export interface IngressStream {
 	readonly readable: ReadableStream<Uint8Array>;
 	/** the guest ended or reset its side, whether or not anyone has read to it */
 	readonly closed: boolean;
+	/**
+	 * the owner holds the stream between two requests: nothing is in flight either way, so a checkpoint
+	 * saves it and the restored machine hands it back (`Machine.restoredStreams`). Set by the one who
+	 * reads the stream, cleared when it sends the next request
+	 */
+	parked: boolean;
 	/** resolves once the guest took the bytes, rejects when the stream is gone */
 	write(data: Uint8Array | string): Promise<void>;
 	/** no more bytes from the host: the guest reads the end of its input */
@@ -77,6 +83,7 @@ class Stream implements IngressStream {
 	/** a send found no room: the host raises the interrupt once a read makes some */
 	starved = false;
 	dead = false;
+	parked = false;
 	/** buffers the kernel lent that are queued or taken and not given back */
 	kept = 0;
 
@@ -188,6 +195,20 @@ class Stream implements IngressStream {
 		}
 	}
 
+	/** the stream holds nothing that a checkpoint would lose: its owner is between two requests and no byte, buffer or end is waiting either way */
+	quiet(): boolean {
+		return (
+			this.parked &&
+			this.opened &&
+			!(this.ended || this.shut || this.aborted || this.dead || this.held || this.starved) &&
+			!(this.readClosed || this.closeAfter) &&
+			this.chunks.length === 0 &&
+			this.queue.length === 0 &&
+			this.taken.length === 0 &&
+			this.kept === 0
+		);
+	}
+
 	/** the next thing the kernel is owed, if the stream may deliver it now */
 	ready(): boolean {
 		if (this.aborted) return true;
@@ -277,9 +298,53 @@ export class Ingress {
 		return [...this.ports].flatMap(([port, n]) => Array<number>(n).fill(port));
 	}
 
-	restore(listeners: number[] = []) {
+	/** why a checkpoint cannot be taken now: a stream that is not parked between two requests, or null */
+	blocker(): string | null {
+		for (const stream of this.streams.values())
+			if (!stream.quiet()) return `a request is in flight on stream ${stream.id}`;
+		return null;
+	}
+
+	/** what the kernel is owed: buffers to free, or a stream's next event; a checkpoint waits until the relay has it */
+	owes(): boolean {
+		return this.freed.length > 0 || [...this.streams.values()].some((s) => s.ready());
+	}
+
+	/** the parked streams a checkpoint saves, and the id the next new stream takes (null with no stream) */
+	get saved(): {
+		streams: { id: number; port: number; borrows: boolean }[];
+		next: number;
+	} | null {
+		if (!this.streams.size) return null;
+		const streams = [...this.streams.values()].map((s) => ({
+			id: s.id,
+			port: s.port,
+			borrows: s.borrows
+		}));
+		return { streams, next: this.nextId };
+	}
+
+	/**
+	 * the listeners of a snapshot and, when it held streams, each of them again as a parked stream the
+	 * kernel still has its connection for; answers the streams so their owner can take them back
+	 */
+	restore(
+		listeners: number[] = [],
+		streams: { id: number; port: number; borrows: boolean }[] = [],
+		next = 0
+	): IngressStream[] {
 		this.ports.clear();
 		for (const port of listeners) this.ports.set(port, (this.ports.get(port) ?? 0) + 1);
+		this.streams.clear();
+		this.nextId = Math.max(1, next);
+		return streams.map(({ id, port, borrows }) => {
+			const stream = new Stream(id, port, this, borrows);
+			stream.opened = true;
+			stream.parked = true;
+			this.streams.set(id, stream);
+			this.nextId = Math.max(this.nextId, id + 1);
+			return stream;
+		});
 	}
 
 	listening(port: number): boolean {

@@ -18,6 +18,10 @@ export interface KeeperHost {
 	options(): MachineOptions;
 	/** wall time, ms since the epoch */
 	now?(): number;
+	/** the object's instance id; a trace's epochs carry it */
+	instance?: string;
+	/** phase lines for the trace; absent, the keeper marks nothing */
+	trace?(line: Record<string, unknown>): void;
 	/** ms until the earliest timer a user process waits on (not the kernel's own), null for none */
 	userTimerMs?(): Promise<number | null>;
 	/**
@@ -57,6 +61,13 @@ export const STEPS_MIN = 500;
 export const STEPS_MAX = 12_000;
 /** the event right after a restore spent part of its CPU on the restore: half the steps */
 export const RESTORE_SHARE = 0.5;
+
+/** a pump step and a wait are hot: traced only when one ran this long, ms */
+const HOT = new Set(['parked', 'wait']);
+const HOT_MS = 100;
+
+/** what a checkpoint answers when the machine was replaced while it awaited */
+const SUPERSEDED = Symbol('superseded');
 
 /**
  * The choices the idle-machine measurements compare. The defaults are what the site runs; each
@@ -129,6 +140,19 @@ export class Keeper {
 	/** the step cap the last turn ran under */
 	stepCap = 0;
 
+	/** bumped whenever `machine` is replaced; an await that spans a replacement compares it */
+	private generation = 0;
+	/** events begun on this instance, and when the current one began (the host's clock) */
+	private events = 0;
+	private eventStart = 0;
+	private seq = 0;
+	private readonly entered = new Map<
+		string,
+		{ at: number; seq: number; epoch: string; extra: Record<string, unknown> }
+	>();
+	/** the phase the previous instance last entered, read when tracing */
+	private previous: string | null = null;
+
 	private lastTurn: Turn | null = null;
 
 	/** the steps the last turn ran */
@@ -165,6 +189,8 @@ export class Keeper {
 		this.history = seen ? JSON.parse(String(seen)) : null;
 		const quiet = this.policy.persistQuiet ? Number(meta('quiet')) : 0;
 		if (quiet >= QUIET_MIN_MS) this.quietMs = quiet;
+		const phase = host.trace ? meta('phase') : undefined;
+		if (phase !== undefined) this.previous = String(phase);
 	}
 
 	private saveHistory() {
@@ -190,13 +216,67 @@ export class Keeper {
 		this.dirty = true;
 	}
 
+	/** the machine is replaced: every await that spans the old one sees a new generation */
+	private replace(machine: Machine | null) {
+		this.machine = machine;
+		this.generation++;
+	}
+
+	/** an event starts (an alarm, or input that pumps): its phases are timed from here */
+	beginEvent() {
+		this.events++;
+		this.eventStart = this.now();
+	}
+
+	private epoch(): string {
+		return `${this.host.instance ?? ''}:${this.generation}`;
+	}
+
+	/**
+	 * a phase's entry or exit, for the trace. An entry is one synchronous row in `gmux_meta`, which the
+	 * next instance reads as `previous` when the event was killed inside the phase; an exit is a line
+	 */
+	mark(name: string, entering: boolean, extra: Record<string, unknown> = {}) {
+		const sink = this.host.trace;
+		if (!sink) return;
+		const now = this.now();
+		if (entering) {
+			const seq = ++this.seq;
+			const epoch = this.epoch();
+			this.entered.set(name, { at: now, seq, epoch, extra });
+			this.host.sql.exec(
+				"INSERT OR REPLACE INTO gmux_meta (k, v) VALUES ('phase', ?)",
+				JSON.stringify({ epoch, seq, phase: name, at: now - this.eventStart, ...extra })
+			);
+			return;
+		}
+		const open = this.entered.get(name);
+		this.entered.delete(name);
+		const ms = now - (open?.at ?? now);
+		if (HOT.has(name) && ms < HOT_MS) return;
+		sink({
+			epoch: open?.epoch ?? this.epoch(),
+			seq: open?.seq ?? null,
+			phase: name,
+			at: (open?.at ?? now) - this.eventStart,
+			ms,
+			events: this.events,
+			...open?.extra
+		});
+	}
+
 	private options(extra: Partial<MachineOptions> = {}): MachineOptions {
 		return {
 			...this.host.options(),
+			...(this.host.trace
+				? { phase: (name: string, entering: boolean) => this.mark(name, entering) }
+				: {}),
 			fileSync: async (file) => {
 				this.activity();
+				this.mark('fileSync', true);
 				this.store.writeFile(file);
 				await this.host.sync();
+				this.mark('fileSync', false);
 			},
 			...extra
 		};
@@ -213,13 +293,14 @@ export class Keeper {
 	private async restore(memory?: WebAssembly.Memory): Promise<Machine | null> {
 		const recovery = this.store.recover();
 		if (!recovery) return null;
-		this.machine = null;
-		this.machine = await Machine.restore(
+		this.replace(null);
+		const restored = await Machine.restore(
 			this.options({ restoreFiles: recovery.files, memory }),
 			decodeSnapshot(recovery.snapshot),
 			recovery.image
 		);
-		return this.machine;
+		this.replace(restored);
+		return restored;
 	}
 
 	/**
@@ -232,6 +313,22 @@ export class Keeper {
 		from: 'running' | 'restored' | 'bootstrapped' | 'booted';
 	}> {
 		if (this.machine) return { machine: this.machine, from: 'running' };
+		if (this.previous !== null) {
+			this.host.trace?.({ previous: this.previous });
+			this.previous = null;
+		}
+		this.mark('open', true);
+		try {
+			return await this.openStored();
+		} finally {
+			this.mark('open', false);
+		}
+	}
+
+	private async openStored(): Promise<{
+		machine: Machine;
+		from: 'restored' | 'bootstrapped' | 'booted';
+	}> {
 		if (!this.history) {
 			this.history = begin(this.now());
 			this.saveHistory();
@@ -247,18 +344,20 @@ export class Keeper {
 		this.dirty = true;
 		const image = await this.host.bootstrap?.();
 		if (image) {
-			this.machine = await Machine.restore(
+			const machine = await Machine.restore(
 				this.options(),
 				image.snapshot,
 				undefined,
 				image.lazy
 			);
+			this.replace(machine);
 			this.counts.bootstraps++;
 			this.restoredNow = true;
-			return { machine: this.machine, from: 'bootstrapped' };
+			return { machine, from: 'bootstrapped' };
 		}
-		this.machine = new Machine(this.options());
-		return { machine: this.machine, from: 'booted' };
+		const machine = new Machine(this.options());
+		this.replace(machine);
+		return { machine, from: 'booted' };
 	}
 
 	/**
@@ -322,10 +421,15 @@ export class Keeper {
 	 * billed 5 s a wake); the others count against the budget
 	 */
 	sleeper(wait: (ms: number) => Promise<void>): (ms: number) => Promise<void> {
-		return (ms) => {
+		return async (ms) => {
 			if (this.endsTurn(ms)) this.idled = true;
 			else if (this.unattended && ms > 0) this.waitedMs += ms;
-			return wait(ms);
+			this.mark('wait', true);
+			try {
+				await wait(ms);
+			} finally {
+				this.mark('wait', false);
+			}
 		};
 	}
 
@@ -342,13 +446,23 @@ export class Keeper {
 		if (turn?.stopped) this.activity();
 		const saveNow = this.policy.saveWake && this.unattended;
 		const written =
-			this.machine && (this.cadence.due || saveNow) ? await this.checkpoint() : null;
+			this.machine && (this.cadence.due || saveNow) ? await this.checkpointFenced() : null;
+		// a machine replaced during the checkpoint belongs to another event, which does not point the alarm
+		if (written === SUPERSEDED) return null;
 		await this.arm(attended);
 		return written;
 	}
 
-	/** checkpoints the machine now and continues it from the store; null when it refused */
+	/** checkpoints the machine now and continues it from the store; null when it refused or was superseded */
 	async checkpoint(): Promise<Written | null> {
+		const written = await this.checkpointFenced();
+		return written === SUPERSEDED ? null : written;
+	}
+
+	private checkpointing = false;
+
+	/** `checkpoint`, but answers SUPERSEDED when the machine was replaced while it awaited */
+	private async checkpointFenced(): Promise<Written | typeof SUPERSEDED | null> {
 		// one at a time: until the resume below, the machine is spent or gone
 		if (!this.machine || this.checkpointing) return null;
 		this.checkpointing = true;
@@ -359,21 +473,32 @@ export class Keeper {
 		}
 	}
 
-	private checkpointing = false;
-
-	private async checkpointOnce(machine: Machine): Promise<Written | null> {
+	private async checkpointOnce(machine: Machine): Promise<Written | typeof SUPERSEDED | null> {
 		const memory = machine.memory;
+		const epoch = this.generation;
 		let snapshot;
+		this.mark('checkpoint', true);
 		try {
 			snapshot = await machine.checkpoint();
 		} catch (error) {
+			this.mark('checkpoint', false);
 			// a refusal leaves the machine running; the next quantum tries again
 			this.counts.refused++;
 			this.last.refused = String((error as Error).message ?? error);
 			return null;
 		}
-		const written = this.store.writeCheckpoint(snapshot.memory, encodeSnapshot(snapshot));
+		this.mark('checkpoint', false);
+		// the fence: a superseded event writes nothing and takes no counts
+		if (epoch !== this.generation) return SUPERSEDED;
+		const written = this.store.writeCheckpoint(
+			snapshot.memory,
+			encodeSnapshot(snapshot),
+			(name, entering) => this.mark(name, entering)
+		);
+		this.mark('sync', true);
 		await this.host.sync();
+		this.mark('sync', false);
+		if (epoch !== this.generation) return SUPERSEDED;
 		this.cadence.checkpointed(
 			checkpointCost(snapshot.memory.byteLength, written.changed),
 			written.rows
@@ -384,8 +509,13 @@ export class Keeper {
 		this.dirty = false;
 		// a checkpointed machine continues only from a restore; its memory already is the image, and
 		// the old instances go before the new ones are made
-		this.machine = null;
-		this.machine = await Machine.resume(this.options({ memory }), snapshot);
+		this.replace(null);
+		const resuming = this.generation;
+		this.mark('resume', true);
+		const resumed = await Machine.resume(this.options({ memory }), snapshot);
+		this.mark('resume', false);
+		if (resuming !== this.generation) return SUPERSEDED;
+		this.replace(resumed);
 		return written;
 	}
 
@@ -439,9 +569,13 @@ export class Keeper {
 			this.host.decided?.(decision);
 			if (!decision.kept) timer = await this.dropped(timer, now);
 		}
+		const checkpointAt = machine && this.dirty ? now + this.cadence.interval : null;
 		this.alarm.want('timer', timer);
-		this.alarm.want('checkpoint', machine && this.dirty ? now + this.cadence.interval : null);
+		this.alarm.want('checkpoint', checkpointAt);
+		const dues = [timer, checkpointAt].filter((due): due is number => due !== null);
+		this.mark('arm', true, { aheadMs: dues.length ? Math.min(...dues) - now : null });
 		await this.alarm.sync();
+		this.mark('arm', false);
 	}
 
 	/**
@@ -451,17 +585,19 @@ export class Keeper {
 	 * and has a machine stored
 	 */
 	async woke(running = false): Promise<boolean> {
+		this.mark('woke', true);
 		const fresh = !this.machine && this.alarm.next === null;
 		const kinds = this.alarm.fired(this.now());
 		// a running pump checkpoints when it returns, if due
 		if (kinds.includes('checkpoint') && this.machine && this.dirty && !running)
 			await this.checkpoint();
+		this.mark('woke', false);
 		return kinds.includes('timer') || (fresh && this.store.checkpointed);
 	}
 
 	/** the machine halted: drop it and everything stored, so the next open boots */
 	async halted() {
-		this.machine = null;
+		this.replace(null);
 		this.store.clear();
 		await this.host.sync();
 		this.alarm.want('timer', null);
@@ -470,6 +606,6 @@ export class Keeper {
 
 	/** the machine stopped with an error: drop it, and the next open restores the last checkpoint */
 	crashed() {
-		this.machine = null;
+		this.replace(null);
 	}
 }

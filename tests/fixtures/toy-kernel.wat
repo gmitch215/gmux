@@ -4,11 +4,12 @@
 	(import "env" "wasm_serialize_tasks" (func $switch (param i32 i32) (result i32)))
 	(import "env" "wasm_idle_wait" (func $idle (param i32 i64)))
 	(import "env" "wasm_halt" (func $halt))
+	(import "env" "wasm_cpu_relax" (func $relax))
 	(import "env" "wasm_panic" (func $panic (param i32)))
 	(import "env" "wasm_driver_hvc_put" (func $put (param i32 i32) (result i32)))
 	(import "env" "wasm_driver_hvc_get" (func $get (param i32 i32) (result i32)))
 	(import "env" "wasm_user_mode_tail" (func $tail (param i32)))
-	(import "env" "wasm_load_executable" (func $load (param i32 i32 i32 i32) (result i32)))
+	(import "env" "wasm_load_program" (func $load (param i32 i32 i32 i32 i32) (result i32)))
 	(import "env" "wasm_cpu_clock_get_monotonic" (func $clock (param i64) (result i64)))
 	(import "env" "wasm_start_cpu" (func $startCpu (param i32 i32)))
 	(import "env" "wasm_release_task" (func $release (param i32)))
@@ -58,6 +59,7 @@
 	(data (i32.const 0x760) "hello")
 	(data (i32.const 0x748) "Z")
 	(data (i32.const 0x768) "T")
+	(data (i32.const 0x770) "K")
 	;; /proc/self/maps: the toy file shared at 0xa0000
 	(data (i32.const 0x880) "000a0000-000a1000 rw-s 00000000 00:01 7 /toy/file\n")
 	;; getdents64 of /: ".", ".." and the regular file "file"
@@ -121,10 +123,11 @@
 						(then (call $startCpu (i32.const 1) (i32.const 9))))
 					(if (i32.eq (i32.load8_u (i32.const 0x600)) (i32.const 114))
 						(then (drop (call $switch (i32.const 1) (i32.const 3)))))
-					;; "x" asks the host to load program "X", as exec does (kernel patch 0018)
+					;; "x" asks the host to load program "X", as exec does (kernel patch 0018), and says the
+					;; mapping at 0x10000 is unzeroed for the length at 0x868 (patch 0044)
 					(if (i32.eq (i32.load8_u (i32.const 0x600)) (i32.const 120))
 						(then
-							(if (call $load (i32.const 0x738) (i32.const 0x73c) (i32.const 0x10000) (i32.const 0))
+							(if (call $load (i32.const 0x738) (i32.const 0x73c) (i32.const 0x10000) (i32.const 0) (i32.load (i32.const 0x868)))
 								(then (call $say (i32.const 0x560) (i32.const 13)))
 								(else (call $say (i32.const 0x570) (i32.const 11))))))
 					(if (i32.eq (i32.load8_u (i32.const 0x600)) (i32.const 118))
@@ -175,6 +178,9 @@
 					;; "y" runs program "Y", which fsyncs
 					(if (i32.eq (i32.load8_u (i32.const 0x600)) (i32.const 121))
 						(then (drop (call $create (i32.const 1) (i32.const 3) (i32.const 0x490) (i32.const 0x740) (i32.const 0x744) (i32.const 0x10000) (i32.const 0)))))
+					;; "b" runs program "K", whose frame leaves its stack segment
+					(if (i32.eq (i32.load8_u (i32.const 0x600)) (i32.const 98))
+						(then (drop (call $create (i32.const 1) (i32.const 3) (i32.const 0x490) (i32.const 0x770) (i32.const 0x774) (i32.const 0x10000) (i32.const 0)))))
 					;; "t" runs program "T", which statxes one path over and over
 					(if (i32.eq (i32.load8_u (i32.const 0x600)) (i32.const 116))
 						(then (drop (call $create (i32.const 1) (i32.const 3) (i32.const 0x490) (i32.const 0x768) (i32.const 0x76c) (i32.const 0x10000) (i32.const 0)))))
@@ -272,13 +278,18 @@
 		(i32.const 0))
 
 	;; mmap (222) hands out 0xa0000 and counts at 0x84c; every mapping starts where it is asked about
-	;; and runs for the length at 0x850 (1 MiB, until the test shrinks it)
+	;; and runs for the length at 0x850 (1 MiB, until the test shrinks it). With 0x870 set, the call
+	;; hands the host thread over once before it returns, as every 256th syscall does
 	(data (i32.const 0x850) "\00\00\10\00")
 	(func (export "wasm_syscall_6") (param $sp i32) (param $tp i32) (param $nr i32)
 		(param $a i32) (param $b i32) (param $c i32) (param $d i32) (param $e i32) (param $f i32) (result i32)
 		(if (i32.eq (local.get $nr) (i32.const 222))
 			(then
 				(i32.store (i32.const 0x84c) (i32.add (i32.load (i32.const 0x84c)) (i32.const 1)))
+				(if (i32.load (i32.const 0x870))
+					(then
+						(i32.store (i32.const 0x870) (i32.const 0))
+						(call $relax)))
 				(return (i32.const 0xa0000))))
 		(i32.const -38))
 	(func (export "wasm_current_mm") (result i32) (i32.const 1))
@@ -400,7 +411,7 @@
 				(i32.store (i32.const 0x840) (i32.add (i32.load (i32.const 0x840)) (local.get $c)))
 				(return (local.get $c))))
 		(if (i32.ne (local.get $nr) (i32.const 221)) (then (return (i32.const -38))))
-		(drop (call $load (i32.const 0x700) (i32.const 0x704) (i32.const 0x10000) (i32.const 0)))
+		(drop (call $load (i32.const 0x700) (i32.const 0x704) (i32.const 0x10000) (i32.const 0) (i32.load (i32.const 0x868))))
 		(drop (call $switch (i32.const 4) (i32.const 3)))
 		(call $tail (i32.const -1))
 		(i32.const 0))

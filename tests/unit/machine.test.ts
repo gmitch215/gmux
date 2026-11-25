@@ -29,6 +29,7 @@ import {
 	ROUTE_WATCH,
 	ROUTE_WRITES,
 	STATX_GUARDS,
+	STATX_PATH_MAX,
 	statxBucket
 } from '../../src/worker/machine/router.ts';
 
@@ -68,6 +69,26 @@ function toyKernel(asyncify: boolean): WebAssembly.Module {
 	return new WebAssembly.Module(bytes);
 }
 
+/** the toy kernel as one built before kernel patch 0044 is: it imports wasm_load_executable and reports no length */
+function legacyToyKernel(): WebAssembly.Module {
+	const text = readFileSync(new URL('../fixtures/toy-kernel.wat', import.meta.url), 'utf8')
+		.replace(
+			'"wasm_load_program" (func $load (param i32 i32 i32 i32 i32)',
+			'"wasm_load_executable" (func $load (param i32 i32 i32 i32)'
+		)
+		.replaceAll(' (i32.load (i32.const 0x868))', '');
+	const module = binaryen.parseText(text);
+	module.setFeatures(
+		binaryen.Features.Atomics |
+			binaryen.Features.MutableGlobals |
+			binaryen.Features.BulkMemory |
+			binaryen.Features.BulkMemoryOpt
+	);
+	const bytes = module.emitBinary();
+	module.dispose();
+	return new WebAssembly.Module(bytes);
+}
+
 function parse(name: string) {
 	return binaryen.parseText(
 		readFileSync(new URL(`../fixtures/${name}`, import.meta.url), 'utf8')
@@ -95,24 +116,31 @@ function toyUser(name = 'toy-user.wat', asyncify = false, data?: number): WebAss
 	return new WebAssembly.Module(bytes);
 }
 
-/** tests/fixtures/toy-shared.wat with share.ts's mark: 16 bytes of data */
-function toyShared(): WebAssembly.Module {
+/** tests/fixtures/toy-shared.wat with share.ts's mark: 16 bytes of data; asyncified as asyncify.sh builds BusyBox */
+function toyShared(asyncify = false): WebAssembly.Module {
 	const module = parse('toy-shared.wat');
 	module.setFeatures(binaryen.Features.Atomics | binaryen.Features.MutableGlobals);
 	module.addCustomSection('gmux.share', new Uint8Array([16, 0, 0, 0]));
+	if (asyncify) {
+		binaryen.setPassArgument('asyncify-imports', 'env.__wasm_syscall_*');
+		module.runPasses(['asyncify']);
+	}
 	const bytes = module.emitBinary();
 	module.dispose();
 	return new WebAssembly.Module(bytes);
 }
 
 /** a toy user program built with experiments/evacuation/scripts/evacuate.ts --resume */
-function evacuated(name: string): WebAssembly.Module {
+function evacuated(name: string, share?: number): WebAssembly.Module {
 	const module = parse(name);
 	module.setFeatures(
 		binaryen.Features.Atomics |
 			binaryen.Features.MutableGlobals |
 			binaryen.Features.ExceptionHandling
 	);
+	// share.ts runs before evacuate.ts: the note and the exported globals are in the input
+	if (share !== undefined)
+		module.addCustomSection('gmux.share', new Uint8Array(new Uint32Array([share]).buffer));
 	const dir = mkdtempSync(join(tmpdir(), 'gmux-evac-'));
 	writeFileSync(join(dir, 'in.wasm'), module.emitBinary());
 	module.dispose();
@@ -149,6 +177,42 @@ function rig(options: Partial<MachineOptions> = {}) {
 	};
 	const run = (machine: Machine, until: () => boolean) => machine.run(until, sleep, 20_000);
 	return { clock, machineOptions, run, output: () => output };
+}
+
+/**
+ * a program whose dylink.0 names `memory` bytes of data, as an exec stub the kernel hands over; `pad`
+ * bytes of an unknown dylink subsection make the stub longer
+ */
+function stubOf(memory: number, tag: number, pad = 0): Uint8Array {
+	const info = [...uleb(memory), 2, 3, 0];
+	const name = [8, ...Buffer.from('dylink.0')];
+	const body = [
+		...name,
+		1,
+		info.length,
+		...info,
+		...(pad ? [5, ...uleb(pad), ...new Uint8Array(pad)] : [])
+	];
+	const program = new Uint8Array([
+		0,
+		0x61,
+		0x73,
+		0x6d,
+		1,
+		0,
+		0,
+		0,
+		0,
+		...uleb(body.length),
+		...body,
+		// a data section distinguishes the programs by hash
+		11,
+		3,
+		1,
+		0,
+		tag
+	]);
+	return stub(program)!;
 }
 
 describe('Machine', () => {
@@ -228,6 +292,44 @@ describe('Machine', () => {
 		machine.type('c');
 		await machine.run(() => r.output().includes('clock'), sleep, 20_000);
 		expect(r.output()).toContain('clock moves');
+	});
+
+	it('does not charge a host stall to the task that is running', async () => {
+		// the same run with and without 3 ms of host time passing partway through it
+		const kernelTime = async (stallAt: number) => {
+			const r = rig();
+			let stall = 0n;
+			let calls = 0;
+			const machine = new Machine({ ...r.machineOptions, now: () => r.clock.ns + stall });
+			const sleep = async (ms: number) => {
+				r.clock.ns += BigInt(Math.max(ms, 1)) * 1_000_000n;
+			};
+			await machine.run(() => r.output().includes('parent ok'), sleep, 20_000);
+			machine.type('x');
+			const before = machine.clockNs;
+			await machine.run(
+				() => {
+					if (++calls === stallAt) stall = 3_000_000n;
+					return r.output().includes('echo:x');
+				},
+				sleep,
+				20_000
+			);
+			return { kernel: machine.clockNs - before, calls };
+		};
+		const stalled = await kernelTime(2);
+		const control = await kernelTime(-1);
+		expect(stalled.calls).toBeGreaterThan(2);
+		expect(stalled.kernel).toBe(control.kernel);
+	});
+
+	it('restores a clock that continues from the checkpoint', async () => {
+		const r = rig({ asyncify: true, sharedKernel: true });
+		const machine = new Machine(r.machineOptions);
+		await r.run(machine, () => r.output().includes('parent ok'));
+		const snapshot = await machine.checkpoint();
+		const restored = await Machine.restore(r.machineOptions, snapshot);
+		expect(restored.clockNs).toBe(BigInt(snapshot.now));
 	});
 
 	it('raises the console interrupt on the interrupt cpu when input arrives, instead of waiting for a poll', async () => {
@@ -383,6 +485,20 @@ describe('Machine', () => {
 		expect(machine.stats.signals).toBe(1);
 	});
 
+	it('delivers a second signal the way it did the first, the signal-return trap being one shared object', async () => {
+		const r = rig({ sharedKernel: true, registry: new Map([['U', toyUser()]]) });
+		const machine = new Machine(r.machineOptions);
+		await r.run(machine, () => r.output().includes('parent ok'));
+		for (const round of [1, 2]) {
+			machine.type('u');
+			await r.run(machine, () => (r.output().match(/handled/g) ?? []).length === round);
+			machine.type('r');
+			await r.run(machine, () => (r.output().match(/user back/g) ?? []).length === round);
+			expect(machine.stats.signals).toBe(round);
+		}
+		expect(machine.crashed).toBeNull();
+	});
+
 	it('runs a vfork child on the parent stack, then hands it back with the pid after execve', async () => {
 		const registry = new Map([
 			['U', toyUser()],
@@ -462,6 +578,27 @@ describe('Machine', () => {
 			});
 		}
 
+		for (const execCache of [false, true, 'verify'] as const) {
+			it(`runs the same transcript and counts with the exec memo ${execCache === 'verify' ? 'verifying' : execCache ? 'on' : 'off'}`, async () => {
+				const { r, machine, release, spawn } = setup({ execCache });
+				await r.run(machine, () => r.output().includes('parent ok'));
+				await spawn('w', 2);
+				await release(3);
+				await release(5);
+				await spawn('w', 4);
+				expect(r.output().match(/shared ok\n/g)).toHaveLength(4);
+				expect(machine.stats.userExecs).toBe(2);
+				expect(machine.stats.recycledStarts).toBe(2);
+				expect(machine.stats.recycleReturns).toBe(2);
+				// the toy kernel's executables are one-byte names, never stubs: each exec is a miss that is not kept
+				const on = execCache ? 4 : 0;
+				expect(machine.stats.execMisses).toBe(on);
+				expect(machine.stats.execRefused.file).toBe(on);
+				expect(machine.stats.execHits).toBe(0);
+				expect(machine.stats.execMismatches).toBe(0);
+			});
+		}
+
 		it('keeps no more idle instances than the pool size', async () => {
 			const { r, machine, release, spawn } = setup({ recycleInstances: 1 });
 			await r.run(machine, () => r.output().includes('parent ok'));
@@ -528,6 +665,127 @@ describe('Machine', () => {
 			expect(bytes.subarray(0x10000, 0x10010)).toEqual(new Uint8Array(16).fill(0xaa));
 		});
 
+		describe('a data mapping the kernel left unzeroed', () => {
+			const [start, size] = [0x10000, 0x3000];
+			const booted = async (options: Partial<MachineOptions> = {}) => {
+				const s = setup(options);
+				await s.r.run(s.machine, () => s.r.output().includes('parent ok'));
+				return { ...s, bytes: new Uint8Array(s.machine.memory.buffer) };
+			};
+			// an exec's first return to user mode, over a mapping the kernel left as it found it
+			const enter = (machine: Machine, bytes: Uint8Array, unzeroed = size) => {
+				const runner = (machine as any).runner('t', { kind: 'secondary', idle: 0 });
+				runner.instance = (machine as any).shared;
+				runner.user = {
+					module: (machine as any).options.registry.get('S'),
+					hash: 'S',
+					dataStart: start,
+					tableStart: 0
+				};
+				bytes.fill(0xaa, start, start + size);
+				runner.unzeroed = unzeroed;
+				(machine as any).enterProgram(runner, false);
+				return runner;
+			};
+			// toy-shared's 16 bytes of data come first; the rest of the mapping is bss and the page tail
+			const dirty = (bytes: Uint8Array) =>
+				bytes.subarray(start + 16, start + size).some((b) => b !== 0);
+			const image = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2, 0, 0, 0];
+
+			it('zeroes the whole mapping before a new instance starts, and takes the pristine image from it', async () => {
+				const { machine, bytes } = await booted();
+				const runner = enter(machine, bytes);
+				expect(dirty(bytes)).toBe(false);
+				expect(runner.unzeroed).toBe(0);
+				expect(machine.stats.dataZeroedBytes).toBe(size);
+				// the start function found its flag word zero and set it
+				const saved = (machine as any).pristine.get(runner.user.module);
+				expect([...saved]).toEqual(image);
+			});
+
+			it('copies the image over a reused instance and zeroes the rest of the mapping', async () => {
+				const { machine, bytes } = await booted();
+				const first = enter(machine, bytes);
+				const pooled = first.recycled;
+				(machine as any).retire(first);
+				const again = enter(machine, bytes);
+				expect(again.recycled).toBe(pooled);
+				expect(machine.stats.recycledStarts).toBe(1);
+				expect(dirty(bytes)).toBe(false);
+				const view = new DataView(machine.memory.buffer);
+				expect(view.getUint32(start + 12, true)).toBe(2);
+				expect(view.getUint32(start + 4, true)).toBe(start);
+				expect(machine.stats.dataZeroedBytes).toBe(size + size - 16);
+			});
+
+			it("gives a shared instance's later process its template and zeroes the rest of the mapping", async () => {
+				const { machine, bytes } = await booted({ shareInstances: true });
+				enter(machine, bytes);
+				expect(dirty(bytes)).toBe(false);
+				enter(machine, bytes);
+				expect(machine.stats.sharedEntries).toBe(1);
+				expect(dirty(bytes)).toBe(false);
+				expect(new DataView(machine.memory.buffer).getUint32(start + 12, true)).toBe(2);
+				expect(machine.stats.dataZeroedBytes).toBe(size + size - 16);
+			});
+
+			it('zeroes the whole mapping for every exec when the pool is off', async () => {
+				const { machine, bytes } = await booted({ recycleInstances: 0 });
+				enter(machine, bytes);
+				expect(dirty(bytes)).toBe(false);
+				enter(machine, bytes);
+				expect(dirty(bytes)).toBe(false);
+				expect(new DataView(machine.memory.buffer).getUint32(start + 12, true)).toBe(2);
+				expect(machine.stats.userExecs).toBe(2);
+				expect(machine.stats.dataZeroedBytes).toBe(size * 2);
+			});
+
+			it('writes nothing when the kernel zeroed the mapping', async () => {
+				const { machine, bytes } = await booted();
+				const runner = enter(machine, bytes, 0);
+				expect(machine.stats.dataZeroedBytes).toBe(0);
+				// the pattern is still there: the host counts on a zeroed mapping, so only the start function wrote
+				expect(bytes[start + size - 1]).toBe(0xaa);
+				expect(runner.unzeroed).toBe(0);
+			});
+
+			it('records the length wasm_load_program reports, and counts only the execs that report one', async () => {
+				const { r, machine } = await booted({ registry: new Map([['X', toyUser()]]) });
+				const task = () => (machine as any).runners.get(1);
+				for (const [i, length] of [size, 0].entries()) {
+					new DataView(machine.memory.buffer).setUint32(0x868, length, true);
+					machine.type('x');
+					await r.run(machine, () => r.output().split('exec taken\n').length === i + 2);
+					expect(task().unzeroed).toBe(length);
+					expect(machine.stats.dataUnzeroedExecs).toBe(1);
+				}
+			});
+
+			it('serves a kernel built before the length, which zeroes the mapping itself', async () => {
+				const r = rig({
+					sharedKernel: true,
+					vmlinux: legacyToyKernel(),
+					registry: new Map([['X', toyUser()]])
+				});
+				const machine = new Machine(r.machineOptions);
+				await r.run(machine, () => r.output().includes('parent ok'));
+				machine.type('x');
+				await r.run(machine, () => /exec (refused|taken)/.test(r.output()));
+				expect(r.output()).toContain('exec taken\n');
+				expect(machine.stats.dataUnzeroedExecs).toBe(0);
+				expect((machine as any).runners.get(1).unzeroed).toBe(0);
+			});
+
+			it('keeps a length no instance has consumed across a checkpoint and restore', async () => {
+				const { r, machine } = await booted({ asyncify: true });
+				(machine as any).runners.get(1).unzeroed = size;
+				const snapshot = await machine.checkpoint();
+				expect(snapshot.runners.find((x) => x.id === 1)?.unzeroed).toBe(size);
+				const restored = await Machine.restore(r.machineOptions, snapshot);
+				expect((restored as any).runners.get(1).unzeroed).toBe(size);
+			});
+		});
+
 		it("never gives a process on a fork child's own memory a pooled instance", async () => {
 			const { r, machine, release, spawn } = setup();
 			await r.run(machine, () => r.output().includes('parent ok'));
@@ -564,6 +822,216 @@ describe('Machine', () => {
 			expect(restored.stats.recycledStarts).toBe(2);
 			expect(r.output()).not.toContain('shared bad');
 		});
+
+		const unwinding = [
+			['asyncified', () => toyShared(true)],
+			['evacuable', () => evacuated('toy-shared.wat', 16)]
+		] as const;
+		for (const [kind, build] of unwinding) {
+			describe(`an ${kind} share build`, () => {
+				let module: WebAssembly.Module | undefined;
+				const made = (options: Partial<MachineOptions> = {}) =>
+					setup({
+						asyncify: true,
+						registry: new Map([['S', (module ??= build())]]),
+						...options
+					});
+				// a process the host started by hand on the machine's own instance, as enterProgram does for an exec
+				const enter = (machine: Machine, clone = false) => {
+					const runner = (machine as any).runner('t', { kind: 'secondary', idle: 0 });
+					runner.instance = (machine as any).shared;
+					runner.user = {
+						module: (machine as any).options.registry.get('S'),
+						hash: 'S',
+						dataStart: 0x10000,
+						tableStart: 0
+					};
+					(machine as any).enterProgram(runner, clone);
+					return runner;
+				};
+				const idle = (machine: Machine) =>
+					(machine as any).pool.get((machine as any).options.registry.get('S')) ?? [];
+				const rounds = async (options: Partial<MachineOptions>) => {
+					const { r, machine, release, spawn } = made(options);
+					await r.run(machine, () => r.output().includes('parent ok'));
+					await spawn('w', 2);
+					await release(3);
+					await release(5);
+					await spawn('w', 4);
+					return { r, machine };
+				};
+
+				it('is recyclable and hands a finished process its instance again, with the same transcript and counts', async () => {
+					const pooled = await rounds({});
+					const plain = await rounds({ recycleInstances: 0 });
+					expect(pooled.r.output()).toBe(plain.r.output());
+					expect(pooled.r.output()).not.toContain('shared bad');
+					expect(pooled.machine.stats.userExecs).toBe(2);
+					expect(plain.machine.stats.userExecs).toBe(4);
+					expect(pooled.machine.stats.recycledStarts).toBe(2);
+					expect(pooled.machine.stats.recycleReturns).toBe(2);
+					expect(plain.machine.stats.recycleReturns).toBe(0);
+					expect(
+						Object.values(pooled.machine.stats.recycleRefused).every((n) => n === 0)
+					).toBe(true);
+				});
+
+				it('never retires a parked process', async () => {
+					const { r, machine, spawn } = made();
+					await r.run(machine, () => r.output().includes('parent ok'));
+					await spawn('w', 2);
+					expect(machine.stats.recycleReturns).toBe(0);
+					expect(idle(machine)).toHaveLength(0);
+					const parked = [...(machine as any).runners.values()].find(
+						(x: any) => x.recycled && x.resume
+					);
+					expect(parked).toBeDefined();
+					(machine as any).retire(parked);
+					expect(idle(machine)).toHaveLength(0);
+					expect(machine.stats.recycleReturns).toBe(0);
+					expect(machine.stats.recycleRefused.parked).toBe(1);
+				});
+
+				it('resets every exported global, and the frame pointer, when it hands an instance on', async () => {
+					const { r, machine, release, spawn } = made();
+					await r.run(machine, () => r.output().includes('parent ok'));
+					await spawn('w', 2);
+					await release(3);
+					await release(5);
+					// the pool hands out its last entry first
+					const pooled = idle(machine).at(-1);
+					expect(pooled.globals.length).toBeGreaterThan(1);
+					pooled.globals.forEach((g: WebAssembly.Global) => (g.value = 99));
+					if (pooled.fp) pooled.fp.value = 12345;
+					const runner = enter(machine);
+					expect(runner.recycled).toBe(pooled);
+					// gmux_g4 is the GOT global, which the relocations set; gmux_g5 only a reset does
+					expect(pooled.exports.gmux_g5.value).toBe(0);
+					expect(pooled.fp === null).toBe(kind === 'asyncified');
+					if (pooled.fp) expect(pooled.exports.gmux_fp.value).toBe(pooled.fpInitial);
+				});
+
+				it('refuses an instance retired in the middle of an unwind, and counts it', async () => {
+					const { r, machine, release, spawn } = made();
+					await r.run(machine, () => r.output().includes('parent ok'));
+					await spawn('w', 2);
+					await release(3);
+					await release(5);
+					const runner = enter(machine);
+					expect(idle(machine)).toHaveLength(1);
+					const p = runner.recycled;
+					if (kind === 'asyncified') {
+						// the data struct asyncify_start_unwind reads: the next free byte and the end
+						const at = 0x1e000;
+						const words = new DataView(machine.memory.buffer);
+						words.setUint32(at, at + 8, true);
+						words.setUint32(at + 4, at + 0x100, true);
+						p.exports.asyncify_start_unwind(at);
+						expect(p.exports.asyncify_get_state()).toBe(1);
+					} else p.exports.gmux_unwinding.value = 1;
+					(machine as any).retire(runner);
+					expect(idle(machine)).toHaveLength(1);
+					expect(
+						machine.stats.recycleRefused[
+							kind === 'asyncified' ? 'asyncify' : 'unwinding'
+						]
+					).toBe(1);
+					// the same instance with its state back at 0 is taken
+					if (kind === 'asyncified') p.exports.asyncify_stop_unwind();
+					else p.exports.gmux_unwinding.value = 0;
+					runner.recycled = p;
+					(machine as any).retire(runner);
+					expect(idle(machine)).toHaveLength(2);
+				});
+
+				it('refuses an instance whose frames a checkpoint holds', async () => {
+					const { r, machine, release, spawn } = made();
+					await r.run(machine, () => r.output().includes('parent ok'));
+					await spawn('w', 2);
+					await release(3);
+					await release(5);
+					const runner = enter(machine);
+					runner.checkpointed = true;
+					(machine as any).retire(runner);
+					expect(idle(machine)).toHaveLength(1);
+					expect(machine.stats.recycleRefused.checkpointed).toBe(1);
+				});
+
+				it('keeps no more idle instances than the pool size, and counts the one it drops', async () => {
+					const { r, machine, release, spawn } = made({ recycleInstances: 1 });
+					await r.run(machine, () => r.output().includes('parent ok'));
+					await spawn('w', 2);
+					await release(3);
+					await release(5);
+					expect(machine.stats.recycleReturns).toBe(1);
+					expect(machine.stats.recycleRefused.full).toBe(1);
+				});
+
+				it("never gives a process on a fork child's own memory a pooled instance", async () => {
+					const { r, machine, release, spawn } = made();
+					await r.run(machine, () => r.output().includes('parent ok'));
+					await spawn('w', 2);
+					await release(3);
+					await release(5);
+					(machine as any).privateMemories.set(
+						1,
+						new WebAssembly.Memory({ initial: 8, maximum: 64, shared: true })
+					);
+					await spawn('w', 4);
+					expect(machine.stats.recycledStarts).toBe(0);
+					expect(machine.stats.userExecs).toBe(4);
+					expect(idle(machine)).toHaveLength(2);
+				});
+
+				it('keeps its pool through an executable the host refuses', async () => {
+					const { r, machine, release, spawn } = made();
+					await r.run(machine, () => r.output().includes('parent ok'));
+					await spawn('w', 2);
+					await release(3);
+					await release(5);
+					machine.type('x');
+					await r.run(machine, () => /exec (refused|taken)/.test(r.output()));
+					expect(machine.stats.unknownExecutables).toEqual(['X (4 bytes)']);
+					expect(idle(machine)).toHaveLength(2);
+					await spawn('w', 4);
+					expect(machine.stats.recycledStarts).toBe(2);
+				});
+
+				it('checkpoints with live processes on recycled instances and idle entries, restores empty, and counts only later execs', async () => {
+					const transcript = async (options: Partial<MachineOptions>) => {
+						const { r, machine, release, spawn } = made(options);
+						await r.run(machine, () => r.output().includes('parent ok'));
+						await spawn('w', 2);
+						await release(3);
+						await release(5);
+						await spawn('w', 4);
+						// one back in the pool, one still running on a recycled instance
+						await release(3);
+						const before = { ...machine.stats };
+						const snapshot = await machine.checkpoint();
+						const restored = await Machine.restore(r.machineOptions, snapshot);
+						expect(idle(restored)).toHaveLength(0);
+						expect(restored.stats.recycledStarts).toBe(before.recycledStarts);
+						await release(5, restored);
+						await spawn('w', 6, restored);
+						expect(restored.stats.recycledStarts).toBe(before.recycledStarts);
+						await release(3, restored);
+						await release(5, restored);
+						await spawn('w', 8, restored);
+						return { r, restored, before };
+					};
+					const pooled = await transcript({});
+					const plain = await transcript({ recycleInstances: 0 });
+					expect(pooled.restored.stats.recycledStarts).toBe(
+						pooled.before.recycledStarts + 2
+					);
+					expect(plain.restored.stats.recycledStarts).toBe(0);
+					expect(pooled.r.output()).toBe(plain.r.output());
+					expect(pooled.r.output()).not.toContain('shared bad');
+					expect(pooled.r.output().match(/shared ok\n/g)).toHaveLength(8);
+				});
+			});
+		}
 
 		describe('instances made ahead', () => {
 			const ahead = async (options: Partial<MachineOptions> = {}) => {
@@ -704,6 +1172,23 @@ describe('Machine', () => {
 		expect(new DataView(machine.memory.buffer).getUint32(0x800, true)).toBe(11);
 		expect(logs.some((line) => line.includes('unwound a syscall'))).toBe(true);
 		expect(machine.crashed).toBeNull();
+	});
+
+	it("maps the next stack segment through promising, as the kernel's every-256th-syscall yield parks the call", async () => {
+		const r = rig({
+			sharedKernel: true,
+			registry: new Map([['K', toyUser('toy-stack.wat')]])
+		});
+		const machine = new Machine(r.machineOptions);
+		await r.run(machine, () => r.output().includes('parent ok'));
+		const view = new DataView(machine.memory.buffer);
+		// RLIMIT_STACK as the kernel writes it into the new segment, and the yield in its mmap
+		view.setBigUint64(0xa0000, 8n << 20n, true);
+		view.setUint32(0x870, 1, true);
+		machine.type('b');
+		await r.run(machine, () => r.output().includes('user back'));
+		expect(machine.crashed).toBeFalsy();
+		expect(machine.stats.stackSegments).toBe(1);
 	});
 
 	it('lets the interrupt run at a yield park its cpu, as a kernel entry of its own', async () => {
@@ -870,33 +1355,6 @@ describe('Machine', () => {
 	});
 
 	describe('an exec whose module outgrows its stub', () => {
-		// a program whose dylink.0 names `memory` bytes of data, as an exec stub the kernel hands over
-		function stubOf(memory: number, tag: number): Uint8Array {
-			const info = [...uleb(memory), 2, 3, 0];
-			const name = [8, ...Buffer.from('dylink.0')];
-			const body = [...name, 1, info.length, ...info];
-			const program = new Uint8Array([
-				0,
-				0x61,
-				0x73,
-				0x6d,
-				1,
-				0,
-				0,
-				0,
-				0,
-				...uleb(body.length),
-				...body,
-				// a data section distinguishes the programs by hash
-				11,
-				3,
-				1,
-				0,
-				tag
-			]);
-			return stub(program)!;
-		}
-
 		function lookup(stubbed: Uint8Array, module: WebAssembly.Module) {
 			const r = rig({ registry: new Map([[stubHash(stubbed)!, module]]) });
 			const machine = new Machine(r.machineOptions);
@@ -935,6 +1393,216 @@ describe('Machine', () => {
 
 		it('runs a module with no note, as an older build has none', () => {
 			expect(lookup(stubOf(100, 3), toyUser()).found).toBeDefined();
+		});
+	});
+
+	describe('the exec memo', () => {
+		const AT = 0x20000;
+		const root = { instance: { exports: { wasm_current_euid: () => 0 } } };
+		const user = { instance: { exports: { wasm_current_euid: () => 1000 } } };
+
+		function memoRig(options: Partial<MachineOptions> = {}, stubs: Uint8Array[] = []) {
+			const registry = new Map(stubs.map((s) => [stubHash(s)!, toyUser()]));
+			const r = rig({ registry, execCache: true, ...options });
+			const machine = new Machine(r.machineOptions);
+			// the stub the kernel hands over sits in the machine's memory at an address of the caller's choosing
+			const exec = (stubbed: Uint8Array, caller: unknown = root, at = AT) => {
+				new Uint8Array(machine.memory.buffer).set(stubbed, at);
+				return (machine as any).lookup(caller, at, at + stubbed.length, 0x10000, 0) as
+					{ module: WebAssembly.Module; hash: string } | undefined;
+			};
+			return { registry, machine, exec, r };
+		}
+
+		it("answers a repeat exec of a stub from the memo and reads the registry's answer each time", () => {
+			const a = stubOf(100, 1);
+			const { registry, machine, exec } = memoRig({}, [a]);
+			const first = exec(a);
+			const second = exec(a);
+			expect(second).toEqual(first);
+			expect(machine.stats.execMisses).toBe(1);
+			expect(machine.stats.execHits).toBe(1);
+			// the memo holds no module: a registry entry swapped under the hash is what the next exec gets
+			const other = toyUser('toy-user.wat', false, 64);
+			registry.set(stubHash(a)!, other);
+			expect(exec(a)!.module).toBe(other);
+			registry.delete(stubHash(a)!);
+			expect(exec(a)).toBeUndefined();
+			expect(machine.stats.unknownExecutables).toHaveLength(1);
+			expect(machine.stats.execHits).toBe(3);
+		});
+
+		it('takes a stub rewritten at the same address for the stub it now is, each way', () => {
+			const [a, b] = [stubOf(100, 1), stubOf(100, 2)];
+			const { machine, exec } = memoRig({}, [a, b]);
+			expect(exec(a)!.hash).toBe(stubHash(a));
+			expect(exec(b)!.hash).toBe(stubHash(b));
+			expect(exec(a)!.hash).toBe(stubHash(a));
+			expect(exec(b)!.hash).toBe(stubHash(b));
+			expect(machine.stats.execMisses).toBe(2);
+			expect(machine.stats.execHits).toBe(2);
+			// a stub that keeps its key and maps less: only the bytes before the key tell it from the first
+			const wide = stubOf(40000, 1);
+			const narrow = stubOf(31664, 1);
+			narrow.set(wide.subarray(wide.length - 32), narrow.length - 32);
+			expect(narrow.length).toBe(wide.length);
+			expect(stubHash(narrow)).toBe(stubHash(wide));
+			const same = memoRig(
+				{ registry: new Map([[stubHash(wide)!, toyUser('toy-user.wat', false, 32992)]]) },
+				[wide]
+			);
+			expect(same.exec(wide)).toBeDefined();
+			expect(same.exec(narrow)).toBeUndefined();
+			expect(same.exec(wide)).toBeDefined();
+			expect(same.machine.stats.execHits).toBe(1);
+			// two stubs of one length that differ in the size they map and in their key
+			const [c, d] = [stubOf(100, 3), stubOf(101, 3)];
+			expect(c.length).toBe(d.length);
+			const second = memoRig({
+				registry: new Map([
+					[stubHash(c)!, toyUser()],
+					[stubHash(d)!, toyUser()]
+				])
+			});
+			expect(second.exec(c)!.hash).toBe(stubHash(c));
+			expect(second.exec(d)!.hash).toBe(stubHash(d));
+			expect(second.machine.stats.execHits).toBe(0);
+		});
+
+		it('gives a root caller the plain build and a non-root caller of the same stub the guarded one', () => {
+			const a = stubOf(100, 1);
+			const [plain, guard] = [toyUser(), toyUser('toy-user.wat', false, 16)];
+			for (const execCache of [true, 'verify'] as const) {
+				const { machine, exec } = memoRig(
+					{
+						registry: new Map([[stubHash(a)!, plain]]),
+						guarded: new Map([[stubHash(a)!, guard]]),
+						execCache
+					},
+					[a]
+				);
+				expect(exec(a, root)!.module).toBe(plain);
+				expect(exec(a, user)!.module).toBe(guard);
+				expect(exec(a, root)!.module).toBe(plain);
+				expect(exec(a, user)!.module).toBe(guard);
+				expect(machine.stats.execHits).toBe(3);
+				expect(machine.stats.execMismatches).toBe(0);
+			}
+		});
+
+		it('never keeps a refused executable and counts it on every exec', () => {
+			const a = stubOf(100, 1);
+			const { machine, exec } = memoRig({ registry: new Map() });
+			expect(exec(a)).toBeUndefined();
+			expect(exec(a)).toBeUndefined();
+			expect(machine.stats.unknownExecutables).toHaveLength(2);
+			expect(machine.stats.execRefused.unknown).toBe(2);
+			expect(machine.stats.execHits).toBe(0);
+			// a non-root exec with no guarded build is refused on a hit as well
+			const b = stubOf(100, 2);
+			const guarded = memoRig({ guarded: new Map() }, [b]);
+			expect(guarded.exec(b, root)).toBeDefined();
+			expect(guarded.exec(b, user)).toBeUndefined();
+			expect(guarded.exec(b, user)).toBeUndefined();
+			expect(guarded.machine.stats.unknownExecutables).toHaveLength(2);
+			expect(guarded.machine.stats.execHits).toBe(2);
+		});
+
+		it('refuses a module that outgrows the stub on every exec, a hit or not', () => {
+			const a = stubOf(31664, 1);
+			const { machine, exec } = memoRig(
+				{ registry: new Map([[stubHash(a)!, toyUser('toy-user.wat', false, 32992)]]) },
+				[a]
+			);
+			expect(exec(a)).toBeUndefined();
+			expect(exec(a)).toBeUndefined();
+			expect(machine.stats.execHits).toBe(1);
+			expect(machine.stats.unknownExecutables).toHaveLength(2);
+			expect(machine.stats.unknownExecutables[1]).toMatch(
+				/needs 32992 bytes of data, stub maps 31664/
+			);
+		});
+
+		it('sends an executable with a recorded dlopen miss down the interpreted path on a hit', () => {
+			const a = stubOf(100, 1);
+			const dlMisses = new Map<string, Set<string>>();
+			const reach = new WebAssembly.Module(parse('toy-reach.wat').emitBinary());
+			const { machine, exec } = memoRig({ dlMisses, interpret: () => reach }, [a]);
+			expect(exec(a)!.module).not.toBe(reach);
+			dlMisses.set(stubHash(a)!, new Set(['L']));
+			expect(exec(a)!.module).toBe(reach);
+			expect(machine.stats.execHits).toBe(1);
+			expect(machine.stats.interpretedStarts).toEqual([stubHash(a)]);
+		});
+
+		it('keeps no full file, no stub past the length limit and no more than 64 stubs', () => {
+			const bytes = new Uint8Array(4).fill(0x55);
+			const full = memoRig({ registry: new Map([['U', toyUser()]]), sha256: () => 'U' });
+			for (let i = 0; i < 2; i++) {
+				new Uint8Array(full.machine.memory.buffer).set(bytes, AT);
+				expect((full.machine as any).lookup(root, AT, AT + 4, 0x10000, 0)).toBeDefined();
+			}
+			expect(full.machine.stats.execRefused.file).toBe(2);
+			expect(full.machine.stats.execHits).toBe(0);
+			const long = stubOf(100, 1, 5000);
+			const big = memoRig({}, [long]);
+			expect(long.length).toBeGreaterThan(4096);
+			expect(big.exec(long)).toBeDefined();
+			expect(big.exec(long)).toBeDefined();
+			expect(big.machine.stats.execRefused.long).toBe(2);
+			expect(big.machine.stats.execHits).toBe(0);
+			const stubs = Array.from({ length: 66 }, (_, i) => stubOf(1000 + i, 9));
+			const many = memoRig({}, stubs);
+			for (const s of stubs) expect(many.exec(s)!.hash).toBe(stubHash(s));
+			for (const s of stubs) expect(many.exec(s)!.hash).toBe(stubHash(s));
+			expect(many.machine.stats.execRefused.full).toBe(2 * 2);
+			expect(many.machine.stats.execHits).toBe(64);
+		});
+
+		it('is off by default and counts nothing', () => {
+			const a = stubOf(100, 1);
+			const { machine, exec } = memoRig({ execCache: undefined }, [a]);
+			exec(a);
+			exec(a);
+			expect(machine.stats.execHits + machine.stats.execMisses).toBe(0);
+			expect((machine as any).execMemoSize).toBe(0);
+		});
+
+		it('counts a memo answer the full computation contradicts, and answers from the full one', () => {
+			const a = stubOf(100, 1);
+			const { machine, exec } = memoRig({ execCache: 'verify' }, [a]);
+			exec(a);
+			expect(exec(a)!.hash).toBe(stubHash(a));
+			expect(machine.stats.execMismatches).toBe(0);
+			expect(machine.stats.execHits).toBe(1);
+			const entry = (machine as any).execMemo.get(a.length)[0];
+			entry.hash = 'wrong';
+			expect(exec(a)!.hash).toBe(stubHash(a));
+			expect(machine.stats.execMismatches).toBe(1);
+			entry.hash = stubHash(a);
+			entry.mapped = 7;
+			expect(exec(a)!.hash).toBe(stubHash(a));
+			expect(machine.stats.execMismatches).toBe(2);
+		});
+
+		it('saves nothing of the memo in a checkpoint, and a restored machine starts with none', async () => {
+			const a = stubOf(100, 1);
+			const { machine, exec, r } = memoRig({ asyncify: true }, [a]);
+			await r.run(machine, () => r.output().includes('parent ok'));
+			exec(a);
+			exec(a);
+			expect(machine.stats.execHits).toBe(1);
+			const snapshot = await machine.checkpoint();
+			const restored = await Machine.restore(r.machineOptions, snapshot);
+			expect((restored as any).execMemoSize).toBe(0);
+			expect(restored.stats.execHits).toBe(1);
+			new Uint8Array(restored.memory.buffer).set(a, AT);
+			const again = () => (restored as any).lookup(root, AT, AT + a.length, 0x10000, 0);
+			expect(again().hash).toBe(stubHash(a));
+			expect(restored.stats.execMisses).toBe(2);
+			expect(restored.stats.execHits).toBe(1);
+			again();
+			expect(restored.stats.execHits).toBe(2);
 		});
 	});
 
@@ -1172,6 +1840,29 @@ describe('Machine', () => {
 			restored.type('r');
 			await r.run(restored, () => r.output().includes('user back'));
 			expect(r.output().slice(before)).toContain('handled\nvfork child\nuser back\n');
+			expect(restored.stats.reentries).toBe(1);
+			expect(restored.crashed).toBeFalsy();
+		});
+
+		it("re-enters through promising when the spill mapping's syscall hands the host thread over", async () => {
+			const r = rig({
+				asyncify: true,
+				sharedKernel: true,
+				registry: new Map([['I', evacuated('toy-evac.wat')]])
+			});
+			const machine = new Machine(r.machineOptions);
+			await r.run(machine, () => r.output().includes('parent ok'));
+			machine.type('i');
+			await r.run(machine, () => machine.stats.fuelYields >= 10);
+			const snapshot = await machine.checkpoint();
+			const saved = { ...snapshot, memory: snapshot.memory.slice() };
+			const restored = await Machine.restore(
+				{ ...r.machineOptions, reenterAfterRestore: 0 },
+				saved
+			);
+			new DataView(restored.memory.buffer).setUint32(0x870, 1, true);
+			await r.run(restored, () => restored.stats.reentries > 0);
+			await r.run(restored, () => false);
 			expect(restored.stats.reentries).toBe(1);
 			expect(restored.crashed).toBeFalsy();
 		});
@@ -1634,6 +2325,34 @@ describe('Machine', () => {
 			expect(stream.feed(raw.subarray(4000), 1 << 30)).toBe(-1);
 		});
 
+		it('holds no more pieces across tasks than the machine total, and gives them back when a task is released', async () => {
+			const m = await started({ maximumInflateBytes: 3 << 20 });
+			const PIECE = 1 << 20;
+			const long = Buffer.concat([
+				deflateRawSync(Buffer.alloc((3 * PIECE) / 2, 'machine total ')),
+				Buffer.alloc(9)
+			]);
+			const t4 = { id: 4 } as never;
+			const t5 = { id: 5 } as never;
+			const streams = () => [...m['inflates'].values()];
+			const held = () => streams().reduce((n, s) => n + s.held, 0);
+			const a = call(m, 8);
+			const b = call(m, 8, 0, 0, 0, t4);
+			const c = call(m, 8, 0, 0, 0, t5);
+			expect(feed(m, a, long)).toBe(1);
+			expect(held()).toBe(2 * PIECE);
+			expect(feed(m, b, long, t4)).toBe(-2);
+			expect(held()).toBe(3 * PIECE);
+			expect(feed(m, c, long, t5)).toBe(-2);
+			expect(held()).toBe(3 * PIECE);
+			expect(streams().every((s) => s.held - s.length < PIECE)).toBe(true);
+			m['dropDigests'](3);
+			expect(held()).toBe(PIECE);
+			const fresh = call(m, 8, 0, 0, 0, t5);
+			expect(feed(m, fresh, long, t5)).toBe(1);
+			expect(held()).toBe(3 * PIECE);
+		});
+
 		it('declines to open one without an inflate option', async () => {
 			const m = await started({ inflate: undefined });
 			expect(call(m, 8)).toBe(-1);
@@ -1736,6 +2455,22 @@ describe('Machine', () => {
 			expect(word(machine, 0x84c)).toBe(2);
 		});
 
+		it("maps its scratch region through promising, as the kernel's every-256th-syscall yield parks the call", async () => {
+			const r = rig({
+				sharedKernel: true,
+				registry: new Map([['Y', toyUser('toy-sync.wat')]]),
+				fileSync: async () => {}
+			});
+			const machine = new Machine(r.machineOptions);
+			await r.run(machine, () => r.output().includes('parent ok'));
+			new DataView(machine.memory.buffer).setUint32(0x870, 1, true);
+			machine.type('y');
+			await r.run(machine, () => r.output().includes('user back'));
+			expect(machine.crashed).toBeFalsy();
+			expect(word(machine, 0x84c)).toBe(1);
+			expect(machine.stats.fileSyncs).toBe(1);
+		});
+
 		it("writes a restore's files back at the first syscall, before it runs, and checkpoints only after", async () => {
 			const r = rig({ asyncify: true, registry: new Map([['Y', toyUser('toy-sync.wat')]]) });
 			const machine = new Machine(r.machineOptions);
@@ -1820,11 +2555,15 @@ describe('Machine', () => {
 			expect(String(machine.crashed)).toMatch(/patch 0036/);
 		});
 
-		describe('statx cache', () => {
+		describe.each([
+			['through the hook', false],
+			['directly', true]
+		])('statx cache, filled %s', (_form, directFill) => {
 			const statxRig = (syscallCache: true | 'verify') => {
 				const r = rig({
 					sharedKernel: true,
 					syscallCache,
+					directFill,
 					registry: new Map([['T', toyUser('toy-statx.wat')]])
 				});
 				const machine = new Machine(r.machineOptions);
@@ -2063,6 +2802,117 @@ describe('Machine', () => {
 				expect(machine.stats.statxHits).toBe(0);
 				expect(machine.stats.statxMismatches).toBe(1);
 			});
+
+			// the two imports of the direct form, driven by hand on a machine that has run
+			const prepared = async () => {
+				const { r, machine } = statxRig(true);
+				await r.run(machine, () => r.output().includes('parent ok'));
+				machine.type('t');
+				await r.run(machine, () => r.output().includes('handled'));
+				const me = [...(machine as any).runners.values()].find((x: any) => x.instance);
+				const bytes = new Uint8Array(machine.memory.buffer);
+				const view = new DataView(machine.memory.buffer);
+				const put = (at: number, text: string) => {
+					bytes.set(new TextEncoder().encode(`${text}\0`), at);
+					return at;
+				};
+				// a regular file's answer, as the kernel builds one: the stx_mask bit 0 and mode at 28
+				const answer = (mode = 0o100644) => {
+					bytes.fill(0, 0x5000, 0x5100);
+					bytes[0x5000] = 1;
+					view.setUint16(0x5000 + 28, mode, true);
+				};
+				const ask = (path: number, result: number, mode?: number, flags = 0) => {
+					answer(mode);
+					const id = (machine as any).statxPrepare(me, [
+						-100,
+						path,
+						flags,
+						0x7ff,
+						0x5000
+					]);
+					if (id >= 0) (machine as any).statxFinish(id, result);
+					return id;
+				};
+				return { machine, put, ask, view };
+			};
+
+			it('keeps an answer it fills, and only one the table may hold', async () => {
+				const { machine, put, ask } = await prepared();
+				const before = machine.stats.statxFills;
+				// a relative path has no query at all
+				expect(ask(put(0x4000, 'toy/file'), 0)).toBe(-1);
+				// the kernel's EFAULT, a path over the longest slot, a socket and a device are not kept
+				expect(ask(put(0x4000, '/toy/file'), -14)).toBeGreaterThan(0);
+				expect(ask(put(0x4000, `/${'p'.repeat(STATX_PATH_MAX)}`), 0)).toBeGreaterThan(0);
+				expect(ask(put(0x4000, '/toy/file'), 0, 0o140000)).toBeGreaterThan(0);
+				expect(ask(put(0x4000, '/toy/file'), 0, 0o060000)).toBeGreaterThan(0);
+				expect(machine.stats.statxFills).toBe(before);
+				// a regular file's is
+				expect(ask(put(0x4000, '/toy/file'), 0)).toBeGreaterThan(0);
+				expect(machine.stats.statxFills).toBe(before + 1);
+			});
+
+			it('drops an answer when the generation moved while the kernel was asked', async () => {
+				const { machine, put, view } = await prepared();
+				const host = machine as any;
+				const me = [...host.runners.values()].find((x: any) => x.instance);
+				put(0x4000, '/toy/file');
+				new Uint8Array(machine.memory.buffer)[0x5000] = 1;
+				view.setUint16(0x5000 + 28, 0o100644, true);
+				const before = machine.stats.statxFills;
+				const id = host.statxPrepare(me, [-100, 0x4000, 0, 0x7ff, 0x5000]);
+				view.setUint32(BLOCK, view.getUint32(BLOCK, true) + 1, true);
+				host.statxFinish(id, 0);
+				expect(machine.stats.statxFills).toBe(before);
+				// asked again at the new generation it is kept
+				const again = host.statxPrepare(me, [-100, 0x4000, 0, 0x7ff, 0x5000]);
+				host.statxFinish(again, 0);
+				expect(machine.stats.statxFills).toBe(before + 1);
+			});
+
+			it('ignores a result whose query was dropped, and one it never gave out', async () => {
+				const { machine } = await prepared();
+				const host = machine as any;
+				const before = machine.stats.statxFills;
+				host.statxFinish(0x3fffffff, 0);
+				host.statxFinish(5, 0);
+				expect(machine.stats.statxFills).toBe(before);
+				expect(host.statxPending.filter(Boolean)).toHaveLength(0);
+			});
+
+			it('lets the pool lap an abandoned query without mistaking it for a later one', async () => {
+				const { machine, put } = await prepared();
+				const host = machine as any;
+				const me = [...host.runners.values()].find((x: any) => x.instance);
+				put(0x4000, '/toy/file');
+				const first = host.statxPrepare(me, [-100, 0x4000, 0, 0x7ff, 0x5000]);
+				// a task killed in the kernel never finishes; 64 more queries reach its slot again
+				let last = first;
+				for (let i = 0; i < 64; i++)
+					last = host.statxPrepare(me, [-100, 0x4000, 0, 0x7ff, 0x5000]);
+				expect(last & 63).toBe(first & 63);
+				const before = machine.stats.statxFills;
+				host.statxFinish(first, 0);
+				expect(machine.stats.statxFills).toBe(before);
+				expect(host.statxPending[first & 63]?.id).toBe(last);
+			});
+		});
+
+		it('refuses a direct fill beside asyncify or without the cache', () => {
+			expect(
+				() =>
+					new Machine({
+						...rig({ syscallCache: true, directFill: true, asyncify: true })
+							.machineOptions
+					})
+			).toThrow(/directFill cannot be combined with asyncify/);
+			expect(() => new Machine(rig({ directFill: true }).machineOptions)).toThrow(
+				/directFill needs syscallCache/
+			);
+			expect(
+				() => new Machine(rig({ syscallCache: true, directFill: true }).machineOptions)
+			).not.toThrow();
 		});
 
 		describe("a fork child's own memory", () => {
@@ -2184,19 +3034,21 @@ describe('Machine', () => {
 				k[n] = (_sp: number, _tls: number, nr: number) => (seen.push(`k${nr}`), 0);
 				h[n] = (_sp: number, _tls: number, nr: number) => (seen.push(`h${nr}`), 0);
 			}
-			const router = (cache: boolean, answer: number) =>
+			const router = (cache: boolean | 2, answer: number) =>
 				new WebAssembly.Instance(RUNTIME.route, {
 					k: k as WebAssembly.ModuleImports,
 					h: h as WebAssembly.ModuleImports,
 					c: {
 						5: (_sp: number, _tls: number, nr: number) => (seen.push(`c${nr}`), answer)
 					},
+					q: { 5: (_sp: number, _tls: number, nr: number) => (seen.push(`q${nr}`), 9) },
+					f: { 5: (id: number) => void seen.push(`f${id}`) },
 					env: {
 						memory: new WebAssembly.Memory({ initial: 1, maximum: 1, shared: true }),
 						route,
 						cache: new WebAssembly.Global(
 							{ value: 'i32', mutable: true },
-							cache ? 1 : 0
+							cache === 2 ? 2 : cache ? 1 : 0
 						)
 					}
 				}).exports as Record<string, (...a: number[]) => number>;
@@ -2235,6 +3087,16 @@ describe('Machine', () => {
 			route.value = ROUTE_HOOK;
 			s.s5!(0, 0, 291, -100, 0, 0, 0, 0);
 			expect(seen).toEqual(['c291', 'h291', 'c291', 'k291', 'h291']);
+			// the direct form: a miss is asked about, answered by the kernel, then filled; a hit answers alone
+			seen.length = 0;
+			route.value = ROUTE_WATCH;
+			s = router(2, MISS);
+			expect(s.s5!(0, 0, 291, -100, 0, 0, 0, 0)).toBe(0);
+			s = router(2, -2);
+			expect(s.s5!(0, 0, 291, -100, 0, 0, 0, 0)).toBe(-2);
+			route.value = ROUTE_HOOK;
+			s.s5!(0, 0, 291, -100, 0, 0, 0, 0);
+			expect(seen).toEqual(['c291', 'q291', 'k291', 'f9', 'c291', 'h291']);
 		});
 
 		it('reports the earliest Linux deadline an idle task waits for, on the kernel clock', async () => {
@@ -2294,18 +3156,106 @@ describe('Machine', () => {
 			expect(machine.stats.netEvents).toBe(3);
 		});
 
-		it('refuses a checkpoint while a stream is open and takes it once the stream is gone', async () => {
+		it('refuses a checkpoint while a request is in flight on a stream and takes it once the stream is gone', async () => {
 			const { r, machine, drive } = await listening();
 			const stream = machine.ingress(80);
-			await expect(machine.checkpoint()).rejects.toThrow('streams are open');
+			await expect(machine.checkpoint()).rejects.toThrow(
+				`a request is in flight on stream ${stream.id}`
+			);
 			stream.abort();
 			await drive(new Promise((resolve) => setTimeout(resolve, 0)));
 			expect(machine.openStreams).toBe(0);
 			const snapshot = await machine.checkpoint();
 			expect(snapshot.ports).toEqual([80]);
+			expect(snapshot).not.toHaveProperty('streams');
+			expect(snapshot).not.toHaveProperty('streamNext');
 			const restored = await Machine.restore(r.machineOptions, snapshot);
 			expect(restored.listening(80)).toBe(true);
 			expect(restored.listening(81)).toBe(false);
+			expect(restored.restoredStreams).toEqual([]);
+		});
+
+		it('saves a stream its owner parked between two requests, and the restored machine serves the next one on it', async () => {
+			const { r, machine, drive } = await listening();
+			const stream = machine.ingress(80);
+			const reader = stream.readable.getReader();
+			const echo = async (
+				text: string,
+				on: typeof stream,
+				from: typeof reader,
+				to: Machine
+			) => {
+				let done = false;
+				const work = (async () => {
+					await on.write(text);
+					return new TextDecoder().decode((await from.read()).value);
+				})().finally(() => (done = true));
+				await r.run(to, () => done);
+				return work;
+			};
+			expect(await echo('first', stream, reader, machine)).toBe('first');
+			stream.parked = true;
+			const snapshot = await machine.checkpoint();
+			expect(snapshot.streams).toEqual([{ id: stream.id, port: 80, borrows: false }]);
+			expect(snapshot.streamNext).toBe(stream.id + 1);
+			const restored = await Machine.restore(r.machineOptions, snapshot);
+			// the table, the parked flag and the open count agree
+			expect(restored.restoredStreams).toHaveLength(1);
+			const again = restored.restoredStreams[0]!;
+			expect(again).toMatchObject({ id: stream.id, parked: true, closed: false });
+			expect(restored.openStreams).toBe(1);
+			const opens = restored.stats.netOpens;
+			again.parked = false;
+			const second = again.readable.getReader();
+			expect(await echo('second', again, second, restored)).toBe('second');
+			// the same stream, the same connection in the guest: no new open event
+			expect(restored.stats.netOpens).toBe(opens);
+			expect(restored.openStreams).toBe(1);
+			expect(restored.ingress(80).id).toBe(stream.id + 1);
+		});
+
+		it('wakes the relay for buffers a reader gave back, so a checkpoint takes them first and is not refused', async () => {
+			const { r, machine, drive } = await listening();
+			const stream = machine.ingress(80);
+			const reader = stream.readable.getReader();
+			await drive(
+				(async () => {
+					await stream.write('x');
+					await reader.read();
+				})()
+			);
+			stream.parked = true;
+			// given back with no wake, as a borrowing reader does when its body ends
+			const net = (
+				machine as unknown as {
+					net: { reclaim(t: number[], now: boolean): void; owes(): boolean };
+				}
+			).net;
+			net.reclaim([], false);
+			net.reclaim([4096], false);
+			expect(net.owes()).toBe(true);
+			const snapshot = await machine.checkpoint();
+			expect(snapshot.streams).toEqual([{ id: stream.id, port: 80, borrows: false }]);
+			expect(net.owes()).toBe(false);
+			void r;
+		});
+
+		it('waits for a stream with a request in flight, even one the guest has answered', async () => {
+			const { machine, drive } = await listening();
+			const stream = machine.ingress(80);
+			const reader = stream.readable.getReader();
+			await drive(
+				(async () => {
+					await stream.write('x');
+					await reader.read();
+				})()
+			);
+			// answered, but nobody parked it: the owner may still be reading
+			await expect(machine.checkpoint()).rejects.toThrow('in flight');
+			stream.parked = true;
+			await expect(machine.checkpoint()).resolves.toMatchObject({
+				streams: [{ id: stream.id }]
+			});
 		});
 
 		it('keeps a port that two programs listen on until both have stopped', () => {
@@ -2386,6 +3336,63 @@ describe('Machine', () => {
 				net.end(first.id, 3);
 				expect(raised.n).toBe(before + 1);
 				expect(next()).toMatchObject({ op: 2, id: first.id });
+			});
+
+			it('calls a stream quiet only while its owner has parked it and nothing waits either way', () => {
+				const { net, next } = rigNet();
+				expect(net.blocker()).toBeNull();
+				expect(net.saved).toBeNull();
+				const stream = net.connect(80);
+				stream.parked = true;
+				// the kernel has not been told of it yet
+				expect(net.blocker()).toBe(`a request is in flight on stream ${stream.id}`);
+				next();
+				expect(net.blocker()).toBeNull();
+				expect(net.owes()).toBe(false);
+				expect(net.saved).toEqual({
+					streams: [{ id: stream.id, port: 80, borrows: false }],
+					next: stream.id + 1
+				});
+				stream.parked = false;
+				expect(net.blocker()).toContain('in flight');
+				stream.parked = true;
+				stream.write('aa').catch(() => {});
+				expect(net.blocker()).toContain('in flight');
+				expect(net.owes()).toBe(true);
+				next();
+				expect(net.blocker()).toBeNull();
+				// buffers the reader gave back are the kernel's to hear of before a checkpoint
+				net.reclaim([4096, 8192], false);
+				expect(net.blocker()).toBeNull();
+				expect(net.owes()).toBe(true);
+				expect(next()).toMatchObject({ op: 5, arg: 2 });
+				expect(net.owes()).toBe(false);
+				stream.end();
+				expect(net.blocker()).toContain('in flight');
+			});
+
+			it('rebuilds a saved table as parked streams and numbers the next one after them', () => {
+				const { net, next } = rigNet();
+				const a = net.connect(80, true);
+				const b = net.connect(80);
+				next();
+				next();
+				a.parked = b.parked = true;
+				const saved = net.saved!;
+				const fresh = new Ingress(netStats(), () => {});
+				const streams = fresh.restore([80], saved.streams, saved.next);
+				expect(streams.map((s) => [s.id, s.parked, s.closed])).toEqual([
+					[a.id, true, false],
+					[b.id, true, false]
+				]);
+				expect(fresh.open).toBe(2);
+				expect(fresh.blocker()).toBeNull();
+				expect(fresh.saved).toEqual(saved);
+				expect(fresh.connect(80).id).toBe(saved.next);
+				// a snapshot with no streams starts the numbering over, as it always did
+				fresh.restore([80]);
+				expect(fresh.open).toBe(0);
+				expect(fresh.connect(80).id).toBe(1);
 			});
 
 			it('takes what the reader has room for, then answers 0 and raises the interrupt once it reads', async () => {

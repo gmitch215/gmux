@@ -89,6 +89,24 @@ describe('DurableStore checkpoints', () => {
 	});
 });
 
+describe('DurableStore checkpoint phases', () => {
+	it('reports the hash, extent and root phases in order, each entered and left', () => {
+		const store = new DurableStore(sqlite());
+		const seen: string[] = [];
+		store.writeCheckpoint(new Uint8Array(1 << 16).fill(7), '{}', (phase, entering) =>
+			seen.push(`${phase} ${entering ? 'in' : 'out'}`)
+		);
+		expect(seen).toEqual([
+			'hash in',
+			'hash out',
+			'extents in',
+			'extents out',
+			'root in',
+			'root out'
+		]);
+	});
+});
+
 describe('DurableStore files', () => {
 	it('writes a small file whole into its record: one row a sync', () => {
 		const store = new DurableStore(sqlite());

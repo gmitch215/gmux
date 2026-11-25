@@ -9,6 +9,9 @@
 	(import "env" "__wasm_syscall_0" (func $syscall (param i32 i32 i32) (result i32)))
 	(global $got (mut i32) (i32.const 0))
 	(export "gmux_g4" (global $got))
+	;; a mutable global no relocation sets, which a recycled instance must have reset
+	(global $seen (mut i32) (i32.const 0))
+	(export "gmux_g5" (global $seen))
 	(start $init)
 	;; a share build's start function sets the flag in its data's last word and copies the image only when it was 0
 	(func $init

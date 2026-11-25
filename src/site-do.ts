@@ -4,18 +4,21 @@ import busybox from '../build/kernel/busybox.async.wasm';
 import busyboxGuard from '../build/kernel/busybox.guard.wasm';
 import initrd from '../build/kernel/initramfs.bin';
 import katybug from '../build/kernel/katybug.wasm';
+import lighttpd from '../build/kernel/lighttpd.async.wasm';
 import manifest from '../build/kernel/manifest.json';
 import vmlinux from '../build/kernel/vmlinux.async.wasm';
+import copy from '../build/router/copy.wasm';
 import core from '../build/router/gmux-core.wasm';
 import router from '../build/router/router.wasm';
 import statx from '../build/router/statx.wasm';
 import { bootstrapOf, fits, type BootstrapIndex } from './worker/bootstrap';
 import type { Sql } from './worker/durable';
+import { Encounters } from './worker/encounter';
 import { Keeper, QUANTUM_MS, type Policy } from './worker/keeper';
 import { claim, verify, type OwnerStore } from './worker/owner';
 import { placement, prime, type PlacementStore } from './worker/placement';
 import { Server } from './worker/serve';
-import { CMDLINE, MAXIMUM_PAGES, siteOptions } from './worker/site-machine';
+import { MAXIMUM_PAGES, siteCmdline, siteOptions } from './worker/site-machine';
 
 export interface Env {
 	MACHINE: DurableObjectNamespace<MachineDO>;
@@ -52,15 +55,21 @@ function sqlOf(storage: SqlStorage): Sql {
 export class MachineDO extends DurableObject<Env> {
 	private readonly keeper: Keeper;
 	private pumping = false;
+	private inAlarm = false;
 	private pending = '';
 	private typed = '';
 	private warm = 0;
 	private readonly instance = crypto.randomUUID();
+	private readonly encounters: Encounters;
 	private readonly server = new Server({
-		open: async () => (await this.keeper.open()).machine,
+		open: () => this.keeper.open(),
+		current: () => this.keeper.machine,
+		encounter: (outcome) => this.encounters.record(outcome),
 		pumping: () => this.pumping,
 		pump: (budgetMs, wake) => this.pump(budgetMs, false, wake),
-		rest: async () => void (await this.keeper.ran(0, this.warm > 0)),
+		rest: async () => {
+			if (await this.keeper.ran(0, this.warm > 0)) this.encounters.flush();
+		},
 		wait: (ms) => scheduler.wait(ms),
 		fixedLength: (length) => new FixedLengthStream(length)
 	});
@@ -68,6 +77,10 @@ export class MachineDO extends DurableObject<Env> {
 	constructor(ctx: DurableObjectState, env: Env) {
 		super(ctx, env);
 		ctx.storage.sql.exec('CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v TEXT)');
+		this.encounters = new Encounters({
+			get: () => this.meta.get('encounters'),
+			set: (value) => this.meta.set('encounters', value)
+		});
 		const id = ctx.id.toString();
 		this.keeper = new Keeper(
 			{
@@ -83,7 +96,8 @@ export class MachineDO extends DurableObject<Env> {
 							busybox,
 							busyboxGuard,
 							katybug,
-							runtime: { route: router, statx, core },
+							lighttpd,
+							runtime: { route: router, statx, core, copy },
 							initrd: new Uint8Array(initrd),
 							manifest
 						},
@@ -99,7 +113,11 @@ export class MachineDO extends DurableObject<Env> {
 							}
 						}
 					),
-				bootstrap: () => this.bootstrap()
+				bootstrap: () => this.bootstrap(),
+				instance: this.instance,
+				trace: (env as Env & { TRACE?: string }).TRACE
+					? (line) => console.log(JSON.stringify({ gmux: 'trace', ...line }))
+					: undefined
 			},
 			{},
 			this.policy()
@@ -118,8 +136,8 @@ export class MachineDO extends DurableObject<Env> {
 		const res = await asset('index.json');
 		if (!res.ok) return null;
 		const index = (await res.json()) as BootstrapIndex;
-		if (!fits(index, (manifest as { image?: string }).image, CMDLINE, MAXIMUM_PAGES))
-			return null;
+		const { image, lighttpd: server } = manifest as { image?: string; lighttpd?: string };
+		if (!fits(index, image, siteCmdline(!!server), MAXIMUM_PAGES)) return null;
 		return bootstrapOf(index, async (n) => {
 			const chunk = await asset(`c${n}.bin`);
 			if (!chunk.ok) throw new Error(`bootstrap chunk ${n}: ${chunk.status}`);
@@ -172,6 +190,7 @@ export class MachineDO extends DurableObject<Env> {
 		if (this.pumping) return;
 		this.pumping = true;
 		const started = Date.now();
+		if (!this.inAlarm) this.keeper.beginEvent();
 		try {
 			const { machine, from } = await this.keeper.open();
 			if (from !== 'running') {
@@ -183,6 +202,7 @@ export class MachineDO extends DurableObject<Env> {
 			}
 			MEMORIES.set(this.ctx.id.toString(), new WeakRef(machine.memory));
 			const stop = this.keeper.turn(budgetMs, unattended);
+			this.keeper.mark('turn', true);
 			const outcome = await machine.run(
 				() => {
 					if (this.typed) {
@@ -193,6 +213,7 @@ export class MachineDO extends DurableObject<Env> {
 				},
 				this.keeper.sleeper((ms) => scheduler.wait(Math.min(ms, 50)))
 			);
+			this.keeper.mark('turn', false);
 			if (outcome === 'halted') {
 				this.send({ t: 'status', d: outcome });
 				await this.keeper.halted();
@@ -201,7 +222,10 @@ export class MachineDO extends DurableObject<Env> {
 				this.keeper.crashed();
 			} else if (!wake) {
 				const written = await this.keeper.ran(Date.now() - started, this.warm > 0);
-				if (written) console.log(JSON.stringify({ gmux: 'checkpoint', ...written }));
+				if (written) {
+					this.encounters.flush();
+					console.log(JSON.stringify({ gmux: 'checkpoint', ...written }));
+				}
 				console.log(
 					JSON.stringify({
 						gmux: 'turn',
@@ -225,6 +249,7 @@ export class MachineDO extends DurableObject<Env> {
 		// a new object is replaced after its first ~1 s of CPU; spend it before a machine exists
 		if (placement(this.meta, this.instance) === 'prime') {
 			prime();
+			this.encounters.record('none');
 			return Response.json(
 				{ placing: true },
 				{ status: 503, headers: { 'retry-after': '1' } }
@@ -237,6 +262,7 @@ export class MachineDO extends DurableObject<Env> {
 					claimed: this.owner.get() !== null,
 					running: this.keeper.machine !== null,
 					stats: this.keeper.machine?.stats ?? null,
+					encounters: this.encounters.report(),
 					streams: {
 						machine: this.keeper.machine?.openStreams ?? null,
 						serving: this.server.open,
@@ -291,7 +317,15 @@ export class MachineDO extends DurableObject<Env> {
 
 	/** a Linux timer came due, or unsaved work: run the machine for a quantum, or checkpoint it */
 	override async alarm() {
-		if (await this.keeper.woke(this.pumping)) await this.pump(QUANTUM_MS, this.warm === 0);
-		else await this.keeper.arm(this.warm > 0);
+		this.keeper.beginEvent();
+		this.inAlarm = true;
+		this.keeper.mark('alarm', true);
+		try {
+			if (await this.keeper.woke(this.pumping)) await this.pump(QUANTUM_MS, this.warm === 0);
+			else await this.keeper.arm(this.warm > 0);
+		} finally {
+			this.keeper.mark('alarm', false);
+			this.inAlarm = false;
+		}
 	}
 }

@@ -5,6 +5,7 @@
 #define SYS_STATX 291
 #define O_DSYNC 010000
 #define MISS 1
+#define CACHE_DIRECT 2
 
 #define IMPORT(module, name)                                                   \
     __attribute__((import_module(module), import_name(name)))
@@ -30,6 +31,8 @@ IMPORT("h", "4") int h4(int, int, int, int, int, int, int);
 IMPORT("h", "5") int h5(int, int, int, int, int, int, int, int);
 IMPORT("h", "6") int h6(int, int, int, int, int, int, int, int, int);
 IMPORT("c", "5") int c5(int, int, int, int, int, int, int, int);
+IMPORT("q", "5") int q5(int, int, int, int, int, int, int, int);
+IMPORT("f", "5") void f5(int, int);
 
 // the hook suspends, so its result comes back here and never by a tail call
 #define KEEP(call)                                                             \
@@ -110,7 +113,14 @@ int s5(int sp, int tls, int nr, int a, int b, int c, int d, int e) {
     if (cache && nr == SYS_STATX && route != ROUTE_HOOK) {
         int answer = KEEP(c5(sp, tls, nr, a, b, c, d, e));
         if (answer != MISS) return answer;
-        return KEEP(h5(sp, tls, nr, a, b, c, d, e));
+        if (cache != CACHE_DIRECT) return KEEP(h5(sp, tls, nr, a, b, c, d, e));
+        // not a tail call, so only a machine that never unwinds may get here
+        int id = q5(sp, tls, nr, a, b, c, d, e);
+        if (id < 0) __attribute__
+            ((musttail)) return k5(sp, tls, nr, a, b, c, d, e);
+        int result = k5(sp, tls, nr, a, b, c, d, e);
+        f5(id, result);
+        return result;
     }
     if (to_hook(nr, c)) return KEEP(h5(sp, tls, nr, a, b, c, d, e));
     __attribute__((musttail)) return k5(sp, tls, nr, a, b, c, d, e);

@@ -1,3 +1,4 @@
+import { encounterOf, type Encounter, type Opened } from './encounter.ts';
 import { QUANTUM_MS } from './keeper.ts';
 import { BodyTooLarge, GatewayTimeout, requestBytes, responseFrom } from './machine/http.ts';
 import type { IngressStream } from './machine/ingress.ts';
@@ -16,12 +17,18 @@ export interface ServeMachine {
 	ingress(port: number, borrows?: boolean): IngressStream;
 	netPoll(): void;
 	readonly netActivity: number;
+	/** the streams a checkpoint saved parked, handed back by the machine restored from it */
+	readonly restoredStreams: readonly IngressStream[];
 }
 
 /** what serving needs of the object that owns the machine */
 export interface ServeHost {
-	/** the machine, restored or booted first */
-	open(): Promise<ServeMachine>;
+	/** the machine, restored or booted first, and how it was opened (`running` when it already was) */
+	open(): Promise<{ machine: ServeMachine; from: Opened }>;
+	/** told once for each request what the machine's state meant to it (`encounter.ts`) */
+	encounter?(outcome: Encounter): void;
+	/** the machine as it is now, without waking one; a checkpoint replaces it */
+	current(): ServeMachine | null;
 	pumping(): boolean;
 	/** runs the machine for up to `budgetMs`, or until `wake` says so */
 	pump(budgetMs: number, wake: () => boolean): Promise<void>;
@@ -62,6 +69,8 @@ export class Server {
 	/** finished streams the guest left open, oldest first */
 	private readonly parked: { stream: IngressStream; at: number }[] = [];
 	private sweeping = false;
+	/** the machine the parked streams belong to */
+	private machine: ServeMachine | null = null;
 	private readonly host: ServeHost;
 	private readonly limits: ServeLimits;
 
@@ -93,7 +102,7 @@ export class Server {
 		);
 		let quiet = Date.now();
 		while (!settled) {
-			const machine = await this.host.open();
+			const { machine } = await this.host.open();
 			const seen = machine.netActivity;
 			if (this.host.pumping()) {
 				machine.netPoll();
@@ -115,9 +124,13 @@ export class Server {
 	async serve(request: Request): Promise<Response> {
 		const { port, maxStreams, maxRequestBytes, idleMs, borrow } = this.limits;
 		// a declared body over the bound is refused before the machine is woken
-		if (Number(request.headers.get('content-length')) > maxRequestBytes)
+		if (Number(request.headers.get('content-length')) > maxRequestBytes) {
+			this.host.encounter?.('none');
 			return new Response('request body too large', { status: 413 });
-		const machine = await this.host.open();
+		}
+		const { machine, from } = await this.host.open();
+		this.host.encounter?.(encounterOf(from));
+		this.adopt(machine);
 		if (!machine.listening(port))
 			return new Response('nothing listens on port 80', {
 				status: 503,
@@ -144,17 +157,37 @@ export class Server {
 		return (await this.exchange(request, machine.ingress(port, borrow), keepAlive, false))!;
 	}
 
+	/**
+	 * a machine this server has not seen is a restored or resumed one (a checkpoint replaces the
+	 * machine object): the streams parked on the old one went with it, and the new one hands back the
+	 * streams its snapshot held, each with a new idle window
+	 */
+	private adopt(machine: ServeMachine | null) {
+		if (!machine || machine === this.machine) return;
+		this.machine = machine;
+		const now = Date.now();
+		this.parked.splice(
+			0,
+			this.parked.length,
+			...machine.restoredStreams.map((stream) => ({ stream, at: now }))
+		);
+		if (this.parked.length) void this.sweep();
+	}
+
 	/** the newest idle stream the guest has not closed and the pool has not outwaited */
 	private take(): IngressStream | undefined {
 		for (let next = this.parked.pop(); next; next = this.parked.pop()) {
-			if (!next.stream.closed && Date.now() - next.at < this.limits.idleMs)
+			if (!next.stream.closed && Date.now() - next.at < this.limits.idleMs) {
+				next.stream.parked = false;
 				return next.stream;
+			}
 			next.stream.end();
 		}
 	}
 
 	/** keeps a finished stream for the next request, and ends it once it has waited too long */
 	private park(stream: IngressStream) {
+		stream.parked = true;
 		this.parked.push({ stream, at: Date.now() });
 		void this.sweep();
 	}
@@ -302,6 +335,9 @@ export class Server {
 
 	/** the last stream is done: the keeper checkpoints if due and points the alarm */
 	async settle() {
-		if (this.serving === 0 && !this.host.pumping()) await this.host.rest();
+		if (this.serving === 0 && !this.host.pumping()) {
+			await this.host.rest();
+			this.adopt(this.host.current());
+		}
 	}
 }

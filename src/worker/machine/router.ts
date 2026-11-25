@@ -9,7 +9,11 @@
  *
  * With the imported global `cache` set, a statx at 0 or 3 first asks the import `c.5`, which answers
  * from the path-query table or returns `MISS`; a miss goes to the hook, which asks the kernel and
- * fills the table.
+ * fills the table. At `CACHE_DIRECT` a miss instead calls the plain import `q.5` (a query id, or a
+ * negative number for a statx the table never holds, which the kernel then answers by a tail call),
+ * calls the kernel with no tail call, and hands the result to `f.5(id, result)`; no suspension
+ * crosses the host, but a stack unwind would meet the router's frame, so a machine that unwinds
+ * cannot use it.
  *
  * The router is `src/gmux/core/router/router.c`; the statx hit, which needs three memories, is
  * `statx.wat` beside it. `scripts/build-router.sh` builds both and the scheduler core
@@ -25,6 +29,9 @@ export const ROUTE_WRITES = 3;
 export const SYNC_CALLS = [81, 82, 83, 84, 227, 267, 287];
 /** and at ROUTE_WRITES: write, writev, pwrite64, pwritev, sendfile, splice, copy_file_range */
 export const WRITE_CALLS = [64, 66, 68, 70, 71, 76, 285];
+/** the router's `cache` global: a miss goes to the hook, or (no unwinding) the kernel is called and `f.5` fills */
+export const CACHE_HOOK = 1;
+export const CACHE_DIRECT = 2;
 export const SYS_STATX = 291;
 /** what `c.5` returns when it has no answer: statx returns 0 or a negative errno */
 export const MISS = 1;
@@ -37,6 +44,8 @@ export interface HostRuntime {
 	route: WebAssembly.Module;
 	statx: WebAssembly.Module;
 	core?: WebAssembly.Module;
+	/** the copies between the kernel's memory and a fork child's own (`Domain`); absent, views copy */
+	copy?: WebAssembly.Module;
 }
 
 // workers-types declare Module abstract; the constructor is real at startup
@@ -45,9 +54,15 @@ const Module = WebAssembly.Module as unknown as new (bytes: BufferSource) => Web
 export function compileRuntime(
 	route: BufferSource,
 	statx: BufferSource,
-	core?: BufferSource
+	core?: BufferSource,
+	copy?: BufferSource
 ): HostRuntime {
-	return { route: new Module(route), statx: new Module(statx), core: core && new Module(core) };
+	return {
+		route: new Module(route),
+		statx: new Module(statx),
+		core: core && new Module(core),
+		copy: copy && new Module(copy)
+	};
 }
 
 /**

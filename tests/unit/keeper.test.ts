@@ -589,6 +589,62 @@ describe('Keeper', () => {
 		expect((await keeper.open()).from).toBe('restored');
 	});
 
+	describe('phases and the fence', () => {
+		it('drops a checkpoint whose machine was replaced while its sync was held open', async () => {
+			const r = rig();
+			const keeper = new Keeper(r.host, { minMs: 1 });
+			await r.run((await keeper.open()).machine, () => r.output().includes('parent ok'));
+			await keeper.ran(10);
+			expect(keeper.counts.checkpoints).toBe(1);
+			let release: () => void = () => {};
+			const arrived = new Promise<void>((reached) => {
+				r.host.sync = () =>
+					new Promise<void>((done) => {
+						release = done;
+						reached();
+					});
+			});
+			keeper.turn(5000, true);
+			const pending = keeper.ran(10);
+			await arrived;
+			keeper.crashed();
+			const { from, machine } = await keeper.open();
+			expect(from).toBe('restored');
+			const counts = { ...keeper.counts };
+			const alarms = [...r.alarms];
+			release();
+			expect(await pending).toBeNull();
+			expect(keeper.machine).toBe(machine);
+			expect(keeper.counts).toEqual(counts);
+			expect(r.alarms).toEqual(alarms);
+		});
+
+		it('traces the phases of a checkpoint, and the phase the previous instance was left in', async () => {
+			const r = rig();
+			const lines: Record<string, unknown>[] = [];
+			r.host.trace = (line) => void lines.push(line);
+			const keeper = new Keeper(r.host, { minMs: 1 });
+			await r.run((await keeper.open()).machine, () => r.output().includes('parent ok'));
+			await keeper.ran(10);
+			expect(lines.map((line) => line.phase)).toEqual(
+				expect.arrayContaining([
+					'open',
+					'checkpoint',
+					'hash',
+					'extents',
+					'root',
+					'sync',
+					'resume',
+					'arm'
+				])
+			);
+			await new Keeper(r.host, { minMs: 1 }).open();
+			expect(lines.find((line) => 'previous' in line)).toEqual({
+				previous: expect.stringContaining('"phase":"arm"')
+			});
+		});
+	});
+
 	describe('turn budget', () => {
 		/** runs `stop` until it says stop, `stepMs` of real time a step, on a clock that never moves */
 		const drive = (r: ReturnType<typeof rig>, stop: () => boolean, stepMs: number) => {

@@ -64,10 +64,16 @@ export class Domain {
 	/** copies between the kernel's memory and this one, when the domain was made with the kernel's */
 	readonly copier: Copier | null;
 
-	constructor(memory: WebAssembly.Memory, perm = READ | WRITE, kernel?: WebAssembly.Memory) {
+	/** `copy` is `HostRuntime.copy`; without it the copies go through views */
+	constructor(
+		memory: WebAssembly.Memory,
+		perm = READ | WRITE,
+		kernel?: WebAssembly.Memory,
+		copy?: WebAssembly.Module
+	) {
 		this.memory = memory;
 		this.perm = perm;
-		this.copier = kernel ? makeCopier(kernel, memory) : null;
+		this.copier = kernel ? makeCopier(kernel, memory, copy) : null;
 	}
 
 	/** whether the span is inside the domain and allowed, with no 32-bit wrap */
@@ -101,45 +107,6 @@ export interface Copier {
 	zero(user: number, n: number): void;
 }
 
-// the two memories are imported shared with the widest limits, which any machine memory fits
-function copierBytes(): Uint8Array {
-	const leb = (n: number) => (n < 128 ? [n] : [(n & 0x7f) | 0x80, n >> 7]);
-	const text = (s: string) => [s.length, ...Array.from(s, (c) => c.charCodeAt(0))];
-	const section = (id: number, body: number[]) => [id, ...leb(body.length), ...body];
-	const memory = (name: string) => [...text('env'), ...text(name), 2, 3, 0, 0x80, 0x80, 4];
-	const get = (...locals: number[]) => locals.flatMap((i) => [0x20, i]);
-	const func = (body: number[]) => [...leb(body.length + 2), 0, ...body, 0x0b];
-	const types = [
-		[0x60, 3, 0x7f, 0x7f, 0x7f, 0],
-		[0x60, 2, 0x7f, 0x7f, 0]
-	];
-	return new Uint8Array([
-		...[0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00],
-		...section(1, [types.length, ...types.flat()]),
-		...section(2, [2, ...memory('kernel'), ...memory('user')]),
-		...section(3, [3, 0, 0, 1]),
-		...section(7, [3, ...text('in'), 0, 0, ...text('out'), 0, 1, ...text('zero'), 0, 2]),
-		...section(10, [
-			3,
-			// memory.copy dst src, then memory.fill
-			...func([...get(0, 1, 2), 0xfc, 0x0a, 0, 1]),
-			...func([...get(1, 0, 2), 0xfc, 0x0a, 1, 0]),
-			...func([...get(0), 0x41, 0, ...get(1), 0xfc, 0x0b, 1])
-		])
-	]);
-}
-
-// workers-types declare Module abstract; the constructor is real at startup
-const Module = WebAssembly.Module as unknown as new (bytes: BufferSource) => WebAssembly.Module;
-// a host that cannot compile it (or link two shared memories) copies through views instead
-const COPIER = (() => {
-	try {
-		return new Module(copierBytes());
-	} catch {
-		return null;
-	}
-})();
-
 /** the same copies through typed arrays, slower than the module's */
 export function jsCopier(kernel: WebAssembly.Memory, user: WebAssembly.Memory): Copier {
 	const bytes = (m: WebAssembly.Memory) => new Uint8Array(m.buffer);
@@ -150,11 +117,16 @@ export function jsCopier(kernel: WebAssembly.Memory, user: WebAssembly.Memory): 
 	};
 }
 
-function makeCopier(kernel: WebAssembly.Memory, user: WebAssembly.Memory): Copier {
-	if (COPIER) {
+/** the module's copies when it is given and links these memories, else the views' */
+function makeCopier(
+	kernel: WebAssembly.Memory,
+	user: WebAssembly.Memory,
+	copy?: WebAssembly.Module
+): Copier {
+	if (copy) {
 		try {
-			const env = { kernel, user };
-			return new WebAssembly.Instance(COPIER, { env }).exports as unknown as Copier;
+			return new WebAssembly.Instance(copy, { env: { kernel, user } })
+				.exports as unknown as Copier;
 		} catch {}
 	}
 	return jsCopier(kernel, user);
