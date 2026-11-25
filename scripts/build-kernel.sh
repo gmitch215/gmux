@@ -27,7 +27,19 @@ wasm2wat --enable-threads --enable-exceptions --generate-names "$in/busybox.wasm
 "$root/scripts/ts" "$root/scripts/wasm/guard-pass.ts" "$tmp/busybox.wat" "$tmp/busybox.guard.wat" --inline > /dev/null
 wat2wasm --enable-threads --enable-exceptions --enable-multi-memory "$tmp/busybox.guard.wat" -o "$tmp/busybox.guard.wasm"
 "$root/scripts/wasm/instrument.sh" "$tmp/busybox.guard.wasm" "$out/busybox.guard.wasm" "$in/busybox.wasm"
-"$root/scripts/ts" "$root/scripts/wasm/exec-stubs.ts" "$in/initramfs.cpio.gz" "$out/initramfs.bin"
+# lighttpd, the server the site's image starts: instrumented like BusyBox, its stub and the files it
+# reads put into the initramfs (rcS included, so a pipeline out from before it still starts the server)
+lt=
+cpio=$in/initramfs.cpio.gz
+if [ -f "$in/lighttpd.wasm" ]; then
+	"$root/scripts/wasm/instrument.sh" "$in/lighttpd.wasm" "$out/lighttpd.wasm"
+	lt=$(printf ', "lighttpd": "%s"' "$(shasum -a 256 "$in/lighttpd.wasm" | cut -d' ' -f1)")
+	cpio=$tmp/initramfs.cpio.gz
+	"$root/scripts/ts" "$root/scripts/wasm/cpio-overlay.ts" "$in/initramfs.cpio.gz" "$cpio" \
+		bin/lighttpd="$in/lighttpd.wasm" etc/init.d/rcS="$root/src/rootfs/etc/init.d/rcS" \
+		etc/lighttpd.conf="$root/src/rootfs/etc/lighttpd.conf" www/index.html="$root/src/rootfs/www/index.html" > /dev/null
+fi
+"$root/scripts/ts" "$root/scripts/wasm/exec-stubs.ts" "$cpio" "$out/initramfs.bin"
 # the registry keys: the hashes of the unfueled busybox and katybug the stubs carry
 sum=$(shasum -a 256 "$in/busybox.wasm" | cut -d' ' -f1)
 # and the hash of the patches the pipeline built from (scripts/wasm/inputs.ts), which tests/c/run.ts checks
@@ -38,11 +50,11 @@ if [ -f "$in/katybug.wasm" ]; then
 	"$root/scripts/wasm/instrument.sh" "$in/katybug.wasm" "$out/katybug.wasm"
 	kb=$(printf ', "katybug": "%s"' "$(shasum -a 256 "$in/katybug.wasm" | cut -d' ' -f1)")
 fi
-# and the builds a checkpoint can unwind, which the site runs
+# and the builds a checkpoint can unwind, which the site runs (busybox from the share build above)
 "$root/scripts/wasm/asyncify.sh" "$out"
 # and the hash of everything the site's machine is made of, which a bootstrap image
 # (scripts/bootstrap.ts) must have been taken from to be used
 image=$(cd "$out" && cat vmlinux.async.wasm busybox.async.wasm busybox.guard.wasm initramfs.bin \
-	$([ -f katybug.wasm ] && echo katybug.wasm) | shasum -a 256 | cut -d' ' -f1)
-printf '{ "busybox": "%s"%s%s, "image": "%s" }\n' "$sum" "$kb" "$inputs" "$image" > "$out/manifest.json"
+	$([ -f katybug.wasm ] && echo katybug.wasm) $([ -n "$lt" ] && echo lighttpd.async.wasm) | shasum -a 256 | cut -d' ' -f1)
+printf '{ "busybox": "%s"%s%s%s, "image": "%s" }\n' "$sum" "$kb" "$lt" "$inputs" "$image" > "$out/manifest.json"
 ls -la "$out"

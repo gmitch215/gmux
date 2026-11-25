@@ -1,0 +1,7 @@
+{
+	"lighttpd": {
+		"url": "https://download.lighttpd.net/lighttpd/releases-1.4.x/lighttpd-1.4.76.tar.gz",
+		"sha256": "ba14a030889518194fd88b33e419d51cc38c8fe917126d5a7a965be79b53e995",
+		"license": "BSD-3-Clause"
+	}
+}

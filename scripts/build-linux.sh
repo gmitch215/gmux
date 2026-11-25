@@ -155,6 +155,15 @@ for c in adler32 compress crc32 deflate infback inffast inflate inftrees trees u
 	zsrc="$zsrc /rig/$(basename "$zlib")/$c.c"
 done
 
+# REGION_PROGRAMS=<dir>: the hot blocks of the pinned programs in it (src/regions.json) become regions built into katybug
+regions=
+if [ -n "${REGION_PROGRAMS:-}" ]; then
+	"$root/scripts/build-regions.sh" "$work/out/regions" "$REGION_PROGRAMS" >> "$work/out/build.log"
+	if [ -f "$work/out/regions/aot.c" ]; then
+		regions="-DKB_AOT -DKB_EPOCH=1 -DKB_FLAT=1048576 -I/rig/repo/src/gmux/katybug /rig/out/regions/aot.c"
+	fi
+fi
+
 # the initramfs from sorted entries owned by root with one timestamp, and no gzip name or time
 run "out=/rig/out/initramfs.cpio
 	cp /rig/linux-wasm/patches/initramfs/initramfs-base.cpio \$out
@@ -174,7 +183,7 @@ run "out=/rig/out/initramfs.cpio
 	(cd /rig/probes-tmp && LINUX_WASM=/rig/linux-wasm REAL_LLVM=$W/install/llvm/bin TMPDIR=/rig/probes-tmp \
 		/rig/repo/scripts/cc-strict --target=wasm-linux-musl -march=wasm32 --sysroot=$W/install/musl-$V \
 		-fPIC -O2 -Wl,-shared -D_DEFAULT_SOURCE -DKB_ZLIB -I/rig/$(basename "$zlib") /rig/repo/src/gmux/katybug/*.c \
-		$zsrc -o /rig/rootfs/bin/katybug -lc)
+		$regions $zsrc -o /rig/rootfs/bin/katybug -lc)
 	cd /rig/rootfs && pack
 	gzip -n -9 -c \$out > \$out.gz"
 
@@ -202,10 +211,12 @@ if [ -n "$pristine" ] && [ -n "$(git -C "$pristine" status --porcelain)" ]; then
 	echo "the build wrote into the kernel checkout it shares with $pristine; fetch a new KERNEL_CACHE" >&2
 	exit 1
 fi
+# lighttpd, the server the site's image starts
+CPUS=$cpus MEMORY=${MEMORY:-12g} "$root/scripts/build-lighttpd.sh" "$work" "$work/out/lighttpd.wasm" >> "$work/out/build.log"
 cp "$lw/workspace/install/kernel-$V/vmlinux.wasm" "$work/out/"
 cp "$lw/workspace/install/busybox-$V/bin/busybox" "$work/out/busybox.wasm"
 cp "$lw/workspace/install/musl-$V/lib/libc.a" "$work/out/"
 cp "$work/rootfs/bin/katybug" "$work/out/katybug.wasm"
-(cd "$work/out" && sha256sum vmlinux.wasm busybox.wasm katybug.wasm libc.a initramfs.cpio.gz probes/*.wasm probes/libz.so probes/libcallback.so > SHA256SUMS)
+(cd "$work/out" && sha256sum vmlinux.wasm busybox.wasm katybug.wasm lighttpd.wasm libc.a initramfs.cpio.gz probes/*.wasm probes/libz.so probes/libcallback.so > SHA256SUMS)
 ts "$root/scripts/wasm/inputs.ts" "$work/repo" > "$work/out/INPUTS"
 cat "$work/out/SHA256SUMS"

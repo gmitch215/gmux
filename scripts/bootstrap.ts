@@ -4,7 +4,7 @@ import { join } from 'node:path';
 import { type BootstrapIndex, CHUNK, packImage } from '../src/worker/bootstrap.ts';
 import { encodeSnapshot } from '../src/worker/durable.ts';
 import { Machine } from '../src/worker/machine/machine.ts';
-import { CMDLINE, MAXIMUM_PAGES, siteOptions } from '../src/worker/site-machine.ts';
+import { MAXIMUM_PAGES, siteOptions } from '../src/worker/site-machine.ts';
 import { checkRestores } from './restore-gap.ts';
 import { hostRuntime } from './wasm/router-modules.ts';
 
@@ -30,6 +30,7 @@ const CHAIN = 60;
 const manifest = JSON.parse(kernel('manifest.json').toString()) as {
 	busybox: string;
 	katybug: string;
+	lighttpd?: string;
 	image?: string;
 };
 if (!manifest.image)
@@ -52,6 +53,9 @@ const options = siteOptions(
 		busybox: new WebAssembly.Module(kernel('busybox.async.wasm')),
 		busyboxGuard: new WebAssembly.Module(kernel('busybox.guard.wasm')),
 		katybug: new WebAssembly.Module(kernel('katybug.wasm')),
+		lighttpd: manifest.lighttpd
+			? new WebAssembly.Module(kernel('lighttpd.async.wasm'))
+			: undefined,
 		runtime: hostRuntime(),
 		initrd: new Uint8Array(kernel('initramfs.bin')),
 		manifest
@@ -84,7 +88,7 @@ const { blocks, chunks } = packImage(snapshot.memory);
 const index: BootstrapIndex = {
 	version: 1,
 	image: manifest.image,
-	cmdline: CMDLINE,
+	cmdline: options.cmdline!,
 	maximumPages: MAXIMUM_PAGES,
 	byteLength: snapshot.memory.byteLength,
 	chunkBytes: CHUNK,

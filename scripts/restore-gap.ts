@@ -39,6 +39,9 @@ function openImage(assets: string, kernel: string) {
 			busybox: new WebAssembly.Module(read('busybox.async.wasm')),
 			busyboxGuard: new WebAssembly.Module(read('busybox.guard.wasm')),
 			katybug: new WebAssembly.Module(read('katybug.wasm')),
+			lighttpd: manifest.lighttpd
+				? new WebAssembly.Module(read('lighttpd.async.wasm'))
+				: undefined,
 			runtime: hostRuntime(),
 			initrd: new Uint8Array(read('initramfs.bin')),
 			manifest
