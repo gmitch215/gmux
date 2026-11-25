@@ -19,6 +19,8 @@ cu=$(cd "$(dirname "$cu")" && pwd)/$(basename "$cu")
 out=$(mktemp -d)
 rig=gmux-rig/k34-sha256
 cc -std=c11 -D_DEFAULT_SOURCE -D_DARWIN_C_SOURCE -O2 -Wall -Wextra -Werror -o "$out/katybug" "$root"/src/gmux/katybug/*.c -lm
+# the same with the carry-less fold left out, so the kernel takes slice-by-16
+cc -std=c11 -D_DEFAULT_SOURCE -D_DARWIN_C_SOURCE -DKB_NO_FOLD -O2 -Wall -Wextra -Werror -o "$out/katybug-slice" "$root"/src/gmux/katybug/*.c -lm
 "$llvm/clang" --target=x86_64-linux-gnu -nostdlib -static -fuse-ld=lld -O2 -ffreestanding -fno-stack-protector \
 	-fno-builtin -mno-sse -mno-mmx -mno-red-zone -o "$out/cksum-faults" "$here/cksum-faults.c"
 fail=0
@@ -56,28 +58,45 @@ rm -f "$out/p.log"
 same "$here/cksum-faults.expected" "$out/faults.off" "cksum-faults: kernel off differs from native"
 same "$here/cksum-faults.expected" "$out/faults.on" "cksum-faults: kernel on differs from native"
 ran "cksum-faults" "$out/p.log"
+# a declined loop is not retried on every iteration: 51 calls ran as kernels, and 40 entries gave up (1,638 without
+# the memory of a declined loop)
+grep -q "cksum 51 (40 gave up)" "$out/p.log" || {
+	echo "FAIL cksum-faults: $(grep -o 'cksum [0-9]* ([0-9]* gave up)' "$out/p.log"), want cksum 51 (40 gave up)"
+	fail=1
+}
+rm -f "$out/p.log"
+(cd "$out" && KATYBUG_STATS=1 KATYBUG_PRIM_LOG="$out/p.log" ./katybug-slice ./cksum-faults "$cu" > faults.slice)
+same "$here/cksum-faults.expected" "$out/faults.slice" "cksum-faults: slice-by-16 kernel differs from native"
+ran "cksum-faults, slice-by-16" "$out/p.log"
+grep -q "cksum 51 (40 gave up)" "$out/p.log" || {
+	echo "FAIL cksum-faults, slice-by-16: $(grep -o 'cksum [0-9]* ([0-9]* gave up)' "$out/p.log"), want cksum 51 (40 gave up)"
+	fail=1
+}
 echo "$(wc -l < "$out/faults.on") fault-case lines, $(grep -c fault "$out/faults.on") with a fault"
 
 # the files in one command, a redirect and a pipe
 ssh "$host" "cd ~/$rig && $gen && { ./coreutils --coreutils-prog=cksum $files; ./coreutils --coreutils-prog=cksum < big; cat big | ./coreutils --coreutils-prog=cksum; echo rc \$?; }" \
 	> "$out/files.native"
-for arm in off on; do
+for arm in off on slice; do
 	rm -f "$out/p.log"
+	kb=katybug
 	if [ $arm = off ]; then export KATYBUG_PRIM=0; else unset KATYBUG_PRIM; fi
+	[ $arm = slice ] && kb=katybug-slice
 	(
 		cd "$out/w"
 		export KATYBUG_STATS=1 KATYBUG_PRIM_LOG="$out/p.log"
 		{
-			"$out/katybug" "$cu" --coreutils-prog=cksum $files 2> /dev/null
-			"$out/katybug" "$cu" --coreutils-prog=cksum < big 2> /dev/null
-			cat big | "$out/katybug" "$cu" --coreutils-prog=cksum 2> /dev/null
+			"$out/$kb" "$cu" --coreutils-prog=cksum $files 2> /dev/null
+			"$out/$kb" "$cu" --coreutils-prog=cksum < big 2> /dev/null
+			cat big | "$out/$kb" "$cu" --coreutils-prog=cksum 2> /dev/null
 			echo "rc $?"
 		} > ../files.$arm
 	)
-	[ $arm = on ] && ran "files, redirect and pipe" "$out/p.log"
+	[ $arm != off ] && ran "files, redirect and pipe, $arm" "$out/p.log"
 done
 unset KATYBUG_PRIM
 same "$out/files.native" "$out/files.on" "files: kernel on differs from native"
+same "$out/files.native" "$out/files.slice" "files: slice-by-16 kernel differs from native"
 same "$out/files.native" "$out/files.off" "files: kernel off differs from native"
 echo "$(wc -l < "$out/files.on") lines"
 exit $fail

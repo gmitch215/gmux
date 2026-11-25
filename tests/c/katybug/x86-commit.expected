@@ -33,6 +33,7 @@ flags-nz 1 8 4 1 0
 flags-flip 1 8 68 1 4660
 flags-skip 1 8 10 0 0
 regs 21845 8 3 0 0
+syscall 0 133 1 2 0
 sigloop 1 0 0 5000 0
 adc 974956261759254951 0 0 0 0
 incdec 0 0 0 1 0

@@ -6,6 +6,10 @@
     #define NR_WRITE 1
     #define NR_MMAP 9
     #define NR_MPROTECT 10
+    #define NR_MUNMAP 11
+    #define NR_FORK 57
+    #define FORK_FLAGS 0
+    #define NR_WAIT4 61
     #define NR_SIGACTION 13
     #define NR_FUTEX 202
     #define NR_EXIT 60
@@ -55,6 +59,10 @@ static void patch_alias(unsigned char* volatile* pp, long idx, int v) {
 static void patch_word(int v, unsigned char* out) {
     out[0] = (unsigned char) v;
 }
+/* the first four bytes of a function that returns v */
+static unsigned long fn_word(int v) {
+    return 0xb8ul | (unsigned long) v << 8;
+}
 /* smc_self(v): stores v over the immediate of the next instruction in the same
  * block, which returns it */
 __asm__(".text\n.globl smc_self\nsmc_self:\n"
@@ -65,6 +73,10 @@ __asm__(".text\n.globl smc_self\nsmc_self:\n"
     #define NR_WRITE 64
     #define NR_MMAP 222
     #define NR_MPROTECT 226
+    #define NR_MUNMAP 215
+    #define NR_FORK 220 /* clone with SIGCHLD */
+    #define FORK_FLAGS 17
+    #define NR_WAIT4 260
     #define NR_SIGACTION 134
     #define NR_FUTEX 98
     #define NR_EXIT 93
@@ -122,6 +134,9 @@ static void patch_alias(unsigned char* volatile* pp, long idx, int v) {
 static void patch_word(int v, unsigned char* out) {
     unsigned w = 0x52800000u | (unsigned) v << 5;
     for (int i = 0; i < 4; i++) out[i] = (unsigned char) (w >> (8 * i));
+}
+static unsigned long fn_word(int v) {
+    return 0x52800000ul | (unsigned long) v << 5;
 }
 /* smc_self(v): stores movz w0, #v over the next instruction in the same
  * block, which returns it */
@@ -536,6 +551,156 @@ static void smc_jit(long n) {
     line("smc-jit", sum, want, 0, 0, 0);
 }
 
+/* the smc-data loop with its data on a page that is not executable: the control
+ * for smc-data, which differs from it in nothing but the page's rights */
+static void plain_data(long n) {
+    map(CODE, PAGE, 7);
+    put_fn((unsigned char*) CODE, 6);
+    sync_code((void*) CODE);
+    sys6(NR_MPROTECT, CODE, PAGE, PROT_R | PROT_X, 0, 0, 0);
+    map(DATA, PAGE, 3);
+    volatile long* d = (volatile long*) (DATA + 1024);
+    long sum = 0;
+    for (long i = 0; i < n; i++) {
+        d[i & 31] = i;
+        ((volatile unsigned char*) (DATA + 2048))[i & 255] = (unsigned char) i;
+        sum += call_code() + d[i & 31] - i;
+    }
+    line("plain-data", sum, n * 6, 0, 0, 0);
+}
+
+/* a store site on a page that is writable and executable keeps what it learned
+ * about the page, so each of these reaches that site again after the page
+ * changed under it; the calls go through a pointer, which keeps a call site
+ * from carrying its own copy of the store (and its own cache) */
+__attribute__((noinline)) static void patch_body(long at, int v) {
+    patch((unsigned char*) at, v);
+}
+static void (*volatile patch_at)(long, int) = patch_body;
+
+static void warm_site(void) {
+    for (int i = 0; i < 4; i++) patch_at(CODE + 512 + 16 * i, i + 1);
+}
+
+/* the site wrote data of the page; then a block is decoded from the page, and
+ * the site's next stores land in that block's bytes */
+static void wx_decode(void) {
+    map(CODE, PAGE, 7);
+    put_fn((unsigned char*) (CODE + 2048), 1);
+    sync_code((void*) (CODE + 2048));
+    warm_site();
+    int (*volatile f)(void) = (int (*)(void))(CODE + 2048);
+    long sum = 0, want = 0;
+#pragma clang loop unroll(disable)
+    for (int i = 0; i < 8; i++) {
+        int v = i % 5 + 1;
+        patch_at(CODE + 2048, v);
+        sum += f();
+        want += v;
+    }
+    line("wx-decode", sum, want, 0, 0, 0);
+}
+
+/* a block decoded from a page that is writable and executable (the guest's own
+ * text is one) drops every store cache, so each case below runs twice: the
+ * first run decodes every block the case needs, leaves the page writable, and
+ * the second run changes the page between the site's stores with nothing new
+ * to decode */
+
+/* the page loses write access after the site wrote it: the next store faults */
+__attribute__((noinline)) static void mprotect_case(long prot) {
+    map(CODE, PAGE, 7);
+    warm_site();
+    sys6(NR_MPROTECT, CODE, PAGE, prot, 0, 0, 0);
+    reset(7, 0, (volatile unsigned char*) (CODE + 513));
+    patch_at(CODE + 512, 9);
+}
+
+static void wx_mprotect(void) {
+    mprotect_case(7);
+    mprotect_case(PROT_R | PROT_X);
+    line(
+        "wx-mprotect", hits, fcode, faddr - CODE, fbyte,
+        ((volatile unsigned char*) CODE)[513]
+    );
+}
+
+/* the page is unmapped and mapped again without write access: the site's next
+ * store faults */
+__attribute__((noinline)) static void munmap_case(long prot) {
+    map(CODE, PAGE, 7);
+    warm_site();
+    sys6(NR_MUNMAP, CODE, PAGE, 0, 0, 0, 0);
+    map(CODE, PAGE, prot);
+    reset(7, 0, 0);
+    patch_at(CODE + 512, 9);
+}
+
+static void wx_munmap(void) {
+    munmap_case(7);
+    munmap_case(PROT_R | PROT_X);
+    line(
+        "wx-munmap", hits, fcode, faddr - CODE,
+        ((volatile unsigned char*) CODE)[513], 0
+    );
+}
+
+/* the child patches code its parent decoded; the parent's copy is its own */
+static void wx_fork(void) {
+    map(CODE, PAGE, 7);
+    put_fn((unsigned char*) (CODE + 2048), 1);
+    sync_code((void*) (CODE + 2048));
+    warm_site();
+    int (*volatile f)(void) = (int (*)(void))(CODE + 2048);
+    long first = f();
+    long pid = sys6(NR_FORK, FORK_FLAGS, 0, 0, 0, 0, 0);
+    if (pid == 0) {
+        patch_at(CODE + 2048, 5);
+        long code = f();
+        sys6(NR_EXIT, code, 0, 0, 0, 0, 0);
+    }
+    int st = 0;
+    sys6(NR_WAIT4, pid, (long) &st, 0, 0, 0, 0);
+    patch_at(CODE + 2048, 7);
+    line("wx-fork", (st >> 8) & 255, f(), first, 0, 0);
+}
+
+__attribute__((noinline)) static void store8_body(long at, unsigned long v) {
+    *(volatile unsigned long*) at = v;
+}
+static void (*volatile store8_at)(long, unsigned long) = store8_body;
+
+/* a store that starts on one page and ends on the next, where the first page
+ * has no code and the second has the function it rewrites; the pages are ones
+ * no other case marks */
+#define EDGE (HOLE + 0x10000L)
+__attribute__((noinline)) static void edge_pass(long* sum, long* want) {
+    put_fn((unsigned char*) (EDGE + PAGE), 1);
+    sync_code((void*) (EDGE + PAGE));
+    int (*volatile f)(void) = (int (*)(void))(EDGE + PAGE);
+    *sum = f();
+    *want = 1;
+    store8_at(EDGE + PAGE - 64, 0);
+#pragma clang loop unroll(disable)
+    for (int i = 0; i < 6; i++) {
+        int v = i + 2;
+        store8_at(EDGE + PAGE - 4, fn_word(v) << 32);
+        sync_code((void*) (EDGE + PAGE));
+        *sum += f();
+        *want += v;
+    }
+}
+
+/* the second pass finds nothing new to decode, so the first store's cache
+ * outlives the call that filled it */
+static void wx_edge(void) {
+    map(EDGE, 2 * PAGE, 7);
+    long sum, want;
+    edge_pass(&sum, &want);
+    edge_pass(&sum, &want);
+    line("wx-edge", sum, want, 0, 0, 0);
+}
+
 /* #endregion */
 
 static long atoi_(const char* s) {
@@ -580,6 +745,12 @@ void rights_main(long* sp) {
     if (pick(only, "smc-self")) smc_own();
 #endif
     if (pick(only, "smc-thread")) smc_thread();
+    if (pick(only, "wx-decode")) wx_decode();
+    if (pick(only, "wx-mprotect")) wx_mprotect();
+    if (pick(only, "wx-munmap")) wx_munmap();
+    if (pick(only, "wx-edge")) wx_edge();
+    if (pick(only, "wx-fork")) wx_fork();
+    if (same(only, "plain-data")) plain_data(n);
     if (same(only, "smc-data")) smc_data(n);
     if (same(only, "smc-jit")) smc_jit(n);
     sys6(NR_WRITE, 1, (long) out, used, 0, 0, 0);

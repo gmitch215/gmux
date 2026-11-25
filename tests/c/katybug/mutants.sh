@@ -51,7 +51,7 @@ if mutant no-exec-check mem.c 'if (acc == KB_X) return m->prot & KB_X;' 'if (acc
 	differs no-exec-check rights-x86 rights-x86.expected fetch-nx
 	differs no-exec-check rights-a64 rights-a64.expected fetch-nx
 fi
-if mutant no-mark-check mem.c 'if (!cpu->nmarks || !len) return;' 'return;'; then
+if mutant no-mark-check mem.c 'if (!cpu->nmarks || !len) return 0;' 'return 0;'; then
 	differs no-mark-check rights-x86 rights-x86.expected smc-store
 	differs no-mark-check rights-a64 rights-a64.expected smc-store
 fi
@@ -64,5 +64,20 @@ fi
 if mutant no-revalidation run.c 'if (kb_marks_current(cpu, b)) return 1;' 'if (b->npv >= 0) return 1;'; then
 	differs no-revalidation rights-x86 rights-x86.expected smc-store
 	differs no-revalidation rights-a64 rights-a64.expected smc-store
+fi
+# the store caches of pages that are writable and executable: marking more bytes of the page leaves them be
+if mutant wx-no-version mem.c 'if (fresh) cpu->mapgen++, KB_BUMP_AS(map);' '(void) fresh;'; then
+	differs wx-no-version rights-x86 rights-x86.expected wx-decode
+	differs wx-no-version rights-a64 rights-a64.expected wx-decode
+fi
+# a protection change leaves them be
+if mutant wx-survives-mprotect mem.c $'            m->prot = prot;\n        }\n    }\n    changed(cpu);' $'            m->prot = prot;\n        }\n    }'; then
+	differs wx-survives-mprotect rights-x86 rights-x86.expected wx-mprotect
+	differs wx-survives-mprotect rights-a64 rights-a64.expected wx-mprotect
+fi
+# a cache spans the whole piece where the page has no marks, across a page edge
+if mutant wx-past-page mem.c 'uint64_t s = base, e = base + 4096;' 'uint64_t s = plo, e = phi;'; then
+	differs wx-past-page rights-x86 rights-x86.expected wx-edge
+	differs wx-past-page rights-a64 rights-a64.expected wx-edge
 fi
 exit $failed

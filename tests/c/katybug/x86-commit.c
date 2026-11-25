@@ -831,9 +831,7 @@ void commit_main(long* sp) {
         c_st(pg + 8, 0x5555L);
         line("regs", h_rbx, h_rcx - pg, h_rdx, 0, 0);
     }
-    /* katybug leaves r11 at 0x246 after a syscall, so only a named run prints
-     * this */
-    if (only && pick(only, "syscall")) {
+    if (pick(only, "syscall")) {
         long o[3];
         c_syscall(o);
         line(

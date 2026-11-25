@@ -67,12 +67,22 @@ cc -std=c11 -O2 -Wall -Wextra -Werror -DFROM_KERNEL -o "$out/libm-tables" "$here
 "$llvm/clang" --target=aarch64-linux-gnu "${flags[@]}" -Wl,-N -mgeneral-regs-only -o "$out/rights-a64" "$here/rights.c"
 "$llvm/clang" --target=x86_64-linux-gnu "${flags[@]}" -Wl,-N -mno-sse -mno-mmx -o "$out/region-smc-x86" "$here/x86-region-smc.c"
 "$llvm/clang" --target=x86_64-linux-gnu "${flags[@]}" -mno-sse -mno-mmx -o "$out/persist-x86" "$here/x86-persist.c"
+"$llvm/clang" --target=x86_64-linux-gnu "${flags[@]}" -mno-sse -mno-mmx -o "$out/fork-x86" "$here/x86-fork.c"
 "$llvm/clang" --target=x86_64-linux-gnu -nostdlib -static -fuse-ld=lld -o "$out/hello-x86" "$here/hello-x86.S"
 "$llvm/clang" --target=aarch64-linux-gnu -nostdlib -static -fuse-ld=lld -o "$out/hello-a64" "$here/hello-a64.S"
+# a small region set in the build option the module ships with: loops-x86's executed blocks are dumped by a -DKB_HOT build,
+# lifted with the epoch guard and built in with every source (-DKB_AOT, -DKB_EPOCH=1, the flat backing)
+cc -std=c11 -D_DEFAULT_SOURCE -D_DARWIN_C_SOURCE -DKB_ZLIB -O2 -DKB_HOT -o "$out/katybug-hot" "$root"/src/gmux/katybug/*.c -lm -lz
+mkdir -p "$out/hot-loops"
+KATYBUG_SEGMENTS=1 KATYBUG_HOT="$out/hot-loops" "$out/katybug-hot" "$out/loops-x86" > /dev/null 2>&1 || true
+"$root/scripts/ts" "$root/experiments/aot-oracle/scripts/lift.ts" --temps --windows --regs --only=1 --epochs \
+	"$out/aot-loops.c" 1 "$(ls -S "$out"/hot-loops/*.hot | head -1)" 2> "$out/aot-loops.log"
+cc -std=c11 -D_DEFAULT_SOURCE -D_DARWIN_C_SOURCE -DKB_ZLIB -O2 -DKB_AOT -DKB_COUNT -DKB_EPOCH=1 -DKB_FLAT=1048576 \
+	-I"$root/src/gmux/katybug" -o "$out/katybug-aot" "$root"/src/gmux/katybug/*.c "$out/aot-loops.c" -lm -lz
 
 # the ELFs for tests/c/run.ts's katybug probe, which runs them inside a machine
 mkdir -p "$root/build/katybug"
-cp "$out"/hello-x86 "$out"/hello-a64 "$out"/guest-x86 "$out"/guest-a64 "$out"/signals-x86 "$out"/signals-a64 \
+cp "$out"/hello-x86 "$out"/hello-a64 "$out"/guest-x86 "$out"/guest-a64 "$out"/signals-x86 "$out"/signals-a64 "$out"/flat-x86 \
 	"$root/build/katybug/"
 
 failed=0
@@ -160,6 +170,16 @@ check loops-x86-small-pieces "$(cat "$here/x86-loops.expected")" 0 "$out/katybug
 check loops-x86-guard "$(cat "$here/x86-loops.expected")" 0 "$out/katybug-epoch" "$out/loops-x86"
 check loops-x86-flat "$(cat "$here/x86-loops.expected")" 0 "$out/katybug-flat" "$out/loops-x86"
 check loops-x86-flat-guard "$(cat "$here/x86-loops.expected")" 0 "$out/katybug-flat-epoch" "$out/loops-x86"
+# the same guest on the build with regions: the same output, and the regions are entered
+: > "$out/aot.count"
+check loops-x86-regions "$(cat "$here/x86-loops.expected")" 0 env KATYBUG_COUNT="$out/aot.count" "$out/katybug-aot" "$out/loops-x86"
+aot_entries=$(awk '/^katybug count:/ { for (i = 3; i < NF; i += 2) if ($i == "entries") n += $(i + 1) } END { print n + 0 }' "$out/aot.count")
+if [ "$aot_entries" -gt 0 ]; then
+	echo "PASS loops-x86-regions-entered ($aot_entries entries)"
+else
+	echo "FAIL loops-x86-regions-entered (no region was entered)"
+	failed=1
+fi
 check index-x86-flat "$(cat "$here/x86-index.expected")" 0 "$out/katybug-flat" "$out/index-x86"
 # x86-flat.expected is native Linux's: loads and stores at an index read from memory on a buffer with a hole, a page without
 # protection or write, one remapped by a signal handler or another thread, grown by brk, forked, and read at addresses that
@@ -304,6 +324,35 @@ for a in x86 a64; do
 	check bigsend-$a-small-pieces "$bigsend" 0 "$out/katybug-4k" "$out/bigsend-$a"
 done
 check bigsend-x86-fork-exec "$bigsend" 0 env KATYBUG_FORK=exec "$out/katybug" "$out/bigsend-x86"
+# x86-fork.c: two fork children see the code as it is at the fork, and the parent keeps its own (mode s: code
+# rewritten between the parent's run and the fork, then again in each child; x: rewritten only in the children,
+# after they ran it; y: rewritten in the child before it runs it; c: a function only the child runs); by exec,
+# with every build that changes decoding, and ten times on one KATYBUG_CACHE directory (the child must not
+# use the parent's cache table)
+for mode in s x y c; do
+	case $mode in
+		s) want=$'c 009\nd 005\nc 009\nd 005\np 009\nq 007' ;;
+		x) want=$'c 007\nd 005\nc 007\nd 005\np 007\nq 007' ;;
+		y) want=$'c 005\nd 006\nc 005\nd 006\np 007\nq 007' ;;
+		c) want=$'c 029\nd 107\ne 107\nc 029\nd 107\ne 107\np 107\nq 107' ;;
+	esac
+	check fork-x86-$mode "$want" 0 "$out/katybug" "$out/fork-x86" $mode
+	for build in katybug katybug-4k katybug-epoch katybug-flat; do
+		check fork-x86-$mode-exec-$build "$want" 0 env KATYBUG_FORK=exec "$out/$build" "$out/fork-x86" $mode
+	done
+	for i in 1 2 3 4 5 6 7 8 9 10; do
+		mkdir -p "$out/cache-fork-$mode"
+		check fork-x86-$mode-cache-$i "$want" 0 env KATYBUG_FORK=exec KATYBUG_CACHE="$out/cache-fork-$mode" "$out/katybug" "$out/fork-x86" $mode
+	done
+done
+# the second child takes blocks the first one reported (a table of the parent's), the first takes none
+taken=$( (KATYBUG_STATS=1 KATYBUG_FORK=exec "$out/katybug" "$out/fork-x86" x 2>&1 > /dev/null || true) | (grep -o '[0-9]* taken from a table' || true) | cut -d' ' -f1)
+if [ -n "$taken" ] && [ "$taken" -gt 0 ] 2> /dev/null; then
+	echo "PASS fork-x86-table (the second child took $taken)"
+else
+	echo "FAIL fork-x86-table (blocks taken from the parent's table: '$taken')"
+	failed=1
+fi
 # prio.c: mknod (x86-64 only), mknodat, getpriority and setpriority, with the errors native Linux
 # gives (EEXIST, ENOENT, EFAULT, EINVAL, ESRCH, EPERM, EACCES for a caller without privilege)
 prio=$'mknod ok\nmknod-exists ok\nmknodat-exists ok\nmknodat ok\nmknod-missing-dir ok\nmknod-fault ok\nmknod-type ok\nmknod-device ok\ngetpriority ok\nsetpriority ok\ngetpriority-raised ok\nsetpriority-lower ok\ngetpriority-which ok\nsetpriority-which ok\ngetpriority-missing ok\nsetpriority-missing ok\nsetpriority-other ok'
@@ -393,7 +442,7 @@ check signals-a64-ignored "$ignored" 143 bash -c "trap '' PIPE; exec \"\$@\"" - 
 # the block functions of the hash kernels (hash.c) against openssl, across the padding boundaries
 cc -std=c11 -D_DEFAULT_SOURCE -D_DARWIN_C_SOURCE -O2 -Wall -Wextra -Werror -o "$out/hashbench" \
 	"$root/experiments/string-kernels/hashbench.c" "$root/src/gmux/katybug/hash.c"
-for n in 0 1 3 55 56 63 64 65 111 112 119 120 128 129 256 1000; do
+for n in 0 1 3 15 16 17 31 32 33 55 56 63 64 65 111 112 119 120 127 128 129 256 1000; do
 	if [ $n = 0 ]; then : > "$out/hash-in"; else seq 1 1000 | head -c $n > "$out/hash-in"; fi
 	for a in md5 sha1 sha256 sha512; do
 		check hash-blocks-$a-$n "$(openssl dgst -$a < "$out/hash-in" | sed 's/.* //')" 0 \
@@ -401,5 +450,20 @@ for n in 0 1 3 55 56 63 64 65 111 112 119 120 128 129 256 1000; do
 	done
 	check hash-blocks-cksum-$n "$(cksum < "$out/hash-in")" 0 \
 		bash -c '"$0" check "$1" < "$2"' "$out/hashbench" cksum "$out/hash-in"
+done
+# the cksum steps over the polynomial's own table (hash.c) against the table kernel at every length, the
+# carry-less fold where this host has one and slice-by-16 with it left out
+for variant in fold slice16; do
+	flag=
+	[ $variant = slice16 ] && flag=-DKB_NO_FOLD
+	cc -std=c11 -D_DEFAULT_SOURCE -D_DARWIN_C_SOURCE $flag -O2 -Wall -Wextra -Werror -o "$out/cksum-fold-$variant" \
+		"$here/cksum-fold.c" "$root/src/gmux/katybug/hash.c"
+	got=$("$out/cksum-fold-$variant" || true)
+	if [[ "$got" == *", ok" ]]; then
+		echo "PASS cksum-fold-$variant ($got)"
+	else
+		echo "FAIL cksum-fold-$variant: $got"
+		failed=1
+	fi
 done
 exit $failed

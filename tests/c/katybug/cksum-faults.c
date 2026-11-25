@@ -10,6 +10,7 @@
 #define NR_WRITE 1
 #define NR_OPEN 2
 #define NR_MMAP 9
+#define NR_MPROTECT 10
 #define NR_MUNMAP 11
 #define NR_SIGACTION 13
 #define NR_PREAD 17
@@ -173,6 +174,15 @@ static void call(
     used = 0;
 }
 
+static char nm[48];
+static void tmp_name(int row, int last) {
+    const char* s = last ? "table row N last entry changed"
+                         : "table row N first entry changed";
+    int n = 0;
+    for (; *s; s++) nm[n++] = *s == 'N' ? (char) ('0' + row) : *s;
+    nm[n] = 0;
+}
+
 void cksum_main(long* sp) {
     char* path = (char*) sp[2];
     struct ksigaction a = {on_segv, SA_SIGINFO | SA_RESTORER, restore_rt, 0};
@@ -251,6 +261,82 @@ void cksum_main(long* sp) {
     call("table runs into the hole", A, D, 4096, 0x55aa55aa, A + 4096 - 4000);
     call("table runs off its mapping", E, D, 4096, 0x55aa55aa, E + 4096);
     call("table in PROT_NONE", C, D, 4096, 9, C + 4096 - 8);
+
+    /* G: a writable copy of the table; H: a copy across two mappings; X: an
+     * execute-only page; M: three pages, the last one made PROT_NONE and back
+     */
+    char* G = A + 0x220000;
+    char* H = A + 0x230000;
+    char* X = A + 0x240000;
+    char* M = A + 0x300000;
+    sys6(NR_MMAP, (long) G, 8192, 3, MAP_FIXED_ANON, -1, 0);
+    sys6(NR_MMAP, (long) H, 4096, 3, MAP_FIXED_ANON, -1, 0);
+    sys6(NR_MMAP, (long) (H + 4096), 4096, 3, MAP_FIXED_ANON, -1, 0);
+    sys6(NR_MMAP, (long) X, 12288, 3, MAP_FIXED_ANON, -1, 0);
+    sys6(NR_MMAP, (long) M, 12288, 3, MAP_FIXED_ANON, -1, 0);
+    for (int i = 0; i < TABLE_LEN; i++) G[i] = E[i];
+    for (int i = 0; i < 12288; i++) X[i] = (char) (i * 3 + 9);
+    for (int i = 0; i < 12288; i++) M[i] = (char) (i * 17 + (i >> 4));
+    /* the table's first and last entry of every row changed, one at a time,
+     * over a chunk long enough to look every entry up */
+    for (int k = 0; k < 8; k++)
+        for (int last = 0; last < 2; last++) {
+            int at = 4 * (k * 256 + (last ? 255 : 0));
+            G[at] ^= 1;
+            tmp_name(k, last);
+            call(nm, D, D, 0x10000, 0x31415926, G);
+            G[at] ^= 1;
+        }
+    call("table copy intact", D, D, 0x10000, 0x31415926, G);
+    /* one process, one table, changed between two calls and put back */
+    call("table about to change", D, D + 8, 0x1000, 3, G);
+    G[0] ^= 1, G[8192 - 4] ^= 0x10;
+    call("table changed", D, D + 8, 0x1000, 3, G);
+    G[0] ^= 1, G[8192 - 4] ^= 0x10;
+    call("table put back", D, D + 8, 0x1000, 3, G);
+    /* the table across two mappings, with its last entry in the second one
+     * changed */
+    for (int i = 0; i < TABLE_LEN; i++) H[i] = E[i];
+    call("copy across two mappings", D, D, 0x10000, 9, H);
+    H[8192 - 1] ^= 0x80;
+    call("copy across two mappings, last entry", D, D, 0x10000, 9, H);
+    /* execute-only pages, where a load faults on the hardware with protection
+     * keys and the kernel must give up as it does on a page without R */
+    sys6(NR_MPROTECT, (long) (X + 4096), 4096, 4, 0, 0, 0);
+    call("data in an execute-only page", X, X + 4096, 4096, 0x77, T);
+    call("data runs into an execute-only page", X, X + 4096 - 16, 64, 0x77, T);
+    call("table in an execute-only page", D, D + 16, 4096, 0x77, X + 4096);
+    call(
+        "table runs into an execute-only page", D, D + 16, 4096, 0x77,
+        X + 4096 - 100
+    );
+    /* lengths of 16n and 16n + 8 bytes, aligned and not */
+    call("32 bytes", D, D + 16, 32, 1, T);
+    call("40 bytes", D, D + 16, 40, 1, T);
+    call("48 bytes", D, D + 16, 48, 1, T);
+    call("64 bytes", D, D + 16, 64, 2, T);
+    call("72 bytes", D, D + 16, 72, 2, T);
+    call("128 bytes", D, D + 24, 128, 3, T);
+    call("136 bytes", D, D + 24, 136, 3, T);
+    call("256 bytes", D, D + 5, 256, 4, T);
+    call("264 bytes", D, D + 5, 264, 4, T);
+    call("1008 bytes", D, D + 3, 1008, 5, T);
+    call("1016 bytes", D, D + 3, 1016, 5, T);
+    call("0x8000 bytes", D, D + 1, 0x8000, 6, T);
+    call("0x8008 bytes", D, D + 1, 0x8008, 6, T);
+    call("ends at the page end, 16n", D, D + 0x10000 - 128, 128, 7, T);
+    call("ends at the page end, 16n + 8", D, D + 0x10000 - 136, 136, 7, T);
+    call("one past the page end, 16n", D, D + 0x10000 - 120, 128, 7, T);
+    call("one past the page end, 16n + 8", D, D + 0x10000 - 128, 136, 7, T);
+    /* a declined loop (it runs into a PROT_NONE page and faults there), then
+     * the page made readable and the same span run again */
+    sys6(NR_MPROTECT, (long) (M + 8192), 4096, 0, 0, 0, 0);
+    call("declined, runs into PROT_NONE", M, M + 4096, 8192, 0x1234, T);
+    call("declined again, same span", M, M + 4096, 8192, 0x1234, T);
+    call("declined, a later entry", M, M + 4096 + 64, 8192 - 64, 0x1234, T);
+    sys6(NR_MPROTECT, (long) (M + 8192), 4096, 3, 0, 0, 0);
+    call("taken after the page is back", M, M + 4096, 8192, 0x1234, T);
+    call("taken, a later entry", M, M + 4096 + 64, 8192 - 64, 0x1234, T);
 
     put("faults ");
     num(faults);
