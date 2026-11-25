@@ -13,9 +13,16 @@ the thread offers the same buffer again later. A kept buffer comes back
 in a release event (the addresses of the buffers, in the event's data)
 and a header on each buffer makes a repeated or invented address free
 nothing.
+
+A buffer holds 32 KiB, which is what the client socket can hold
+(HN_RCVBUF), so one wake moves half as many chunks as with 16 KiB. Buffers
+the host gives back go to a pool of eight that the thread reuses before it
+asks the allocator, and the pool drops to one buffer when no stream is
+left. A release address outside the machine's memory is ignored; the
+header check would have trapped on it.
 ---
- arch/wasm/kernel/hostnet.c | 120 +++++++++++++++++++++++++++++++-----------
- 1 file changed, 82 insertions(+), 38 deletions(-)
+ arch/wasm/kernel/hostnet.c | 141 ++++++++++++++++++++++++++++++++------------
+ 1 file changed, 102 insertions(+), 39 deletions(-)
 
 diff --git a/arch/wasm/kernel/hostnet.c b/arch/wasm/kernel/hostnet.c
 --- a/arch/wasm/kernel/hostnet.c
@@ -29,7 +36,7 @@ diff --git a/arch/wasm/kernel/hostnet.c b/arch/wasm/kernel/hostnet.c
  /* what wasm_net_end tells the host: the guest's end is done, or the stream is gone; hold and release
     pause and resume the host's events for one stream */
  enum { HN_END_FIN, HN_END_RESET, HN_END_HOLD, HN_END_RELEASE };
-@@ -32,16 +32,19 @@
+@@ -32,16 +32,22 @@
  struct hn_event {
  	u32 op;
  	u32 id;
@@ -44,14 +51,18 @@ diff --git a/arch/wasm/kernel/hostnet.c b/arch/wasm/kernel/hostnet.c
 +extern int wasm_net_lend(unsigned int id, const void *buf, unsigned int len);
  extern void wasm_net_end(unsigned int id, int how);
  
- #define HN_BUF		16384
+-#define HN_BUF		16384
++/* what one read of the socket takes: the client socket holds about HN_RCVBUF of payload, so a larger buffer would not fill */
++#define HN_BUF		32768
 +/* wasm_net_lend answers the count with this bit set when it copied the bytes: the buffer is ours again */
 +#define HN_COPIED	0x40000000
 +#define HN_LEND_MAGIC	0x6c656e64686f7374ULL
++/* buffers kept for reuse: the host holds a few at a time for one stream */
++#define HN_POOL		8
  /* SO_RCVBUF of the client socket, which bounds what a slow host reader leaves queued here */
  #define HN_RCVBUF	32768
  /* chunks one stream moves before the others take a turn */
-@@ -49,6 +52,15 @@
+@@ -49,6 +55,15 @@
  
  enum { C_WORK, C_UP, C_FIN_OUT, C_WDONE, C_RDONE };
  
@@ -67,7 +78,7 @@ diff --git a/arch/wasm/kernel/hostnet.c b/arch/wasm/kernel/hostnet.c
  struct hn_conn {
  	struct list_head node;
  	struct socket *sock;
-@@ -58,10 +70,9 @@
+@@ -58,10 +73,9 @@
  	u8 *wtail;
  	u32 wlen;
  	u32 woff;
@@ -80,30 +91,34 @@ diff --git a/arch/wasm/kernel/hostnet.c b/arch/wasm/kernel/hostnet.c
  	void (*data_ready)(struct sock *sk);
  	void (*write_space)(struct sock *sk);
  	void (*state_change)(struct sock *sk);
-@@ -79,7 +90,43 @@
+@@ -79,7 +93,50 @@
  /* only khostnetd touches the list */
  static LIST_HEAD(hn_conns);
  static DEFINE_MUTEX(hn_start);
-+/* a buffer the last read left unused, for the next one */
-+static struct hn_lend *hn_spare;
++/* buffers the thread reuses before it asks the allocator, the one freed last first so its bytes are still warm */
++static struct hn_lend *hn_pool[HN_POOL];
++static unsigned int hn_pooled;
 +
 +static struct hn_lend *hn_lend_get(void)
 +{
-+	struct hn_lend *lend = hn_spare;
-+
-+	if (lend) {
-+		hn_spare = NULL;
-+		return lend;
-+	}
-+	return kmalloc(sizeof(*lend), GFP_KERNEL);
++	if (hn_pooled)
++		return hn_pool[--hn_pooled];
++	return kmalloc(sizeof(struct hn_lend), GFP_KERNEL);
 +}
- 
++
 +static void hn_lend_put(struct hn_lend *lend)
 +{
-+	if (hn_spare)
-+		kfree(lend);
++	if (hn_pooled < HN_POOL)
++		hn_pool[hn_pooled++] = lend;
 +	else
-+		hn_spare = lend;
++		kfree(lend);
++}
+ 
++/* with no stream left only one buffer stays */
++static void hn_pool_trim(void)
++{
++	while (hn_pooled > 1)
++		kfree(hn_pool[--hn_pooled]);
 +}
 +
 +/* the host is done with these buffers (a token is the address of its bytes) */
@@ -114,7 +129,10 @@ diff --git a/arch/wasm/kernel/hostnet.c b/arch/wasm/kernel/hostnet.c
 +	for (i = 0; i < count; i++) {
 +		struct hn_lend *lend = (void *)((unsigned long)tokens[i] - offsetof(struct hn_lend, data));
 +
-+		if (tokens[i] < PAGE_SIZE || lend->magic != (HN_LEND_MAGIC ^ (u64)(unsigned long)lend))
++		/* an address outside the machine's memory is read by nothing: the header check would trap on it */
++		if (tokens[i] < PAGE_SIZE || !virt_addr_valid(lend) ||
++		    !virt_addr_valid((u8 *)lend + sizeof(lend->magic) - 1) ||
++		    lend->magic != (HN_LEND_MAGIC ^ (u64)(unsigned long)lend))
 +			continue;
 +		lend->magic = 0;
 +		hn_lend_put(lend);
@@ -124,7 +142,7 @@ diff --git a/arch/wasm/kernel/hostnet.c b/arch/wasm/kernel/hostnet.c
  __visible int wasm_net_irq(void)
  {
  	return WASM_IRQ_NET;
-@@ -123,7 +170,7 @@
+@@ -123,7 +180,7 @@
  	sock_release(c->sock);
  	list_del(&c->node);
  	kfree(c->wtail);
@@ -133,7 +151,7 @@ diff --git a/arch/wasm/kernel/hostnet.c b/arch/wasm/kernel/hostnet.c
  	kfree(c);
  }
  
-@@ -231,6 +278,10 @@
+@@ -231,6 +288,10 @@
  			hostnet_open(event->id, event->arg);
  			continue;
  		}
@@ -144,7 +162,7 @@ diff --git a/arch/wasm/kernel/hostnet.c b/arch/wasm/kernel/hostnet.c
  		c = hn_find(event->id);
  		if (!c)
  			continue;
-@@ -247,48 +298,48 @@
+@@ -247,48 +308,48 @@
  /* the socket's bytes to the host, until the host is full or the socket has nothing more */
  static bool hostnet_to_host(struct hn_conn *c)
  {
@@ -223,15 +241,18 @@ diff --git a/arch/wasm/kernel/hostnet.c b/arch/wasm/kernel/hostnet.c
  	}
  	/* more may be waiting: come back after the other streams */
  	set_bit(C_WORK, &c->flags);
-@@ -349,7 +400,7 @@
+@@ -349,8 +410,10 @@
  		/* ponytail: a walk of every stream per wake; a ready list when streams number in the thousands */
  		list_for_each_entry_safe(c, next, &hn_conns, node)
  			/* the host's interrupt means room in its buffers: a stream holding bytes retries */
 -			if (test_and_clear_bit(C_WORK, &c->flags) || c->rlen)
 +			if (test_and_clear_bit(C_WORK, &c->flags) || c->rbuf)
  				hn_service(c);
++		if (list_empty(&hn_conns))
++			hn_pool_trim();
  		cond_resched();
  	}
+ 	return 0;
 --
 2.43.0
 
