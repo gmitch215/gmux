@@ -5,6 +5,7 @@
 # usage: CPU=13 LOCK=/tmp/paisley-timing.lock QUIET=<quiet.sh> COREUTILS=<static x86-64 coreutils> hash-run.sh <out dir>
 # LAYOUTS (3) link orders of the katybug sources and REPS (5) samples each; LAYOUTS=1 REPS=1 is the smoke run;
 # a sample waits up to WAITS (8) times 15 s for a quiet reading of 0.5 or less before it runs anyway;
+# TOOLS ("md5sum sha1sum sha256sum sha512sum cksum") picks the tools; CTLSRC and SLICE add the arms ctl and slice (below);
 # ONLY="tool:input:arm ..." keeps those cells; a failed check ends its cell, three in a row end the sweep;
 # the sweep ends with <out dir>/done holding its status, the kernel arm's calls are in <out dir>/equal.txt
 set -uo pipefail
@@ -25,6 +26,21 @@ for ((l = 0; l < layouts; l++)); do
 	s=$((l * ${#srcs[@]} / layouts))
 	cc -std=c11 -D_DEFAULT_SOURCE -O2 -o "$out/bin-$l" "${srcs[@]:$s}" "${srcs[@]:0:$s}" -lm || exit 1
 done
+# CTLSRC (a katybug source dir) adds the arm ctl, those sources built the same way; slice is this tree built with -DKB_NO_FOLD
+# when SLICE is set: ONLY picks the cells of both
+if [ -n "${CTLSRC:-}" ]; then
+	csrcs=("$CTLSRC"/*.c)
+	for ((l = 0; l < layouts; l++)); do
+		s=$((l * ${#csrcs[@]} / layouts))
+		cc -std=c11 -D_DEFAULT_SOURCE -O2 -o "$out/ctl-$l" "${csrcs[@]:$s}" "${csrcs[@]:0:$s}" -lm || exit 1
+	done
+fi
+if [ -n "${SLICE:-}" ]; then
+	for ((l = 0; l < layouts; l++)); do
+		s=$((l * ${#srcs[@]} / layouts))
+		cc -std=c11 -D_DEFAULT_SOURCE -DKB_NO_FOLD -O2 -o "$out/slice-$l" "${srcs[@]:$s}" "${srcs[@]:0:$s}" -lm || exit 1
+	done
+fi
 # the input is AES-128-CTR keystream, key and iv all zero
 gen() { openssl enc -aes-128-ctr -K 00000000000000000000000000000000 -iv 00000000000000000000000000000000 < /dev/zero 2> /dev/null | head -c "$1"; }
 [ -f "$out/in0" ] || : > "$out/in0"
@@ -46,6 +62,8 @@ cmd() { # tool arm layout input
 		native) ;;
 		off) pre="env KATYBUG_PRIM=0 $out/bin-$3 " ;;
 		kernel) pre="env KATYBUG_PRIM=$(prim "$1") $out/bin-$3 " ;;
+		ctl) pre="env KATYBUG_PRIM=$(prim "$1") $out/ctl-$3 " ;;
+		slice) pre="env KATYBUG_PRIM=$(prim "$1") $out/slice-$3 " ;;
 	esac
 	echo "$pre$cu --coreutils-prog=$1 $4"
 }
@@ -55,8 +73,9 @@ precheck() { # tool
 	local t=$1 i a n
 	for i in in0 in1 in64 in512; do
 		(cd "$out" && $(cmd "$t" native 0 "$i")) > "$out/exp-$t-$i" 2> /dev/null
-		for a in off kernel; do
+		for a in off kernel ctl slice; do
 			[ "$i" = in512 ] && [ "$a" = off ] && continue
+			[ -x "$out/$a-0" ] || [ "$a" = off ] || [ "$a" = kernel ] || continue
 			rm -f "$out/prim.log"
 			(cd "$out" && KATYBUG_STATS=1 KATYBUG_PRIM_LOG="$out/prim.log" $(cmd "$t" $a 0 "$i")) > "$out/o-check" 2> /dev/null
 			n=$(grep -o "$(prim "$t") [0-9]*" "$out/prim.log" 2> /dev/null | tail -1 | cut -d' ' -f2)
@@ -117,14 +136,20 @@ cell() { # tool input arm layouts reps [stop after a first sample over this many
 	return 0
 }
 status=0
-for t in md5sum sha1sum sha256sum sha512sum cksum; do
+for t in ${TOOLS:-md5sum sha1sum sha256sum sha512sum cksum}; do
 	precheck $t
 	grep -q "^DIFFERENT $t" "$out/equal.txt" && status=1 && break
 	for i in in0 in1 in64; do
-		for a in native off kernel; do cell $t $i $a "$layouts" "$reps" || status=1; done
+		for a in native off kernel ctl slice; do
+			[ -x "$out/$a-0" ] || [ "$a" = native ] || [ "$a" = off ] || [ "$a" = kernel ] || continue
+			cell $t $i $a "$layouts" "$reps" || status=1
+		done
 	done
 	cell $t in512 native "$layouts" "$reps" || status=1
-	cell $t in512 kernel "$layouts" "$reps" || status=1
+	for a in kernel ctl slice; do
+		[ -x "$out/$a-0" ] || [ "$a" = kernel ] || continue
+		cell $t in512 $a "$layouts" "$reps" || status=1
+	done
 	# 512 MiB off stops after a sample that passes 120 s
 	cell $t in512 off "$layouts" "$reps" $limit || status=1
 	[ "$status" = 0 ] || break

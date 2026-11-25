@@ -28,7 +28,7 @@ if [ -n "${LINUX_WASM:-}" ]; then
 	for f in hashbench.c:hb hash.c:hh; do
 		src=$here/../hashbench.c
 		[ "${f%%:*}" = hash.c ] && src=$K/hash.c
-		LINUX_WASM=$LINUX_WASM REAL_LLVM=$llvm TMPDIR=/tmp bash "$root/scripts/cc-strict" -c -D_DEFAULT_SOURCE "$src" -o "$out/${f##*:}.o" > /dev/null || exit 1
+		LINUX_WASM=$LINUX_WASM REAL_LLVM=$llvm TMPDIR=/tmp bash "$root/scripts/cc-strict" -c -D_DEFAULT_SOURCE ${WASM_OPT--O2} "$src" -o "$out/${f##*:}.o" > /dev/null || exit 1
 	done
 	"$llvm/wasm-ld" --no-entry "$out/hb.o" "$out/hh.o" -o "$out/hb.wasm" || exit 1
 fi

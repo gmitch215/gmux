@@ -5,7 +5,8 @@ import { readFileSync } from 'node:fs';
  * (a machine under V8): per cell the samples kept, wall median and range, MB/s, the spread of the layouts' medians
  * and the highest quiet reading (above 0.5 a sample is a smoke run); then r, the arm's median wall over the native
  * one, whole and net of the arm's own 0-byte start-up.
- * `node --experimental-strip-types hash-report.ts native|v8 <samples.tsv>`
+ * `bench` reads hashbench.sh's hashbench.tsv.
+ * `node --experimental-strip-types hash-report.ts native|v8|bench <samples.tsv>`
  */
 const MIB: Record<string, number> = { in0: 0, in1: 1, in64: 64, in512: 512 };
 const median = (v: number[]) => [...v].sort((a, b) => a - b)[Math.floor(v.length / 2)]!;
@@ -58,7 +59,7 @@ export function nativeReport(tsv: string): string[] {
 	out.push('', '| tool | input | arm | wall r | r net of start-up | start-up s (arm / native) |', '| --- | --- | --- | --- | --- | --- |');
 	for (const tool of new Set([...cells.keys()].map((k) => k.split('\t')[0]!)))
 		for (const input of ['in1', 'in64', 'in512'])
-			for (const arm of ['off', 'kernel']) {
+			for (const arm of ['off', 'ctl', 'slice', 'kernel']) {
 				const w = med(tool, input, arm);
 				const n = med(tool, input, 'native');
 				if (!Number.isFinite(w) || !Number.isFinite(n)) continue;
@@ -139,7 +140,29 @@ export function v8Report(tsv: string): string[] {
 	return out;
 }
 
+/** markdown rows for the text of a hashbench.sh hashbench.tsv: per label and variant the rounds' medians */
+export function benchReport(tsv: string): string[] {
+	const cells = new Map<string, { mbs: number[]; quiet: number }>();
+	for (const [label, , variant, mbs, , , quiet] of tsv
+		.trim()
+		.split('\n')
+		.map((l) => l.split('\t'))) {
+		const key = `${label}\t${variant}`;
+		const c = cells.get(key) ?? { mbs: [], quiet: 0 };
+		c.mbs.push(Number(mbs));
+		c.quiet = Math.max(c.quiet, Number(quiet));
+		cells.set(key, c);
+	}
+	const out = ['| label | variant | rounds | MB/s median | min-max | max quiet |', '| --- | --- | --- | --- | --- | --- |'];
+	for (const [key, c] of cells) {
+		const [label, variant] = key.split('\t') as [string, string];
+		out.push(`| ${label} | ${variant} | ${c.mbs.length} | ${f(median(c.mbs), 1)} | ${f(Math.min(...c.mbs), 1)}-${f(Math.max(...c.mbs), 1)} | ${f(c.quiet, 2)} |`);
+	}
+	return out;
+}
+
 if (process.argv[1]?.endsWith('hash-report.ts')) {
 	const [kind = '', file = ''] = process.argv.slice(2);
-	console.log((kind === 'v8' ? v8Report : nativeReport)(readFileSync(file, 'utf8')).join('\n'));
+	const report = kind === 'v8' ? v8Report : kind === 'bench' ? benchReport : nativeReport;
+	console.log(report(readFileSync(file, 'utf8')).join('\n'));
 }

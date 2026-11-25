@@ -5,7 +5,7 @@ import { readFileSync } from 'node:fs';
 const [file = '', mibArg = '256', runsArg = '5'] = process.argv.slice(2);
 const mib = Number(mibArg);
 const runs = Number(runsArg);
-const names = ['sha256 shipped', 'sha256 renamed', 'sha256 final 1 block a call', 'sha256 final', 'sha1 final', 'md5 final', 'sha512 final', 'cksum final'];
+const names = ['sha256 shipped', 'sha256 renamed', 'sha256 final 1 block a call', 'sha256 final', 'sha1 final', 'md5 final', 'sha512 final', 'cksum final', 'cksum fast'];
 const { instance } = await WebAssembly.instantiate(readFileSync(file));
 const run = instance.exports.run as (variant: number, reps: number) => number;
 const reps = (mib * 1048576) / 32768;

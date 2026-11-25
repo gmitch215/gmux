@@ -19,6 +19,7 @@ void kb_sha512_blocks(uint64_t st[8], const uint8_t* p, size_t n);
 uint32_t kb_cksum_blocks(
     uint32_t crc, const uint8_t* tab, const uint8_t* p, size_t n
 );
+uint32_t kb_cksum_fast(uint32_t crc, const uint8_t* p, size_t n);
 
 #define CHUNK 32768
 
@@ -118,6 +119,11 @@ static void cksum_final(void* st, const uint8_t* p, size_t n) {
     *crc = kb_cksum_blocks(*crc, crctab, p, n);
 }
 
+static void cksum_fast(void* st, const uint8_t* p, size_t n) {
+    uint32_t* crc = st;
+    *crc = kb_cksum_fast(*crc, p, n);
+}
+
 typedef void (*block_fn)(void*, const uint8_t*, size_t);
 
 union state {
@@ -178,6 +184,7 @@ static const struct variant {
           0xa54ff53a5f1d36f1ull, 0x510e527fade682d1ull, 0x9b05688c2b3e6c1full,
           0x1f83d9abfb41bd6bull, 0x5be0cd19137e2179ull}},
     {"cksum final", cksum_final, 1, 4, 8, {{0}}},
+    {"cksum fast", cksum_fast, 1, 4, 8, {{0}}},
 };
 #define NVARIANTS (sizeof variants / sizeof *variants)
 #define V_SHA256 3
@@ -265,7 +272,7 @@ static int cmp(const void* a, const void* b) {
  * the rest bytewise, then the length's bytes, as cksum.c's crc_sum_stream */
 static int check_cksum(void) {
     static uint8_t in[CHUNK];
-    uint32_t crc = 0;
+    uint32_t crc = 0, fast = 0;
     uint64_t total = 0;
     size_t got;
     fill_crctab();
@@ -277,8 +284,15 @@ static int check_cksum(void) {
         total += got;
         size_t n = got / 8;
         crc = kb_cksum_blocks(crc, crctab, in, n);
-        for (size_t i = n * 8; i < got; i++)
+        fast = kb_cksum_fast(fast, in, n);
+        for (size_t i = n * 8; i < got; i++) {
             crc = (crc << 8) ^ T0((crc >> 24) ^ in[i]);
+            fast = (fast << 8) ^ T0((fast >> 24) ^ in[i]);
+        }
+    }
+    if (crc != fast) {
+        printf("fast step differs: %u %u\n", (unsigned) ~crc, (unsigned) ~fast);
+        return 1;
     }
     for (uint64_t n = total; n; n >>= 8)
         crc = (crc << 8) ^ T0((crc >> 24) ^ (uint32_t) (n & 255));
